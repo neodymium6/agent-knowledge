@@ -12,10 +12,14 @@ init:
 # Format repository-owned files.
 fmt:
   nix fmt -- flake.nix
+  cargo fmt --all
 
 # Run all repository checks.
 check:
   pre-commit run --all-files
+  cargo fmt --all -- --check
+  cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+  cargo test --workspace --all-features --locked
   nix flake check path:.
 
 # CI alias.
