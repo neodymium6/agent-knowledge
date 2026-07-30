@@ -1,5 +1,6 @@
 .direnv/
 .local/
 .pre-commit-cache/
+/target/
 result
 result-*

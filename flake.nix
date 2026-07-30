@@ -23,11 +23,15 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               actionlint
+              cargo
+              clippy
               gh
               git
               just
               nixfmt-tree
               pre-commit
+              rustc
+              rustfmt
             ];
           };
         }

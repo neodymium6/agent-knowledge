@@ -9,7 +9,8 @@ restricted gateway; they do not synchronize the repository with Git.
 
 ## Status
 
-The initial architecture is defined and implementation has not started.
+The initial architecture is defined and the Rust implementation scaffold is in
+place.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
