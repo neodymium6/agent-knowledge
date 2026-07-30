@@ -22,6 +22,7 @@
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
+              actionlint
               gh
               git
               just
