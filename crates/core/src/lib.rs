@@ -1,5 +1,20 @@
 //! Shared domain types and validation for Agent Knowledge.
 
+mod error_code;
+mod id;
+mod path;
+mod request;
+mod revision;
+
+pub use error_code::{DocumentStatus, ErrorCode};
+pub use id::{DocumentId, RequestId, SessionId};
+pub use path::{AttachmentName, PathValidationError, PayloadPath, ProjectId};
+pub use request::{
+    CURRENT_PROTOCOL_VERSION, ChangeRequest, DocumentType, Operation, RequestLimits,
+    RequestValidationError,
+};
+pub use revision::{Revision, RevisionParseError};
+
 /// The stable application name used by commands and diagnostics.
 pub const APPLICATION_NAME: &str = "agent-knowledge";
 
