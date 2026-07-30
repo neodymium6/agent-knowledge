@@ -22,6 +22,7 @@
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
+              gh
               git
               just
               nixfmt-tree
