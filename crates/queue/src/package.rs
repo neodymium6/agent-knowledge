@@ -13,8 +13,10 @@ use sha2::{Digest, Sha256};
 
 const REQUEST_FILE_NAME: &str = "request.json";
 const PAYLOAD_DIRECTORY_NAME: &str = "payload";
+const DIGEST_FILE_NAME: &str = "digest";
 const DIGEST_DOMAIN: &[u8] = b"agent-knowledge-request-package-v1\0";
 const HASH_BUFFER_LENGTH: usize = 64 * 1024;
+const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
 
 /// Configurable byte and file-count limits for one request package.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,8 +218,36 @@ pub fn validate_package(
     package_root: &Path,
     policy: &PackagePolicy,
 ) -> Result<ValidatedPackage, PackageValidationError> {
-    validate_package_root(package_root)?;
+    validate_package_root(package_root, false)?;
+    validate_package_contents(package_root, policy)
+}
 
+/// Revalidates an accepted package and its stored digest.
+///
+/// # Errors
+///
+/// Returns an error when the immutable package is malformed, its contents no
+/// longer match its stored digest, or an I/O operation fails.
+pub fn validate_accepted_package(
+    package_root: &Path,
+    policy: &PackagePolicy,
+) -> Result<ValidatedPackage, PackageValidationError> {
+    validate_package_root(package_root, true)?;
+    let stored_digest = read_digest_file(&package_root.join(DIGEST_FILE_NAME))?;
+    let package = validate_package_contents(package_root, policy)?;
+    if stored_digest != package.digest {
+        return Err(PackageValidationError::StoredDigestMismatch {
+            stored: stored_digest,
+            calculated: package.digest,
+        });
+    }
+    Ok(package)
+}
+
+fn validate_package_contents(
+    package_root: &Path,
+    policy: &PackagePolicy,
+) -> Result<ValidatedPackage, PackageValidationError> {
     let request_path = package_root.join(REQUEST_FILE_NAME);
     let request_bytes = read_limited_file(&request_path, policy.limits.maximum_file_bytes)?;
     let mut total_bytes = request_bytes.len() as u64;
@@ -255,7 +285,10 @@ pub fn validate_package(
     })
 }
 
-fn validate_package_root(package_root: &Path) -> Result<(), PackageValidationError> {
+fn validate_package_root(
+    package_root: &Path,
+    accepted: bool,
+) -> Result<(), PackageValidationError> {
     let root_metadata = fs::symlink_metadata(package_root).map_err(PackageValidationError::Io)?;
     if !root_metadata.file_type().is_dir() {
         return Err(PackageValidationError::InvalidEntryType {
@@ -270,7 +303,10 @@ fn validate_package_root(package_root: &Path) -> Result<(), PackageValidationErr
             .file_name()
             .into_string()
             .map_err(|_| PackageValidationError::InvalidLayout)?;
-        if name != REQUEST_FILE_NAME && name != PAYLOAD_DIRECTORY_NAME {
+        if name != REQUEST_FILE_NAME
+            && name != PAYLOAD_DIRECTORY_NAME
+            && !(accepted && name == DIGEST_FILE_NAME)
+        {
             return Err(PackageValidationError::UnexpectedTopLevelEntry(name));
         }
         names.insert(name);
@@ -284,6 +320,11 @@ fn validate_package_root(package_root: &Path) -> Result<(), PackageValidationErr
     if !names.contains(PAYLOAD_DIRECTORY_NAME) {
         return Err(PackageValidationError::MissingTopLevelEntry(
             PAYLOAD_DIRECTORY_NAME,
+        ));
+    }
+    if accepted && !names.contains(DIGEST_FILE_NAME) {
+        return Err(PackageValidationError::MissingTopLevelEntry(
+            DIGEST_FILE_NAME,
         ));
     }
 
@@ -302,8 +343,40 @@ fn validate_package_root(package_root: &Path) -> Result<(), PackageValidationErr
             path: PathBuf::from(PAYLOAD_DIRECTORY_NAME),
         });
     }
+    if accepted {
+        let digest_metadata = fs::symlink_metadata(package_root.join(DIGEST_FILE_NAME))
+            .map_err(PackageValidationError::Io)?;
+        if !digest_metadata.file_type().is_file() {
+            return Err(PackageValidationError::InvalidEntryType {
+                path: PathBuf::from(DIGEST_FILE_NAME),
+            });
+        }
+    }
 
     Ok(())
+}
+
+fn read_digest_file(path: &Path) -> Result<PackageDigest, PackageValidationError> {
+    let mut bytes = Vec::with_capacity(MAXIMUM_DIGEST_FILE_BYTES as usize);
+    File::open(path)
+        .map_err(PackageValidationError::Io)?
+        .take(MAXIMUM_DIGEST_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(PackageValidationError::Io)?;
+    if bytes.len() as u64 > MAXIMUM_DIGEST_FILE_BYTES {
+        return Err(PackageValidationError::InvalidStoredDigest);
+    }
+    let contents =
+        std::str::from_utf8(&bytes).map_err(|_| PackageValidationError::InvalidStoredDigest)?;
+    let Some(value) = contents.strip_suffix('\n') else {
+        return Err(PackageValidationError::InvalidStoredDigest);
+    };
+    if value.contains('\n') {
+        return Err(PackageValidationError::InvalidStoredDigest);
+    }
+    value
+        .parse()
+        .map_err(|_| PackageValidationError::InvalidStoredDigest)
 }
 
 fn scan_payload_directory(
@@ -619,6 +692,15 @@ pub enum PackageValidationError {
     UnexpectedPayload(PayloadPath),
     /// A payload file changed while its digest was calculated.
     FileChangedDuringValidation(PayloadPath),
+    /// The stored digest file was not canonical.
+    InvalidStoredDigest,
+    /// Immutable accepted contents no longer matched the stored digest.
+    StoredDigestMismatch {
+        /// The digest recorded at acceptance.
+        stored: PackageDigest,
+        /// The digest calculated during revalidation.
+        calculated: PackageDigest,
+    },
 }
 
 impl PackageValidationError {
@@ -641,6 +723,9 @@ impl PackageValidationError {
             | Self::MissingPayload(_)
             | Self::UnexpectedPayload(_)
             | Self::FileChangedDuringValidation(_) => ErrorCode::InvalidRequest,
+            Self::InvalidStoredDigest | Self::StoredDigestMismatch { .. } => {
+                ErrorCode::ContentValidationFailed
+            }
         }
     }
 }
@@ -716,6 +801,13 @@ impl fmt::Display for PackageValidationError {
             Self::FileChangedDuringValidation(path) => {
                 write!(formatter, "payload `{path}` changed during validation")
             }
+            Self::InvalidStoredDigest => {
+                formatter.write_str("stored package digest is not canonical")
+            }
+            Self::StoredDigestMismatch { stored, calculated } => write!(
+                formatter,
+                "stored package digest `{stored}` does not match calculated digest `{calculated}`"
+            ),
         }
     }
 }

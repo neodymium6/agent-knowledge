@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_knowledge_core::ErrorCode;
 
-use super::{PackageLimit, PackageLimits, PackagePolicy, PackageValidationError, validate_package};
+use super::{
+    PackageLimit, PackageLimits, PackagePolicy, PackageValidationError, validate_accepted_package,
+    validate_package,
+};
 
 const REQUEST_JSON: &str = r#"{
     "protocol_version": 1,
@@ -225,4 +228,43 @@ fn rejects_symbolic_links() {
         error,
         PackageValidationError::InvalidEntryType { .. }
     ));
+}
+
+#[test]
+fn revalidates_accepted_digest_and_detects_changed_contents() {
+    let root = TestDirectory::create();
+    write_fixture(root.path(), REQUEST_JSON, false);
+    let package = match validate_package(root.path(), &PackagePolicy::default()) {
+        Ok(package) => package,
+        Err(error) => panic!("incoming fixture package must validate: {error}"),
+    };
+    if let Err(error) = fs::write(
+        root.path().join("digest"),
+        format!("{}\n", package.digest()),
+    ) {
+        panic!("fixture digest must be written: {error}");
+    }
+
+    let accepted = match validate_accepted_package(root.path(), &PackagePolicy::default()) {
+        Ok(package) => package,
+        Err(error) => panic!("accepted fixture package must validate: {error}"),
+    };
+    assert_eq!(accepted.digest(), package.digest());
+    assert!(validate_package(root.path(), &PackagePolicy::default()).is_err());
+
+    if let Err(error) = fs::write(
+        root.path().join("payload/benchmark/results.csv"),
+        "step,value\n1,99\n",
+    ) {
+        panic!("fixture payload must be changed: {error}");
+    }
+    let error = match validate_accepted_package(root.path(), &PackagePolicy::default()) {
+        Ok(_) => panic!("changed accepted package must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        PackageValidationError::StoredDigestMismatch { .. }
+    ));
+    assert_eq!(error.error_code(), ErrorCode::ContentValidationFailed);
 }
