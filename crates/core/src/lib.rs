@@ -1,11 +1,15 @@
 //! Shared domain types and validation for Agent Knowledge.
 
+mod document;
 mod error_code;
 mod id;
 mod path;
 mod request;
 mod revision;
 
+pub use document::{
+    CURRENT_DOCUMENT_SCHEMA_VERSION, DocumentLimits, DocumentMetadata, DocumentValidationError,
+};
 pub use error_code::{DocumentStatus, ErrorCode};
 pub use id::{DocumentId, RequestId, SessionId};
 pub use path::{AttachmentName, PathValidationError, PayloadPath, ProjectId};

@@ -38,7 +38,16 @@ const REQUEST_JSON: &str = r#"{
     ]
 }"#;
 
-const MARKDOWN: &[u8] = b"---\ntitle: Fictional benchmark\n---\n";
+const MARKDOWN: &[u8] = b"---\n\
+schema_version: 1\n\
+document_id: 01K00000000000000000000002\n\
+title: Fictional benchmark\n\
+created: 2026-07-31T03:50:00+09:00\n\
+request_id: 01K00000000000000000000000\n\
+tags:\n\
+  - benchmark\n\
+status: active\n\
+---\n";
 const RESULTS: &[u8] = b"step,value\n1,42\n";
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);

@@ -82,7 +82,11 @@ fn write_fixture(root: &Path, request_json: &str, reverse_payload_order: bool) {
     }
 
     let files = [
-        ("index.md", b"---\ntitle: Fictional\n---\n" as &[u8]),
+        (
+            "index.md",
+            b"---\nschema_version: 1\ndocument_id: 01K00000000000000000000002\ntitle: Fictional benchmark\ncreated: 2026-07-31T03:50:00+09:00\nrequest_id: 01K00000000000000000000000\ntags:\n  - benchmark\nstatus: active\n---\n"
+                as &[u8],
+        ),
         ("results.csv", b"step,value\n1,42\n" as &[u8]),
     ];
     let order: &[usize] = if reverse_payload_order {
@@ -205,6 +209,85 @@ fn rejects_disallowed_attachment_extensions() {
         PackageValidationError::UnsupportedAttachment(ref name) if name == "results.csv"
     ));
     assert_eq!(error.error_code(), ErrorCode::UnsupportedFileType);
+}
+
+#[test]
+fn rejects_incomplete_or_inconsistent_front_matter() {
+    let incomplete = TestDirectory::create();
+    write_fixture(incomplete.path(), REQUEST_JSON, false);
+    if let Err(error) = fs::write(
+        incomplete.path().join("payload/benchmark/index.md"),
+        "---\ntitle: Incomplete\n---\n",
+    ) {
+        panic!("incomplete fixture Markdown must be written: {error}");
+    }
+    let error = match validate_package(incomplete.path(), &PackagePolicy::default()) {
+        Ok(_) => panic!("incomplete front matter must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        PackageValidationError::InvalidFrontMatter(_)
+    ));
+    assert_eq!(error.error_code(), ErrorCode::InvalidFrontMatter);
+
+    let mismatched = TestDirectory::create();
+    write_fixture(mismatched.path(), REQUEST_JSON, false);
+    let markdown_path = mismatched.path().join("payload/benchmark/index.md");
+    let markdown = match fs::read_to_string(&markdown_path) {
+        Ok(markdown) => markdown,
+        Err(error) => panic!("fixture Markdown must be readable: {error}"),
+    }
+    .replace("01K00000000000000000000002", "01K00000000000000000000003");
+    if let Err(error) = fs::write(markdown_path, markdown) {
+        panic!("mismatched fixture Markdown must be written: {error}");
+    }
+    assert!(matches!(
+        validate_package(mismatched.path(), &PackagePolicy::default()),
+        Err(PackageValidationError::InvalidFrontMatter(_))
+    ));
+
+    let duplicate = TestDirectory::create();
+    write_fixture(duplicate.path(), REQUEST_JSON, false);
+    let markdown_path = duplicate.path().join("payload/benchmark/index.md");
+    let markdown = match fs::read_to_string(&markdown_path) {
+        Ok(markdown) => markdown,
+        Err(error) => panic!("fixture Markdown must be readable: {error}"),
+    }
+    .replace(
+        "title: Fictional benchmark",
+        "title: Fictional benchmark\ntitle: Duplicate",
+    );
+    if let Err(error) = fs::write(markdown_path, markdown) {
+        panic!("duplicate-key fixture Markdown must be written: {error}");
+    }
+    assert!(matches!(
+        validate_package(duplicate.path(), &PackagePolicy::default()),
+        Err(PackageValidationError::InvalidFrontMatter(_))
+    ));
+}
+
+#[test]
+fn updated_documents_require_updated_metadata() {
+    let root = TestDirectory::create();
+    let update_request = REQUEST_JSON.replace(
+        "\"type\": \"create_document\",",
+        concat!(
+            "\"type\": \"update_document\",",
+            "\n                \"expected_revision\": ",
+            "\"sha256:0000000000000000000000000000000000000000000000000000000000000000\","
+        ),
+    );
+    write_fixture(root.path(), &update_request, false);
+
+    let error = match validate_package(root.path(), &PackagePolicy::default()) {
+        Ok(_) => panic!("updated document without `updated` metadata must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        PackageValidationError::InvalidFrontMatter(_)
+    ));
 }
 
 #[cfg(unix)]

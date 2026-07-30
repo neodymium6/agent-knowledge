@@ -6,10 +6,13 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use agent_knowledge_core::{
-    ChangeRequest, ErrorCode, Operation, PayloadPath, RequestLimits, RequestValidationError,
-    Revision, RevisionParseError,
+    ChangeRequest, DocumentLimits, ErrorCode, Operation, PayloadPath, RequestLimits,
+    RequestValidationError, Revision, RevisionParseError,
 };
 use sha2::{Digest, Sha256};
+
+mod markdown;
+pub use markdown::MarkdownValidationError;
 
 const REQUEST_FILE_NAME: &str = "request.json";
 const PAYLOAD_DIRECTORY_NAME: &str = "payload";
@@ -29,6 +32,8 @@ pub struct PackageLimits {
     pub maximum_file_count: usize,
     /// Validation limits for the decoded change request.
     pub request: RequestLimits,
+    /// Validation limits for Markdown document front matter.
+    pub document: DocumentLimits,
 }
 
 impl Default for PackageLimits {
@@ -38,6 +43,7 @@ impl Default for PackageLimits {
             maximum_file_bytes: 32 * 1024 * 1024,
             maximum_file_count: 256,
             request: RequestLimits::default(),
+            document: DocumentLimits::default(),
         }
     }
 }
@@ -273,6 +279,8 @@ fn validate_package_contents(
     payload_files.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
 
     validate_payload_references(&request, &payload_files, policy)?;
+    markdown::validate_documents(&request, &payload_root, policy.limits.document)
+        .map_err(PackageValidationError::InvalidFrontMatter)?;
 
     let canonical_request =
         serde_json::to_vec(&request).map_err(PackageValidationError::InvalidRequestJson)?;
@@ -692,6 +700,8 @@ pub enum PackageValidationError {
     UnexpectedPayload(PayloadPath),
     /// A payload file changed while its digest was calculated.
     FileChangedDuringValidation(PayloadPath),
+    /// A Markdown document's front matter was invalid or inconsistent.
+    InvalidFrontMatter(markdown::MarkdownValidationError),
     /// The stored digest file was not canonical.
     InvalidStoredDigest,
     /// Immutable accepted contents no longer matched the stored digest.
@@ -712,6 +722,7 @@ impl PackageValidationError {
             Self::InvalidPayloadPath(_) => ErrorCode::InvalidPath,
             Self::LimitExceeded { .. } | Self::FileTooLarge { .. } => ErrorCode::LimitExceeded,
             Self::UnsupportedAttachment(_) => ErrorCode::UnsupportedFileType,
+            Self::InvalidFrontMatter(error) => error.error_code(),
             Self::InvalidLayout
             | Self::MissingTopLevelEntry(_)
             | Self::UnexpectedTopLevelEntry(_)
@@ -801,6 +812,9 @@ impl fmt::Display for PackageValidationError {
             Self::FileChangedDuringValidation(path) => {
                 write!(formatter, "payload `{path}` changed during validation")
             }
+            Self::InvalidFrontMatter(error) => {
+                write!(formatter, "Markdown front matter is invalid: {error}")
+            }
             Self::InvalidStoredDigest => {
                 formatter.write_str("stored package digest is not canonical")
             }
@@ -818,6 +832,7 @@ impl std::error::Error for PackageValidationError {
             Self::Io(error) => Some(error),
             Self::InvalidRequestJson(error) => Some(error),
             Self::InvalidRequest(error) => Some(error),
+            Self::InvalidFrontMatter(error) => Some(error),
             _ => None,
         }
     }

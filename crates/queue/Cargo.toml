@@ -13,3 +13,4 @@ agent-knowledge-core = { path = "../core" }
 serde_json.workspace = true
 sha2.workspace = true
 ulid.workspace = true
+yaml_serde.workspace = true
