@@ -9,9 +9,19 @@ restricted gateway; they do not synchronize the repository with Git.
 
 ## Status
 
-The project is in its initial design and scaffolding phase. The implementation
-language, runtime architecture, deployment target, static-site generator
-integration, and search backend have not been selected.
+The initial architecture is defined and implementation has not started.
+
+- Rust is the implementation language.
+- OpenSSH forced commands provide the client transport and authentication
+  boundary.
+- A durable file queue separates request acceptance from repository changes.
+- A single Repository Worker applies atomic changes, commits them with Git, and
+  publishes static releases with Quartz.
+- A conventional Linux host is the initial target. The design remains
+  compatible with a future single-replica Kubernetes deployment.
+
+See [DESIGN.md](DESIGN.md) for the complete architecture, invariants,
+protocol, persistence, recovery, and delivery plan.
 
 ## Development
 
