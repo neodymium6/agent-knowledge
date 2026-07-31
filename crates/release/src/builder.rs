@@ -134,10 +134,10 @@ impl QuartzBuilder {
         let mut child = ChildGuard::new(child)?;
         let status = loop {
             if let Some(status) = child.try_wait()? {
-                enforce_output_limits(output, self.output_policy)?;
+                enforce_output_limits(output, self.output_policy, deadline, self.timeout)?;
                 break status;
             }
-            enforce_output_limits(output, self.output_policy)?;
+            enforce_output_limits(output, self.output_policy, deadline, self.timeout)?;
             if Instant::now() >= deadline {
                 child.terminate();
                 return Err(QuartzBuildError::TimedOut {
@@ -381,7 +381,13 @@ fn ensure_nonempty_directory(path: &Path) -> Result<(), QuartzBuildError> {
     }
 }
 
-fn enforce_output_limits(output: &Path, policy: ReleasePolicy) -> Result<(), QuartzBuildError> {
+fn enforce_output_limits(
+    output: &Path,
+    policy: ReleasePolicy,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<(), QuartzBuildError> {
+    check_build_deadline(deadline, timeout)?;
     let listed = match fs::symlink_metadata(output) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -399,53 +405,83 @@ fn enforce_output_limits(output: &Path, policy: ReleasePolicy) -> Result<(), Qua
         return Ok(());
     }
 
-    let mut entries = 0_u64;
-    let mut total_bytes = 0_u64;
-    let mut directories = vec![(root, output.to_path_buf(), 0_usize)];
-    while let Some((directory, configured, depth)) = directories.pop() {
-        let stable = stable_file_path(&directory, &configured)?;
-        for entry in fs::read_dir(&stable).map_err(QuartzBuildError::Io)? {
-            let path = entry.map_err(QuartzBuildError::Io)?.path();
-            entries = entries
-                .checked_add(1)
-                .ok_or(QuartzBuildError::OutputLimitExceeded)?;
-            if entries > policy.maximum_entries {
+    let mut usage = OutputUsage::default();
+    scan_output_directory(&root, output, 0, policy, deadline, timeout, &mut usage)
+}
+
+#[derive(Default)]
+struct OutputUsage {
+    entries: u64,
+    total_bytes: u64,
+}
+
+fn scan_output_directory(
+    directory: &File,
+    configured: &Path,
+    depth: usize,
+    policy: ReleasePolicy,
+    deadline: Instant,
+    timeout: Duration,
+    usage: &mut OutputUsage,
+) -> Result<(), QuartzBuildError> {
+    check_build_deadline(deadline, timeout)?;
+    let stable = stable_file_path(directory, configured)?;
+    let mut children = Vec::new();
+    for entry in fs::read_dir(&stable).map_err(QuartzBuildError::Io)? {
+        check_build_deadline(deadline, timeout)?;
+        usage.entries = usage
+            .entries
+            .checked_add(1)
+            .ok_or(QuartzBuildError::OutputLimitExceeded)?;
+        if usage.entries > policy.maximum_entries {
+            return Err(QuartzBuildError::OutputLimitExceeded);
+        }
+        children.push(entry.map_err(QuartzBuildError::Io)?.path());
+    }
+    for path in children {
+        check_build_deadline(deadline, timeout)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(QuartzBuildError::Io(error)),
+        };
+        if metadata.file_type().is_dir() {
+            if depth == MAXIMUM_RELEASE_TREE_DEPTH {
                 return Err(QuartzBuildError::OutputLimitExceeded);
             }
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
+            let child = match open_scan_directory(&path) {
+                Ok(child) => child,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(QuartzBuildError::Io(error)),
             };
-            if metadata.file_type().is_dir() {
-                if depth == MAXIMUM_RELEASE_TREE_DEPTH {
-                    return Err(QuartzBuildError::OutputLimitExceeded);
-                }
-                let child = match open_scan_directory(&path) {
-                    Ok(child) => child,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(QuartzBuildError::Io(error)),
-                };
-                if !same_metadata(&metadata, &child.metadata().map_err(QuartzBuildError::Io)?) {
-                    continue;
-                }
-                directories.push((child, path, depth + 1));
-            } else if metadata.file_type().is_file() {
-                if metadata.len() > policy.maximum_file_bytes {
-                    return Err(QuartzBuildError::OutputLimitExceeded);
-                }
-                total_bytes = total_bytes
-                    .checked_add(metadata.len())
-                    .ok_or(QuartzBuildError::OutputLimitExceeded)?;
-                if total_bytes > policy.maximum_total_bytes {
-                    return Err(QuartzBuildError::OutputLimitExceeded);
-                }
-            } else {
+            if !same_metadata(&metadata, &child.metadata().map_err(QuartzBuildError::Io)?) {
+                continue;
+            }
+            scan_output_directory(&child, &path, depth + 1, policy, deadline, timeout, usage)?;
+        } else if metadata.file_type().is_file() {
+            if metadata.len() > policy.maximum_file_bytes {
                 return Err(QuartzBuildError::OutputLimitExceeded);
             }
+            usage.total_bytes = usage
+                .total_bytes
+                .checked_add(metadata.len())
+                .ok_or(QuartzBuildError::OutputLimitExceeded)?;
+            if usage.total_bytes > policy.maximum_total_bytes {
+                return Err(QuartzBuildError::OutputLimitExceeded);
+            }
+        } else {
+            return Err(QuartzBuildError::OutputLimitExceeded);
         }
     }
     Ok(())
+}
+
+fn check_build_deadline(deadline: Instant, timeout: Duration) -> Result<(), QuartzBuildError> {
+    if Instant::now() >= deadline {
+        Err(QuartzBuildError::TimedOut { timeout })
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(unix)]

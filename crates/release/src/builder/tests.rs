@@ -7,7 +7,7 @@ use std::time::Duration;
 use std::os::unix::fs::PermissionsExt;
 use ulid::Ulid;
 
-use super::{QuartzBuildError, QuartzBuilder};
+use super::{QuartzBuildError, QuartzBuilder, enforce_output_limits};
 use crate::ReleasePolicy;
 
 struct TestDirectory(PathBuf);
@@ -225,6 +225,67 @@ fn terminates_quartz_when_live_output_exceeds_policy() {
         Err(QuartzBuildError::OutputLimitExceeded)
     ));
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn live_output_scan_bounds_descriptors_for_wide_trees() {
+    const CHILD_MARKER: &str = "AGENT_KNOWLEDGE_LOW_FD_SCAN";
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let executable = std::env::current_exe()
+            .unwrap_or_else(|error| panic!("test executable path must be available: {error}"));
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "ulimit -n 64 && exec \"$1\" --exact \
+                 builder::tests::live_output_scan_bounds_descriptors_for_wide_trees --nocapture",
+            )
+            .arg("sh")
+            .arg(executable)
+            .env(CHILD_MARKER, "1")
+            .status()
+            .unwrap_or_else(|error| panic!("low-descriptor test process must start: {error}"));
+        assert!(status.success());
+        return;
+    }
+
+    let root = TestDirectory::new();
+    let output = root.0.join("output");
+    fs::create_dir(&output)
+        .unwrap_or_else(|error| panic!("output directory must be created: {error}"));
+    for index in 0..256 {
+        fs::create_dir(output.join(format!("directory-{index:04}")))
+            .unwrap_or_else(|error| panic!("wide output directory must be created: {error}"));
+    }
+    enforce_output_limits(
+        &output,
+        ReleasePolicy {
+            maximum_entries: 512,
+            maximum_file_bytes: 64,
+            maximum_total_bytes: 64,
+        },
+        std::time::Instant::now() + Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .unwrap_or_else(|error| panic!("wide output must scan within descriptor limits: {error}"));
+}
+
+#[test]
+fn live_output_scan_observes_the_build_deadline() {
+    let root = TestDirectory::new();
+    let output = root.0.join("output");
+    fs::create_dir(&output)
+        .unwrap_or_else(|error| panic!("output directory must be created: {error}"));
+
+    assert!(matches!(
+        enforce_output_limits(
+            &output,
+            ReleasePolicy::default(),
+            std::time::Instant::now(),
+            Duration::from_millis(10),
+        ),
+        Err(QuartzBuildError::TimedOut { .. })
+    ));
 }
 
 #[cfg(unix)]
