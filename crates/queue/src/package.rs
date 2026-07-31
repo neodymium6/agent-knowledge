@@ -9,7 +9,9 @@ use agent_knowledge_core::{
     ChangeRequest, DocumentLimits, ErrorCode, Operation, PayloadPath, RequestDecodeError,
     RequestLimits, RequestValidationError, Revision, RevisionParseError,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 
 mod markdown;
 pub use markdown::MarkdownValidationError;
@@ -17,11 +19,24 @@ pub use markdown::MarkdownValidationError;
 const REQUEST_FILE_NAME: &str = "request.json";
 const PAYLOAD_DIRECTORY_NAME: &str = "payload";
 const DIGEST_FILE_NAME: &str = "digest";
+const ACCEPTANCE_FILE_NAME: &str = "acceptance.json";
 const PHASE_FILE_NAME: &str = "phase.json";
 const RESULT_FILE_NAME: &str = "result.json";
 const DIGEST_DOMAIN: &[u8] = b"agent-knowledge-request-package-v1\0";
 const HASH_BUFFER_LENGTH: usize = 64 * 1024;
 const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
+const MAXIMUM_ACCEPTANCE_FILE_BYTES: u64 = 256;
+
+/// Immutable Gateway-owned ordering metadata for an accepted package.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceMetadata {
+    /// Queue-local durable acceptance order, starting at one.
+    pub sequence: u64,
+    /// Central-server timestamp recorded while holding the acceptance lock.
+    #[serde(with = "time::serde::rfc3339")]
+    pub accepted_at: OffsetDateTime,
+}
 
 /// Configurable byte and file-count limits for one request package.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +47,12 @@ pub struct PackageLimits {
     pub maximum_file_bytes: u64,
     /// Maximum number of files, including `request.json`.
     pub maximum_file_count: usize,
+    /// Maximum number of nested directories below `payload/`.
+    pub maximum_directory_count: usize,
+    /// Maximum combined request file, payload files, and payload directories.
+    pub maximum_entry_count: usize,
+    /// Maximum path components in one payload file or directory.
+    pub maximum_path_components: usize,
     /// Maximum bytes in one Markdown document's YAML front matter.
     pub maximum_front_matter_bytes: usize,
     /// Validation limits for the decoded change request.
@@ -46,6 +67,9 @@ impl Default for PackageLimits {
             maximum_total_bytes: 64 * 1024 * 1024,
             maximum_file_bytes: 32 * 1024 * 1024,
             maximum_file_count: 256,
+            maximum_directory_count: 1_024,
+            maximum_entry_count: 1_280,
+            maximum_path_components: 64,
             maximum_front_matter_bytes: 64 * 1024,
             request: RequestLimits::default(),
             document: DocumentLimits::default(),
@@ -194,6 +218,7 @@ pub struct ValidatedPackage {
     request: ChangeRequest,
     digest: PackageDigest,
     payload: Vec<PayloadMetadata>,
+    acceptance: Option<AcceptanceMetadata>,
 }
 
 impl ValidatedPackage {
@@ -213,6 +238,14 @@ impl ValidatedPackage {
     #[must_use]
     pub fn payload(&self) -> &[PayloadMetadata] {
         &self.payload
+    }
+
+    /// Returns Gateway-owned ordering metadata for an accepted package.
+    ///
+    /// Incoming packages do not have acceptance metadata yet.
+    #[must_use]
+    pub const fn acceptance(&self) -> Option<AcceptanceMetadata> {
+        self.acceptance
     }
 }
 
@@ -245,13 +278,15 @@ pub fn validate_accepted_package(
 ) -> Result<ValidatedPackage, PackageValidationError> {
     validate_package_root(package_root, true)?;
     let stored_digest = read_digest_file(&package_root.join(DIGEST_FILE_NAME))?;
-    let package = validate_package_contents(package_root, policy)?;
+    let acceptance = read_acceptance_file(&package_root.join(ACCEPTANCE_FILE_NAME))?;
+    let mut package = validate_package_contents(package_root, policy)?;
     if stored_digest != package.digest {
         return Err(PackageValidationError::StoredDigestMismatch {
             stored: stored_digest,
             calculated: package.digest,
         });
     }
+    package.acceptance = Some(acceptance);
     Ok(package)
 }
 
@@ -300,6 +335,7 @@ fn validate_package_contents(
         request,
         digest,
         payload: payload_files,
+        acceptance: None,
     })
 }
 
@@ -324,6 +360,7 @@ fn validate_package_root(
         if name != REQUEST_FILE_NAME
             && name != PAYLOAD_DIRECTORY_NAME
             && !(accepted && name == DIGEST_FILE_NAME)
+            && !(accepted && name == ACCEPTANCE_FILE_NAME)
             && !(accepted && name == PHASE_FILE_NAME)
             && !(accepted && name == RESULT_FILE_NAME)
         {
@@ -347,6 +384,11 @@ fn validate_package_root(
             DIGEST_FILE_NAME,
         ));
     }
+    if accepted && !names.contains(ACCEPTANCE_FILE_NAME) {
+        return Err(PackageValidationError::MissingTopLevelEntry(
+            ACCEPTANCE_FILE_NAME,
+        ));
+    }
 
     let request_metadata = fs::symlink_metadata(package_root.join(REQUEST_FILE_NAME))
         .map_err(PackageValidationError::Io)?;
@@ -363,6 +405,9 @@ fn validate_package_root(
         let digest_metadata = fs::symlink_metadata(package_root.join(DIGEST_FILE_NAME))
             .map_err(PackageValidationError::Io)?;
         validate_regular_file(&digest_metadata, Path::new(DIGEST_FILE_NAME))?;
+        let acceptance_metadata = fs::symlink_metadata(package_root.join(ACCEPTANCE_FILE_NAME))
+            .map_err(PackageValidationError::Io)?;
+        validate_regular_file(&acceptance_metadata, Path::new(ACCEPTANCE_FILE_NAME))?;
         for sidecar in [PHASE_FILE_NAME, RESULT_FILE_NAME] {
             if names.contains(sidecar) {
                 let metadata = fs::symlink_metadata(package_root.join(sidecar))
@@ -373,6 +418,11 @@ fn validate_package_root(
     }
 
     Ok(())
+}
+
+fn read_acceptance_file(path: &Path) -> Result<AcceptanceMetadata, PackageValidationError> {
+    let bytes = read_limited_file(path, MAXIMUM_ACCEPTANCE_FILE_BYTES)?;
+    serde_json::from_slice(&bytes).map_err(PackageValidationError::InvalidAcceptanceMetadata)
 }
 
 fn read_digest_file(path: &Path) -> Result<PackageDigest, PackageValidationError> {
@@ -406,67 +456,123 @@ fn scan_payload_directory(
     file_count: &mut usize,
     files: &mut Vec<PayloadMetadata>,
 ) -> Result<usize, PackageValidationError> {
-    let mut descendant_files = 0_usize;
-    for entry in fs::read_dir(directory).map_err(PackageValidationError::Io)? {
-        let entry = entry.map_err(PackageValidationError::Io)?;
-        let metadata = fs::symlink_metadata(entry.path()).map_err(PackageValidationError::Io)?;
-        let relative = entry
-            .path()
-            .strip_prefix(payload_root)
-            .map_err(|_| PackageValidationError::InvalidLayout)?
-            .to_str()
-            .ok_or(PackageValidationError::InvalidLayout)?
-            .to_owned();
-        let path = relative
-            .parse::<PayloadPath>()
-            .map_err(|_| PackageValidationError::InvalidPayloadPath(relative.clone()))?;
+    let mut stack = vec![directory.to_path_buf()];
+    let mut directories = Vec::new();
+    let mut nonempty_directories = HashSet::new();
+    let mut entry_count = *file_count;
 
-        if metadata.file_type().is_dir() {
-            let nested_files = scan_payload_directory(
-                &entry.path(),
-                payload_root,
-                limits,
-                total_bytes,
-                file_count,
-                files,
-            )?;
-            if nested_files == 0 {
-                return Err(PackageValidationError::EmptyPayloadDirectory(path));
-            }
-            descendant_files += nested_files;
-            continue;
+    while let Some(current) = stack.pop() {
+        let remaining = limits.maximum_entry_count.saturating_sub(entry_count);
+        let mut entries = fs::read_dir(&current)
+            .map_err(PackageValidationError::Io)?
+            .take(remaining.saturating_add(1))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PackageValidationError::Io)?;
+        if entries.len() > remaining {
+            return Err(PackageValidationError::LimitExceeded {
+                limit: PackageLimit::EntryCount,
+                maximum: limits.maximum_entry_count as u64,
+                actual: entry_count.saturating_add(entries.len()) as u64,
+            });
         }
+        entry_count += entries.len();
+        entries.sort_by_key(fs::DirEntry::file_name);
 
-        validate_regular_file(
-            &metadata,
-            &PathBuf::from(PAYLOAD_DIRECTORY_NAME).join(&relative),
-        )?;
+        for entry in entries {
+            let entry_path = entry.path();
+            let metadata = fs::symlink_metadata(&entry_path).map_err(PackageValidationError::Io)?;
+            let relative_path = entry_path
+                .strip_prefix(payload_root)
+                .map_err(|_| PackageValidationError::InvalidLayout)?;
+            let relative = relative_path
+                .to_str()
+                .ok_or(PackageValidationError::InvalidLayout)?
+                .to_owned();
+            let path = relative
+                .parse::<PayloadPath>()
+                .map_err(|_| PackageValidationError::InvalidPayloadPath(relative.clone()))?;
+            enforce_path_components(&path, limits)?;
 
-        enforce_file_size(metadata.len(), limits.maximum_file_bytes, path.as_str())?;
-        *total_bytes = total_bytes.checked_add(metadata.len()).ok_or(
-            PackageValidationError::LimitExceeded {
-                limit: PackageLimit::TotalBytes,
-                maximum: limits.maximum_total_bytes,
-                actual: u64::MAX,
-            },
-        )?;
-        *file_count = file_count
-            .checked_add(1)
-            .ok_or(PackageValidationError::LimitExceeded {
-                limit: PackageLimit::FileCount,
-                maximum: limits.maximum_file_count as u64,
-                actual: u64::MAX,
-            })?;
-        enforce_totals(*total_bytes, *file_count, limits)?;
+            if metadata.file_type().is_dir() {
+                let actual = directories.len().checked_add(1).ok_or(
+                    PackageValidationError::LimitExceeded {
+                        limit: PackageLimit::DirectoryCount,
+                        maximum: limits.maximum_directory_count as u64,
+                        actual: u64::MAX,
+                    },
+                )?;
+                if actual > limits.maximum_directory_count {
+                    return Err(PackageValidationError::LimitExceeded {
+                        limit: PackageLimit::DirectoryCount,
+                        maximum: limits.maximum_directory_count as u64,
+                        actual: actual as u64,
+                    });
+                }
+                directories.push((relative_path.to_path_buf(), path));
+                stack.push(entry_path);
+                continue;
+            }
 
-        files.push(PayloadMetadata {
-            path,
-            byte_length: metadata.len(),
-        });
-        descendant_files += 1;
+            validate_regular_file(
+                &metadata,
+                &PathBuf::from(PAYLOAD_DIRECTORY_NAME).join(&relative),
+            )?;
+            enforce_file_size(metadata.len(), limits.maximum_file_bytes, path.as_str())?;
+            *total_bytes = total_bytes.checked_add(metadata.len()).ok_or(
+                PackageValidationError::LimitExceeded {
+                    limit: PackageLimit::TotalBytes,
+                    maximum: limits.maximum_total_bytes,
+                    actual: u64::MAX,
+                },
+            )?;
+            *file_count =
+                file_count
+                    .checked_add(1)
+                    .ok_or(PackageValidationError::LimitExceeded {
+                        limit: PackageLimit::FileCount,
+                        maximum: limits.maximum_file_count as u64,
+                        actual: u64::MAX,
+                    })?;
+            enforce_totals(*total_bytes, *file_count, limits)?;
+
+            let mut parent = relative_path.parent();
+            while let Some(directory) = parent {
+                if directory.as_os_str().is_empty() {
+                    break;
+                }
+                nonempty_directories.insert(directory.to_path_buf());
+                parent = directory.parent();
+            }
+            files.push(PayloadMetadata {
+                path,
+                byte_length: metadata.len(),
+            });
+        }
     }
 
-    Ok(descendant_files)
+    directories.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some((_, path)) = directories
+        .iter()
+        .find(|(relative, _)| !nonempty_directories.contains(relative))
+    {
+        return Err(PackageValidationError::EmptyPayloadDirectory(path.clone()));
+    }
+    Ok(files.len())
+}
+
+fn enforce_path_components(
+    path: &PayloadPath,
+    limits: PackageLimits,
+) -> Result<(), PackageValidationError> {
+    let actual = path.as_str().split('/').count();
+    if actual > limits.maximum_path_components {
+        return Err(PackageValidationError::LimitExceeded {
+            limit: PackageLimit::PathComponents,
+            maximum: limits.maximum_path_components as u64,
+            actual: actual as u64,
+        });
+    }
+    Ok(())
 }
 
 fn validate_regular_file(
@@ -685,6 +791,12 @@ pub enum PackageLimit {
     IndividualFileBytes,
     /// Number of request and payload files.
     FileCount,
+    /// Number of nested directories below `payload/`.
+    DirectoryCount,
+    /// Combined number of request, payload-file, and payload-directory entries.
+    EntryCount,
+    /// Number of components in one payload path.
+    PathComponents,
 }
 
 /// A package validation failure.
@@ -755,6 +867,8 @@ pub enum PackageValidationError {
     InvalidFrontMatter(markdown::MarkdownValidationError),
     /// The stored digest file was not canonical.
     InvalidStoredDigest,
+    /// Gateway-owned acceptance ordering metadata was malformed.
+    InvalidAcceptanceMetadata(serde_json::Error),
     /// Immutable accepted contents no longer matched the stored digest.
     StoredDigestMismatch {
         /// The digest recorded at acceptance.
@@ -794,9 +908,9 @@ impl PackageValidationError {
             | Self::UnexpectedPayload(_)
             | Self::FileChangedDuringValidation(_) => ErrorCode::InvalidRequest,
             Self::CanonicalRequestJson(_) => ErrorCode::InternalError,
-            Self::InvalidStoredDigest | Self::StoredDigestMismatch { .. } => {
-                ErrorCode::ContentValidationFailed
-            }
+            Self::InvalidStoredDigest
+            | Self::InvalidAcceptanceMetadata(_)
+            | Self::StoredDigestMismatch { .. } => ErrorCode::ContentValidationFailed,
         }
     }
 }
@@ -895,6 +1009,9 @@ impl fmt::Display for PackageValidationError {
             Self::InvalidStoredDigest => {
                 formatter.write_str("stored package digest is not canonical")
             }
+            Self::InvalidAcceptanceMetadata(error) => {
+                write!(formatter, "acceptance metadata is invalid: {error}")
+            }
             Self::StoredDigestMismatch { stored, calculated } => write!(
                 formatter,
                 "stored package digest `{stored}` does not match calculated digest `{calculated}`"
@@ -910,6 +1027,7 @@ impl std::error::Error for PackageValidationError {
             Self::InvalidRequest(error) => Some(error),
             Self::InvalidRequestMetadata(error) => Some(error),
             Self::CanonicalRequestJson(error) => Some(error),
+            Self::InvalidAcceptanceMetadata(error) => Some(error),
             Self::InvalidFrontMatter(error) => Some(error),
             _ => None,
         }

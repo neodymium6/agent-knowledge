@@ -11,7 +11,7 @@ use super::{
     AcceptanceHook, AcceptancePhase, EnqueueOutcome, FileQueue, IncomingPackage, QueueError,
     QueueLimit, QueueState,
 };
-use crate::{PackageLimits, PackagePolicy};
+use crate::{PackageLimits, PackagePolicy, validate_accepted_package};
 
 const REQUEST_JSON: &str = r#"{
     "protocol_version": 1,
@@ -103,14 +103,26 @@ fn payload_path(value: &str) -> PayloadPath {
 }
 
 fn stage_package(queue: &FileQueue, results: &[u8]) -> IncomingPackage {
+    stage_package_with_request_id(queue, results, "01K00000000000000000000000")
+}
+
+fn stage_package_with_request_id(
+    queue: &FileQueue,
+    results: &[u8],
+    request_id: &str,
+) -> IncomingPackage {
     let mut package = match queue.begin() {
         Ok(package) => package,
         Err(error) => panic!("incoming package must begin: {error}"),
     };
-    if let Err(error) = package.write_request(REQUEST_JSON.as_bytes()) {
+    let request = REQUEST_JSON.replace("01K00000000000000000000000", request_id);
+    if let Err(error) = package.write_request(request.as_bytes()) {
         panic!("fixture request must be written: {error}");
     }
-    if let Err(error) = package.add_payload(payload_path("benchmark/index.md"), MARKDOWN) {
+    let markdown =
+        String::from_utf8_lossy(MARKDOWN).replace("01K00000000000000000000000", request_id);
+    if let Err(error) = package.add_payload(payload_path("benchmark/index.md"), markdown.as_bytes())
+    {
         panic!("fixture Markdown must be written: {error}");
     }
     if let Err(error) = package.add_payload(payload_path("benchmark/results.csv"), results) {
@@ -156,6 +168,14 @@ fn accepts_new_package_and_returns_existing_for_an_identical_retry() {
         Err(error) => panic!("stored digest must be readable: {error}"),
     };
     assert_eq!(stored_digest, format!("{digest}\n"));
+    let validated = match validate_accepted_package(&pending, &PackagePolicy::default()) {
+        Ok(validated) => validated,
+        Err(error) => panic!("accepted package must revalidate: {error}"),
+    };
+    assert_eq!(
+        validated.acceptance().map(|metadata| metadata.sequence),
+        Some(1)
+    );
     assert!(incoming_is_empty(root.path()));
 
     assert_eq!(
@@ -167,6 +187,87 @@ fn accepts_new_package_and_returns_existing_for_an_identical_retry() {
         }
     );
     assert!(incoming_is_empty(root.path()));
+}
+
+#[test]
+fn acceptance_sequence_is_monotonic_across_restart() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let request_ids = ["01K00000000000000000000010", "01K00000000000000000000011"];
+
+    for (index, request_id) in request_ids.into_iter().enumerate() {
+        let outcome = accept(stage_package_with_request_id(&queue, RESULTS, request_id));
+        let accepted_id = match outcome {
+            EnqueueOutcome::Accepted { request_id, .. } => request_id,
+            EnqueueOutcome::Existing { .. } => panic!("unique request must be newly accepted"),
+        };
+        let package = match validate_accepted_package(
+            &root
+                .path()
+                .join("queue/pending")
+                .join(accepted_id.to_string()),
+            &PackagePolicy::default(),
+        ) {
+            Ok(package) => package,
+            Err(error) => panic!("accepted package must validate: {error}"),
+        };
+        assert_eq!(
+            package.acceptance().map(|metadata| metadata.sequence),
+            Some(index as u64 + 1)
+        );
+    }
+
+    drop(queue);
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let outcome = accept(stage_package_with_request_id(
+        &queue,
+        RESULTS,
+        "01K00000000000000000000012",
+    ));
+    let accepted_id = match outcome {
+        EnqueueOutcome::Accepted { request_id, .. } => request_id,
+        EnqueueOutcome::Existing { .. } => panic!("unique request must be newly accepted"),
+    };
+    let package = match validate_accepted_package(
+        &root
+            .path()
+            .join("queue/pending")
+            .join(accepted_id.to_string()),
+        &PackagePolicy::default(),
+    ) {
+        Ok(package) => package,
+        Err(error) => panic!("accepted package must validate: {error}"),
+    };
+    assert_eq!(
+        package.acceptance().map(|metadata| metadata.sequence),
+        Some(3)
+    );
+}
+
+#[test]
+fn missing_accepted_digest_is_permanent_corruption() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let accepted = accept(stage_package(&queue, RESULTS));
+    let request_id = match accepted {
+        EnqueueOutcome::Accepted { request_id, .. } => request_id,
+        EnqueueOutcome::Existing { .. } => panic!("first request must be newly accepted"),
+    };
+    let digest = root
+        .path()
+        .join("queue/pending")
+        .join(request_id.to_string())
+        .join("digest");
+    if let Err(error) = fs::remove_file(digest) {
+        panic!("fixture digest must be removed: {error}");
+    }
+
+    let error = match stage_package(&queue, RESULTS).accept() {
+        Ok(_) => panic!("missing accepted digest must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, QueueError::CorruptState { .. }));
+    assert_eq!(error.error_code(), ErrorCode::ContentValidationFailed);
 }
 
 #[test]
@@ -267,6 +368,113 @@ fn rejects_streams_at_limits_without_leaving_partial_files() {
         panic!("payload path must remain reusable after a rejected stream: {error}");
     }
     let _ = accept(package);
+}
+
+#[test]
+fn rejects_payload_prefix_collisions_in_both_orders() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let mut file_first = match queue.begin() {
+        Ok(package) => package,
+        Err(error) => panic!("incoming package must begin: {error}"),
+    };
+    if let Err(error) = file_first.add_payload(payload_path("a"), b"fictional".as_slice()) {
+        panic!("first payload file must be written: {error}");
+    }
+    let error = match file_first.add_payload(payload_path("a/b"), b"fictional".as_slice()) {
+        Ok(()) => panic!("file-prefix collision must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, QueueError::PayloadPrefixCollision(_)));
+    assert_eq!(error.error_code(), ErrorCode::InvalidRequest);
+
+    let mut directory_first = match queue.begin() {
+        Ok(package) => package,
+        Err(error) => panic!("incoming package must begin: {error}"),
+    };
+    if let Err(error) = directory_first.add_payload(payload_path("a/b"), b"fictional".as_slice()) {
+        panic!("nested payload file must be written: {error}");
+    }
+    let error = match directory_first.add_payload(payload_path("a"), b"fictional".as_slice()) {
+        Ok(()) => panic!("directory-prefix collision must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, QueueError::PayloadPrefixCollision(_)));
+    assert_eq!(error.error_code(), ErrorCode::InvalidRequest);
+}
+
+#[test]
+fn enforces_directory_and_path_component_limits_before_writing() {
+    let root = TestDirectory::create();
+    let policy = match PackagePolicy::new(
+        PackageLimits {
+            maximum_directory_count: 0,
+            maximum_path_components: 2,
+            ..PackageLimits::default()
+        },
+        ["csv"],
+    ) {
+        Ok(policy) => policy,
+        Err(error) => panic!("fixture policy must be valid: {error}"),
+    };
+    let queue = initialize_queue(root.path(), policy);
+    let mut package = match queue.begin() {
+        Ok(package) => package,
+        Err(error) => panic!("incoming package must begin: {error}"),
+    };
+
+    let error = match package.add_payload(payload_path("a/b"), b"fictional".as_slice()) {
+        Ok(()) => panic!("directory-count limit must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        QueueError::LimitExceeded {
+            limit: QueueLimit::DirectoryCount,
+            ..
+        }
+    ));
+    assert!(!package.staging_path.join("payload/a").exists());
+
+    let error = match package.add_payload(payload_path("a/b/c"), b"fictional".as_slice()) {
+        Ok(()) => panic!("path-component limit must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        QueueError::LimitExceeded {
+            limit: QueueLimit::PathComponents,
+            ..
+        }
+    ));
+
+    let entry_policy = match PackagePolicy::new(
+        PackageLimits {
+            maximum_entry_count: 1,
+            ..PackageLimits::default()
+        },
+        ["csv"],
+    ) {
+        Ok(policy) => policy,
+        Err(error) => panic!("fixture policy must be valid: {error}"),
+    };
+    let entry_queue = initialize_queue(&root.path().join("entry-limit"), entry_policy);
+    let mut entry_package = match entry_queue.begin() {
+        Ok(package) => package,
+        Err(error) => panic!("entry-limit package must begin: {error}"),
+    };
+    let error = match entry_package.add_payload(payload_path("a/b"), b"fictional".as_slice()) {
+        Ok(()) => panic!("entry-count limit must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        QueueError::LimitExceeded {
+            limit: QueueLimit::EntryCount,
+            ..
+        }
+    ));
+    assert!(!entry_package.staging_path.join("payload/a").exists());
 }
 
 struct FailAfterRename;
@@ -422,4 +630,40 @@ fn an_abandoned_incoming_directory_is_never_reported_as_accepted() {
         EnqueueOutcome::Accepted { .. }
     ));
     assert!(abandoned_path.is_dir());
+}
+
+#[test]
+fn stale_incoming_requires_quarantine_before_reaping() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let active = match queue.begin() {
+        Ok(package) => package,
+        Err(error) => panic!("active incoming package must begin: {error}"),
+    };
+    let abandoned = root
+        .path()
+        .join("queue/incoming/.incoming-01K00000000000000000000999");
+    if let Err(error) = fs::create_dir(&abandoned) {
+        panic!("abandoned incoming fixture must be created: {error}");
+    }
+
+    let moved = match queue.quarantine_stale_incoming(std::time::Duration::ZERO) {
+        Ok(moved) => moved,
+        Err(error) => panic!("stale incoming quarantine must succeed: {error}"),
+    };
+    assert_eq!(moved, 1);
+    assert!(active.staging_path.is_dir());
+    assert!(!abandoned.exists());
+    assert!(
+        root.path()
+            .join("queue/quarantine/.incoming-01K00000000000000000000999")
+            .is_dir()
+    );
+
+    let removed = match queue.reap_quarantined_incoming(std::time::Duration::ZERO) {
+        Ok(removed) => removed,
+        Err(error) => panic!("quarantined incoming reap must succeed: {error}"),
+    };
+    assert_eq!(removed, 1);
+    assert!(active.staging_path.is_dir());
 }

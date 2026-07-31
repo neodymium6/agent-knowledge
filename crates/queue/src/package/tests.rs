@@ -102,6 +102,17 @@ fn write_fixture(root: &Path, request_json: &str, reverse_payload_order: bool) {
     }
 }
 
+fn write_accepted_metadata(root: &Path, digest: super::PackageDigest, sequence: u64) {
+    if let Err(error) = fs::write(root.join("digest"), format!("{digest}\n")) {
+        panic!("fixture digest must be written: {error}");
+    }
+    let acceptance =
+        format!("{{\"sequence\":{sequence},\"accepted_at\":\"2026-07-31T00:00:00Z\"}}\n");
+    if let Err(error) = fs::write(root.join("acceptance.json"), acceptance) {
+        panic!("fixture acceptance metadata must be written: {error}");
+    }
+}
+
 #[test]
 fn validates_complete_package_and_calculates_stable_digest() {
     let first = TestDirectory::create();
@@ -189,6 +200,84 @@ fn enforces_file_count_and_byte_limits() {
         }
     ));
     assert_eq!(error.error_code(), ErrorCode::LimitExceeded);
+}
+
+#[test]
+fn bounds_payload_directory_count_and_path_depth() {
+    let directories = TestDirectory::create();
+    write_fixture(directories.path(), REQUEST_JSON, false);
+    let policy = match PackagePolicy::new(
+        PackageLimits {
+            maximum_directory_count: 0,
+            ..PackageLimits::default()
+        },
+        ["csv"],
+    ) {
+        Ok(policy) => policy,
+        Err(error) => panic!("test policy must be valid: {error}"),
+    };
+    let error = match validate_package(directories.path(), &policy) {
+        Ok(_) => panic!("directory-count limit must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        PackageValidationError::LimitExceeded {
+            limit: PackageLimit::DirectoryCount,
+            maximum: 0,
+            actual: 1
+        }
+    ));
+
+    let entries = TestDirectory::create();
+    write_fixture(entries.path(), REQUEST_JSON, false);
+    let policy = match PackagePolicy::new(
+        PackageLimits {
+            maximum_entry_count: 2,
+            ..PackageLimits::default()
+        },
+        ["csv"],
+    ) {
+        Ok(policy) => policy,
+        Err(error) => panic!("test policy must be valid: {error}"),
+    };
+    let error = match validate_package(entries.path(), &policy) {
+        Ok(_) => panic!("entry-count limit must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        PackageValidationError::LimitExceeded {
+            limit: PackageLimit::EntryCount,
+            maximum: 2,
+            ..
+        }
+    ));
+
+    let depth = TestDirectory::create();
+    write_fixture(depth.path(), REQUEST_JSON, false);
+    let policy = match PackagePolicy::new(
+        PackageLimits {
+            maximum_path_components: 1,
+            ..PackageLimits::default()
+        },
+        ["csv"],
+    ) {
+        Ok(policy) => policy,
+        Err(error) => panic!("test policy must be valid: {error}"),
+    };
+    let error = match validate_package(depth.path(), &policy) {
+        Ok(_) => panic!("path-component limit must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        PackageValidationError::LimitExceeded {
+            limit: PackageLimit::PathComponents,
+            maximum: 1,
+            actual: 2
+        }
+    ));
 }
 
 #[test]
@@ -363,6 +452,54 @@ fn updated_documents_require_updated_metadata() {
     ));
 }
 
+#[test]
+fn parses_each_referenced_markdown_payload_once() {
+    let root = TestDirectory::create();
+    let mut request = match serde_json::from_str::<serde_json::Value>(REQUEST_JSON) {
+        Ok(request) => request,
+        Err(error) => panic!("fixture request JSON must parse: {error}"),
+    };
+    let operations = match request
+        .get_mut("operations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(operations) => operations,
+        None => panic!("fixture operations must be an array"),
+    };
+    let update = serde_json::json!({
+        "type": "update_document",
+        "document_id": "01K00000000000000000000002",
+        "expected_revision":
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "content": "benchmark/index.md"
+    });
+    operations[0] = update.clone();
+    operations.insert(1, update);
+    let request = match serde_json::to_string(&request) {
+        Ok(request) => request,
+        Err(error) => panic!("fixture request JSON must serialize: {error}"),
+    };
+    write_fixture(root.path(), &request, false);
+    let markdown_path = root.path().join("payload/benchmark/index.md");
+    let markdown = match fs::read_to_string(&markdown_path) {
+        Ok(markdown) => markdown,
+        Err(error) => panic!("fixture Markdown must be readable: {error}"),
+    }
+    .replace(
+        "created: 2026-07-31T03:50:00+09:00",
+        "created: 2026-07-31T03:50:00+09:00\nupdated: 2026-07-31T04:00:00+09:00",
+    );
+    if let Err(error) = fs::write(markdown_path, markdown) {
+        panic!("updated fixture Markdown must be written: {error}");
+    }
+
+    super::markdown::reset_document_parse_count();
+    if let Err(error) = validate_package(root.path(), &PackagePolicy::default()) {
+        panic!("repeated Markdown reference must validate: {error}");
+    }
+    assert_eq!(super::markdown::document_parse_count(), 1);
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_symbolic_links() {
@@ -430,12 +567,7 @@ fn revalidates_accepted_digest_and_detects_changed_contents() {
         Ok(package) => package,
         Err(error) => panic!("incoming fixture package must validate: {error}"),
     };
-    if let Err(error) = fs::write(
-        root.path().join("digest"),
-        format!("{}\n", package.digest()),
-    ) {
-        panic!("fixture digest must be written: {error}");
-    }
+    write_accepted_metadata(root.path(), package.digest(), 1);
 
     let accepted = match validate_accepted_package(root.path(), &PackagePolicy::default()) {
         Ok(package) => package,
@@ -469,12 +601,7 @@ fn accepted_packages_allow_only_defined_worker_sidecars() {
         Ok(package) => package,
         Err(error) => panic!("incoming fixture package must validate: {error}"),
     };
-    if let Err(error) = fs::write(
-        root.path().join("digest"),
-        format!("{}\n", package.digest()),
-    ) {
-        panic!("fixture digest must be written: {error}");
-    }
+    write_accepted_metadata(root.path(), package.digest(), 1);
     for sidecar in ["phase.json", "result.json"] {
         if let Err(error) = fs::write(root.path().join(sidecar), "{}\n") {
             panic!("fixture sidecar must be written: {error}");

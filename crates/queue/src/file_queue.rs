@@ -1,21 +1,26 @@
 use std::collections::HashSet;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use agent_knowledge_core::{ErrorCode, PayloadPath, RequestId};
 use ulid::Ulid;
 
 use crate::{
-    PackageDigest, PackagePolicy, PackageValidationError, ValidatedPackage, validate_package,
+    AcceptanceMetadata, PackageDigest, PackagePolicy, PackageValidationError, ValidatedPackage,
+    validate_package,
 };
 
 const REQUEST_FILE_NAME: &str = "request.json";
 const DIGEST_FILE_NAME: &str = "digest";
+const ACCEPTANCE_FILE_NAME: &str = "acceptance.json";
+const NEXT_SEQUENCE_FILE_NAME: &str = "next-sequence";
 const PAYLOAD_DIRECTORY_NAME: &str = "payload";
 const COPY_BUFFER_LENGTH: usize = 64 * 1024;
 const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
+const MAXIMUM_SEQUENCE_FILE_BYTES: u64 = 32;
 const MAXIMUM_STAGING_NAME_ATTEMPTS: usize = 16;
 
 /// An accepted queue state represented by one directory below `queue/`.
@@ -107,6 +112,7 @@ impl FileQueue {
 
         ensure_directory(&queue_root)?;
         ensure_directory(&queue_root.join("incoming"))?;
+        ensure_directory(&queue_root.join("quarantine"))?;
         for state in QueueState::ALL {
             ensure_directory(&queue_root.join(state.directory_name()))?;
         }
@@ -117,6 +123,13 @@ impl FileQueue {
             ensure_directory(parent)?;
         }
         ensure_lock_file(&lock_file)?;
+        let initialization_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_file)
+            .map_err(QueueError::Io)?;
+        initialization_lock.lock().map_err(QueueError::Io)?;
+        ensure_sequence_file(&queue_root.join(NEXT_SEQUENCE_FILE_NAME))?;
 
         sync_directory(&queue_root)?;
         if let Some(parent) = queue_root.parent()
@@ -153,10 +166,23 @@ impl FileQueue {
                         let _ = fs::remove_dir(&staging_path);
                         return Err(QueueError::Io(error));
                     }
+                    let lease = match File::open(&staging_path) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            let _ = fs::remove_dir_all(&staging_path);
+                            return Err(QueueError::Io(error));
+                        }
+                    };
+                    if let Err(error) = lease.lock() {
+                        let _ = fs::remove_dir_all(&staging_path);
+                        return Err(QueueError::Io(error));
+                    }
                     return Ok(IncomingPackage {
                         queue: self.clone(),
                         staging_path,
+                        _lease: lease,
                         written_payload: HashSet::new(),
+                        written_directories: HashSet::new(),
                         written_files: 0,
                         written_bytes: 0,
                         request_written: false,
@@ -175,6 +201,69 @@ impl FileQueue {
         self.queue_root
             .join(state.directory_name())
             .join(request_id.to_string())
+    }
+
+    /// Moves inactive stale staging directories into `quarantine/`.
+    ///
+    /// Active packages are protected by a directory lease and are never moved.
+    /// Quarantined data is retained for a separate administrative reap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queue locking, age inspection, lease acquisition,
+    /// rename, or directory synchronization fails.
+    pub fn quarantine_stale_incoming(&self, minimum_age: Duration) -> Result<usize, QueueError> {
+        let lock = self.open_queue_lock()?;
+        lock.lock().map_err(QueueError::Io)?;
+
+        let incoming_root = self.queue_root.join("incoming");
+        let quarantine_root = self.queue_root.join("quarantine");
+        let candidates = inactive_stale_directories(&incoming_root, minimum_age)?;
+        let mut moved = 0_usize;
+        for candidate in candidates {
+            let name = candidate
+                .file_name()
+                .ok_or_else(|| QueueError::InvalidStoragePath(candidate.clone()))?;
+            fs::rename(&candidate, quarantine_root.join(name)).map_err(QueueError::Io)?;
+            moved += 1;
+        }
+        if moved > 0 {
+            sync_directory(&quarantine_root)?;
+            sync_directory(&incoming_root)?;
+        }
+        Ok(moved)
+    }
+
+    /// Permanently removes inactive stale directories already in `quarantine/`.
+    ///
+    /// This operation never scans or removes accepted queue states.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queue locking, age inspection, lease acquisition,
+    /// removal, or directory synchronization fails.
+    pub fn reap_quarantined_incoming(&self, minimum_age: Duration) -> Result<usize, QueueError> {
+        let lock = self.open_queue_lock()?;
+        lock.lock().map_err(QueueError::Io)?;
+
+        let quarantine_root = self.queue_root.join("quarantine");
+        let candidates = inactive_stale_directories(&quarantine_root, minimum_age)?;
+        let removed = candidates.len();
+        for candidate in candidates {
+            fs::remove_dir_all(candidate).map_err(QueueError::Io)?;
+        }
+        if removed > 0 {
+            sync_directory(&quarantine_root)?;
+        }
+        Ok(removed)
+    }
+
+    fn open_queue_lock(&self) -> Result<File, QueueError> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.lock_file)
+            .map_err(QueueError::Io)
     }
 
     fn find_existing(
@@ -211,7 +300,9 @@ impl FileQueue {
 pub struct IncomingPackage {
     queue: FileQueue,
     staging_path: PathBuf,
+    _lease: File,
     written_payload: HashSet<PayloadPath>,
+    written_directories: HashSet<String>,
     written_files: usize,
     written_bytes: u64,
     request_written: bool,
@@ -245,6 +336,87 @@ impl IncomingPackage {
             return Err(QueueError::PayloadAlreadyWritten(path));
         }
 
+        let limits = self.queue.policy.limits();
+        let components = path.as_str().split('/').collect::<Vec<_>>();
+        if components.len() > limits.maximum_path_components {
+            return Err(QueueError::LimitExceeded {
+                limit: QueueLimit::PathComponents,
+                maximum: limits.maximum_path_components as u64,
+                actual: components.len() as u64,
+            });
+        }
+
+        let mut parents = Vec::with_capacity(components.len().saturating_sub(1));
+        let mut prefix = String::new();
+        for component in &components[..components.len().saturating_sub(1)] {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            if self
+                .written_payload
+                .iter()
+                .any(|written| written.as_str() == prefix)
+            {
+                return Err(QueueError::PayloadPrefixCollision(path));
+            }
+            parents.push(prefix.clone());
+        }
+        if self.written_directories.contains(path.as_str()) {
+            return Err(QueueError::PayloadPrefixCollision(path));
+        }
+
+        let new_directories = parents
+            .iter()
+            .filter(|parent| !self.written_directories.contains(parent.as_str()))
+            .count();
+        let directory_count = self
+            .written_directories
+            .len()
+            .checked_add(new_directories)
+            .ok_or(QueueError::LimitExceeded {
+                limit: QueueLimit::DirectoryCount,
+                maximum: limits.maximum_directory_count as u64,
+                actual: u64::MAX,
+            })?;
+        if directory_count > limits.maximum_directory_count {
+            return Err(QueueError::LimitExceeded {
+                limit: QueueLimit::DirectoryCount,
+                maximum: limits.maximum_directory_count as u64,
+                actual: directory_count as u64,
+            });
+        }
+        let next_file_count =
+            self.written_files
+                .checked_add(1)
+                .ok_or(QueueError::LimitExceeded {
+                    limit: QueueLimit::FileCount,
+                    maximum: limits.maximum_file_count as u64,
+                    actual: u64::MAX,
+                })?;
+        if next_file_count > limits.maximum_file_count {
+            return Err(QueueError::LimitExceeded {
+                limit: QueueLimit::FileCount,
+                maximum: limits.maximum_file_count as u64,
+                actual: next_file_count as u64,
+            });
+        }
+        let entry_count =
+            directory_count
+                .checked_add(next_file_count)
+                .ok_or(QueueError::LimitExceeded {
+                    limit: QueueLimit::EntryCount,
+                    maximum: limits.maximum_entry_count as u64,
+                    actual: u64::MAX,
+                })?;
+        if entry_count > limits.maximum_entry_count {
+            return Err(QueueError::LimitExceeded {
+                limit: QueueLimit::EntryCount,
+                maximum: limits.maximum_entry_count as u64,
+                actual: entry_count as u64,
+            });
+        }
+
         let destination = self
             .staging_path
             .join(PAYLOAD_DIRECTORY_NAME)
@@ -252,6 +424,7 @@ impl IncomingPackage {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(QueueError::Io)?;
         }
+        self.written_directories.extend(parents);
         self.write_file(destination, source)?;
         self.written_payload.insert(path);
         Ok(())
@@ -290,6 +463,22 @@ impl IncomingPackage {
                 limit: QueueLimit::FileCount,
                 maximum: limits.maximum_file_count as u64,
                 actual: next_file_count as u64,
+            });
+        }
+        let next_entry_count = self
+            .written_directories
+            .len()
+            .checked_add(next_file_count)
+            .ok_or(QueueError::LimitExceeded {
+                limit: QueueLimit::EntryCount,
+                maximum: limits.maximum_entry_count as u64,
+                actual: u64::MAX,
+            })?;
+        if next_entry_count > limits.maximum_entry_count {
+            return Err(QueueError::LimitExceeded {
+                limit: QueueLimit::EntryCount,
+                maximum: limits.maximum_entry_count as u64,
+                actual: next_entry_count as u64,
             });
         }
 
@@ -373,11 +562,7 @@ impl IncomingPackage {
         hook.reached(AcceptancePhase::PackageSynchronized)
             .map_err(QueueError::Io)?;
 
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.queue.lock_file)
-            .map_err(QueueError::Io)?;
+        let lock = self.queue.open_queue_lock()?;
         lock.lock().map_err(QueueError::Io)?;
 
         let request_id = validated.request().request_id;
@@ -399,6 +584,17 @@ impl IncomingPackage {
             return Err(QueueError::RequestIdReused { request_id, state });
         }
 
+        let sequence = allocate_sequence(&self.queue.queue_root)?;
+        let acceptance = AcceptanceMetadata {
+            sequence,
+            accepted_at: time::OffsetDateTime::now_utc(),
+        };
+        write_acceptance_file(&self.staging_path, acceptance)?;
+        sync_file(&self.staging_path.join(ACCEPTANCE_FILE_NAME))?;
+        sync_directory(&self.staging_path)?;
+        hook.reached(AcceptancePhase::AcceptanceMetadataSynchronized)
+            .map_err(QueueError::Io)?;
+
         let pending_path = self.queue.state_path(QueueState::Pending, request_id);
         fs::rename(&self.staging_path, &pending_path).map_err(QueueError::Io)?;
         self.promoted = true;
@@ -412,6 +608,58 @@ impl IncomingPackage {
 
         Ok(EnqueueOutcome::Accepted { request_id, digest })
     }
+}
+
+fn inactive_stale_directories(
+    root: &Path,
+    minimum_age: Duration,
+) -> Result<Vec<PathBuf>, QueueError> {
+    let now = SystemTime::now();
+    let mut entries = fs::read_dir(root)
+        .map_err(QueueError::Io)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(QueueError::Io)?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+
+    let mut stale = Vec::new();
+    for entry in entries {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_staging_directory_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(QueueError::Io)?;
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        let modified = metadata.modified().map_err(QueueError::Io)?;
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < minimum_age {
+            continue;
+        }
+
+        let lease = File::open(&path).map_err(QueueError::Io)?;
+        match lease.try_lock() {
+            Ok(()) => stale.push(path),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(error)) => return Err(QueueError::Io(error)),
+        }
+    }
+    Ok(stale)
+}
+
+fn is_staging_directory_name(name: &str) -> bool {
+    let Some(value) = name.strip_prefix(".incoming-") else {
+        return false;
+    };
+    value
+        .parse::<Ulid>()
+        .is_ok_and(|identifier| identifier.to_string() == value)
 }
 
 impl Drop for IncomingPackage {
@@ -450,6 +698,29 @@ fn ensure_lock_file(path: &Path) -> Result<(), QueueError> {
     }
 }
 
+fn ensure_sequence_file(path: &Path) -> Result<(), QueueError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let _ = read_next_sequence(path)?;
+            Ok(())
+        }
+        Ok(_) => Err(QueueError::InvalidStoragePath(path.into())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(mut file) => {
+                    file.write_all(b"1\n").map_err(QueueError::Io)?;
+                    file.sync_all().map_err(QueueError::Io)
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    ensure_sequence_file(path)
+                }
+                Err(error) => Err(QueueError::Io(error)),
+            }
+        }
+        Err(error) => Err(QueueError::Io(error)),
+    }
+}
+
 fn write_digest_file(package_root: &Path, digest: PackageDigest) -> Result<(), QueueError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -460,24 +731,81 @@ fn write_digest_file(package_root: &Path, digest: PackageDigest) -> Result<(), Q
     Ok(())
 }
 
+fn write_acceptance_file(
+    package_root: &Path,
+    acceptance: AcceptanceMetadata,
+) -> Result<(), QueueError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(package_root.join(ACCEPTANCE_FILE_NAME))
+        .map_err(QueueError::Io)?;
+    serde_json::to_writer(&mut file, &acceptance).map_err(QueueError::AcceptanceMetadata)?;
+    file.write_all(b"\n").map_err(QueueError::Io)
+}
+
+fn allocate_sequence(queue_root: &Path) -> Result<u64, QueueError> {
+    let sequence_path = queue_root.join(NEXT_SEQUENCE_FILE_NAME);
+    let sequence = read_next_sequence(&sequence_path)?;
+    let next = sequence
+        .checked_add(1)
+        .ok_or(QueueError::SequenceExhausted)?;
+    let temporary_path = queue_root.join(format!(".next-sequence-{}", Ulid::generate()));
+    let mut temporary = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary_path)
+        .map_err(QueueError::Io)?;
+    if let Err(error) = writeln!(temporary, "{next}") {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(QueueError::Io(error));
+    }
+    if let Err(error) = temporary.sync_all() {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(QueueError::Io(error));
+    }
+    drop(temporary);
+    if let Err(error) = fs::rename(&temporary_path, &sequence_path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(QueueError::Io(error));
+    }
+    sync_directory(queue_root)?;
+    Ok(sequence)
+}
+
+fn read_next_sequence(path: &Path) -> Result<u64, QueueError> {
+    let mut bytes = Vec::with_capacity(MAXIMUM_SEQUENCE_FILE_BYTES as usize);
+    File::open(path)
+        .map_err(QueueError::Io)?
+        .take(MAXIMUM_SEQUENCE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(QueueError::Io)?;
+    if bytes.len() as u64 > MAXIMUM_SEQUENCE_FILE_BYTES {
+        return Err(QueueError::InvalidSequenceState);
+    }
+    let contents = std::str::from_utf8(&bytes).map_err(|_| QueueError::InvalidSequenceState)?;
+    let Some(value) = contents.strip_suffix('\n') else {
+        return Err(QueueError::InvalidSequenceState);
+    };
+    if value.is_empty()
+        || value.starts_with('0')
+        || value.contains('\n')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(QueueError::InvalidSequenceState);
+    }
+    value.parse().map_err(|_| QueueError::InvalidSequenceState)
+}
+
 fn sync_package(package_root: &Path, package: &ValidatedPackage) -> Result<(), QueueError> {
-    File::open(package_root.join(REQUEST_FILE_NAME))
-        .map_err(QueueError::Io)?
-        .sync_all()
-        .map_err(QueueError::Io)?;
-    File::open(package_root.join(DIGEST_FILE_NAME))
-        .map_err(QueueError::Io)?
-        .sync_all()
-        .map_err(QueueError::Io)?;
+    sync_file(&package_root.join(REQUEST_FILE_NAME))?;
+    sync_file(&package_root.join(DIGEST_FILE_NAME))?;
 
     let payload_root = package_root.join(PAYLOAD_DIRECTORY_NAME);
     let mut directories = HashSet::new();
     directories.insert(payload_root.clone());
     for payload in package.payload() {
-        File::open(payload_root.join(payload.path().as_str()))
-            .map_err(QueueError::Io)?
-            .sync_all()
-            .map_err(QueueError::Io)?;
+        sync_file(&payload_root.join(payload.path().as_str()))?;
 
         let mut current = payload_root
             .join(payload.path().as_str())
@@ -504,6 +832,13 @@ fn sync_package(package_root: &Path, package: &ValidatedPackage) -> Result<(), Q
     Ok(())
 }
 
+fn sync_file(path: &Path) -> Result<(), QueueError> {
+    File::open(path)
+        .map_err(QueueError::Io)?
+        .sync_all()
+        .map_err(QueueError::Io)
+}
+
 fn sync_directory(path: &Path) -> Result<(), QueueError> {
     File::open(path)
         .map_err(QueueError::Io)?
@@ -517,7 +852,17 @@ fn read_stored_digest(
     state: QueueState,
 ) -> Result<PackageDigest, QueueError> {
     let digest_path = package_root.join(DIGEST_FILE_NAME);
-    let digest_metadata = fs::symlink_metadata(&digest_path).map_err(QueueError::Io)?;
+    let digest_metadata = match fs::symlink_metadata(&digest_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(QueueError::CorruptState {
+                request_id,
+                state,
+                detail: "digest is missing",
+            });
+        }
+        Err(error) => return Err(QueueError::Io(error)),
+    };
     if !digest_metadata.file_type().is_file() {
         return Err(QueueError::CorruptState {
             request_id,
@@ -567,6 +912,7 @@ fn read_stored_digest(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AcceptancePhase {
     PackageSynchronized,
+    AcceptanceMetadataSynchronized,
     Renamed,
     QueueDirectoriesSynchronized,
     ExistingQueueDirectoriesSynchronized,
@@ -593,6 +939,12 @@ pub enum QueueLimit {
     IndividualFileBytes,
     /// Number of request and payload files.
     FileCount,
+    /// Number of nested directories below `payload/`.
+    DirectoryCount,
+    /// Combined number of request, payload-file, and payload-directory entries.
+    EntryCount,
+    /// Number of components in one payload path.
+    PathComponents,
 }
 
 /// A durable queue operation failure.
@@ -610,6 +962,8 @@ pub enum QueueError {
     RequestAlreadyWritten,
     /// The same payload path was supplied more than once.
     PayloadAlreadyWritten(PayloadPath),
+    /// A payload file path collided with an existing payload directory.
+    PayloadPrefixCollision(PayloadPath),
     /// A streaming input limit was exceeded.
     LimitExceeded {
         /// The rejected limit.
@@ -626,6 +980,12 @@ pub enum QueueError {
         /// The existing request's current state.
         state: QueueState,
     },
+    /// Serializing Gateway-owned acceptance metadata failed.
+    AcceptanceMetadata(serde_json::Error),
+    /// The durable queue acceptance sequence was exhausted.
+    SequenceExhausted,
+    /// The durable queue acceptance sequence file was malformed.
+    InvalidSequenceState,
     /// The same request ID appeared in more than one accepted state.
     RequestInMultipleStates {
         /// The duplicated request identifier.
@@ -649,15 +1009,17 @@ impl QueueError {
         match self {
             Self::Io(_) | Self::StagingNameExhausted => ErrorCode::TemporaryFailure,
             Self::Package(error) => error.error_code(),
-            Self::RequestAlreadyWritten | Self::PayloadAlreadyWritten(_) => {
-                ErrorCode::InvalidRequest
-            }
+            Self::RequestAlreadyWritten
+            | Self::PayloadAlreadyWritten(_)
+            | Self::PayloadPrefixCollision(_) => ErrorCode::InvalidRequest,
             Self::LimitExceeded { .. } => ErrorCode::LimitExceeded,
             Self::RequestIdReused { .. } => ErrorCode::RequestIdReused,
             Self::CorruptState { .. } => ErrorCode::ContentValidationFailed,
-            Self::InvalidStoragePath(_) | Self::RequestInMultipleStates { .. } => {
-                ErrorCode::InternalError
-            }
+            Self::InvalidStoragePath(_)
+            | Self::RequestInMultipleStates { .. }
+            | Self::AcceptanceMetadata(_)
+            | Self::SequenceExhausted
+            | Self::InvalidSequenceState => ErrorCode::InternalError,
         }
     }
 }
@@ -686,6 +1048,12 @@ impl fmt::Display for QueueError {
                     "payload `{path}` was already written to this package"
                 )
             }
+            Self::PayloadPrefixCollision(path) => {
+                write!(
+                    formatter,
+                    "payload path `{path}` collides with an existing file or directory"
+                )
+            }
             Self::LimitExceeded {
                 limit,
                 maximum,
@@ -698,6 +1066,18 @@ impl fmt::Display for QueueError {
                 formatter,
                 "request ID `{request_id}` already exists in `{state}` with different contents"
             ),
+            Self::AcceptanceMetadata(error) => {
+                write!(
+                    formatter,
+                    "acceptance metadata serialization failed: {error}"
+                )
+            }
+            Self::SequenceExhausted => {
+                formatter.write_str("durable acceptance sequence is exhausted")
+            }
+            Self::InvalidSequenceState => {
+                formatter.write_str("durable acceptance sequence state is invalid")
+            }
             Self::RequestInMultipleStates { request_id } => {
                 write!(
                     formatter,
@@ -721,6 +1101,7 @@ impl std::error::Error for QueueError {
         match self {
             Self::Io(error) => Some(error),
             Self::Package(error) => Some(error),
+            Self::AcceptanceMetadata(error) => Some(error),
             _ => None,
         }
     }

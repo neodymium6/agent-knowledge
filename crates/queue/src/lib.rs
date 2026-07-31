@@ -7,7 +7,7 @@ pub use file_queue::{
     EnqueueOutcome, FileQueue, IncomingPackage, QueueError, QueueLimit, QueueState,
 };
 pub use package::{
-    MarkdownValidationError, PackageDigest, PackageLimit, PackageLimits, PackagePolicy,
-    PackagePolicyError, PackageValidationError, PayloadMetadata, ValidatedPackage,
+    AcceptanceMetadata, MarkdownValidationError, PackageDigest, PackageLimit, PackageLimits,
+    PackagePolicy, PackagePolicyError, PackageValidationError, PayloadMetadata, ValidatedPackage,
     validate_accepted_package, validate_package,
 };

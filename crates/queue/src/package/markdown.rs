@@ -1,12 +1,21 @@
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
+#[cfg(test)]
+use std::{cell::Cell, thread_local};
 
 use agent_knowledge_core::{
     ChangeRequest, DocumentId, DocumentLimits, DocumentMetadata, DocumentValidationError,
     Operation, PayloadPath, RequestId,
 };
+
+#[cfg(test)]
+thread_local! {
+    static DOCUMENT_PARSE_COUNT: Cell<usize> = const { Cell::new(0) };
+}
 
 pub(super) fn validate_documents(
     request: &ChangeRequest,
@@ -14,50 +23,48 @@ pub(super) fn validate_documents(
     limits: DocumentLimits,
     maximum_front_matter_bytes: usize,
 ) -> Result<(), MarkdownValidationError> {
+    let mut documents = HashMap::new();
     for operation in &request.operations {
-        match operation {
+        let (document_id, content, updated_required) = match operation {
             Operation::CreateDocument {
                 document_id,
                 content,
-            } => validate_document(
-                payload_root,
-                content,
-                *document_id,
-                request,
-                limits,
-                maximum_front_matter_bytes,
-                false,
-            )?,
+            } => (*document_id, content, false),
             Operation::UpdateDocument {
                 document_id,
                 content,
                 ..
-            } => validate_document(
+            } => (*document_id, content, true),
+            Operation::MoveDocument { .. }
+            | Operation::ArchiveDocument { .. }
+            | Operation::AddAttachment { .. } => continue,
+        };
+        let metadata = match documents.entry(content.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(parse_document(
                 payload_root,
                 content,
-                *document_id,
                 request,
                 limits,
                 maximum_front_matter_bytes,
-                true,
-            )?,
-            Operation::MoveDocument { .. }
-            | Operation::ArchiveDocument { .. }
-            | Operation::AddAttachment { .. } => {}
-        }
+            )?),
+        };
+        validate_operation_metadata(metadata, content, document_id, updated_required)?;
     }
+
     Ok(())
 }
 
-fn validate_document(
+fn parse_document(
     payload_root: &Path,
     payload_path: &PayloadPath,
-    expected_document_id: DocumentId,
     request: &ChangeRequest,
     limits: DocumentLimits,
     maximum_front_matter_bytes: usize,
-    updated_required: bool,
-) -> Result<(), MarkdownValidationError> {
+) -> Result<DocumentMetadata, MarkdownValidationError> {
+    #[cfg(test)]
+    DOCUMENT_PARSE_COUNT.set(DOCUMENT_PARSE_COUNT.get() + 1);
+
     let bytes =
         fs::read(payload_root.join(payload_path.as_str())).map_err(MarkdownValidationError::Io)?;
     let markdown = std::str::from_utf8(&bytes)
@@ -92,13 +99,6 @@ fn validate_document(
             source,
         })?;
 
-    if metadata.document_id != expected_document_id {
-        return Err(MarkdownValidationError::DocumentIdMismatch {
-            path: payload_path.clone(),
-            expected: expected_document_id,
-            found: metadata.document_id,
-        });
-    }
     if metadata.request_id != request.request_id {
         return Err(MarkdownValidationError::RequestIdMismatch {
             path: payload_path.clone(),
@@ -124,6 +124,32 @@ fn validate_document(
         return Err(MarkdownValidationError::RequestMetadataMismatch {
             path: payload_path.clone(),
             field: "session",
+        });
+    }
+    Ok(metadata)
+}
+
+#[cfg(test)]
+pub(super) fn reset_document_parse_count() {
+    DOCUMENT_PARSE_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn document_parse_count() -> usize {
+    DOCUMENT_PARSE_COUNT.get()
+}
+
+fn validate_operation_metadata(
+    metadata: &DocumentMetadata,
+    payload_path: &PayloadPath,
+    expected_document_id: DocumentId,
+    updated_required: bool,
+) -> Result<(), MarkdownValidationError> {
+    if metadata.document_id != expected_document_id {
+        return Err(MarkdownValidationError::DocumentIdMismatch {
+            path: payload_path.clone(),
+            expected: expected_document_id,
+            found: metadata.document_id,
         });
     }
     if updated_required && metadata.updated.is_none() {
