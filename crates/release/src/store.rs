@@ -18,11 +18,12 @@ const CLEANUP_INTENT_DIRECTORY: &str = "cleanup-intent";
 const STAGING_DIRECTORY: &str = ".staging";
 const SITE_DIRECTORY: &str = "site";
 const CURRENT_ENTRY: &str = "current";
-const BINDING_FILE: &str = ".release-store-binding-v4";
+const BINDING_FILE: &str = ".release-store-binding-v5";
 const MANIFEST_FILE: &str = ".agent-knowledge-release.json";
 const CLEANUP_MARKER_FILE: &str = ".agent-knowledge-cleanup";
 const MANIFEST_SCHEMA_VERSION: u16 = 2;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024;
+const MAXIMUM_RELEASE_TREE_DEPTH: usize = 64;
 const MAXIMUM_CLEANUP_ACTIONS: usize = 256;
 const MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH: usize = 32;
 
@@ -214,7 +215,7 @@ impl ReleaseStore {
         }
         match fs::create_dir(&path) {
             Ok(()) => {
-                let handle = Arc::new(File::open(&path).map_err(ReleaseError::Io)?);
+                let handle = Arc::new(open_directory(&path)?);
                 lock_file(&handle)?;
                 let stable = stable_directory_path(&handle, &configured)?;
                 fs::create_dir(stable.join(SITE_DIRECTORY)).map_err(ReleaseError::Io)?;
@@ -588,7 +589,7 @@ impl ReleaseStore {
             sync_directory(&self.staging.stable)?;
             validate_pinned_directory(&private, &batch.handle)?;
         }
-        validate_cleanup_mount(&self.staging.handle, &batch.handle)?;
+        validate_same_mount(&self.staging.handle, &batch.handle)?;
         clear_cleanup_directory(&batch.handle, batch_id)?;
         validate_pinned_directory(&private, &batch.handle)?;
         remove_empty_directory_at(&self.staging.handle, &cleanup_name(batch_id), &private)?;
@@ -806,14 +807,8 @@ impl ReleaseStore {
         match fs::symlink_metadata(&path) {
             Ok(_) => validate_binding(&path, &expected),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .map_err(ReleaseError::Io)?;
-                file.write_all(&expected).map_err(ReleaseError::Io)?;
-                file.sync_all().map_err(ReleaseError::Io)?;
-                sync_directory(&self.root)
+                replace_regular_file(&self.root, &path, &expected, "store-binding")?;
+                validate_binding(&path, &expected)
             }
             Err(error) => Err(ReleaseError::Io(error)),
         }
@@ -1020,7 +1015,7 @@ fn read_manifest(release: &Path) -> Result<ReleaseManifest, ReleaseError> {
         return Err(ReleaseError::InvalidManifest);
     }
     validate_regular_file(&path, &metadata)?;
-    let file = File::open(&path).map_err(ReleaseError::Io)?;
+    let file = open_regular_file(&path)?;
     let opened = file.metadata().map_err(ReleaseError::Io)?;
     if !same_metadata(&metadata, &opened)
         || !opened.file_type().is_file()
@@ -1066,8 +1061,15 @@ fn validate_release_tree(
     synchronize: bool,
 ) -> Result<Revision, ReleaseError> {
     ensure_real_directory(root)?;
+    let listed = fs::symlink_metadata(root).map_err(ReleaseError::Io)?;
+    let root_handle = open_directory(root)?;
+    let opened = root_handle.metadata().map_err(ReleaseError::Io)?;
+    if !opened.file_type().is_dir() || !same_metadata(&listed, &opened) {
+        return Err(ReleaseError::UnsafeOutput(root.into()));
+    }
     let mut validation = TreeValidation {
         root,
+        root_handle,
         policy,
         synchronize,
         entries: 0,
@@ -1078,7 +1080,15 @@ fn validate_release_tree(
     validation
         .digest
         .update(b"agent-knowledge-release-tree-v1\0");
-    validation.directory(root, true)?;
+    let root_directory = validation
+        .root_handle
+        .try_clone()
+        .map_err(ReleaseError::Io)?;
+    validation.directory(&root_directory, Path::new(""), true, 0)?;
+    validate_pinned_directory(root, &validation.root_handle).map_err(|error| match error {
+        ReleaseError::StorageBindingMismatch => ReleaseError::UnsafeOutput(root.into()),
+        error => error,
+    })?;
     if validation.site_files == 0 {
         return Err(ReleaseError::EmptyOutput);
     }
@@ -1087,6 +1097,7 @@ fn validate_release_tree(
 
 struct TreeValidation<'a> {
     root: &'a Path,
+    root_handle: File,
     policy: ReleasePolicy,
     synchronize: bool,
     entries: u64,
@@ -1096,21 +1107,21 @@ struct TreeValidation<'a> {
 }
 
 impl TreeValidation<'_> {
-    fn directory(&mut self, directory: &Path, is_root: bool) -> Result<(), ReleaseError> {
-        let listed = fs::symlink_metadata(directory).map_err(ReleaseError::Io)?;
-        let directory_handle = File::open(directory).map_err(ReleaseError::Io)?;
-        let opened = directory_handle.metadata().map_err(ReleaseError::Io)?;
-        if !listed.file_type().is_dir()
-            || !opened.file_type().is_dir()
-            || !same_metadata(&listed, &opened)
-        {
-            return Err(ReleaseError::UnsafeOutput(directory.into()));
-        }
+    fn directory(
+        &mut self,
+        directory: &File,
+        relative_directory: &Path,
+        is_root: bool,
+        depth: usize,
+    ) -> Result<(), ReleaseError> {
+        validate_same_mount(&self.root_handle, directory)?;
+        let configured = self.root.join(relative_directory);
+        let stable = stable_directory_path(directory, &configured)?;
         let mut children = Vec::new();
-        for entry in fs::read_dir(directory).map_err(ReleaseError::Io)? {
-            let path = entry.map_err(ReleaseError::Io)?.path();
+        for entry in fs::read_dir(&stable).map_err(ReleaseError::Io)? {
+            let name = entry.map_err(ReleaseError::Io)?.file_name();
             let is_root_manifest =
-                is_root && path.file_name().and_then(|name| name.to_str()) == Some(MANIFEST_FILE);
+                is_root && name.as_os_str() == std::ffi::OsStr::new(MANIFEST_FILE);
             if !is_root_manifest {
                 self.entries = self
                     .entries
@@ -1120,32 +1131,52 @@ impl TreeValidation<'_> {
                     return Err(ReleaseError::OutputTooLarge);
                 }
             }
-            children.push(path);
+            children.push(name);
         }
         children.sort_unstable();
-        for path in children {
+        for name in children {
+            let path = stable.join(&name);
+            let relative = relative_directory.join(&name);
             let is_root_manifest =
-                is_root && path.file_name().and_then(|name| name.to_str()) == Some(MANIFEST_FILE);
+                is_root && name.as_os_str() == std::ffi::OsStr::new(MANIFEST_FILE);
             if is_root_manifest {
                 self.manifest(&path)?;
                 continue;
             }
             let metadata = fs::symlink_metadata(&path).map_err(ReleaseError::Io)?;
-            let relative = path
-                .strip_prefix(self.root)
-                .map_err(|_| ReleaseError::UnsafeOutput(path.clone()))?;
             if metadata.file_type().is_dir() {
-                self.hash_entry(b'd', relative);
-                self.directory(&path, false)?;
+                if depth == MAXIMUM_RELEASE_TREE_DEPTH {
+                    return Err(ReleaseError::OutputTooLarge);
+                }
+                let child = open_directory(&path)?;
+                let opened = child.metadata().map_err(ReleaseError::Io)?;
+                if !opened.file_type().is_dir() || !same_metadata(&metadata, &opened) {
+                    return Err(ReleaseError::UnsafeOutput(relative));
+                }
+                validate_same_mount(&self.root_handle, &child)?;
+                self.hash_entry(b'd', &relative);
+                self.directory(&child, &relative, false, depth + 1)?;
+                let current = fs::symlink_metadata(&path).map_err(ReleaseError::Io)?;
+                if !current.file_type().is_dir() || !same_metadata(&current, &opened) {
+                    return Err(ReleaseError::UnsafeOutput(relative));
+                }
+                let current_handle = open_directory(&path)?;
+                if !same_metadata(
+                    &current_handle.metadata().map_err(ReleaseError::Io)?,
+                    &opened,
+                ) {
+                    return Err(ReleaseError::UnsafeOutput(relative));
+                }
+                validate_same_mount(&self.root_handle, &current_handle)?;
             } else if metadata.file_type().is_file() {
-                self.hash_entry(b'f', relative);
-                self.file(&path, &metadata)?;
+                self.hash_entry(b'f', &relative);
+                self.file(&path, &relative, &metadata)?;
             } else {
-                return Err(ReleaseError::UnsafeOutput(path));
+                return Err(ReleaseError::UnsafeOutput(relative));
             }
         }
         if self.synchronize {
-            directory_handle.sync_all().map_err(ReleaseError::Io)?;
+            directory.sync_all().map_err(ReleaseError::Io)?;
         }
         Ok(())
     }
@@ -1156,7 +1187,7 @@ impl TreeValidation<'_> {
         if listed.len() > MAXIMUM_MANIFEST_BYTES {
             return Err(ReleaseError::InvalidManifest);
         }
-        let file = File::open(path).map_err(ReleaseError::Io)?;
+        let file = open_regular_file(path)?;
         let opened = file.metadata().map_err(ReleaseError::Io)?;
         if !opened.file_type().is_file()
             || !same_metadata(&listed, &opened)
@@ -1165,20 +1196,36 @@ impl TreeValidation<'_> {
             return Err(ReleaseError::InvalidManifest);
         }
         validate_regular_file(path, &opened)?;
+        validate_same_mount(&self.root_handle, &file)?;
         if self.synchronize {
             file.sync_all().map_err(ReleaseError::Io)?;
         }
+        let current = fs::symlink_metadata(path).map_err(ReleaseError::Io)?;
+        if !current.file_type().is_file() || !same_metadata(&current, &opened) {
+            return Err(ReleaseError::InvalidManifest);
+        }
+        let current_file = open_regular_file(path)?;
+        if !same_metadata(&current_file.metadata().map_err(ReleaseError::Io)?, &opened) {
+            return Err(ReleaseError::InvalidManifest);
+        }
+        validate_same_mount(&self.root_handle, &current_file)?;
         Ok(())
     }
 
-    fn file(&mut self, path: &Path, listed: &fs::Metadata) -> Result<(), ReleaseError> {
+    fn file(
+        &mut self,
+        path: &Path,
+        relative: &Path,
+        listed: &fs::Metadata,
+    ) -> Result<(), ReleaseError> {
         validate_regular_file(path, listed)?;
-        let mut file = File::open(path).map_err(ReleaseError::Io)?;
+        let mut file = open_regular_file(path)?;
         let opened = file.metadata().map_err(ReleaseError::Io)?;
         if !opened.file_type().is_file() || !same_metadata(listed, &opened) {
-            return Err(ReleaseError::UnsafeOutput(path.into()));
+            return Err(ReleaseError::UnsafeOutput(relative.into()));
         }
         validate_regular_file(path, &opened)?;
+        validate_same_mount(&self.root_handle, &file)?;
         if opened.len() > self.policy.maximum_file_bytes {
             return Err(ReleaseError::OutputTooLarge);
         }
@@ -1216,6 +1263,15 @@ impl TreeValidation<'_> {
         if self.synchronize {
             file.sync_all().map_err(ReleaseError::Io)?;
         }
+        let current = fs::symlink_metadata(path).map_err(ReleaseError::Io)?;
+        if !current.file_type().is_file() || !same_metadata(&current, &opened) {
+            return Err(ReleaseError::OutputChanged);
+        }
+        let current_file = open_regular_file(path)?;
+        if !same_metadata(&current_file.metadata().map_err(ReleaseError::Io)?, &opened) {
+            return Err(ReleaseError::OutputChanged);
+        }
+        validate_same_mount(&self.root_handle, &current_file)?;
         Ok(())
     }
 
@@ -1244,7 +1300,7 @@ fn lock_batch_directory(
     private: bool,
 ) -> Result<BatchLease, ReleaseError> {
     ensure_real_directory(path)?;
-    let handle = Arc::new(File::open(path).map_err(ReleaseError::Io)?);
+    let handle = Arc::new(open_directory(path)?);
     lock_file(&handle)?;
     let stable = stable_directory_path(&handle, configured)?;
     validate_pinned_directory(configured, &handle)?;
@@ -1283,7 +1339,7 @@ fn read_bounded_regular_file(path: &Path, maximum: u64) -> Result<Vec<u8>, Relea
         return Err(ReleaseError::InvalidCleanupIntent);
     }
     validate_regular_file(path, &listed).map_err(|_| ReleaseError::InvalidCleanupIntent)?;
-    let file = File::open(path).map_err(ReleaseError::Io)?;
+    let file = open_regular_file(path)?;
     let opened = file.metadata().map_err(ReleaseError::Io)?;
     if !opened.file_type().is_file()
         || opened.len() != listed.len()
@@ -1315,7 +1371,7 @@ fn ensure_cleanup_marker(directory: &Path, batch_id: BatchId) -> Result<(), Rele
             if metadata.len() != expected.len() as u64 {
                 return replace_regular_file(directory, &marker, &expected, "cleanup-marker");
             }
-            let mut file = File::open(&marker).map_err(ReleaseError::Io)?;
+            let mut file = open_regular_file(&marker)?;
             let opened = file.metadata().map_err(ReleaseError::Io)?;
             if !opened.file_type().is_file()
                 || !same_metadata(&metadata, &opened)
@@ -1461,7 +1517,7 @@ fn clear_directory_at(directory: &File, preserved_name: Option<&[u8]>) -> Result
             if listed.st_dev != opened.st_dev || listed.st_ino != opened.st_ino {
                 return Err(ReleaseError::StorageBindingMismatch);
             }
-            validate_cleanup_mount(&root, &child)?;
+            validate_same_mount(&root, &child)?;
             if frames.len() < MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH {
                 frames.push(Frame {
                     directory: child,
@@ -1518,7 +1574,7 @@ fn next_cleanup_entry(
 }
 
 #[cfg(target_os = "linux")]
-fn validate_cleanup_mount(root: &File, child: &File) -> Result<(), ReleaseError> {
+fn validate_same_mount(root: &File, child: &File) -> Result<(), ReleaseError> {
     if mount_id(root)? == mount_id(child)? {
         Ok(())
     } else {
@@ -1527,7 +1583,7 @@ fn validate_cleanup_mount(root: &File, child: &File) -> Result<(), ReleaseError>
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn validate_cleanup_mount(root: &File, child: &File) -> Result<(), ReleaseError> {
+fn validate_same_mount(root: &File, child: &File) -> Result<(), ReleaseError> {
     use std::os::unix::fs::MetadataExt;
 
     if root.metadata().map_err(ReleaseError::Io)?.dev()
@@ -1537,6 +1593,11 @@ fn validate_cleanup_mount(root: &File, child: &File) -> Result<(), ReleaseError>
     } else {
         Err(ReleaseError::CrossMountStorage)
     }
+}
+
+#[cfg(not(unix))]
+fn validate_same_mount(_root: &File, _child: &File) -> Result<(), ReleaseError> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1628,6 +1689,38 @@ fn stable_directory_path(handle: &File, configured: &Path) -> Result<PathBuf, Re
     }
 }
 
+#[cfg(unix)]
+fn open_directory(path: &Path) -> Result<File, ReleaseError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(ReleaseError::Io)
+}
+
+#[cfg(not(unix))]
+fn open_directory(path: &Path) -> Result<File, ReleaseError> {
+    File::open(path).map_err(ReleaseError::Io)
+}
+
+#[cfg(unix)]
+fn open_regular_file(path: &Path) -> Result<File, ReleaseError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .map_err(ReleaseError::Io)
+}
+
+#[cfg(not(unix))]
+fn open_regular_file(path: &Path) -> Result<File, ReleaseError> {
+    File::open(path).map_err(ReleaseError::Io)
+}
+
 fn ensure_or_create_directory(path: &Path) -> Result<(), ReleaseError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
@@ -1669,7 +1762,7 @@ fn validate_pinned_directory(path: &Path, pinned: &File) -> Result<(), ReleaseEr
     }
     #[cfg(target_os = "linux")]
     {
-        let live = File::open(path).map_err(ReleaseError::Io)?;
+        let live = open_directory(path)?;
         if !same_metadata(
             &live.metadata().map_err(ReleaseError::Io)?,
             &pinned_metadata,
@@ -1697,7 +1790,7 @@ fn binding_bytes<'a>(
     root_handle: &File,
     directories: impl IntoIterator<Item = &'a PinnedDirectory>,
 ) -> Result<Vec<u8>, ReleaseError> {
-    let mut bytes = b"agent-knowledge-release-store-v4\0".to_vec();
+    let mut bytes = b"agent-knowledge-release-store-v5\0".to_vec();
     bytes.extend_from_slice(root.as_os_str().as_encoded_bytes());
     for handle in std::iter::once(root_handle).chain(
         directories
@@ -1709,7 +1802,6 @@ fn binding_bytes<'a>(
             use std::os::unix::fs::MetadataExt;
             let metadata = handle.metadata().map_err(ReleaseError::Io)?;
             bytes.push(0);
-            bytes.extend_from_slice(&metadata.dev().to_le_bytes());
             bytes.extend_from_slice(&metadata.ino().to_le_bytes());
         }
     }
@@ -1717,15 +1809,31 @@ fn binding_bytes<'a>(
 }
 
 fn validate_binding(path: &Path, expected: &[u8]) -> Result<(), ReleaseError> {
-    let metadata = fs::symlink_metadata(path).map_err(ReleaseError::Io)?;
-    if !metadata.file_type().is_file() || metadata.len() > 64 * 1024 {
+    const MAXIMUM_BINDING_BYTES: u64 = 64 * 1024;
+    let listed = fs::symlink_metadata(path).map_err(ReleaseError::Io)?;
+    if !listed.file_type().is_file() || listed.len() > MAXIMUM_BINDING_BYTES {
         return Err(ReleaseError::StorageBindingMismatch);
     }
-    let mut actual = Vec::with_capacity(metadata.len() as usize);
-    File::open(path)
-        .and_then(|file| file.take(64 * 1024 + 1).read_to_end(&mut actual))
+    validate_regular_file(path, &listed).map_err(|_| ReleaseError::StorageBindingMismatch)?;
+    let file = open_regular_file(path)?;
+    let opened = file.metadata().map_err(ReleaseError::Io)?;
+    if !opened.file_type().is_file()
+        || opened.len() != listed.len()
+        || !same_metadata(&listed, &opened)
+    {
+        return Err(ReleaseError::StorageBindingMismatch);
+    }
+    validate_regular_file(path, &opened).map_err(|_| ReleaseError::StorageBindingMismatch)?;
+    let mut actual = Vec::with_capacity(opened.len() as usize);
+    file.take(MAXIMUM_BINDING_BYTES + 1)
+        .read_to_end(&mut actual)
         .map_err(ReleaseError::Io)?;
-    if actual == expected {
+    let current = fs::symlink_metadata(path).map_err(ReleaseError::Io)?;
+    if actual == expected
+        && current.file_type().is_file()
+        && same_metadata(&current, &opened)
+        && actual.len() as u64 == opened.len()
+    {
         Ok(())
     } else {
         Err(ReleaseError::StorageBindingMismatch)
@@ -1794,15 +1902,7 @@ fn replace_regular_file(
     contents: &[u8],
     kind: &str,
 ) -> Result<(), ReleaseError> {
-    let temporary = directory.join(format!(".{kind}.pending"));
-    match fs::symlink_metadata(&temporary) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            fs::remove_file(&temporary).map_err(ReleaseError::Io)?;
-        }
-        Ok(_) => return Err(ReleaseError::InvalidCleanupIntent),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ReleaseError::Io(error)),
-    }
+    let temporary = directory.join(format!(".{kind}-{}", Ulid::generate()));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)

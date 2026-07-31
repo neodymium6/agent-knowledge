@@ -12,9 +12,10 @@ use ulid::Ulid;
 use super::unix_mode_is_directory;
 use super::{
     BuildDirectory, CLEANUP_MARKER_FILE, MANIFEST_FILE, MANIFEST_SCHEMA_VERSION,
-    MAXIMUM_CLEANUP_ACTIONS, MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH, ReleaseError, ReleaseManifest,
-    ReleasePolicy, ReleaseStore, cleanup_name, derived_reference_is_repairable,
-    ensure_cleanup_marker, ensure_manifest, read_manifest, release_id, validate_release_tree,
+    MAXIMUM_CLEANUP_ACTIONS, MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH, MAXIMUM_RELEASE_TREE_DEPTH,
+    ReleaseError, ReleaseManifest, ReleasePolicy, ReleaseStore, cleanup_name,
+    derived_reference_is_repairable, ensure_cleanup_marker, ensure_manifest, read_manifest,
+    release_id, validate_release_tree,
 };
 
 const FIRST_BATCH: &str = "01K00000000000000000000001";
@@ -1088,6 +1089,40 @@ fn enforces_aggregate_generated_output_limit() {
         .unwrap_or_else(|error| panic!("second output file must be written: {error}"));
     assert!(matches!(
         store.prepare(output, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z")),
+        Err(ReleaseError::OutputTooLarge)
+    ));
+}
+
+#[test]
+fn generated_output_depth_is_bounded() {
+    let root = TestDirectory::new();
+    let within_limit = root.0.join("within-limit");
+    fs::create_dir(&within_limit)
+        .unwrap_or_else(|error| panic!("bounded output root must be created: {error}"));
+    let mut directory = within_limit.clone();
+    for depth in 0..MAXIMUM_RELEASE_TREE_DEPTH {
+        directory = directory.join(format!("level-{depth:02}"));
+        fs::create_dir(&directory)
+            .unwrap_or_else(|error| panic!("bounded output directory must be created: {error}"));
+    }
+    fs::write(directory.join("index.html"), "fictional output\n")
+        .unwrap_or_else(|error| panic!("bounded output file must be written: {error}"));
+    validate_release_tree(&within_limit, ReleasePolicy::default(), false)
+        .unwrap_or_else(|error| panic!("output at the depth limit must validate: {error}"));
+
+    let beyond_limit = root.0.join("beyond-limit");
+    fs::create_dir(&beyond_limit)
+        .unwrap_or_else(|error| panic!("deep output root must be created: {error}"));
+    let mut directory = beyond_limit.clone();
+    for depth in 0..=MAXIMUM_RELEASE_TREE_DEPTH {
+        directory = directory.join(format!("level-{depth:02}"));
+        fs::create_dir(&directory)
+            .unwrap_or_else(|error| panic!("deep output directory must be created: {error}"));
+    }
+    fs::write(directory.join("index.html"), "fictional output\n")
+        .unwrap_or_else(|error| panic!("deep output file must be written: {error}"));
+    assert!(matches!(
+        validate_release_tree(&beyond_limit, ReleasePolicy::default(), false),
         Err(ReleaseError::OutputTooLarge)
     ));
 }

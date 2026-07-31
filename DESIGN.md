@@ -1095,10 +1095,17 @@ available.
 
 The release store pins the release root, `.staging/`, `by-id/`, `by-commit/`,
 `by-batch/`, and `cleanup-intent/` directory identities and requires them to
-share one Linux mount. Generated output is bounded by entry count,
-individual-file bytes, and total bytes during validation and synchronization;
-symbolic links, special files, and hard-linked files are rejected. Before
-promotion, each release receives a synchronized, versioned
+share one Linux mount. Its durable binding records the canonical path and
+stable inode identities, while live mount IDs are checked separately so a
+valid persistent volume can recover after a reboot or remount. The binding is
+published from a synchronized temporary file by atomic rename.
+
+Generated output is bounded by entry count, directory depth, individual-file
+bytes, and total bytes during validation and synchronization. Validation walks
+from pinned directory descriptors, revalidates every parent entry against the
+opened child, and rejects nested mounts, symbolic links, special files, and
+hard-linked files. Before promotion, each release receives a synchronized,
+versioned
 `.agent-knowledge-release.json` manifest binding its release ID, full commit
 ID, UTC creation time, and a deterministic SHA-256 revision of the generated
 tree. The tree revision is checked again before activation, so a changed
