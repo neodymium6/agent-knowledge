@@ -8,7 +8,10 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use ulid::Ulid;
 
-use super::{ReleaseError, ReleasePolicy, ReleaseStore};
+use super::{
+    BuildDirectory, MANIFEST_FILE, MANIFEST_SCHEMA_VERSION, ReleaseError, ReleaseManifest,
+    ReleasePolicy, ReleaseStore, ensure_manifest, release_id, validate_release_tree,
+};
 
 const FIRST_BATCH: &str = "01K00000000000000000000001";
 const SECOND_BATCH: &str = "01K00000000000000000000002";
@@ -50,12 +53,13 @@ fn timestamp(value: &str) -> OffsetDateTime {
         .unwrap_or_else(|error| panic!("fixture timestamp must parse: {error}"))
 }
 
-fn build(store: &ReleaseStore, batch_id: BatchId, body: &str) {
+fn build(store: &ReleaseStore, batch_id: BatchId, body: &str) -> BuildDirectory {
     let output = store
         .begin_build(batch_id)
         .unwrap_or_else(|error| panic!("release build must begin: {error}"));
     fs::write(output.path().join("index.html"), body)
         .unwrap_or_else(|error| panic!("release output must be written: {error}"));
+    output
 }
 
 #[test]
@@ -64,17 +68,13 @@ fn prepares_immutable_releases_and_atomically_changes_current() {
     let releases = root.0.join("releases");
     let store = ReleaseStore::open(&releases, ReleasePolicy::default())
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
-    build(
+    let first_build = build(
         &store,
         batch(FIRST_BATCH),
         "<p>first fictional release</p>\n",
     );
     let first = store
-        .prepare(
-            batch(FIRST_BATCH),
-            FIRST_COMMIT,
-            timestamp("2026-07-31T04:00:00Z"),
-        )
+        .prepare(first_build, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z"))
         .unwrap_or_else(|error| panic!("first release must prepare: {error}"));
     let active = store
         .activate(&first)
@@ -86,14 +86,14 @@ fn prepares_immutable_releases_and_atomically_changes_current() {
         PathBuf::from("by-id").join(first.release_id())
     );
 
-    build(
+    let second_build = build(
         &store,
         batch(SECOND_BATCH),
         "<p>second fictional release</p>\n",
     );
     let second = store
         .prepare(
-            batch(SECOND_BATCH),
+            second_build,
             SECOND_COMMIT,
             timestamp("2026-07-31T04:05:00Z"),
         )
@@ -126,13 +126,9 @@ fn activation_is_idempotent_for_the_same_release() {
     let root = TestDirectory::new();
     let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
-    build(&store, batch(FIRST_BATCH), "fictional output\n");
+    let build = build(&store, batch(FIRST_BATCH), "fictional output\n");
     let release = store
-        .prepare(
-            batch(FIRST_BATCH),
-            FIRST_COMMIT,
-            timestamp("2026-07-31T04:00:00Z"),
-        )
+        .prepare(build, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z"))
         .unwrap_or_else(|error| panic!("release must prepare: {error}"));
     let first = store
         .activate(&release)
@@ -148,13 +144,13 @@ fn preparation_recovers_after_the_release_rename() {
     let root = TestDirectory::new();
     let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
-    build(&store, batch(FIRST_BATCH), "fictional output\n");
+    let build = build(&store, batch(FIRST_BATCH), "fictional output\n");
     let created_at = timestamp("2026-07-31T04:00:00Z");
     let first = store
-        .prepare(batch(FIRST_BATCH), FIRST_COMMIT, created_at)
+        .prepare(build, FIRST_COMMIT, created_at)
         .unwrap_or_else(|error| panic!("release must prepare: {error}"));
     let recovered = store
-        .prepare(batch(FIRST_BATCH), FIRST_COMMIT, created_at)
+        .resume_prepare(batch(FIRST_BATCH), FIRST_COMMIT)
         .unwrap_or_else(|error| panic!("renamed release must recover: {error}"));
 
     assert_eq!(first, recovered);
@@ -166,10 +162,10 @@ fn preparation_removes_a_recovered_duplicate_staging_tree() {
     let releases = root.0.join("releases");
     let store = ReleaseStore::open(&releases, ReleasePolicy::default())
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
-    build(&store, batch(FIRST_BATCH), "fictional output\n");
+    let build = build(&store, batch(FIRST_BATCH), "fictional output\n");
     let created_at = timestamp("2026-07-31T04:00:00Z");
     let release = store
-        .prepare(batch(FIRST_BATCH), FIRST_COMMIT, created_at)
+        .prepare(build, FIRST_COMMIT, created_at)
         .unwrap_or_else(|error| panic!("release must prepare: {error}"));
     let prepared = releases.join("by-id").join(release.release_id());
     let recovered_staging = releases.join(".staging").join(FIRST_BATCH);
@@ -182,7 +178,7 @@ fn preparation_removes_a_recovered_duplicate_staging_tree() {
     }
 
     store
-        .prepare(batch(FIRST_BATCH), FIRST_COMMIT, created_at)
+        .resume_prepare(batch(FIRST_BATCH), FIRST_COMMIT)
         .unwrap_or_else(|error| panic!("duplicated staging state must recover: {error}"));
     assert!(!recovered_staging.exists());
 }
@@ -194,13 +190,9 @@ fn recovers_a_prepared_release_after_reopening_the_store() {
     let prepared = {
         let store = ReleaseStore::open(&releases, ReleasePolicy::default())
             .unwrap_or_else(|error| panic!("release store must open: {error}"));
-        build(&store, batch(FIRST_BATCH), "fictional output\n");
+        let build = build(&store, batch(FIRST_BATCH), "fictional output\n");
         store
-            .prepare(
-                batch(FIRST_BATCH),
-                FIRST_COMMIT,
-                timestamp("2026-07-31T04:00:00Z"),
-            )
+            .prepare(build, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z"))
             .unwrap_or_else(|error| panic!("release must prepare: {error}"))
     };
     let reopened = ReleaseStore::open(&releases, ReleasePolicy::default())
@@ -221,27 +213,72 @@ fn recovers_a_prepared_release_after_reopening_the_store() {
 }
 
 #[test]
+fn resumes_from_a_durable_batch_intent_before_promotion() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = build(&store, batch(FIRST_BATCH), "fictional output\n");
+    let created_at = timestamp("2026-07-31T04:00:00Z");
+    let content_revision = validate_release_tree(output.path(), ReleasePolicy::default(), false)
+        .unwrap_or_else(|error| panic!("staged output must validate: {error}"));
+    let manifest = ReleaseManifest {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        release_id: release_id(created_at, FIRST_COMMIT),
+        commit: FIRST_COMMIT.into(),
+        content_revision,
+        created_at,
+    };
+    ensure_manifest(&output.path().join(MANIFEST_FILE), &manifest)
+        .unwrap_or_else(|error| panic!("staged manifest must be durable: {error}"));
+    store
+        .ensure_batch_intent(batch(FIRST_BATCH), &manifest)
+        .unwrap_or_else(|error| panic!("batch intent must be durable: {error}"));
+    drop(output);
+    assert!(matches!(
+        store.discard_build(batch(FIRST_BATCH)),
+        Err(ReleaseError::BuildRecoveryRequired)
+    ));
+    drop(store);
+
+    let reopened = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must reopen: {error}"));
+    let recovered = reopened
+        .resume_prepare(batch(FIRST_BATCH), FIRST_COMMIT)
+        .unwrap_or_else(|error| panic!("durable batch intent must resume: {error}"));
+    assert_eq!(recovered.release_id(), manifest.release_id);
+    assert!(!releases.join("by-batch").join(FIRST_BATCH).exists());
+    assert_eq!(
+        reopened
+            .prepared_for_commit(FIRST_COMMIT)
+            .unwrap_or_else(|error| panic!("commit lookup must succeed: {error}"))
+            .unwrap_or_else(|| panic!("resumed release must be indexed")),
+        recovered
+    );
+}
+
+#[test]
 fn retrying_an_older_release_does_not_regress_commit_lookup() {
     let root = TestDirectory::new();
     let releases = root.0.join("releases");
     let store = ReleaseStore::open(&releases, ReleasePolicy::default())
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
-    build(&store, batch(FIRST_BATCH), "first fictional output\n");
+    let first_build = build(&store, batch(FIRST_BATCH), "first fictional output\n");
     let first_created_at = timestamp("2026-07-31T04:00:00Z");
     let first = store
-        .prepare(batch(FIRST_BATCH), FIRST_COMMIT, first_created_at)
+        .prepare(first_build, FIRST_COMMIT, first_created_at)
         .unwrap_or_else(|error| panic!("first release must prepare: {error}"));
-    build(&store, batch(SECOND_BATCH), "second fictional output\n");
+    let second_build = build(&store, batch(SECOND_BATCH), "second fictional output\n");
     let second = store
         .prepare(
-            batch(SECOND_BATCH),
+            second_build,
             FIRST_COMMIT,
             timestamp("2026-07-31T04:05:00Z"),
         )
         .unwrap_or_else(|error| panic!("second release must prepare: {error}"));
 
     store
-        .prepare(batch(FIRST_BATCH), FIRST_COMMIT, first_created_at)
+        .resume_prepare(batch(FIRST_BATCH), FIRST_COMMIT)
         .unwrap_or_else(|error| panic!("older release retry must succeed: {error}"));
     let recovered = store
         .prepared_for_commit(FIRST_COMMIT)
@@ -249,6 +286,39 @@ fn retrying_an_older_release_does_not_regress_commit_lookup() {
         .unwrap_or_else(|| panic!("newest release must remain indexed"));
     assert_ne!(first, second);
     assert_eq!(recovered, second);
+}
+
+#[test]
+fn repairs_a_corrupt_derived_commit_reference() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let build = build(&store, batch(FIRST_BATCH), "fictional output\n");
+    let prepared = store
+        .prepare(build, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z"))
+        .unwrap_or_else(|error| panic!("release must prepare: {error}"));
+    let reference = releases.join("by-commit").join(FIRST_COMMIT);
+    fs::remove_file(&reference)
+        .unwrap_or_else(|error| panic!("derived reference must be removed: {error}"));
+    fs::write(&reference, "corrupt fictional reference\n")
+        .unwrap_or_else(|error| panic!("corrupt reference fixture must be written: {error}"));
+
+    assert!(matches!(
+        store.prepared_for_commit(FIRST_COMMIT),
+        Err(ReleaseError::InvalidCommitReference)
+    ));
+    let repaired = store
+        .repair_commit_reference(prepared.release_id())
+        .unwrap_or_else(|error| panic!("derived reference must be repairable: {error}"));
+    assert_eq!(repaired, prepared);
+    assert_eq!(
+        store
+            .prepared_for_commit(FIRST_COMMIT)
+            .unwrap_or_else(|error| panic!("repaired lookup must succeed: {error}"))
+            .unwrap_or_else(|| panic!("repaired release must be found")),
+        prepared
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -288,6 +358,16 @@ fn build_directory_keeps_its_identity_after_entry_replacement() {
         .unwrap_or_else(|error| panic!("pinned output must remain writable: {error}"));
     assert!(detached.join("site").join("index.html").is_file());
     assert!(!configured.join("site").join("index.html").exists());
+    assert!(matches!(
+        store.prepare(output, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z")),
+        Err(ReleaseError::StorageBindingMismatch)
+    ));
+    assert!(
+        !releases
+            .join("by-id")
+            .join(format!("20260731T040000Z-{FIRST_COMMIT}"))
+            .exists()
+    );
 }
 
 #[test]
@@ -302,24 +382,15 @@ fn active_build_lease_blocks_prepare_and_discard() {
         .unwrap_or_else(|error| panic!("release output must be written: {error}"));
 
     assert!(matches!(
-        store.prepare(
-            batch(FIRST_BATCH),
-            FIRST_COMMIT,
-            timestamp("2026-07-31T04:00:00Z")
-        ),
-        Err(ReleaseError::BuildInProgress)
+        store.resume_prepare(batch(FIRST_BATCH), FIRST_COMMIT),
+        Err(ReleaseError::ReleaseStoreBusy)
     ));
     assert!(matches!(
         store.discard_build(batch(FIRST_BATCH)),
-        Err(ReleaseError::BuildInProgress)
+        Err(ReleaseError::ReleaseStoreBusy)
     ));
-    drop(output);
     store
-        .prepare(
-            batch(FIRST_BATCH),
-            FIRST_COMMIT,
-            timestamp("2026-07-31T04:00:00Z"),
-        )
+        .prepare(output, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z"))
         .unwrap_or_else(|error| panic!("finished build must prepare: {error}"));
 }
 
@@ -367,14 +438,8 @@ fn rejects_generated_symlinks_before_publication() {
         .unwrap_or_else(|error| panic!("release output must be written: {error}"));
     symlink("/fictional/private", output.path().join("escape"))
         .unwrap_or_else(|error| panic!("unsafe fixture symlink must be created: {error}"));
-    drop(output);
-
     assert!(matches!(
-        store.prepare(
-            batch(FIRST_BATCH),
-            FIRST_COMMIT,
-            timestamp("2026-07-31T04:00:00Z")
-        ),
+        store.prepare(output, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z")),
         Err(ReleaseError::UnsafeOutput(_))
     ));
     assert!(
@@ -393,13 +458,9 @@ fn invalid_new_output_keeps_the_previous_release_active() {
     let root = TestDirectory::new();
     let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
-    build(&store, batch(FIRST_BATCH), "first fictional output\n");
+    let first_build = build(&store, batch(FIRST_BATCH), "first fictional output\n");
     let first = store
-        .prepare(
-            batch(FIRST_BATCH),
-            FIRST_COMMIT,
-            timestamp("2026-07-31T04:00:00Z"),
-        )
+        .prepare(first_build, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z"))
         .unwrap_or_else(|error| panic!("first release must prepare: {error}"));
     store
         .activate(&first)
@@ -415,13 +476,8 @@ fn invalid_new_output_keeps_the_previous_release_active() {
     .unwrap_or_else(|error| panic!("second output must be written: {error}"));
     symlink("/fictional/private", output.path().join("escape"))
         .unwrap_or_else(|error| panic!("unsafe fixture symlink must be created: {error}"));
-    drop(output);
     assert!(matches!(
-        store.prepare(
-            batch(SECOND_BATCH),
-            SECOND_COMMIT,
-            timestamp("2026-07-31T04:05:00Z")
-        ),
+        store.prepare(output, SECOND_COMMIT, timestamp("2026-07-31T04:05:00Z")),
         Err(ReleaseError::UnsafeOutput(_))
     ));
     assert_eq!(
@@ -440,22 +496,18 @@ fn changed_prepared_output_cannot_replace_the_active_release() {
     let releases = root.0.join("releases");
     let store = ReleaseStore::open(&releases, ReleasePolicy::default())
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
-    build(&store, batch(FIRST_BATCH), "first fictional output\n");
+    let first_build = build(&store, batch(FIRST_BATCH), "first fictional output\n");
     let first = store
-        .prepare(
-            batch(FIRST_BATCH),
-            FIRST_COMMIT,
-            timestamp("2026-07-31T04:00:00Z"),
-        )
+        .prepare(first_build, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z"))
         .unwrap_or_else(|error| panic!("first release must prepare: {error}"));
     store
         .activate(&first)
         .unwrap_or_else(|error| panic!("first release must activate: {error}"));
 
-    build(&store, batch(SECOND_BATCH), "second fictional output\n");
+    let second_build = build(&store, batch(SECOND_BATCH), "second fictional output\n");
     let second = store
         .prepare(
-            batch(SECOND_BATCH),
+            second_build,
             SECOND_COMMIT,
             timestamp("2026-07-31T04:05:00Z"),
         )
@@ -490,13 +542,9 @@ fn hard_linked_manifest_cannot_be_activated() {
     let releases = root.0.join("releases");
     let store = ReleaseStore::open(&releases, ReleasePolicy::default())
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
-    build(&store, batch(FIRST_BATCH), "fictional output\n");
+    let build = build(&store, batch(FIRST_BATCH), "fictional output\n");
     let release = store
-        .prepare(
-            batch(FIRST_BATCH),
-            FIRST_COMMIT,
-            timestamp("2026-07-31T04:00:00Z"),
-        )
+        .prepare(build, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z"))
         .unwrap_or_else(|error| panic!("release must prepare: {error}"));
     fs::hard_link(
         releases
@@ -518,18 +566,14 @@ fn cloned_stores_serialize_activation_results() {
     let root = TestDirectory::new();
     let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
-    build(&store, batch(FIRST_BATCH), "first fictional output\n");
+    let first_build = build(&store, batch(FIRST_BATCH), "first fictional output\n");
     let first = store
-        .prepare(
-            batch(FIRST_BATCH),
-            FIRST_COMMIT,
-            timestamp("2026-07-31T04:00:00Z"),
-        )
+        .prepare(first_build, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z"))
         .unwrap_or_else(|error| panic!("first release must prepare: {error}"));
-    build(&store, batch(SECOND_BATCH), "second fictional output\n");
+    let second_build = build(&store, batch(SECOND_BATCH), "second fictional output\n");
     let second = store
         .prepare(
-            batch(SECOND_BATCH),
+            second_build,
             SECOND_COMMIT,
             timestamp("2026-07-31T04:05:00Z"),
         )
@@ -549,22 +593,27 @@ fn cloned_stores_serialize_activation_results() {
     });
     barrier.wait();
 
-    assert_eq!(
-        first_thread
-            .join()
-            .unwrap_or_else(|_| panic!("first activation thread must not panic"))
-            .unwrap_or_else(|error| panic!("first activation must succeed: {error}"))
-            .commit(),
-        FIRST_COMMIT
-    );
-    assert_eq!(
-        second_thread
-            .join()
-            .unwrap_or_else(|_| panic!("second activation thread must not panic"))
-            .unwrap_or_else(|error| panic!("second activation must succeed: {error}"))
-            .commit(),
-        SECOND_COMMIT
-    );
+    let first_result = first_thread
+        .join()
+        .unwrap_or_else(|_| panic!("first activation thread must not panic"));
+    let second_result = second_thread
+        .join()
+        .unwrap_or_else(|_| panic!("second activation thread must not panic"));
+    match (first_result, second_result) {
+        (Ok(first), Err(ReleaseError::ReleaseStoreBusy)) => {
+            assert_eq!(first.commit(), FIRST_COMMIT);
+        }
+        (Err(ReleaseError::ReleaseStoreBusy), Ok(second)) => {
+            assert_eq!(second.commit(), SECOND_COMMIT);
+        }
+        (Ok(first), Ok(second)) => {
+            assert_eq!(first.commit(), FIRST_COMMIT);
+            assert_eq!(second.commit(), SECOND_COMMIT);
+        }
+        (first, second) => {
+            panic!("concurrent activation results are invalid: {first:?}, {second:?}");
+        }
+    }
 }
 
 #[test]
@@ -577,14 +626,10 @@ fn root_manifest_does_not_consume_generated_entry_budget() {
     };
     let store = ReleaseStore::open(root.0.join("releases"), policy)
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
-    build(&store, batch(FIRST_BATCH), "fictional output\n");
+    let build = build(&store, batch(FIRST_BATCH), "fictional output\n");
 
     let release = store
-        .prepare(
-            batch(FIRST_BATCH),
-            FIRST_COMMIT,
-            timestamp("2026-07-31T04:00:00Z"),
-        )
+        .prepare(build, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z"))
         .unwrap_or_else(|error| panic!("manifest must not consume the site entry limit: {error}"));
     store
         .activate(&release)
@@ -601,18 +646,14 @@ fn enforces_generated_output_limits() {
     };
     let store = ReleaseStore::open(root.0.join("releases"), policy)
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
-    build(
+    let build = build(
         &store,
         batch(FIRST_BATCH),
         "fictional output exceeds limit\n",
     );
 
     assert!(matches!(
-        store.prepare(
-            batch(FIRST_BATCH),
-            FIRST_COMMIT,
-            timestamp("2026-07-31T04:00:00Z")
-        ),
+        store.prepare(build, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z")),
         Err(ReleaseError::OutputTooLarge)
     ));
 }
@@ -634,14 +675,8 @@ fn enforces_aggregate_generated_output_limit() {
         .unwrap_or_else(|error| panic!("first output file must be written: {error}"));
     fs::write(output.path().join("page.html"), "123456789012")
         .unwrap_or_else(|error| panic!("second output file must be written: {error}"));
-    drop(output);
-
     assert!(matches!(
-        store.prepare(
-            batch(FIRST_BATCH),
-            FIRST_COMMIT,
-            timestamp("2026-07-31T04:00:00Z")
-        ),
+        store.prepare(output, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z")),
         Err(ReleaseError::OutputTooLarge)
     ));
 }

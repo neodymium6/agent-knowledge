@@ -1074,6 +1074,8 @@ releases/
 │   └── 20260731T040500Z-<commit>/
 ├── by-commit/
 │   └── <commit> -> ../by-id/<release-id>/
+├── by-batch/
+│   └── <batch-id> -> ../by-id/<release-id>/
 └── current -> by-id/20260731T040500Z-<commit>/
 ```
 
@@ -1089,12 +1091,12 @@ The Worker:
 If a build or activation fails, the previous `current` release remains
 available.
 
-The release store pins the release root, `.staging/`, `by-id/`, and
-`by-commit/` directory identities and requires them to share one Linux mount.
-Generated output is bounded by entry count, individual-file bytes, and total
-bytes during validation and synchronization; symbolic links, special files,
-and hard-linked files are rejected. Before promotion, each release receives a
-synchronized, versioned
+The release store pins the release root, `.staging/`, `by-id/`, `by-commit/`,
+and `by-batch/` directory identities and requires them to share one Linux
+mount. Generated output is bounded by entry count, individual-file bytes, and
+total bytes during validation and synchronization; symbolic links, special
+files, and hard-linked files are rejected. Before promotion, each release
+receives a synchronized, versioned
 `.agent-knowledge-release.json` manifest binding its release ID, full commit
 ID, UTC creation time, and a deterministic SHA-256 revision of the generated
 tree. The tree revision is checked again before activation, so a changed
@@ -1104,14 +1106,17 @@ separately atomic and idempotent. After a restart, the Worker can recover a
 validated prepared release through the bounded `by-commit/<commit>` lookup and
 resume after either rename without replacing the previously active site. The
 `by-commit/` references are derived indexes and may be rebuilt from validated
-release manifests.
+release manifests through the bounded repair operation.
 
-The batch directory is pinned and exclusively leased for the build lifetime.
+The batch directory is pinned while a store-wide exclusive lease spans the
+build and live preparation. `prepare` consumes that lease-bearing build handle,
+so the directory identity cannot be dropped and reopened between those phases.
 Quartz receives its replaceable `site/` child as the output path, allowing the
 CLI to remove and recreate the output root without invalidating the batch
-lease. Before promotion, the Worker durably writes the `by-commit/` intent;
-the reference may be temporarily dangling until the atomic `site/` promotion,
-but a crash cannot leave a durable prepared release without its recovery key.
+container. Restart recovery uses the batch ID and the durable
+`by-batch/<batch-id>` intent. That intent may be temporarily dangling until the
+atomic `site/` promotion; the ready-only `by-commit/` index is updated after
+promotion and never points at an in-progress release.
 
 Failed or interrupted output may be removed only through a batch-scoped
 staging cleanup operation; prepared `by-id/` releases are never removed by the
