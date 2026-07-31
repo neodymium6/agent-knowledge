@@ -809,6 +809,26 @@ fn rejects_live_work_root_replacement() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn rejects_a_symlink_restoring_a_replaced_work_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let repository = fixture.open();
+    let detached = root.path().join("detached-work");
+    fs::rename(&fixture.work, &detached)
+        .unwrap_or_else(|error| panic!("work root must be moved aside: {error}"));
+    symlink(&detached, &fixture.work)
+        .unwrap_or_else(|error| panic!("work root symlink must be created: {error}"));
+
+    assert!(matches!(
+        repository.lock_writer(),
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+}
+
 #[test]
 fn repository_root_lock_is_exclusive_across_cloned_handles() {
     let root = TestDirectory::new();
@@ -871,6 +891,23 @@ fn rejects_transaction_directory_replacement_after_restart() {
         ),
         Err(GitTransactionError::RepositoryBindingMismatch)
     ));
+}
+
+#[test]
+fn cleanup_removes_an_unregistered_disposable_batch_worktree() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let repository = fixture.open();
+    let worktree = repository.worktree_path(parse_batch_id());
+    fs::create_dir(&worktree)
+        .unwrap_or_else(|error| panic!("unregistered worktree must be created: {error}"));
+    fs::write(worktree.join("interrupted.txt"), b"fictional residue\n")
+        .unwrap_or_else(|error| panic!("unregistered worktree residue must be created: {error}"));
+
+    repository
+        .remove_worktree(&worktree)
+        .unwrap_or_else(|error| panic!("unregistered worktree cleanup must succeed: {error}"));
+    assert!(!worktree.exists());
 }
 
 #[test]
@@ -1517,6 +1554,25 @@ fn rejects_unsafe_commit_identity_values() {
         GitIdentity::new("Worker\nInjected", "worker@example.invalid"),
         Err(GitTransactionError::InvalidIdentity)
     ));
+}
+
+#[test]
+fn repository_binding_enforces_its_serialized_size_limit() {
+    let root = TestDirectory::new();
+    let maximum = root.path().join("maximum-binding");
+    let oversized = root.path().join("oversized-binding");
+    let maximum_bytes = vec![b'x'; super::MAXIMUM_BINDING_BYTES];
+    super::ensure_binding(&maximum, &maximum_bytes)
+        .unwrap_or_else(|error| panic!("maximum binding must be accepted: {error}"));
+    super::validate_binding(&maximum, &maximum_bytes)
+        .unwrap_or_else(|error| panic!("maximum binding must validate: {error}"));
+
+    let oversized_bytes = vec![b'x'; super::MAXIMUM_BINDING_BYTES + 1];
+    assert!(matches!(
+        super::ensure_binding(&oversized, &oversized_bytes),
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+    assert!(!oversized.exists());
 }
 
 #[test]

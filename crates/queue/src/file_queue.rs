@@ -220,6 +220,7 @@ impl FileQueue {
                 pin_directory(&queue_root.join(QueueState::Failed.directory_name()))?,
             ],
         });
+        validate_common_queue_mount(&root_handle, &directories)?;
         let lock_file = directories.lock.stable.join(QUEUE_LOCK_FILE_NAME);
         let worker_lock_file = directories.lock.stable.join(WORKER_LOCK_FILE_NAME);
 
@@ -472,8 +473,9 @@ impl FileQueue {
             use std::os::unix::fs::MetadataExt;
 
             let pinned = self.root_handle.metadata().map_err(QueueError::Io)?;
-            let configured = fs::metadata(&self.configured_queue_root).map_err(QueueError::Io)?;
-            if !configured.is_dir()
+            let configured =
+                fs::symlink_metadata(&self.configured_queue_root).map_err(QueueError::Io)?;
+            if !configured.file_type().is_dir()
                 || pinned.dev() != configured.dev()
                 || pinned.ino() != configured.ino()
             {
@@ -1247,9 +1249,9 @@ fn validate_queue_root_binding(
 }
 
 fn validate_pinned_lock(path: &Path, pinned: &File) -> Result<(), QueueError> {
-    let configured = fs::metadata(path).map_err(QueueError::Io)?;
+    let configured = fs::symlink_metadata(path).map_err(QueueError::Io)?;
     let pinned = pinned.metadata().map_err(QueueError::Io)?;
-    if !configured.is_file() {
+    if !configured.file_type().is_file() {
         return Err(QueueError::InvalidQueueIdentity);
     }
     #[cfg(unix)]
@@ -1276,10 +1278,89 @@ fn pin_directory(path: &Path) -> Result<PinnedDirectory, QueueError> {
     })
 }
 
+#[cfg(target_os = "linux")]
+fn validate_common_queue_mount(
+    root: &File,
+    directories: &QueueDirectories,
+) -> Result<(), QueueError> {
+    let root_mount = linux_mount_id(root)?;
+    for directory in directories.all() {
+        if linux_mount_id(&directory.handle)? != root_mount {
+            return Err(QueueError::InvalidStoragePath(directory.entry.clone()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_id(file: &File) -> Result<u64, QueueError> {
+    use std::os::fd::AsRawFd;
+
+    const MAXIMUM_FDINFO_BYTES: u64 = 16 * 1024;
+
+    let path = PathBuf::from(format!("/proc/self/fdinfo/{}", file.as_raw_fd()));
+    let mut bytes = Vec::with_capacity(MAXIMUM_FDINFO_BYTES as usize);
+    File::open(path)
+        .and_then(|file| file.take(MAXIMUM_FDINFO_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(QueueError::Io)?;
+    if bytes.len() as u64 > MAXIMUM_FDINFO_BYTES {
+        return Err(QueueError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file descriptor metadata exceeds the supported size",
+        )));
+    }
+    let contents = std::str::from_utf8(&bytes).map_err(|_| {
+        QueueError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file descriptor metadata is not UTF-8",
+        ))
+    })?;
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))
+        .ok_or_else(|| {
+            QueueError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file descriptor metadata has no mount identifier",
+            ))
+        })?
+        .parse()
+        .map_err(|_| {
+            QueueError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file descriptor mount identifier is invalid",
+            ))
+        })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn validate_common_queue_mount(
+    root: &File,
+    directories: &QueueDirectories,
+) -> Result<(), QueueError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root_device = root.metadata().map_err(QueueError::Io)?.dev();
+    for directory in directories.all() {
+        if directory.handle.metadata().map_err(QueueError::Io)?.dev() != root_device {
+            return Err(QueueError::InvalidStoragePath(directory.entry.clone()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_common_queue_mount(
+    _root: &File,
+    _directories: &QueueDirectories,
+) -> Result<(), QueueError> {
+    Ok(())
+}
+
 fn validate_pinned_directory(directory: &PinnedDirectory) -> Result<(), QueueError> {
-    let entry = fs::metadata(&directory.entry).map_err(QueueError::Io)?;
+    let entry = fs::symlink_metadata(&directory.entry).map_err(QueueError::Io)?;
     let pinned = directory.handle.metadata().map_err(QueueError::Io)?;
-    if !entry.is_dir() {
+    if !entry.file_type().is_dir() {
         return Err(QueueError::InvalidQueueIdentity);
     }
     #[cfg(unix)]

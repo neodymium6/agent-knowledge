@@ -20,6 +20,7 @@ use crate::{ApplyError, ContentPolicy};
 
 const MAXIMUM_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const MAXIMUM_JOURNAL_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_BINDING_BYTES: usize = 64 * 1024;
 const JOURNAL_SCHEMA_VERSION: u16 = 2;
 
 /// Fixed author identity for mechanically generated knowledge commits.
@@ -385,6 +386,7 @@ impl GitRepository {
                 OsStr::new(&base),
             ],
         )?;
+        sync_directory(&self.worktree_root).map_err(GitTransactionError::Io)?;
 
         let prepared = self.apply_in_worktree(worker, claims, policy, package_policy, &worktree)?;
         if prepared.successful.is_empty() {
@@ -1030,7 +1032,7 @@ impl GitRepository {
 
     fn remove_worktree(&self, worktree: &Path) -> Result<(), GitTransactionError> {
         if path_exists(worktree)? {
-            run_git(
+            let removal = run_git(
                 None,
                 Some(&self.git_directory),
                 [
@@ -1039,7 +1041,10 @@ impl GitRepository {
                     OsStr::new("--force"),
                     worktree.as_os_str(),
                 ],
-            )?;
+            );
+            if removal.is_err() {
+                self.remove_unregistered_worktree(worktree)?;
+            }
         }
         run_git(
             None,
@@ -1050,7 +1055,26 @@ impl GitRepository {
                 OsStr::new("--expire=now"),
             ],
         )?;
-        Ok(())
+        sync_directory(&self.worktree_root).map_err(GitTransactionError::Io)
+    }
+
+    fn remove_unregistered_worktree(&self, worktree: &Path) -> Result<(), GitTransactionError> {
+        let direct_child = worktree.parent() == Some(self.worktree_root.as_path());
+        let valid_batch_name = worktree
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.strip_prefix("batch-"))
+            .is_some_and(|identifier| {
+                identifier
+                    .parse::<BatchId>()
+                    .is_ok_and(|batch_id| batch_id.to_string() == identifier)
+            });
+        if !direct_child || !valid_batch_name {
+            return Err(GitTransactionError::InvalidDirectory(worktree.into()));
+        }
+        ensure_real_directory(worktree)?;
+        fs::remove_dir_all(worktree).map_err(GitTransactionError::Io)?;
+        sync_directory(&self.worktree_root).map_err(GitTransactionError::Io)
     }
 
     fn remove_transaction_ref(
@@ -1555,9 +1579,11 @@ fn lock_root_paths(
 }
 
 fn validate_pinned_directory(configured: &Path, pinned: &File) -> Result<(), GitTransactionError> {
-    let configured_metadata = fs::metadata(configured).map_err(GitTransactionError::Io)?;
+    let configured_metadata = fs::symlink_metadata(configured).map_err(GitTransactionError::Io)?;
     let pinned_metadata = pinned.metadata().map_err(GitTransactionError::Io)?;
-    if !configured_metadata.is_dir() || !same_metadata(&configured_metadata, &pinned_metadata) {
+    if !configured_metadata.file_type().is_dir()
+        || !same_metadata(&configured_metadata, &pinned_metadata)
+    {
         return Err(GitTransactionError::RepositoryBindingMismatch);
     }
     Ok(())
@@ -1583,6 +1609,9 @@ fn same_directory(left: &Path, right: &Path) -> Result<bool, GitTransactionError
 }
 
 fn ensure_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionError> {
+    if expected.len() > MAXIMUM_BINDING_BYTES {
+        return Err(GitTransactionError::RepositoryBindingMismatch);
+    }
     match fs::symlink_metadata(path) {
         Ok(_) => validate_binding(path, expected),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1610,10 +1639,16 @@ fn validate_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionEr
             GitTransactionError::Io(error)
         }
     })?;
-    if !metadata.file_type().is_file() || metadata.len() > 16 * 1024 {
+    if !metadata.file_type().is_file() || metadata.len() > MAXIMUM_BINDING_BYTES as u64 {
         return Err(GitTransactionError::RepositoryBindingMismatch);
     }
-    let actual = fs::read(path).map_err(GitTransactionError::Io)?;
+    let mut actual = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .and_then(|file| {
+            file.take(MAXIMUM_BINDING_BYTES as u64 + 1)
+                .read_to_end(&mut actual)
+        })
+        .map_err(GitTransactionError::Io)?;
     if actual == expected {
         Ok(())
     } else {

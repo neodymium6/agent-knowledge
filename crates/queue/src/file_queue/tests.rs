@@ -304,6 +304,51 @@ fn rejects_replaced_fixed_queue_directories() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn rejects_symlinks_that_restore_replaced_queue_entries() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let queue_entry = root.path().join("queue");
+    let detached_queue = root.path().join("detached-queue");
+    fs::rename(&queue_entry, &detached_queue)
+        .unwrap_or_else(|error| panic!("queue root must be moved aside: {error}"));
+    symlink(&detached_queue, &queue_entry)
+        .unwrap_or_else(|error| panic!("queue root symlink must be created: {error}"));
+    assert!(matches!(
+        queue.begin(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let pending = root.path().join("queue/pending");
+    let detached_pending = root.path().join("detached-pending");
+    fs::rename(&pending, &detached_pending)
+        .unwrap_or_else(|error| panic!("pending directory must be moved aside: {error}"));
+    symlink(&detached_pending, &pending)
+        .unwrap_or_else(|error| panic!("pending symlink must be created: {error}"));
+    assert!(matches!(
+        queue.begin(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let queue_lock = root.path().join("queue/.locks/queue.lock");
+    let detached_lock = root.path().join("detached-queue-lock");
+    fs::rename(&queue_lock, &detached_lock)
+        .unwrap_or_else(|error| panic!("queue lock must be moved aside: {error}"));
+    symlink(&detached_lock, &queue_lock)
+        .unwrap_or_else(|error| panic!("queue lock symlink must be created: {error}"));
+    assert!(matches!(
+        queue.begin(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+}
+
 #[test]
 fn accepts_new_package_and_returns_existing_for_an_identical_retry() {
     let root = TestDirectory::create();

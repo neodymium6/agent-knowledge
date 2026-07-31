@@ -146,13 +146,18 @@ requires:
 - advisory `flock` locking on regular files and read-only directory
   descriptors;
 - normal POSIX file and directory semantics; and
-- a mounted `/proc` file system exposing `/proc/self/fd`.
+- a mounted `/proc` file system exposing `/proc/self/fd` and allowing same-UID
+  Git descendants to resolve `/proc/<worker-pid>/fd`.
 
 All durable paths are configurable. Processes handle termination signals and
 shut down at transaction boundaries. The configured queue root may be created
 by the application, but its parent directory must already exist so the
 application can durably synchronize the new root entry without recursively
 creating unsynchronized ancestors.
+
+The queue root and every fixed queue child directory must be on the same Linux
+mount so all queue transitions have atomic-rename semantics. Initialization
+compares mount identities and rejects nested mounts before accepting work.
 
 A Worker must run under a supervisor that terminates the entire Worker process
 group or control group, including Git descendants, before restarting recovery.
@@ -936,7 +941,10 @@ before starting or recovering a transaction. It repeats this validation
 immediately before the official-ref compare-and-swap and after canonical
 synchronization and cleanup, so it never reports a terminal outcome against a
 detached storage tree. After reset and clean, every materialized canonical file
-and directory is synchronized before publication can complete.
+and directory is synchronized before publication can complete. Creation and
+removal of disposable Git worktrees also synchronize the pinned `worktrees/`
+directory; recovery may remove only a direct child whose name is a canonical
+batch ID when Git registration is already absent.
 
 An all-failed batch records the same durable claim tokens and failure outcomes
 in a `no_changes` journal even though it creates no Git commit.
