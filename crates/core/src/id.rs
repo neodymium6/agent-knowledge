@@ -68,6 +68,7 @@ macro_rules! define_id {
 }
 
 define_id!(RequestId, "A permanent identifier for one change request.");
+define_id!(BatchId, "An identifier for one Repository Worker batch.");
 define_id!(
     DocumentId,
     "A permanent identifier for one Markdown document."
@@ -79,17 +80,19 @@ define_id!(
 
 #[cfg(test)]
 mod tests {
-    use super::{DocumentId, RequestId, SessionId};
+    use super::{BatchId, DocumentId, RequestId, SessionId};
 
     const ULID_TEXT: &str = "01K00000000000000000000000";
 
     #[test]
     fn typed_ids_parse_and_display_canonically() {
         let request_id = ULID_TEXT.parse::<RequestId>();
+        let batch_id = ULID_TEXT.parse::<BatchId>();
         let document_id = ULID_TEXT.parse::<DocumentId>();
         let session_id = ULID_TEXT.parse::<SessionId>();
 
         assert_eq!(request_id.map(|id| id.to_string()), Ok(ULID_TEXT.into()));
+        assert_eq!(batch_id.map(|id| id.to_string()), Ok(ULID_TEXT.into()));
         assert_eq!(document_id.map(|id| id.to_string()), Ok(ULID_TEXT.into()));
         assert_eq!(session_id.map(|id| id.to_string()), Ok(ULID_TEXT.into()));
     }
@@ -97,6 +100,7 @@ mod tests {
     #[test]
     fn typed_ids_reject_invalid_text() {
         assert!("not-a-ulid".parse::<RequestId>().is_err());
+        assert!("not-a-ulid".parse::<BatchId>().is_err());
         assert!("not-a-ulid".parse::<DocumentId>().is_err());
         assert!("not-a-ulid".parse::<SessionId>().is_err());
         assert!("01k00000000000000000000000".parse::<RequestId>().is_err());
@@ -108,12 +112,20 @@ mod tests {
         let Ok(request_id) = ULID_TEXT.parse::<RequestId>() else {
             panic!("fixture ULID must be valid");
         };
+        let Ok(batch_id) = ULID_TEXT.parse::<BatchId>() else {
+            panic!("fixture ULID must be valid");
+        };
 
         let serialized = match serde_json::to_string(&request_id) {
             Ok(serialized) => serialized,
             Err(error) => panic!("request ID must serialize: {error}"),
         };
         assert_eq!(serialized, format!("\"{ULID_TEXT}\""));
+        let batch_serialized = match serde_json::to_string(&batch_id) {
+            Ok(serialized) => serialized,
+            Err(error) => panic!("batch ID must serialize: {error}"),
+        };
+        assert_eq!(batch_serialized, format!("\"{ULID_TEXT}\""));
         assert!(serde_json::from_str::<RequestId>("\"01k00000000000000000000000\"").is_err());
     }
 }

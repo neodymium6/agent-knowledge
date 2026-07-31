@@ -686,6 +686,31 @@ examines interrupted entries, commit trailers, the official branch, and
 release metadata. It either resumes the next idempotent phase or returns the
 request to `pending/`.
 
+The initial claim record is a bounded, versioned `phase.json` sidecar:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "01K00000000000000000000000",
+  "batch_id": "01K00000000000000000000010",
+  "attempt": 1,
+  "phase": "claimed",
+  "updated_at": "2026-07-31T04:00:00Z"
+}
+```
+
+Claiming one request holds the queue lock, revalidates the accepted package,
+atomically writes and synchronizes this record through `queue/worker-tmp/`,
+renames `pending/<request-id>/` to `processing/<request-id>/`, and
+synchronizes both state directories. A retry after a phase-only interrupted
+claim advances the attempt number. A request already renamed to `processing/`
+keeps enough durable ownership metadata to be recovered.
+
+Returning a claimed request to `pending/` requires an exact token containing
+the request ID, batch ID, and attempt. This prevents a stale Worker from
+requeueing a later attempt owned by another batch. The phase record remains in
+the package so the next claim can advance the attempt monotonically.
+
 ## 17. Revisions and conflicts
 
 Mutable Markdown updates use an exact SHA-256 digest of the current file bytes:

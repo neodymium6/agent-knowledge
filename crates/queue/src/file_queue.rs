@@ -15,11 +15,18 @@ use crate::{
     validate_accepted_package, validate_package,
 };
 
+mod worker;
+pub use worker::{
+    CURRENT_WORKER_PHASE_SCHEMA_VERSION, ClaimToken, ClaimedPackage, WorkerPhase,
+    WorkerPhaseRecord, WorkerQueueError,
+};
+
 const REQUEST_FILE_NAME: &str = "request.json";
 const DIGEST_FILE_NAME: &str = "digest";
 const ACCEPTANCE_FILE_NAME: &str = "acceptance.json";
 const NEXT_SEQUENCE_FILE_NAME: &str = "next-sequence";
 const QUARANTINE_MARKER_FILE_NAME: &str = ".quarantined-at";
+const WORKER_TEMP_DIRECTORY_NAME: &str = "worker-tmp";
 const PAYLOAD_DIRECTORY_NAME: &str = "payload";
 const COPY_BUFFER_LENGTH: usize = 64 * 1024;
 const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
@@ -118,6 +125,7 @@ impl FileQueue {
         ensure_directory(&queue_root)?;
         ensure_directory(&queue_root.join("incoming"))?;
         ensure_directory(&queue_root.join("quarantine"))?;
+        ensure_directory(&queue_root.join(WORKER_TEMP_DIRECTORY_NAME))?;
         for state in QueueState::ALL {
             ensure_directory(&queue_root.join(state.directory_name()))?;
         }
