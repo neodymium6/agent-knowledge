@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -96,6 +96,8 @@ pub struct GitRepository {
     canonical_worktree: PathBuf,
     journal_root: PathBuf,
     worktree_root: PathBuf,
+    writer_lock: PathBuf,
+    canonical_index: PathBuf,
     official_ref: String,
     identity: GitIdentity,
 }
@@ -174,6 +176,7 @@ impl GitRepository {
         if parse_text(&bare.stdout)? != "true" {
             return Err(GitTransactionError::RepositoryNotBare);
         }
+        validate_local_git_config(git_directory)?;
         ensure_real_directory(canonical_worktree)?;
         run_git(
             Some(canonical_worktree),
@@ -206,17 +209,33 @@ impl GitRepository {
         if parse_text(&symbolic_head.stdout)? != official_ref {
             return Err(GitTransactionError::CanonicalWorktreeBranchMismatch);
         }
+        let canonical_index = run_git(
+            Some(canonical_worktree),
+            None,
+            [
+                OsStr::new("rev-parse"),
+                OsStr::new("--path-format=absolute"),
+                OsStr::new("--git-path"),
+                OsStr::new("index"),
+            ],
+        )?;
+        let canonical_index = PathBuf::from(parse_text(&canonical_index.stdout)?);
         validate_nonoverlapping_paths(git_directory, canonical_worktree, work_root)?;
         let journal_root = work_root.join("transactions");
         let worktree_root = work_root.join("worktrees");
         ensure_or_create_real_directory(&journal_root)?;
         ensure_or_create_real_directory(&worktree_root)?;
+        let writer_lock = work_root.join("repository-writer.lock");
+        ensure_regular_file(&writer_lock)?;
+        sync_directory(work_root).map_err(GitTransactionError::Io)?;
 
         Ok(Self {
             git_directory: git_directory.into(),
             canonical_worktree: canonical_worktree.into(),
             journal_root,
             worktree_root,
+            writer_lock,
+            canonical_index,
             official_ref,
             identity,
         })
@@ -274,6 +293,7 @@ impl GitRepository {
         F: FnOnce(&Path) -> Result<(), GitTransactionError>,
         H: FnOnce(&str, &str) -> Result<(), GitTransactionError>,
     {
+        let _writer = self.lock_writer()?;
         let TransactionHooks {
             trial_build,
             before_publish,
@@ -288,6 +308,10 @@ impl GitRepository {
             validate_worker_identity(&journal, worker)?;
             match journal.state {
                 JournalState::Preparing => {
+                    remove_stale_lock(&ref_lock_path(
+                        &self.git_directory,
+                        &transaction_ref(batch_id),
+                    )?)?;
                     let actual = self.resolve_commit(&self.official_ref)?;
                     if actual != journal.base_commit {
                         return Err(GitTransactionError::OfficialBranchChanged {
@@ -373,6 +397,7 @@ impl GitRepository {
 
         let stats = staged_stats(&worktree, &base, &prepared.moves)?;
         trial_build(&worktree)?;
+        self.ensure_prepared_worktree_unchanged(&worktree, &prepared.tree)?;
         let message = commit_message(batch_id, claims, &prepared.successful, stats);
         let commit = commit_tree(
             &self.git_directory,
@@ -479,6 +504,47 @@ impl GitRepository {
         })
     }
 
+    /// Discards a still-unpublished preparing transaction so its claims can be
+    /// requeued and replayed in smaller groups after a deterministic build
+    /// failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the journal, live claims, queue instance, and
+    /// unchanged official branch all match exactly.
+    pub fn abort_preparing_batch(
+        &self,
+        worker: &mut WorkerSession,
+        batch_id: BatchId,
+        claims: &[ClaimedPackage],
+    ) -> Result<(), GitTransactionError> {
+        let _writer = self.lock_writer()?;
+        self.ensure_no_other_journal(batch_id)?;
+        let journal_path = self.journal_path(batch_id);
+        let journal = read_journal(&journal_path)?.ok_or(GitTransactionError::JournalMissing)?;
+        validate_journal_structure(&journal, batch_id)?;
+        validate_worker_identity(&journal, worker)?;
+        if !matches!(journal.state, JournalState::Preparing) {
+            return Err(GitTransactionError::JournalState);
+        }
+        validate_batch_claims(worker, batch_id, claims)?;
+        validate_journal_claims(&journal, claims)?;
+        let actual = self.resolve_commit(&self.official_ref)?;
+        if actual != journal.base_commit {
+            return Err(GitTransactionError::OfficialBranchChanged {
+                expected: journal.base_commit,
+                actual,
+            });
+        }
+        remove_stale_lock(&ref_lock_path(
+            &self.git_directory,
+            &transaction_ref(batch_id),
+        )?)?;
+        self.remove_worktree(&self.worktree_path(batch_id))?;
+        self.remove_preparing_ref(batch_id, &journal.base_commit)?;
+        remove_journal(&journal_path)
+    }
+
     /// Removes a terminal transaction journal after the caller has durably
     /// recorded every queue transition and activated the corresponding release.
     ///
@@ -492,6 +558,7 @@ impl GitRepository {
         batch_id: BatchId,
         commit: Option<&str>,
     ) -> Result<(), GitTransactionError> {
+        let _writer = self.lock_writer()?;
         worker
             .ensure_transaction_ready()
             .map_err(GitTransactionError::Queue)?;
@@ -538,6 +605,7 @@ impl GitRepository {
         worker: &WorkerSession,
         batch_id: BatchId,
     ) -> Result<BatchCommitOutcome, GitTransactionError> {
+        let _writer = self.lock_writer()?;
         worker
             .ensure_transaction_ready()
             .map_err(GitTransactionError::Queue)?;
@@ -557,7 +625,9 @@ impl GitRepository {
         };
         if let Some((commit, publication_started)) = committed {
             self.validate_committed_journal(&journal)?;
-            if !publication_started {
+            if publication_started {
+                self.remove_stale_publication_locks(batch_id)?;
+            } else {
                 let actual = self.resolve_commit(&self.official_ref)?;
                 if actual != journal.base_commit {
                     return Err(GitTransactionError::OfficialBranchChanged {
@@ -616,7 +686,7 @@ impl GitRepository {
                 actual,
             });
         } else if publication_started {
-            self.ensure_canonical_repairable()?;
+            self.ensure_canonical_repairable(base)?;
         } else {
             return Err(GitTransactionError::JournalMismatch);
         }
@@ -627,6 +697,31 @@ impl GitRepository {
                 commit: commit.into(),
                 source: Box::new(source),
             })
+    }
+
+    fn lock_writer(&self) -> Result<RepositoryWriter, GitTransactionError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.writer_lock)
+            .map_err(GitTransactionError::Io)?;
+        match file.try_lock() {
+            Ok(()) => Ok(RepositoryWriter(file)),
+            Err(TryLockError::WouldBlock) => Err(GitTransactionError::RepositoryBusy(
+                self.writer_lock.clone(),
+            )),
+            Err(TryLockError::Error(error)) => Err(GitTransactionError::Io(error)),
+        }
+    }
+
+    fn remove_stale_publication_locks(&self, batch_id: BatchId) -> Result<(), GitTransactionError> {
+        let official = ref_lock_path(&self.git_directory, &self.official_ref)?;
+        let transaction = ref_lock_path(&self.git_directory, &transaction_ref(batch_id))?;
+        let index_lock = self.canonical_index.with_extension("lock");
+        for path in [&official, &transaction, &index_lock] {
+            remove_stale_lock(path)?;
+        }
+        Ok(())
     }
 
     fn validate_committed_journal(
@@ -711,33 +806,41 @@ impl GitRepository {
         }
     }
 
-    fn ensure_canonical_repairable(&self) -> Result<(), GitTransactionError> {
-        let untracked = run_git(
-            Some(&self.canonical_worktree),
+    fn ensure_prepared_worktree_unchanged(
+        &self,
+        worktree: &Path,
+        expected_tree: &str,
+    ) -> Result<(), GitTransactionError> {
+        let unstaged = run_git(
+            Some(worktree),
             None,
             [
-                OsStr::new("ls-files"),
-                OsStr::new("--others"),
+                OsStr::new("diff"),
+                OsStr::new("--name-only"),
                 OsStr::new("-z"),
-                OsStr::new("--exclude-standard"),
             ],
         )?;
-        if !untracked.stdout.is_empty() {
-            return Err(GitTransactionError::CanonicalWorktreeDirty);
+        let untracked = untracked_files(worktree)?;
+        let actual_tree = run_git(Some(worktree), None, [OsStr::new("write-tree")])?;
+        if !unstaged.stdout.is_empty()
+            || !untracked.is_empty()
+            || parse_object_id(&actual_tree.stdout)? != expected_tree
+        {
+            return Err(GitTransactionError::TrialBuildMutatedWorktree);
         }
-        let ignored = run_git(
-            Some(&self.canonical_worktree),
-            None,
-            [
-                OsStr::new("ls-files"),
-                OsStr::new("--others"),
-                OsStr::new("--ignored"),
-                OsStr::new("-z"),
-                OsStr::new("--exclude-standard"),
-            ],
-        )?;
-        if !ignored.stdout.is_empty() {
-            return Err(GitTransactionError::CanonicalWorktreeDirty);
+        Ok(())
+    }
+
+    fn ensure_canonical_repairable(&self, base: &str) -> Result<(), GitTransactionError> {
+        for path in untracked_files(&self.canonical_worktree)? {
+            let base_object = resolve_tree_path(&self.git_directory, base, &path)?;
+            let Some(base_object) = base_object else {
+                return Err(GitTransactionError::CanonicalWorktreeDirty);
+            };
+            let current_object = hash_worktree_file(&self.canonical_worktree, &path)?;
+            if current_object != base_object {
+                return Err(GitTransactionError::CanonicalWorktreeDirty);
+            }
         }
         Ok(())
     }
@@ -986,6 +1089,14 @@ impl GitRepository {
                 stderr: diagnostic(&output.stderr),
             })
         }
+    }
+}
+
+struct RepositoryWriter(File);
+
+impl Drop for RepositoryWriter {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
     }
 }
 
@@ -1303,6 +1414,48 @@ fn ensure_or_create_real_directory(path: &Path) -> Result<(), GitTransactionErro
     }
 }
 
+fn ensure_regular_file(path: &Path) -> Result<(), GitTransactionError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(GitTransactionError::InvalidDirectory(path.into())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(GitTransactionError::Io),
+        Err(error) => Err(GitTransactionError::Io(error)),
+    }
+}
+
+fn ref_lock_path(git_directory: &Path, reference: &str) -> Result<PathBuf, GitTransactionError> {
+    let relative = reference
+        .strip_prefix("refs/")
+        .ok_or(GitTransactionError::InvalidGitOutput)?;
+    let reference_path = git_directory.join("refs").join(relative);
+    let name = reference_path
+        .file_name()
+        .ok_or(GitTransactionError::InvalidGitOutput)?;
+    let mut lock_name = name.to_os_string();
+    lock_name.push(".lock");
+    Ok(reference_path.with_file_name(lock_name))
+}
+
+fn remove_stale_lock(path: &Path) -> Result<(), GitTransactionError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::remove_file(path).map_err(GitTransactionError::Io)?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| GitTransactionError::UnsafeGitLock(path.into()))?;
+            sync_directory(parent).map_err(GitTransactionError::Io)
+        }
+        Ok(_) => Err(GitTransactionError::UnsafeGitLock(path.into())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(GitTransactionError::Io(error)),
+    }
+}
+
 fn validate_nonoverlapping_paths(
     git_directory: &Path,
     canonical_worktree: &Path,
@@ -1375,6 +1528,7 @@ fn staged_stats(
     base: &str,
     moves: &[AppliedMove],
 ) -> Result<FileStats, GitTransactionError> {
+    let final_moves = reduce_moves(moves)?;
     let output = run_git(
         Some(worktree),
         None,
@@ -1416,15 +1570,8 @@ fn staged_stats(
         }
     }
     for source in deleted {
-        let mut destination = source.clone();
-        for applied_move in moves {
-            if destination == applied_move.source {
-                destination.clone_from(&applied_move.destination);
-            } else if let Ok(suffix) = destination.strip_prefix(&applied_move.source) {
-                let suffix = suffix.to_path_buf();
-                destination = applied_move.destination.join(suffix);
-            }
-        }
+        let destination = moved_file_destination(&source, &final_moves)
+            .ok_or(GitTransactionError::PhysicalDeletion)?;
         if destination == source || !added.remove(&destination) {
             return Err(GitTransactionError::PhysicalDeletion);
         }
@@ -1435,6 +1582,43 @@ fn staged_stats(
         modified,
         deleted: 0,
     })
+}
+
+fn reduce_moves(moves: &[AppliedMove]) -> Result<HashMap<PathBuf, PathBuf>, GitTransactionError> {
+    let mut origins = HashMap::<PathBuf, PathBuf>::with_capacity(moves.len());
+    for applied_move in moves {
+        let origin = origins
+            .remove(&applied_move.source)
+            .unwrap_or_else(|| applied_move.source.clone());
+        if origins
+            .insert(applied_move.destination.clone(), origin)
+            .is_some()
+        {
+            return Err(GitTransactionError::InvalidGitOutput);
+        }
+    }
+    let mut final_moves = HashMap::with_capacity(origins.len());
+    for (destination, origin) in origins {
+        if final_moves.insert(origin, destination).is_some() {
+            return Err(GitTransactionError::InvalidGitOutput);
+        }
+    }
+    Ok(final_moves)
+}
+
+fn moved_file_destination(
+    source: &Path,
+    final_moves: &HashMap<PathBuf, PathBuf>,
+) -> Option<PathBuf> {
+    let mut ancestor = Some(source);
+    while let Some(candidate) = ancestor {
+        if let Some(destination) = final_moves.get(candidate) {
+            let suffix = source.strip_prefix(candidate).ok()?;
+            return Some(destination.join(suffix));
+        }
+        ancestor = candidate.parent();
+    }
+    None
 }
 
 fn commit_message(
@@ -1534,8 +1718,163 @@ fn git_command() -> Command {
     command
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .args(["-c", "core.fsync=all", "-c", "core.hooksPath=/dev/null"]);
+        .args([
+            "-c",
+            "core.fsync=all",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.eol=lf",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "tag.gpgSign=false",
+        ]);
     command
+}
+
+fn validate_local_git_config(git_directory: &Path) -> Result<(), GitTransactionError> {
+    let output = run_git(
+        None,
+        Some(git_directory),
+        [
+            OsStr::new("config"),
+            OsStr::new("--local"),
+            OsStr::new("--name-only"),
+            OsStr::new("--null"),
+            OsStr::new("--list"),
+        ],
+    )?;
+    for key in output.stdout.split(|byte| *byte == 0) {
+        if key.is_empty() {
+            continue;
+        }
+        let key = std::str::from_utf8(key).map_err(|_| GitTransactionError::UnsafeGitConfig)?;
+        let allowed = matches!(
+            key,
+            "core.repositoryformatversion"
+                | "core.filemode"
+                | "core.bare"
+                | "core.logallrefupdates"
+                | "core.ignorecase"
+                | "core.precomposeunicode"
+                | "extensions.objectformat"
+                | "extensions.worktreeconfig"
+        ) || safe_remote_or_branch_config(key);
+        if !allowed {
+            return Err(GitTransactionError::UnsafeGitConfig);
+        }
+    }
+    Ok(())
+}
+
+fn safe_remote_or_branch_config(key: &str) -> bool {
+    let mut parts = key.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (
+            Some("remote"),
+            Some(_),
+            Some("url" | "pushurl" | "fetch" | "mirror"),
+            None
+        ) | (Some("branch"), Some(_), Some("remote" | "merge"), None)
+    )
+}
+
+fn untracked_files(worktree: &Path) -> Result<Vec<PathBuf>, GitTransactionError> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for arguments in [
+        &["ls-files", "--others", "-z", "--exclude-standard"][..],
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "-z",
+            "--exclude-standard",
+        ][..],
+    ] {
+        let output = run_git(Some(worktree), None, arguments.iter().map(OsStr::new))?;
+        for path in output.stdout.split(|byte| *byte == 0) {
+            if path.is_empty() {
+                continue;
+            }
+            let path =
+                std::str::from_utf8(path).map_err(|_| GitTransactionError::InvalidGitOutput)?;
+            let path = PathBuf::from(path);
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn resolve_tree_path(
+    git_directory: &Path,
+    tree: &str,
+    path: &Path,
+) -> Result<Option<String>, GitTransactionError> {
+    let output = run_git(
+        None,
+        Some(git_directory),
+        [
+            OsStr::new("ls-tree"),
+            OsStr::new("-z"),
+            OsStr::new("--full-tree"),
+            OsStr::new(tree),
+            OsStr::new("--"),
+            path.as_os_str(),
+        ],
+    )?;
+    let records = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Ok(None);
+    }
+    if records.len() != 1 {
+        return Err(GitTransactionError::InvalidGitOutput);
+    }
+    let record =
+        std::str::from_utf8(records[0]).map_err(|_| GitTransactionError::InvalidGitOutput)?;
+    let (metadata, found_path) = record
+        .split_once('\t')
+        .ok_or(GitTransactionError::InvalidGitOutput)?;
+    if Path::new(found_path) != path {
+        return Err(GitTransactionError::InvalidGitOutput);
+    }
+    let mut metadata = metadata.split_ascii_whitespace();
+    let _mode = metadata.next();
+    let kind = metadata.next();
+    let object = metadata.next();
+    if kind != Some("blob") || metadata.next().is_some() {
+        return Err(GitTransactionError::InvalidGitOutput);
+    }
+    object
+        .filter(|object| valid_object_id(object))
+        .map(|object| Some(object.into()))
+        .ok_or(GitTransactionError::InvalidGitOutput)
+}
+
+fn hash_worktree_file(worktree: &Path, path: &Path) -> Result<String, GitTransactionError> {
+    let output = run_git(
+        Some(worktree),
+        None,
+        [
+            OsStr::new("hash-object"),
+            OsStr::new("--no-filters"),
+            OsStr::new("--"),
+            path.as_os_str(),
+        ],
+    )?;
+    parse_object_id(&output.stdout)
 }
 
 fn ensure_supported_git() -> Result<(), GitTransactionError> {
@@ -1617,6 +1956,8 @@ pub enum GitTransactionError {
     },
     /// The caller's trial static-site build rejected the prepared worktree.
     TrialBuildFailed,
+    /// The trial build changed its supposedly read-only input worktree.
+    TrialBuildMutatedWorktree,
     /// The configured author identity was empty or contained control characters.
     InvalidIdentity,
     /// The official branch name was empty or contained control characters.
@@ -1629,6 +1970,12 @@ pub enum GitTransactionError {
     CanonicalWorktreeBranchMismatch,
     /// Repository, canonical content, and disposable work paths overlapped.
     OverlappingRepositoryPaths,
+    /// Another process holds the repository-scoped writer lock.
+    RepositoryBusy(PathBuf),
+    /// A journal-proven stale Git lock was not a removable regular file.
+    UnsafeGitLock(PathBuf),
+    /// Repository-local Git configuration contained a non-allowlisted key.
+    UnsafeGitConfig,
     /// A required directory was a link or non-directory entry.
     InvalidDirectory(PathBuf),
     /// The batch contained no claims.
@@ -1706,6 +2053,9 @@ impl fmt::Display for GitTransactionError {
                 write!(formatter, "Git 2.36 or newer is required; found `{found}`")
             }
             Self::TrialBuildFailed => formatter.write_str("trial static-site build failed"),
+            Self::TrialBuildMutatedWorktree => {
+                formatter.write_str("trial static-site build changed its input worktree")
+            }
             Self::InvalidIdentity => {
                 formatter.write_str("Git identity values must be nonempty and contain no controls")
             }
@@ -1719,6 +2069,21 @@ impl fmt::Display for GitTransactionError {
             }
             Self::OverlappingRepositoryPaths => formatter
                 .write_str("Git repository, canonical worktree, and work root must not overlap"),
+            Self::RepositoryBusy(path) => write!(
+                formatter,
+                "repository writer lock `{}` is already held",
+                path.display()
+            ),
+            Self::UnsafeGitLock(path) => {
+                write!(
+                    formatter,
+                    "Git lock `{}` is not a regular file",
+                    path.display()
+                )
+            }
+            Self::UnsafeGitConfig => {
+                formatter.write_str("repository-local Git configuration is not allowlisted")
+            }
             Self::InvalidDirectory(path) => {
                 write!(formatter, "`{}` must be a real directory", path.display())
             }

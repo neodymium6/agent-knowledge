@@ -580,6 +580,69 @@ fn trial_build_failure_keeps_the_official_commit_unchanged() {
 }
 
 #[test]
+fn trial_build_cannot_change_the_tree_that_will_be_committed() {
+    let root = TestDirectory::new();
+    let git = GitFixture::initialize(root.path());
+    let base = git.official_commit();
+    let (queue, mut worker) = queue_and_worker(&root.path().join("queue"));
+    let claim = enqueue_and_claim(
+        &queue,
+        &mut worker,
+        FIRST_REQUEST_ID,
+        &create_request(FIRST_REQUEST_ID, "Create a fictional experiment"),
+        &markdown(FIRST_REQUEST_ID, "Fictional experiment"),
+    );
+    let result = git.open().apply_batch(
+        &mut worker,
+        parse_batch_id(),
+        &[claim],
+        ContentPolicy::default(),
+        &PackagePolicy::default(),
+        |worktree| {
+            fs::write(worktree.join("generated.html"), "<p>unexpected</p>\n")
+                .map_err(GitTransactionError::Io)
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(GitTransactionError::TrialBuildMutatedWorktree)
+    ));
+    assert_eq!(git.official_commit(), base);
+}
+
+#[test]
+fn rejects_executable_repository_local_git_configuration() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    git(
+        None,
+        [
+            "--git-dir",
+            fixture
+                .repository
+                .to_str()
+                .unwrap_or("invalid-fictional-repository"),
+            "config",
+            "core.fsmonitor",
+            "/fictional/fsmonitor",
+        ],
+        None,
+    );
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+    assert!(matches!(
+        GitRepository::open(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity,
+        ),
+        Err(GitTransactionError::UnsafeGitConfig)
+    ));
+}
+
+#[test]
 fn resumes_publication_from_a_committed_journal_after_interruption() {
     let root = TestDirectory::new();
     let git = GitFixture::initialize(root.path());
@@ -635,7 +698,7 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
         repository.recover_batch(&worker, parse_batch_id()),
         Err(GitTransactionError::JournalMismatch)
     ));
-    if let Err(error) = fs::write(&journal_path, original_journal) {
+    if let Err(error) = fs::write(&journal_path, &original_journal) {
         panic!("original journal fixture must be restored: {error}");
     }
 
@@ -646,10 +709,23 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
         Err(GitTransactionError::JournalMismatch)
     ));
 
+    let mut publishing_journal: serde_json::Value = serde_json::from_slice(&original_journal)
+        .unwrap_or_else(|error| panic!("journal fixture must decode: {error}"));
+    publishing_journal["state"]["publication_started"] = serde_json::Value::Bool(true);
+    let publishing_journal = serde_json::to_vec(&publishing_journal)
+        .unwrap_or_else(|error| panic!("publishing journal must encode: {error}"));
+    if let Err(error) = fs::write(&journal_path, publishing_journal) {
+        panic!("publishing journal fixture must be written: {error}");
+    }
+    let official_lock = git.repository.join("refs/heads/main.lock");
+    if let Err(error) = fs::write(&official_lock, b"stale fictional lock\n") {
+        panic!("stale lock fixture must be written: {error}");
+    }
     let outcome = match repository.recover_batch(&worker, parse_batch_id()) {
         Ok(outcome) => outcome,
         Err(error) => panic!("committed journal must resume publication: {error}"),
     };
+    assert!(!official_lock.exists());
     let BatchCommitOutcome::Committed { commit, .. } = outcome else {
         panic!("resumed transaction must retain its commit outcome");
     };
@@ -769,6 +845,31 @@ fn move_fixture(worktree: &Path, source: &Path, destination: &Path) {
     if let Err(error) = fs::rename(worktree.join(source), destination) {
         panic!("move fixture must be renamed: {error}");
     }
+}
+
+#[test]
+fn interrupted_reset_allows_only_exact_base_tree_residue() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let source = PathBuf::from("projects/fictional-a/runbooks/source/index.md");
+    let destination = PathBuf::from("projects/fictional-a/archive/runbooks/source/index.md");
+    let bytes = b"Fictional pre-reset bytes.\n";
+    write_tracked_fixture(&fixture.canonical, &source, bytes);
+    let base = commit_canonical_fixture(&fixture.canonical, "Add reset source");
+    move_fixture(&fixture.canonical, &source, &destination);
+    let _target = commit_canonical_fixture(&fixture.canonical, "Move reset source");
+    write_tracked_fixture(&fixture.canonical, &source, bytes);
+    let repository = fixture.open();
+    if let Err(error) = repository.ensure_canonical_repairable(&base) {
+        panic!("exact base residue must be repairable: {error}");
+    }
+    if let Err(error) = fs::write(fixture.canonical.join(&source), b"unrelated bytes\n") {
+        panic!("changed residue fixture must be written: {error}");
+    }
+    assert!(matches!(
+        repository.ensure_canonical_repairable(&base),
+        Err(GitTransactionError::CanonicalWorktreeDirty)
+    ));
 }
 
 fn write_tracked_fixture(worktree: &Path, relative_path: &Path, bytes: &[u8]) {

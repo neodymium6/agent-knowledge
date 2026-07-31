@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -623,12 +623,13 @@ fn validate_payload_references(
 ) -> Result<(), PackageValidationError> {
     let available = payload
         .iter()
-        .map(|file| file.path.as_str())
-        .collect::<HashSet<_>>();
+        .map(|file| (file.path.as_str(), file.byte_length))
+        .collect::<HashMap<_, _>>();
     let mut referenced = HashSet::new();
+    let mut materialized_bytes = 0_u64;
 
     for operation in &request.operations {
-        match operation {
+        let source = match operation {
             Operation::CreateDocument { content, .. }
             | Operation::UpdateDocument { content, .. } => {
                 if Path::new(content.as_str())
@@ -642,6 +643,7 @@ fn validate_payload_references(
                 }
                 require_payload(content, &available)?;
                 referenced.insert(content.as_str());
+                Some(content)
             }
             Operation::AddAttachment { source, name, .. } => {
                 if !policy.allows_attachment_name(name.as_str()) {
@@ -651,8 +653,25 @@ fn validate_payload_references(
                 }
                 require_payload(source, &available)?;
                 referenced.insert(source.as_str());
+                Some(source)
             }
-            Operation::MoveDocument { .. } | Operation::ArchiveDocument { .. } => {}
+            Operation::MoveDocument { .. } | Operation::ArchiveDocument { .. } => None,
+        };
+        if let Some(source) = source {
+            materialized_bytes = materialized_bytes
+                .checked_add(available[source.as_str()])
+                .ok_or(PackageValidationError::LimitExceeded {
+                    limit: PackageLimit::MaterializedBytes,
+                    maximum: policy.limits.maximum_total_bytes,
+                    actual: u64::MAX,
+                })?;
+            if materialized_bytes > policy.limits.maximum_total_bytes {
+                return Err(PackageValidationError::LimitExceeded {
+                    limit: PackageLimit::MaterializedBytes,
+                    maximum: policy.limits.maximum_total_bytes,
+                    actual: materialized_bytes,
+                });
+            }
         }
     }
 
@@ -670,9 +689,9 @@ fn validate_payload_references(
 
 fn require_payload(
     path: &PayloadPath,
-    available: &HashSet<&str>,
+    available: &HashMap<&str, u64>,
 ) -> Result<(), PackageValidationError> {
-    if available.contains(path.as_str()) {
+    if available.contains_key(path.as_str()) {
         Ok(())
     } else {
         Err(PackageValidationError::MissingPayload(path.clone()))
@@ -816,6 +835,8 @@ fn hash_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
 pub enum PackageLimit {
     /// Combined request and payload bytes.
     TotalBytes,
+    /// Payload bytes materialized by all operations, including repeated sources.
+    MaterializedBytes,
     /// Bytes in one file.
     IndividualFileBytes,
     /// Number of request and payload files.

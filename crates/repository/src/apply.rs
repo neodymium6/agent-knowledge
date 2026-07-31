@@ -1,5 +1,5 @@
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -157,7 +157,7 @@ fn build_plan(
     }
     let mut plan = Vec::with_capacity(request.operations.len());
     let mut documents = HashMap::<DocumentId, VirtualDocument>::new();
-    let mut destinations = HashSet::<PathBuf>::new();
+    let mut occupancy = VirtualOccupancy::new(content_root);
 
     for operation in &request.operations {
         match operation {
@@ -194,11 +194,7 @@ fn build_plan(
                     metadata.created,
                     *document_id,
                 );
-                reserve_new_destination(
-                    content_root,
-                    &bundle_path(&relative_path, request.document_type),
-                    &mut destinations,
-                )?;
+                occupancy.reserve(&bundle_path(&relative_path, request.document_type))?;
                 plan.push(PlannedMutation::WriteNew {
                     relative_path: relative_path.clone(),
                     bytes: bytes.clone(),
@@ -304,7 +300,7 @@ fn build_plan(
                 );
                 let source_bundle = bundle_path(&document.relative_path, document.document_type);
                 let destination_bundle = bundle_path(&destination, *document_type);
-                reserve_new_destination(content_root, &destination_bundle, &mut destinations)?;
+                occupancy.move_path(&source_bundle, &destination_bundle)?;
                 plan.push(PlannedMutation::Move {
                     source: source_bundle,
                     destination: destination_bundle,
@@ -329,7 +325,8 @@ fn build_plan(
                 require_movable(document, *document_id)?;
                 let destination = archive_document_path(document, *document_id);
                 let destination_bundle = bundle_path(&destination, document.document_type);
-                reserve_new_destination(content_root, &destination_bundle, &mut destinations)?;
+                let source_bundle = bundle_path(&document.relative_path, document.document_type);
+                occupancy.move_path(&source_bundle, &destination_bundle)?;
                 let archived = archived_markdown(
                     &document.markdown,
                     policy,
@@ -342,7 +339,7 @@ fn build_plan(
                     bytes: archived.clone(),
                 });
                 plan.push(PlannedMutation::Move {
-                    source: bundle_path(&document.relative_path, document.document_type),
+                    source: source_bundle,
                     destination: destination_bundle,
                 });
                 document.relative_path = destination;
@@ -376,7 +373,7 @@ fn build_plan(
                     .parent()
                     .unwrap_or_else(|| Path::new(""))
                     .join(name.as_str());
-                reserve_new_destination(content_root, &relative_path, &mut destinations)?;
+                occupancy.reserve(&relative_path)?;
                 plan.push(PlannedMutation::WriteNew {
                     relative_path,
                     bytes: read_payload(package_root, package, source.as_str())?,
@@ -705,22 +702,55 @@ const fn category_name(document_type: DocumentType) -> &'static str {
     }
 }
 
-fn reserve_new_destination(
-    content_root: &Path,
-    relative_path: &Path,
-    destinations: &mut HashSet<PathBuf>,
-) -> Result<(), ApplyError> {
-    if !destinations.insert(relative_path.to_path_buf()) {
-        return Err(ApplyError::DestinationExists {
-            path: relative_path.to_path_buf(),
-        });
+struct VirtualOccupancy<'a> {
+    content_root: &'a Path,
+    entries: HashMap<PathBuf, bool>,
+}
+
+impl<'a> VirtualOccupancy<'a> {
+    fn new(content_root: &'a Path) -> Self {
+        Self {
+            content_root,
+            entries: HashMap::new(),
+        }
     }
-    match fs::symlink_metadata(content_root.join(relative_path)) {
-        Ok(_) => Err(ApplyError::DestinationExists {
-            path: relative_path.to_path_buf(),
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ApplyError::Io(error)),
+
+    fn reserve(&mut self, relative_path: &Path) -> Result<(), ApplyError> {
+        if self.is_occupied(relative_path)? {
+            return Err(ApplyError::DestinationExists {
+                path: relative_path.to_path_buf(),
+            });
+        }
+        self.entries.insert(relative_path.to_path_buf(), true);
+        Ok(())
+    }
+
+    fn move_path(&mut self, source: &Path, destination: &Path) -> Result<(), ApplyError> {
+        if source == destination {
+            return Err(ApplyError::DestinationExists {
+                path: destination.to_path_buf(),
+            });
+        }
+        self.reserve(destination)?;
+        self.entries.insert(source.to_path_buf(), false);
+        Ok(())
+    }
+
+    fn is_occupied(&mut self, relative_path: &Path) -> Result<bool, ApplyError> {
+        if let Some(occupied) = self.entries.get(relative_path) {
+            return Ok(*occupied);
+        }
+        match fs::symlink_metadata(self.content_root.join(relative_path)) {
+            Ok(_) => {
+                self.entries.insert(relative_path.to_path_buf(), true);
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.entries.insert(relative_path.to_path_buf(), false);
+                Ok(false)
+            }
+            Err(error) => Err(ApplyError::Io(error)),
+        }
     }
 }
 

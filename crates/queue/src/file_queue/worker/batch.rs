@@ -4,7 +4,6 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::Path;
 
 use agent_knowledge_core::{BatchId, RequestId, Revision};
-use sha2::{Digest, Sha256};
 
 use super::{ClaimedPackage, WorkerQueueError, next_attempt, revalidate_accepted};
 use crate::file_queue::{
@@ -119,11 +118,20 @@ impl WorkerSession {
     ///
     /// Returns an I/O error if the queue root can no longer be canonicalized.
     pub fn queue_identity(&self) -> Result<Revision, WorkerQueueError> {
-        let root = fs::canonicalize(&self.queue.queue_root).map_err(WorkerQueueError::Io)?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"agent-knowledge-queue-identity-v1\0");
-        hasher.update(root.as_os_str().as_encoded_bytes());
-        Ok(Revision::from_bytes(hasher.finalize().into()))
+        let identity = super::super::read_queue_identity(
+            &self
+                .queue
+                .queue_root
+                .join(super::super::QUEUE_IDENTITY_FILE_NAME),
+        )
+        .map_err(WorkerQueueError::Queue)?;
+        if identity == self.queue.identity {
+            Ok(identity)
+        } else {
+            Err(WorkerQueueError::Queue(
+                super::super::QueueError::InvalidQueueIdentity,
+            ))
+        }
     }
 
     /// Verifies that this live Worker can perform one repository transaction.

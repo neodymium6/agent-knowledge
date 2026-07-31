@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use agent_knowledge_core::{ErrorCode, PayloadPath, RequestId};
+use agent_knowledge_core::{ErrorCode, PayloadPath, RequestId, Revision};
+use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::{
@@ -26,6 +27,7 @@ const REQUEST_FILE_NAME: &str = "request.json";
 const DIGEST_FILE_NAME: &str = "digest";
 const ACCEPTANCE_FILE_NAME: &str = "acceptance.json";
 const NEXT_SEQUENCE_FILE_NAME: &str = "next-sequence";
+const QUEUE_IDENTITY_FILE_NAME: &str = "queue-id";
 const QUARANTINE_MARKER_FILE_NAME: &str = ".quarantined-at";
 const WORKER_TEMP_DIRECTORY_NAME: &str = "worker-tmp";
 const LOCK_DIRECTORY_NAME: &str = ".locks";
@@ -35,6 +37,7 @@ const PAYLOAD_DIRECTORY_NAME: &str = "payload";
 const COPY_BUFFER_LENGTH: usize = 64 * 1024;
 const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
 const MAXIMUM_SEQUENCE_FILE_BYTES: u64 = 32;
+const MAXIMUM_QUEUE_IDENTITY_BYTES: u64 = 72;
 const MAXIMUM_QUARANTINE_MARKER_BYTES: u64 = 64;
 const MAXIMUM_STAGING_NAME_ATTEMPTS: usize = 16;
 
@@ -102,6 +105,7 @@ pub enum EnqueueOutcome {
 #[derive(Clone, Debug)]
 pub struct FileQueue {
     queue_root: PathBuf,
+    identity: Revision,
     lock_file: PathBuf,
     worker_lock_file: PathBuf,
     policy: PackagePolicy,
@@ -146,6 +150,8 @@ impl FileQueue {
             .open(&lock_file)
             .map_err(QueueError::Io)?;
         initialization_lock.lock().map_err(QueueError::Io)?;
+        let identity =
+            ensure_queue_identity_file(&queue_root.join(QUEUE_IDENTITY_FILE_NAME), &queue_root)?;
         ensure_sequence_file(&queue_root.join(NEXT_SEQUENCE_FILE_NAME), &queue_root)?;
 
         sync_directory(&lock_root)?;
@@ -157,6 +163,7 @@ impl FileQueue {
         }
         Ok(Self {
             queue_root,
+            identity,
             lock_file,
             worker_lock_file,
             policy,
@@ -934,6 +941,53 @@ fn ensure_sequence_file(path: &Path, queue_root: &Path) -> Result<(), QueueError
     }
 }
 
+fn ensure_queue_identity_file(path: &Path, queue_root: &Path) -> Result<Revision, QueueError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => read_queue_identity(path),
+        Ok(_) => Err(QueueError::InvalidStoragePath(path.into())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if !accepted_states_are_empty(queue_root)? {
+                return Err(QueueError::InvalidQueueIdentity);
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(b"agent-knowledge-queue-instance-v1\0");
+            hasher.update(Ulid::generate().to_bytes());
+            let identity = Revision::from_bytes(hasher.finalize().into());
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(QueueError::Io)?;
+            writeln!(file, "{identity}").map_err(QueueError::Io)?;
+            file.sync_all().map_err(QueueError::Io)?;
+            sync_directory(queue_root)?;
+            Ok(identity)
+        }
+        Err(error) => Err(QueueError::Io(error)),
+    }
+}
+
+fn read_queue_identity(path: &Path) -> Result<Revision, QueueError> {
+    let metadata = fs::symlink_metadata(path).map_err(QueueError::Io)?;
+    if !metadata.file_type().is_file() || metadata.len() > MAXIMUM_QUEUE_IDENTITY_BYTES {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .and_then(|file| {
+            file.take(MAXIMUM_QUEUE_IDENTITY_BYTES + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(QueueError::Io)?;
+    if bytes.len() as u64 > MAXIMUM_QUEUE_IDENTITY_BYTES {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    let value = std::str::from_utf8(&bytes)
+        .map_err(|_| QueueError::InvalidQueueIdentity)?
+        .trim();
+    value.parse().map_err(|_| QueueError::InvalidQueueIdentity)
+}
+
 fn accepted_states_are_empty(queue_root: &Path) -> Result<bool, QueueError> {
     for state in QueueState::ALL {
         let mut entries =
@@ -1217,6 +1271,8 @@ pub enum QueueError {
     SequenceExhausted,
     /// The durable queue acceptance sequence file was malformed.
     InvalidSequenceState,
+    /// The immutable queue instance identity was missing, malformed, or changed.
+    InvalidQueueIdentity,
     /// An in-process maintenance scanner mutex was poisoned.
     MaintenanceScannerPoisoned,
     /// The same request ID appeared in more than one accepted state.
@@ -1254,6 +1310,7 @@ impl QueueError {
             | Self::QuarantineTimestamp(_)
             | Self::SequenceExhausted
             | Self::InvalidSequenceState
+            | Self::InvalidQueueIdentity
             | Self::MaintenanceScannerPoisoned => ErrorCode::InternalError,
         }
     }
@@ -1315,6 +1372,9 @@ impl fmt::Display for QueueError {
             }
             Self::InvalidSequenceState => {
                 formatter.write_str("durable acceptance sequence state is invalid")
+            }
+            Self::InvalidQueueIdentity => {
+                formatter.write_str("durable queue instance identity is invalid")
             }
             Self::MaintenanceScannerPoisoned => {
                 formatter.write_str("maintenance scanner state is unavailable")

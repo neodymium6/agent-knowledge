@@ -740,3 +740,24 @@ fn processing_recovery_error_keeps_worker_transitions_gated() {
         WorkerQueueError::ProcessingRecoveryRequired
     ));
 }
+
+#[test]
+fn queue_identity_rejects_replacement_at_the_same_path() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    let worker = open_worker(&queue);
+    let queue_path = root.path().join("queue");
+    let replaced_path = root.path().join("replaced-queue");
+    if let Err(error) = fs::rename(&queue_path, &replaced_path) {
+        panic!("original queue must be moved aside: {error}");
+    }
+    if let Err(error) = FileQueue::initialize(&queue_path, PackagePolicy::default()) {
+        panic!("replacement queue must initialize: {error}");
+    }
+    assert!(matches!(
+        worker.queue_identity(),
+        Err(WorkerQueueError::Queue(
+            crate::QueueError::InvalidQueueIdentity
+        ))
+    ));
+}

@@ -205,7 +205,7 @@ The Gateway:
 - receives only forced-command SSH sessions;
 - derives a client ID from the authenticated public key configuration;
 - validates the wire format and operation;
-- enforces request, file-count, and byte limits;
+- enforces request, file-count, stored-byte, and materialized-output limits;
 - rejects unsafe archive entries and paths;
 - validates request metadata and front matter;
 - derives create destinations from fixed rules;
@@ -264,12 +264,13 @@ knowledge/
 │   ├── processing/
 │   ├── completed/
 │   ├── failed/
+│   ├── queue-id              # immutable, synchronized queue instance ID
 │   └── .locks/                # fixed queue and Worker lock identities
 ├── repository/              # bare Git repository
 ├── releases/
 │   ├── by-id/
 │   └── current -> by-id/<release-id>/
-└── work/                    # disposable worktrees and builds
+└── work/                    # repository lock, journals, worktrees, and builds
 ```
 
 `repository/` is a bare Git repository. `content/` is its canonical linked
@@ -857,11 +858,17 @@ object and internal recovery ref exist, a `committed` journal containing the
 exact claim tokens and per-request outcomes is synchronized before the
 official branch can advance. A later batch cannot begin until this journal is
 reconciled and finalized. Each journal is bound to the canonical queue
-identity held by the live Worker session.
+instance ID held by the live Worker session. Replacing a queue at the same path
+creates a different ID and invalidates sessions opened against the old queue.
 
 Git 2.36 or newer is required. Git subprocesses discard inherited `GIT_*`
-overrides, disable system/global configuration and hooks, and run object and
-reference mutations with Git fsync enabled. Before
+overrides, disable system/global configuration, hooks, signing, fsmonitor, and
+line-ending conversion, and reject repository-local configuration outside a
+small data-only allowlist. Object and reference mutations run with Git fsync
+enabled. A repository-scoped file lock serializes all repository instances.
+During journal-proven recovery, the Worker removes only the known regular ref
+and canonical-index lockfiles that its interrupted Git commands could have
+left behind. Before
 publication or recovery, the Worker verifies that the journaled commit exists,
 has the pinned base as its sole direct parent, and contains the exact batch and
 successful-request trailers recorded by the journal. A stale `preparing`
@@ -883,10 +890,12 @@ terminal queue reconciliation or journal finalization.
 
 A synchronized `publication_started` journal marker is written before the
 official ref can advance. It authorizes recovery to replace partially updated
-tracked checkout state after an interrupted reset, while unexpected untracked
-or ignored files still fail closed. The canonical checkout and release can be
-repaired from the official commit after a crash. Normal readers use the pinned
-official commit, not an in-progress checkout update.
+tracked checkout state after an interrupted reset. Untracked or ignored files
+are accepted only when their paths and bytes exactly match the pinned base
+tree, which identifies old-tree residue from a move interrupted after the new
+index was installed; every other file fails closed. The canonical checkout and
+release can be repaired from the official commit after a crash. Normal readers
+use the pinned official commit, not an in-progress checkout update.
 
 ## 19. Batch isolation
 
@@ -914,7 +923,12 @@ If the final Quartz build fails:
 - unaffected requests are rebuilt and committed together.
 
 This fallback is slower than the normal batch path but preserves request-level
-isolation.
+isolation. The repository transaction API can securely abort only a
+`preparing` journal whose queue, claims, and pinned official base still match,
+allowing the Worker to requeue and bisect a deterministic failure. A successful
+trial builder must leave its input worktree and index unchanged; the Worker
+verifies the staged tree, tracked bytes, and untracked/ignored set before
+creating the commit.
 
 ## 20. Commit policy
 
