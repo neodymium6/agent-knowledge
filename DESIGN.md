@@ -1127,11 +1127,16 @@ descriptors by the directory-depth limit, and checks the build deadline
 throughout traversal. This bounds normal runaway builds before final
 validation. When the Quartz leader exits, the Worker terminates the remaining
 process group and waits, within the build deadline, until the group has no
-signalable members before performing the final output scan. This prevents a
-descendant with an in-flight filesystem operation from changing the observed
-tree after validation. Deployments should additionally place build staging on
-a quota-limited filesystem or apply an equivalent ephemeral-storage limit when
-a hard kernel-enforced capacity boundary is required.
+signalable members before performing the final output scan. On Linux the Worker
+acts as a child subreaper and reaps orphaned group members, including when it is
+PID 1 in a container. It sends the termination signal only once and disarms the
+numeric process-group identifier before waiting, preventing a reused identifier
+from receiving a later signal. The configured Quartz process and its plugins
+must not detach from the assigned process group. Deployments that execute
+untrusted plugins require a cgroup or equivalent containment boundary.
+Deployments should additionally place build staging on a quota-limited
+filesystem or apply an equivalent ephemeral-storage limit when a hard
+kernel-enforced capacity boundary is required.
 
 The batch directory is pinned while a store-wide exclusive lease spans the
 build and live preparation. `prepare` consumes that lease-bearing build handle,

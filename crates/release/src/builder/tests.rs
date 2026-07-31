@@ -190,7 +190,7 @@ fn terminates_quartz_descendants_after_a_timeout() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn terminates_descendants_before_scanning_successful_output() {
+fn reaps_descendants_before_scanning_successful_output() {
     let root = TestDirectory::new();
     let integration = root.0.join("integration");
     let content = root.0.join("content");

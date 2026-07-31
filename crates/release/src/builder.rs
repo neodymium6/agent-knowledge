@@ -14,6 +14,8 @@ use crate::store::{MAXIMUM_RELEASE_TREE_DEPTH, ReleasePolicy};
 use nix::errno::Errno;
 #[cfg(unix)]
 use nix::sys::signal::{Signal, killpg};
+#[cfg(target_os = "linux")]
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 #[cfg(unix)]
 use nix::unistd::Pid;
 #[cfg(unix)]
@@ -22,6 +24,8 @@ use std::fs::OpenOptions;
 use std::os::unix::process::CommandExt;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(unix)]
+const TERMINATION_GRACE: Duration = Duration::from_secs(1);
 
 /// A bounded invocation of the configured Quartz CLI.
 #[derive(Clone, Debug)]
@@ -112,6 +116,7 @@ impl QuartzBuilder {
             return Err(QuartzBuildError::OverlappingPaths);
         }
         self.validate_live_command()?;
+        enable_child_subreaper()?;
         let deadline = Instant::now()
             .checked_add(self.timeout)
             .ok_or(QuartzBuildError::InvalidTimeout)?;
@@ -165,6 +170,7 @@ impl QuartzBuilder {
 
 struct ChildGuard {
     child: Option<Child>,
+    group_armed: bool,
     #[cfg(unix)]
     process_group: Pid,
 }
@@ -182,6 +188,7 @@ impl ChildGuard {
         };
         Ok(Self {
             child: Some(child),
+            group_armed: true,
             #[cfg(unix)]
             process_group,
         })
@@ -196,6 +203,9 @@ impl ChildGuard {
     }
 
     fn terminate_group(&self) -> Result<(), QuartzBuildError> {
+        if !self.group_armed {
+            return Ok(());
+        }
         #[cfg(unix)]
         match killpg(self.process_group, Signal::SIGKILL) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
@@ -213,36 +223,40 @@ impl ChildGuard {
         timeout: Duration,
     ) -> Result<(), QuartzBuildError> {
         self.terminate_group()?;
-        #[cfg(not(unix))]
-        let _ = (deadline, timeout);
-        #[cfg(unix)]
-        loop {
-            match killpg(self.process_group, None) {
-                Err(Errno::ESRCH) => break,
-                Ok(()) => {}
-                Err(error) => {
-                    return Err(QuartzBuildError::Io(io::Error::from_raw_os_error(
-                        error as i32,
-                    )));
-                }
-            }
-            check_build_deadline(deadline, timeout)?;
-            thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
-        }
         self.disarm();
-        Ok(())
+        #[cfg(not(unix))]
+        {
+            let _ = (deadline, timeout);
+            Ok(())
+        }
+        #[cfg(unix)]
+        wait_for_process_group(self.process_group, deadline, timeout)
     }
 
     fn terminate(&mut self) {
+        if !self.group_armed && self.child.is_none() {
+            return;
+        }
+        #[cfg(unix)]
+        let process_group = self.process_group;
         let _ = self.terminate_group();
+        self.group_armed = false;
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
         self.child = None;
+        #[cfg(unix)]
+        {
+            let deadline = Instant::now()
+                .checked_add(TERMINATION_GRACE)
+                .unwrap_or_else(Instant::now);
+            let _ = wait_for_process_group(process_group, deadline, TERMINATION_GRACE);
+        }
     }
 
     fn disarm(&mut self) {
+        self.group_armed = false;
         self.child = None;
     }
 }
@@ -251,6 +265,60 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         self.terminate();
     }
+}
+
+#[cfg(target_os = "linux")]
+fn enable_child_subreaper() -> Result<(), QuartzBuildError> {
+    nix::sys::prctl::set_child_subreaper(true)
+        .map_err(|error| QuartzBuildError::Io(io::Error::from_raw_os_error(error as i32)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_child_subreaper() -> Result<(), QuartzBuildError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_process_group(
+    process_group: Pid,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<(), QuartzBuildError> {
+    loop {
+        reap_process_group_children(process_group)?;
+        match killpg(process_group, None) {
+            Err(Errno::ESRCH) => return Ok(()),
+            Ok(()) => {}
+            Err(error) => {
+                return Err(QuartzBuildError::Io(io::Error::from_raw_os_error(
+                    error as i32,
+                )));
+            }
+        }
+        check_build_deadline(deadline, timeout)?;
+        thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reap_process_group_children(process_group: Pid) -> Result<(), QuartzBuildError> {
+    let group_selector = Pid::from_raw(-process_group.as_raw());
+    loop {
+        match waitpid(group_selector, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => return Ok(()),
+            Ok(_) | Err(Errno::EINTR) => {}
+            Err(error) => {
+                return Err(QuartzBuildError::Io(io::Error::from_raw_os_error(
+                    error as i32,
+                )));
+            }
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn reap_process_group_children(_process_group: Pid) -> Result<(), QuartzBuildError> {
+    Ok(())
 }
 
 fn canonical_regular_file(path: &Path) -> Result<PathBuf, QuartzBuildError> {
