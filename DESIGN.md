@@ -245,6 +245,7 @@ knowledge/
 ├── content/                 # canonical committed checkout
 ├── queue/
 │   ├── incoming/            # incomplete Gateway writes
+│   ├── quarantine/          # inactive incomplete packages awaiting reap
 │   ├── pending/
 │   ├── processing/
 │   ├── completed/
@@ -575,9 +576,14 @@ The Gateway calculates a digest of the normalized request metadata and payload.
 It searches all queue states for the request ID.
 
 - A new request ID is accepted normally.
-- An existing ID with the same digest returns the existing status.
+- An existing ID with the same digest is revalidated as an immutable accepted
+  package before the Gateway returns its existing status.
 - An existing ID with a different digest fails with
   `REQUEST_ID_REUSED`.
+
+The existing accepted package is revalidated before either digest comparison.
+A malformed stored digest or a mismatch between stored and calculated
+immutable contents is queue corruption, not request ID reuse.
 
 The Worker records request IDs in machine-readable Git commit trailers. Crash
 recovery checks both queue state and committed history before applying a
@@ -594,28 +600,49 @@ pending/
 └── 01K00000000000000000000000/
     ├── request.json
     ├── digest
+    ├── acceptance.json  # immutable Gateway sequence and timestamp
+    ├── phase.json       # optional Worker-owned sidecar
+    ├── result.json      # optional Worker-owned sidecar
     └── payload/
         ├── index.md
         ├── graph.png
         └── results.csv
 ```
 
-Worker state and results are separate files next to the immutable request
-data. They are written through temporary files and atomic rename.
+`request.json`, `digest`, `acceptance.json`, and `payload/` are immutable.
+`acceptance.json` contains the central acceptance timestamp and a queue-local
+monotonic sequence allocated under the queue lock. Gaps are allowed after an
+interrupted acceptance, but accepted packages never share a sequence. Worker
+state and results use only the optional `phase.json` and `result.json`
+sidecars next to that immutable data. The Gateway never creates these
+sidecars. The Worker writes them through temporary files and atomic rename;
+package revalidation excludes Gateway and Worker metadata bytes from the
+immutable client-package digest but still rejects links, executable files,
+and any unknown top-level entry.
+
+The next sequence is stored durably in `queue/next-sequence`. If that file is
+missing while any accepted-state directory is nonempty, queue initialization
+fails instead of restarting at one. Operators must recover the sequence state
+from durable queue metadata before accepting another request.
 
 ### 16.2 Durable acceptance
 
 The Gateway accepts a request as follows:
 
-1. Create a randomly named directory below `queue/incoming/` with exclusive
-   creation.
+1. While holding the queue lock, create a randomly named directory below
+   `queue/incoming/`, acquire its advisory lease, and then release the queue
+   lock.
 2. Stream files while enforcing count and byte limits.
 3. Validate the complete package and calculate its digest.
 4. Synchronize every file.
 5. Synchronize the payload and package directories.
-6. Atomically rename the package to `queue/pending/<request-id>/`.
-7. Synchronize the `pending/` directory.
-8. Return success.
+6. Allocate and durably record the next acceptance sequence under the queue
+   lock.
+7. Write and synchronize `acceptance.json` with that sequence and the central
+   acceptance timestamp.
+8. Atomically rename the package to `queue/pending/<request-id>/`.
+9. Synchronize the `pending/` directory.
+10. Return success.
 
 Gateway success therefore means that the request survives a normal process or
 host crash according to the guarantees of the configured storage.
@@ -635,8 +662,24 @@ incoming ──accepted──> pending ──claimed──> processing
 ```
 
 `incoming/` is not an accepted state. Stale incomplete incoming directories
-may be quarantined and later removed by an administrative maintenance command.
-The command must never remove accepted packages.
+are protected by an advisory lease while active. An explicit administrative
+maintenance operation may atomically move only inactive entries older than a
+configured threshold into `quarantine/`. A separate operation may remove
+stale quarantined entries. Neither operation scans or removes accepted
+packages. Each maintenance invocation has explicit maximum scan and action
+counts so a large abandoned directory set cannot cause unbounded work or
+memory use. Marker creation or repair consumes the same action budget as a
+move or reap. A long-running queue handle retains each directory iterator
+between invocations, so bounded scans resume after the previous entry instead
+of repeatedly inspecting the same prefix.
+
+After the atomic quarantine rename, maintenance atomically writes and
+synchronizes a completed `.quarantined-at` marker. Reaping validates the
+marker and measures retention age from its modification time rather than from
+the incoming directory's older modification time. If a crash leaves the
+quarantined directory without a complete marker, the next reap invocation
+atomically creates a fresh marker and retains the directory for the full
+configured period.
 
 `processing/` entries contain an atomic phase record. On startup, the Worker
 examines interrupted entries, commit trailers, the official branch, and
@@ -905,6 +948,10 @@ Configuration, rather than architecture, controls:
 - maximum request bytes;
 - maximum individual file bytes;
 - maximum file count;
+- maximum directory and total package-entry counts;
+- maximum payload path components;
+- maximum front-matter bytes;
+- incoming quarantine and reap age thresholds;
 - allowed attachment extensions;
 - project identifiers;
 - document types;

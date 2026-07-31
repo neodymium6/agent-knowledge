@@ -4,7 +4,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::{AttachmentName, DocumentId, PayloadPath, ProjectId, RequestId, Revision, SessionId};
+use crate::{
+    AttachmentName, DocumentId, PathValidationError, PayloadPath, ProjectId, RequestId, Revision,
+    SessionId,
+};
 
 /// The only protocol version supported by this implementation.
 pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
@@ -109,6 +112,17 @@ pub struct ChangeRequest {
 }
 
 impl ChangeRequest {
+    /// Decodes a JSON request while preserving path-validation failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured JSON failure or the invalid typed path field.
+    pub fn decode_json(input: &[u8]) -> Result<Self, RequestDecodeError> {
+        let wire =
+            serde_json::from_slice::<WireChangeRequest>(input).map_err(RequestDecodeError::Json)?;
+        wire.try_into()
+    }
+
     /// Validates request-level invariants that do not require repository state.
     ///
     /// # Errors
@@ -173,6 +187,185 @@ impl ChangeRequest {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireChangeRequest {
+    protocol_version: u16,
+    request_id: RequestId,
+    title: String,
+    #[serde(default)]
+    project: Option<String>,
+    document_type: DocumentType,
+    #[serde(default)]
+    node: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    session: Option<SessionId>,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    operations: Vec<WireOperation>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum WireOperation {
+    CreateDocument {
+        document_id: DocumentId,
+        content: String,
+    },
+    UpdateDocument {
+        document_id: DocumentId,
+        expected_revision: Revision,
+        content: String,
+    },
+    MoveDocument {
+        document_id: DocumentId,
+        expected_revision: Revision,
+        #[serde(default)]
+        project: Option<String>,
+        document_type: DocumentType,
+    },
+    ArchiveDocument {
+        document_id: DocumentId,
+        expected_revision: Revision,
+    },
+    AddAttachment {
+        document_id: DocumentId,
+        source: String,
+        name: String,
+    },
+}
+
+impl TryFrom<WireChangeRequest> for ChangeRequest {
+    type Error = RequestDecodeError;
+
+    fn try_from(wire: WireChangeRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            protocol_version: wire.protocol_version,
+            request_id: wire.request_id,
+            title: wire.title,
+            project: parse_optional_path("project", wire.project)?,
+            document_type: wire.document_type,
+            node: wire.node,
+            agent: wire.agent,
+            session: wire.session,
+            created_at: wire.created_at,
+            operations: wire
+                .operations
+                .into_iter()
+                .map(Operation::try_from)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl TryFrom<WireOperation> for Operation {
+    type Error = RequestDecodeError;
+
+    fn try_from(wire: WireOperation) -> Result<Self, Self::Error> {
+        match wire {
+            WireOperation::CreateDocument {
+                document_id,
+                content,
+            } => Ok(Self::CreateDocument {
+                document_id,
+                content: parse_path("content", content)?,
+            }),
+            WireOperation::UpdateDocument {
+                document_id,
+                expected_revision,
+                content,
+            } => Ok(Self::UpdateDocument {
+                document_id,
+                expected_revision,
+                content: parse_path("content", content)?,
+            }),
+            WireOperation::MoveDocument {
+                document_id,
+                expected_revision,
+                project,
+                document_type,
+            } => Ok(Self::MoveDocument {
+                document_id,
+                expected_revision,
+                project: parse_optional_path("project", project)?,
+                document_type,
+            }),
+            WireOperation::ArchiveDocument {
+                document_id,
+                expected_revision,
+            } => Ok(Self::ArchiveDocument {
+                document_id,
+                expected_revision,
+            }),
+            WireOperation::AddAttachment {
+                document_id,
+                source,
+                name,
+            } => Ok(Self::AddAttachment {
+                document_id,
+                source: parse_path("source", source)?,
+                name: parse_path("name", name)?,
+            }),
+        }
+    }
+}
+
+fn parse_path<T>(field: &'static str, value: String) -> Result<T, RequestDecodeError>
+where
+    T: TryFrom<String, Error = PathValidationError>,
+{
+    T::try_from(value).map_err(|source| RequestDecodeError::InvalidPath { field, source })
+}
+
+fn parse_optional_path<T>(
+    field: &'static str,
+    value: Option<String>,
+) -> Result<Option<T>, RequestDecodeError>
+where
+    T: TryFrom<String, Error = PathValidationError>,
+{
+    value.map(|value| parse_path(field, value)).transpose()
+}
+
+/// A deterministic failure while decoding request JSON into domain types.
+#[derive(Debug)]
+pub enum RequestDecodeError {
+    /// JSON syntax or a non-path wire field was invalid.
+    Json(serde_json::Error),
+    /// A typed path field was not normalized or safe.
+    InvalidPath {
+        /// The wire field containing the invalid path.
+        field: &'static str,
+        /// The path invariant that failed.
+        source: PathValidationError,
+    },
+}
+
+impl fmt::Display for RequestDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Json(error) => write!(formatter, "request JSON is invalid: {error}"),
+            Self::InvalidPath { field, source } => {
+                write!(
+                    formatter,
+                    "request path field `{field}` is invalid: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RequestDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Json(error) => Some(error),
+            Self::InvalidPath { source, .. } => Some(source),
+        }
     }
 }
 
@@ -295,8 +488,8 @@ impl std::error::Error for RequestValidationError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CURRENT_PROTOCOL_VERSION, ChangeRequest, DocumentType, Operation, RequestLimits,
-        RequestValidationError,
+        CURRENT_PROTOCOL_VERSION, ChangeRequest, DocumentType, Operation, RequestDecodeError,
+        RequestLimits, RequestValidationError,
     };
     use crate::{DocumentId, RequestId, SessionId};
 
@@ -346,6 +539,25 @@ mod tests {
             Err(error) => panic!("serialized request must parse: {error}"),
         };
         assert_eq!(reparsed, request);
+    }
+
+    #[test]
+    fn request_decoder_preserves_invalid_path_failures() {
+        let json = REQUEST_JSON.replace(
+            "\"content\": \"experiment/index.md\"",
+            "\"content\": \"../index.md\"",
+        );
+        let error = match ChangeRequest::decode_json(json.as_bytes()) {
+            Ok(_) => panic!("traversal path must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RequestDecodeError::InvalidPath {
+                field: "content",
+                ..
+            }
+        ));
     }
 
     #[test]
