@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -9,49 +9,30 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::store::{BuildDirectory, BuiltDirectory, MAXIMUM_RELEASE_TREE_DEPTH, ReleasePolicy};
-use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use nix::errno::Errno;
-#[cfg(target_os = "linux")]
-use nix::fcntl::{FcntlArg, SealFlag, fcntl};
-#[cfg(target_os = "linux")]
-use nix::sys::memfd::{MFdFlags, memfd_create};
 #[cfg(unix)]
 use nix::sys::signal::{Signal, killpg};
-#[cfg(target_os = "linux")]
-use nix::sys::stat::{Mode, fchmod};
 #[cfg(target_os = "linux")]
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 #[cfg(unix)]
 use nix::unistd::Pid;
 #[cfg(unix)]
 use std::fs::OpenOptions;
-#[cfg(target_os = "linux")]
-use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
-const MAXIMUM_PROGRAM_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(unix)]
 const TERMINATION_GRACE: Duration = Duration::from_secs(1);
 static BUILD_PROCESS_LEASE: Mutex<()> = Mutex::new(());
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProgramRevision {
-    length: u64,
-    digest: [u8; 32],
-}
 
 /// A bounded invocation of the configured Quartz CLI.
 #[derive(Clone, Debug)]
 pub struct QuartzBuilder {
     configured_program: PathBuf,
     program_handle: Arc<File>,
-    program_revision: ProgramRevision,
-    program: PathBuf,
-    immutable_program_handle: Arc<File>,
     configured_integration_directory: PathBuf,
     integration_directory: PathBuf,
     integration_handle: Arc<File>,
@@ -61,11 +42,12 @@ pub struct QuartzBuilder {
 }
 
 impl QuartzBuilder {
-    /// Validates and pins operator-controlled Quartz command configuration.
+    /// Validates operator-controlled, trusted Quartz command configuration.
     ///
     /// `prefix_arguments` typically contains `quartz` when `program` is an
     /// absolute `npx` path. The builder appends `build -d <content> -o
-    /// <output>` without invoking a shell.
+    /// <output>` without invoking a shell. The program and integration tree
+    /// must be deployed immutably for the lifetime of this builder.
     pub fn new(
         program: impl AsRef<Path>,
         integration_directory: impl AsRef<Path>,
@@ -101,11 +83,6 @@ impl QuartzBuilder {
         let configured_program = canonical_regular_file(program.as_ref())?;
         let program_handle =
             Arc::new(File::open(&configured_program).map_err(QuartzBuildError::Io)?);
-        let stable_program = stable_file_path(&program_handle, &configured_program)?;
-        let (program_bytes, program_revision) = read_program(&stable_program)?;
-        validate_pinned_file(&configured_program, &program_handle)?;
-        validate_file_revision(&stable_program, program_revision)?;
-        let (program, immutable_program_handle) = immutable_program(&program_bytes)?;
         let configured_integration_directory = canonical_directory(integration_directory.as_ref())?;
         let integration_handle =
             Arc::new(File::open(&configured_integration_directory).map_err(QuartzBuildError::Io)?);
@@ -114,9 +91,6 @@ impl QuartzBuilder {
         Ok(Self {
             configured_program,
             program_handle,
-            program_revision,
-            program,
-            immutable_program_handle,
             configured_integration_directory,
             integration_directory,
             integration_handle,
@@ -156,7 +130,7 @@ impl QuartzBuilder {
             .checked_add(self.timeout)
             .ok_or(QuartzBuildError::InvalidTimeout)?;
 
-        let mut command = Command::new(&self.program);
+        let mut command = Command::new(&self.configured_program);
         command
             .current_dir(&self.integration_directory)
             .args(&self.prefix_arguments)
@@ -196,11 +170,6 @@ impl QuartzBuilder {
 
     fn validate_live_command(&self) -> Result<(), QuartzBuildError> {
         validate_pinned_file(&self.configured_program, &self.program_handle)?;
-        let stable_program = stable_file_path(&self.program_handle, &self.configured_program)?;
-        validate_file_revision(&stable_program, self.program_revision)?;
-        self.immutable_program_handle
-            .metadata()
-            .map_err(QuartzBuildError::Io)?;
         validate_pinned_directory(
             &self.configured_integration_directory,
             &self.integration_handle,
@@ -215,105 +184,6 @@ fn spawn_quartz(
 ) -> Result<Child, QuartzBuildError> {
     check_build_deadline(deadline, timeout)?;
     command.spawn().map_err(QuartzBuildError::Io)
-}
-
-fn read_program(path: &Path) -> Result<(Vec<u8>, ProgramRevision), QuartzBuildError> {
-    let file = File::open(path).map_err(QuartzBuildError::Io)?;
-    let length = file.metadata().map_err(QuartzBuildError::Io)?.len();
-    if length > MAXIMUM_PROGRAM_BYTES {
-        return Err(QuartzBuildError::ProgramTooLarge);
-    }
-    let capacity = usize::try_from(length).map_err(|_| QuartzBuildError::ProgramTooLarge)?;
-    let mut contents = Vec::with_capacity(capacity);
-    file.take(MAXIMUM_PROGRAM_BYTES + 1)
-        .read_to_end(&mut contents)
-        .map_err(QuartzBuildError::Io)?;
-    if contents.len() as u64 > MAXIMUM_PROGRAM_BYTES {
-        return Err(QuartzBuildError::ProgramTooLarge);
-    }
-    if contents.len() as u64 != length {
-        return Err(QuartzBuildError::CommandIdentityChanged);
-    }
-    let revision = ProgramRevision {
-        length,
-        digest: Sha256::digest(&contents).into(),
-    };
-    Ok((contents, revision))
-}
-
-fn validate_file_revision(path: &Path, expected: ProgramRevision) -> Result<(), QuartzBuildError> {
-    let file = File::open(path).map_err(QuartzBuildError::Io)?;
-    let length = file.metadata().map_err(QuartzBuildError::Io)?.len();
-    if length > MAXIMUM_PROGRAM_BYTES
-        || length != expected.length
-        || digest_file(file, expected.length)? != expected.digest
-    {
-        return Err(QuartzBuildError::CommandIdentityChanged);
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn immutable_program(contents: &[u8]) -> Result<(PathBuf, Arc<File>), QuartzBuildError> {
-    use std::os::fd::AsRawFd;
-
-    let descriptor = memfd_create(
-        "agent-knowledge-quartz",
-        MFdFlags::MFD_ALLOW_SEALING | MFdFlags::MFD_CLOEXEC,
-    )
-    .map_err(nix_error)?;
-    let mut file = File::from(descriptor);
-    file.write_all(contents).map_err(QuartzBuildError::Io)?;
-    fchmod(&file, Mode::from_bits_truncate(0o500)).map_err(nix_error)?;
-    fcntl(
-        &file,
-        FcntlArg::F_ADD_SEALS(
-            SealFlag::F_SEAL_SEAL
-                | SealFlag::F_SEAL_SHRINK
-                | SealFlag::F_SEAL_GROW
-                | SealFlag::F_SEAL_WRITE,
-        ),
-    )
-    .map_err(nix_error)?;
-    let path = PathBuf::from(format!(
-        "/proc/{}/fd/{}",
-        std::process::id(),
-        file.as_raw_fd()
-    ));
-    fs::metadata(&path).map_err(QuartzBuildError::Io)?;
-    Ok((path, Arc::new(file)))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn immutable_program(_contents: &[u8]) -> Result<(PathBuf, Arc<File>), QuartzBuildError> {
-    Err(QuartzBuildError::ImmutableProgramUnsupported)
-}
-
-#[cfg(target_os = "linux")]
-fn nix_error(error: Errno) -> QuartzBuildError {
-    process_error(error as i32)
-}
-
-fn digest_file(mut file: File, length: u64) -> Result<[u8; 32], QuartzBuildError> {
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut remaining = length;
-    while remaining > 0 {
-        let maximum = usize::try_from(remaining.min(buffer.len() as u64))
-            .map_err(|_| QuartzBuildError::CommandIdentityChanged)?;
-        let read = file
-            .read(&mut buffer[..maximum])
-            .map_err(QuartzBuildError::Io)?;
-        if read == 0 {
-            return Err(QuartzBuildError::CommandIdentityChanged);
-        }
-        digest.update(&buffer[..read]);
-        remaining -= read as u64;
-    }
-    if file.read(&mut buffer[..1]).map_err(QuartzBuildError::Io)? != 0 {
-        return Err(QuartzBuildError::CommandIdentityChanged);
-    }
-    Ok(digest.finalize().into())
 }
 
 struct ChildGuard {
@@ -766,8 +636,6 @@ fn open_scan_directory(path: &Path) -> io::Result<File> {
 pub enum QuartzBuildError {
     ProgramMustBeAbsolute,
     InvalidProgram,
-    ProgramTooLarge,
-    ImmutableProgramUnsupported,
     InvalidDirectory,
     BuildPathsMustBeAbsolute,
     InvalidTimeout,
@@ -790,10 +658,6 @@ impl fmt::Display for QuartzBuildError {
                 formatter.write_str("Quartz program path must be absolute")
             }
             Self::InvalidProgram => formatter.write_str("Quartz program is not a regular file"),
-            Self::ProgramTooLarge => formatter.write_str("Quartz program exceeds the size limit"),
-            Self::ImmutableProgramUnsupported => {
-                formatter.write_str("immutable Quartz execution is unsupported on this platform")
-            }
             Self::InvalidDirectory => formatter.write_str("Quartz path is not a real directory"),
             Self::BuildPathsMustBeAbsolute => {
                 formatter.write_str("Quartz content and output paths must be absolute")
