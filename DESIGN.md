@@ -581,6 +581,10 @@ It searches all queue states for the request ID.
 - An existing ID with a different digest fails with
   `REQUEST_ID_REUSED`.
 
+The existing accepted package is revalidated before either digest comparison.
+A malformed stored digest or a mismatch between stored and calculated
+immutable contents is queue corruption, not request ID reuse.
+
 The Worker records request IDs in machine-readable Git commit trailers. Crash
 recovery checks both queue state and committed history before applying a
 request.
@@ -664,7 +668,8 @@ configured threshold into `quarantine/`. A separate operation may remove
 stale quarantined entries. Neither operation scans or removes accepted
 packages. Each maintenance invocation has explicit maximum scan and action
 counts so a large abandoned directory set cannot cause unbounded work or
-memory use. A long-running queue handle retains each directory iterator
+memory use. Marker creation or repair consumes the same action budget as a
+move or reap. A long-running queue handle retains each directory iterator
 between invocations, so bounded scans resume after the previous entry instead
 of repeatedly inspecting the same prefix.
 

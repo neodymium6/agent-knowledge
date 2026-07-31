@@ -237,6 +237,28 @@ fn identical_retry_revalidates_the_existing_accepted_package() {
     };
     assert!(matches!(error, QueueError::CorruptState { .. }));
     assert_eq!(error.error_code(), ErrorCode::ContentValidationFailed);
+
+    let changed_digest_root = TestDirectory::create();
+    let queue = initialize_queue(changed_digest_root.path(), PackagePolicy::default());
+    let accepted = accept(stage_package(&queue, RESULTS));
+    let request_id = match accepted {
+        EnqueueOutcome::Accepted { request_id, .. } => request_id,
+        EnqueueOutcome::Existing { .. } => panic!("first request must be newly accepted"),
+    };
+    let digest = changed_digest_root
+        .path()
+        .join("queue/pending")
+        .join(request_id.to_string())
+        .join("digest");
+    if let Err(error) = fs::write(digest, format!("sha256:{}\n", "0".repeat(64))) {
+        panic!("fixture accepted digest must be changed canonically: {error}");
+    }
+    let error = match stage_package(&queue, RESULTS).accept() {
+        Ok(_) => panic!("retry must not classify a corrupt stored digest as request ID reuse"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, QueueError::CorruptState { .. }));
+    assert_eq!(error.error_code(), ErrorCode::ContentValidationFailed);
 }
 
 #[test]
@@ -852,6 +874,39 @@ fn reaping_repairs_an_incomplete_quarantine_marker_before_aging() {
     };
     assert_eq!(removed, 1);
     assert!(!quarantined.exists());
+}
+
+#[test]
+fn marker_repairs_consume_the_maintenance_action_budget() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let quarantine_root = root.path().join("queue/quarantine");
+    for suffix in ["00989", "00990", "00991"] {
+        let path = quarantine_root.join(format!(".incoming-01K000000000000000000{suffix}"));
+        if let Err(error) = fs::create_dir(&path) {
+            panic!("quarantined fixture must be created: {error}");
+        }
+        if let Err(error) = fs::write(path.join(".quarantined-at"), b"") {
+            panic!("incomplete marker fixture must be written: {error}");
+        }
+    }
+
+    let removed = match queue.reap_quarantined_incoming(Duration::ZERO, 100, 1) {
+        Ok(removed) => removed,
+        Err(error) => panic!("budgeted marker repair must succeed: {error}"),
+    };
+    assert_eq!(removed, 0);
+    let completed_markers = match fs::read_dir(&quarantine_root) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                fs::read(entry.path().join(".quarantined-at"))
+                    .is_ok_and(|marker| !marker.is_empty())
+            })
+            .count(),
+        Err(error) => panic!("quarantine fixtures must be readable: {error}"),
+    };
+    assert_eq!(completed_markers, 1);
 }
 
 #[test]

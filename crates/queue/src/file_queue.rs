@@ -619,25 +619,27 @@ impl IncomingPackage {
 
         let request_id = validated.request().request_id;
         let digest = validated.digest();
-        if let Some((state, existing_digest)) = self.queue.find_existing(request_id)? {
-            if existing_digest == digest {
-                let existing_path = self.queue.state_path(state, request_id);
-                let existing = validate_accepted_package(&existing_path, &self.queue.policy)
-                    .map_err(|error| match error {
+        if let Some((state, _stored_digest)) = self.queue.find_existing(request_id)? {
+            let existing_path = self.queue.state_path(state, request_id);
+            let existing =
+                validate_accepted_package(&existing_path, &self.queue.policy).map_err(|error| {
+                    match error {
                         PackageValidationError::Io(error) => QueueError::Io(error),
                         _ => QueueError::CorruptState {
                             request_id,
                             state,
                             detail: "accepted package failed immutable revalidation",
                         },
-                    })?;
-                if existing.request().request_id != request_id || existing.digest() != digest {
-                    return Err(QueueError::CorruptState {
-                        request_id,
-                        state,
-                        detail: "accepted package identity does not match its queue entry",
-                    });
-                }
+                    }
+                })?;
+            if existing.request().request_id != request_id {
+                return Err(QueueError::CorruptState {
+                    request_id,
+                    state,
+                    detail: "accepted package identity does not match its queue entry",
+                });
+            }
+            if existing.digest() == digest {
                 sync_directory(&self.queue.queue_root.join("incoming"))?;
                 for accepted_state in QueueState::ALL {
                     sync_directory(&self.queue.queue_root.join(accepted_state.directory_name()))?;
@@ -707,7 +709,8 @@ fn inactive_stale_directories(
     let now = SystemTime::now();
     let mut stale = Vec::with_capacity(maximum_actions.min(maximum_scan_entries));
     let mut scanned = 0_usize;
-    while scanned < maximum_scan_entries {
+    let mut actions = 0_usize;
+    while scanned < maximum_scan_entries && actions < maximum_actions {
         let Some(entries) = scanner.entries.as_mut() else {
             break;
         };
@@ -735,6 +738,7 @@ fn inactive_stale_directories(
                 QuarantineMarker::Complete(modified) => modified,
                 QuarantineMarker::MissingOrIncomplete => {
                     replace_quarantine_marker(&path)?;
+                    actions += 1;
                     continue;
                 }
                 QuarantineMarker::UnsafeType => continue,
@@ -751,9 +755,7 @@ fn inactive_stale_directories(
         match lease.try_lock() {
             Ok(()) => {
                 stale.push(path);
-                if stale.len() == maximum_actions {
-                    break;
-                }
+                actions += 1;
             }
             Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Error(error)) => return Err(QueueError::Io(error)),
