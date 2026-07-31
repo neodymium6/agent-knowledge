@@ -1,7 +1,8 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use agent_knowledge_core::BatchId;
@@ -12,7 +13,8 @@ use time::OffsetDateTime;
 use ulid::Ulid;
 
 use super::{
-    BUILD_PROCESS_LEASE, BuildProcessLease, QuartzBuildError, QuartzBuilder, enforce_output_limits,
+    BUILD_PROCESS_LEASE, BuildProcessLease, MAXIMUM_PROGRAM_BYTES, QuartzBuildError, QuartzBuilder,
+    enforce_output_limits, spawn_quartz,
 };
 use crate::ReleasePolicy;
 #[cfg(unix)]
@@ -106,7 +108,7 @@ fn invokes_quartz_with_fixed_content_and_output_arguments() {
 
 #[cfg(unix)]
 #[test]
-fn retries_a_temporarily_busy_quartz_executable() {
+fn executes_an_immutable_copy_while_the_configured_program_is_busy() {
     use std::fs::OpenOptions;
 
     let root = TestDirectory::new();
@@ -158,7 +160,7 @@ fn rejects_a_quartz_executable_modified_while_busy() {
     let program = root.0.join("fake-busy-quartz");
     executable(
         &program,
-        "#!/bin/sh\nprintf '%s\\n' safe > \"$5/index.html\"\n",
+        "#!/bin/sh\nsleep 0.1\nprintf '%s\\n' safe > \"$5/index.html\"\n",
     );
     let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
         .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
@@ -186,12 +188,35 @@ fn rejects_a_quartz_executable_modified_while_busy() {
     modify_writer
         .join()
         .unwrap_or_else(|_| panic!("busy executable writer must finish"));
-    assert!(
-        fs::read_dir(&output)
-            .unwrap_or_else(|error| panic!("output directory must be readable: {error}"))
-            .next()
-            .is_none()
+    assert_eq!(
+        fs::read_to_string(output.join("index.html"))
+            .unwrap_or_else(|error| panic!("sealed Quartz output must be readable: {error}")),
+        "safe\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn does_not_spawn_quartz_after_the_deadline() {
+    let root = TestDirectory::new();
+    let marker = root.0.join("spawned");
+    let program = root.0.join("fake-quartz");
+    executable(
+        &program,
+        &format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()),
+    );
+    let mut command = Command::new(&program);
+    let timeout = Duration::from_millis(1);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(|| panic!("test deadline must be representable"));
+    std::thread::sleep(Duration::from_millis(10));
+
+    assert!(matches!(
+        spawn_quartz(&mut command, deadline, timeout),
+        Err(QuartzBuildError::TimedOut { .. })
+    ));
+    assert!(!marker.exists());
 }
 
 #[cfg(unix)]
@@ -624,6 +649,27 @@ fn rejects_a_deadline_that_cannot_be_represented() {
     assert!(matches!(
         QuartzBuilder::new(&program, &integration, Vec::new(), Duration::MAX),
         Err(QuartzBuildError::InvalidTimeout)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_an_oversized_quartz_executable_before_reading_it() {
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    fs::create_dir(&integration)
+        .unwrap_or_else(|error| panic!("integration directory must be created: {error}"));
+    let program = root.0.join("oversized-quartz");
+    executable(&program, "#!/bin/sh\nexit 0\n");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&program)
+        .and_then(|file| file.set_len(MAXIMUM_PROGRAM_BYTES + 1))
+        .unwrap_or_else(|error| panic!("oversized executable must be created: {error}"));
+
+    assert!(matches!(
+        QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2)),
+        Err(QuartzBuildError::ProgramTooLarge)
     ));
 }
 
