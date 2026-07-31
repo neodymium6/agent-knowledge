@@ -113,6 +113,93 @@ fn terminates_a_quartz_command_after_its_deadline() {
     ));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn terminates_quartz_descendants_after_a_timeout() {
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    let output = root.0.join("output");
+    for directory in [&integration, &content, &output] {
+        fs::create_dir(directory)
+            .unwrap_or_else(|error| panic!("fixture directory must be created: {error}"));
+    }
+    let program = root.0.join("fake-descendant-quartz");
+    executable(
+        &program,
+        "#!/bin/sh\n\
+         (sleep 0.15; printf '%s\\n' escaped > \"$5/escaped\") &\n\
+         while :; do :; done\n",
+    );
+    let builder = QuartzBuilder::new(
+        &program,
+        &integration,
+        Vec::new(),
+        Duration::from_millis(25),
+    )
+    .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+
+    assert!(matches!(
+        builder.build(&content, &output),
+        Err(QuartzBuildError::TimedOut { .. })
+    ));
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(!output.join("escaped").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_deadline_that_cannot_be_represented() {
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    fs::create_dir(&integration)
+        .unwrap_or_else(|error| panic!("integration directory must be created: {error}"));
+    let program = root.0.join("fake-quartz");
+    executable(&program, "#!/bin/sh\nexit 0\n");
+
+    assert!(matches!(
+        QuartzBuilder::new(&program, &integration, Vec::new(), Duration::MAX),
+        Err(QuartzBuildError::InvalidTimeout)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_replaced_command_configuration() {
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    let output = root.0.join("output");
+    for directory in [&integration, &content, &output] {
+        fs::create_dir(directory)
+            .unwrap_or_else(|error| panic!("fixture directory must be created: {error}"));
+    }
+    let program = root.0.join("fake-quartz");
+    executable(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' safe > \"$5/index.html\"\n",
+    );
+    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+    fs::rename(&program, root.0.join("detached-fake-quartz"))
+        .unwrap_or_else(|error| panic!("configured program must be moved: {error}"));
+    executable(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' replacement > \"$5/index.html\"\n",
+    );
+
+    assert!(matches!(
+        builder.build(&content, &output),
+        Err(QuartzBuildError::CommandIdentityChanged)
+    ));
+    assert!(
+        fs::read_dir(&output)
+            .unwrap_or_else(|error| panic!("output directory must be readable: {error}"))
+            .next()
+            .is_none()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_a_successful_command_that_produces_no_site() {

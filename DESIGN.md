@@ -271,8 +271,10 @@ The Rust builder resolves an absolute executable and integration directory at
 startup, passes arguments without a shell, and appends Quartz's
 `build -d <content> -o <output>` interface. Standard input and process output
 are disconnected from request data and logs, and every invocation has a
-positive execution deadline. The service supervisor remains responsible for
-terminating any descendant process left behind by a failed external command.
+positive execution deadline. Each invocation runs in an isolated process
+group; the builder kills that group on timeout and after the command wrapper
+exits. The service supervisor remains responsible for terminating any process
+that escapes the group before restarting recovery.
 
 ### 7.4 Git remote
 
@@ -1090,9 +1092,13 @@ bounded by entry count, individual-file bytes, and total bytes; symbolic links,
 special files, and hard-linked files are rejected. Before promotion, each
 release receives a synchronized, versioned
 `.agent-knowledge-release.json` manifest binding its release ID, full commit
-ID, and UTC creation time. Promotion from `.staging/<batch-id>/` to `by-id/`
-and replacement of `current` are separately atomic and idempotent, so recovery
-can resume after either rename without replacing the previously active site.
+ID, UTC creation time, and a deterministic SHA-256 revision of the generated
+tree. The tree revision is checked again before activation, so a changed
+prepared release cannot become current. Promotion from
+`.staging/<batch-id>/` to `by-id/` and replacement of `current` are separately
+atomic and idempotent. After a restart, the Worker can recover a validated
+prepared release by commit ID and resume after either rename without replacing
+the previously active site.
 Failed or interrupted output may be removed only through a batch-scoped
 staging cleanup operation; prepared `by-id/` releases are never removed by the
 publication path.

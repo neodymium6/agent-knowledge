@@ -160,6 +160,55 @@ fn preparation_recovers_after_the_release_rename() {
 }
 
 #[test]
+fn recovers_a_prepared_release_after_reopening_the_store() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let prepared = {
+        let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+            .unwrap_or_else(|error| panic!("release store must open: {error}"));
+        build(&store, batch(FIRST_BATCH), "fictional output\n");
+        store
+            .prepare(
+                batch(FIRST_BATCH),
+                FIRST_COMMIT,
+                timestamp("2026-07-31T04:00:00Z"),
+            )
+            .unwrap_or_else(|error| panic!("release must prepare: {error}"))
+    };
+    let reopened = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must reopen: {error}"));
+
+    let recovered = reopened
+        .prepared_for_commit(FIRST_COMMIT)
+        .unwrap_or_else(|error| panic!("prepared release lookup must succeed: {error}"))
+        .unwrap_or_else(|| panic!("prepared release must be recovered"));
+    assert_eq!(recovered, prepared);
+    assert_eq!(
+        reopened
+            .activate(&recovered)
+            .unwrap_or_else(|error| panic!("recovered release must activate: {error}"))
+            .commit(),
+        FIRST_COMMIT
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn build_directory_keeps_its_staging_lease_after_store_drop() {
+    let root = TestDirectory::new();
+    let output = {
+        let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
+            .unwrap_or_else(|error| panic!("release store must open: {error}"));
+        store
+            .begin_build(batch(FIRST_BATCH))
+            .unwrap_or_else(|error| panic!("release build must begin: {error}"))
+    };
+
+    fs::write(output.path().join("index.html"), "fictional output\n")
+        .unwrap_or_else(|error| panic!("leased build output must remain writable: {error}"));
+}
+
+#[test]
 fn discarded_build_output_can_be_rebuilt_for_the_same_batch() {
     let root = TestDirectory::new();
     let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
@@ -265,6 +314,79 @@ fn invalid_new_output_keeps_the_previous_release_active() {
             .commit(),
         FIRST_COMMIT
     );
+}
+
+#[test]
+fn changed_prepared_output_cannot_replace_the_active_release() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    build(&store, batch(FIRST_BATCH), "first fictional output\n");
+    let first = store
+        .prepare(
+            batch(FIRST_BATCH),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("first release must prepare: {error}"));
+    store
+        .activate(&first)
+        .unwrap_or_else(|error| panic!("first release must activate: {error}"));
+
+    build(&store, batch(SECOND_BATCH), "second fictional output\n");
+    let second = store
+        .prepare(
+            batch(SECOND_BATCH),
+            SECOND_COMMIT,
+            timestamp("2026-07-31T04:05:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("second release must prepare: {error}"));
+    fs::write(
+        releases
+            .join("by-id")
+            .join(second.release_id())
+            .join("index.html"),
+        "changed fictional output\n",
+    )
+    .unwrap_or_else(|error| panic!("prepared output fixture must be changed: {error}"));
+
+    assert!(matches!(
+        store.activate(&second),
+        Err(ReleaseError::InvalidManifest)
+    ));
+    assert_eq!(
+        store
+            .active_release()
+            .unwrap_or_else(|error| panic!("active release must validate: {error}"))
+            .unwrap_or_else(|| panic!("first release must remain active"))
+            .commit(),
+        FIRST_COMMIT
+    );
+}
+
+#[test]
+fn root_manifest_does_not_consume_generated_entry_budget() {
+    let root = TestDirectory::new();
+    let policy = ReleasePolicy {
+        maximum_entries: 1,
+        maximum_file_bytes: 64,
+        maximum_total_bytes: 64,
+    };
+    let store = ReleaseStore::open(root.0.join("releases"), policy)
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    build(&store, batch(FIRST_BATCH), "fictional output\n");
+
+    let release = store
+        .prepare(
+            batch(FIRST_BATCH),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("manifest must not consume the site entry limit: {error}"));
+    store
+        .activate(&release)
+        .unwrap_or_else(|error| panic!("bounded release must activate: {error}"));
 }
 
 #[test]
