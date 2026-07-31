@@ -12,18 +12,35 @@ pub(super) fn validate_documents(
     request: &ChangeRequest,
     payload_root: &Path,
     limits: DocumentLimits,
+    maximum_front_matter_bytes: usize,
 ) -> Result<(), MarkdownValidationError> {
     for operation in &request.operations {
         match operation {
             Operation::CreateDocument {
                 document_id,
                 content,
-            } => validate_document(payload_root, content, *document_id, request, limits, false)?,
+            } => validate_document(
+                payload_root,
+                content,
+                *document_id,
+                request,
+                limits,
+                maximum_front_matter_bytes,
+                false,
+            )?,
             Operation::UpdateDocument {
                 document_id,
                 content,
                 ..
-            } => validate_document(payload_root, content, *document_id, request, limits, true)?,
+            } => validate_document(
+                payload_root,
+                content,
+                *document_id,
+                request,
+                limits,
+                maximum_front_matter_bytes,
+                true,
+            )?,
             Operation::MoveDocument { .. }
             | Operation::ArchiveDocument { .. }
             | Operation::AddAttachment { .. } => {}
@@ -38,19 +55,36 @@ fn validate_document(
     expected_document_id: DocumentId,
     request: &ChangeRequest,
     limits: DocumentLimits,
+    maximum_front_matter_bytes: usize,
     updated_required: bool,
 ) -> Result<(), MarkdownValidationError> {
     let bytes =
         fs::read(payload_root.join(payload_path.as_str())).map_err(MarkdownValidationError::Io)?;
     let markdown = std::str::from_utf8(&bytes)
         .map_err(|_| MarkdownValidationError::InvalidUtf8(payload_path.clone()))?;
-    let yaml = extract_front_matter(markdown, payload_path)?;
-    let metadata = yaml_serde::from_str::<DocumentMetadata>(yaml).map_err(|source| {
-        MarkdownValidationError::InvalidYaml {
+    let yaml = extract_front_matter(markdown, payload_path, maximum_front_matter_bytes)?;
+    let options = serde_saphyr::options! {
+        budget: serde_saphyr::budget! {
+            max_events: maximum_front_matter_bytes,
+            max_aliases: 0,
+            max_anchors: 0,
+            max_depth: 16,
+            max_documents: 1,
+            max_nodes: maximum_front_matter_bytes,
+            max_total_scalar_bytes: maximum_front_matter_bytes,
+            max_total_comment_bytes: maximum_front_matter_bytes,
+            max_merge_keys: 0,
+        },
+        merge_keys: serde_saphyr::MergeKeyPolicy::Error,
+        strict_booleans: true,
+        with_snippet: false,
+    };
+    let metadata = serde_saphyr::from_str_with_options::<DocumentMetadata>(yaml, options).map_err(
+        |source| MarkdownValidationError::InvalidYaml {
             path: payload_path.clone(),
-            source,
-        }
-    })?;
+            source: Box::new(source),
+        },
+    )?;
     metadata
         .validate(request.document_type, limits)
         .map_err(|source| MarkdownValidationError::InvalidMetadata {
@@ -104,6 +138,7 @@ fn validate_document(
 fn extract_front_matter<'a>(
     markdown: &'a str,
     path: &PayloadPath,
+    maximum_bytes: usize,
 ) -> Result<&'a str, MarkdownValidationError> {
     let remainder = markdown
         .strip_prefix("---\n")
@@ -117,9 +152,23 @@ fn extract_front_matter<'a>(
             .strip_suffix('\r')
             .unwrap_or(without_newline);
         if content == "---" {
+            if offset > maximum_bytes {
+                return Err(MarkdownValidationError::FrontMatterTooLarge {
+                    path: path.clone(),
+                    maximum: maximum_bytes,
+                    actual: offset,
+                });
+            }
             return Ok(&remainder[..offset]);
         }
         offset += line.len();
+        if offset > maximum_bytes {
+            return Err(MarkdownValidationError::FrontMatterTooLarge {
+                path: path.clone(),
+                maximum: maximum_bytes,
+                actual: offset,
+            });
+        }
     }
 
     Err(MarkdownValidationError::MissingClosingDelimiter(
@@ -160,7 +209,16 @@ pub enum MarkdownValidationError {
         /// The Markdown payload path.
         path: PayloadPath,
         /// The YAML decoder error.
-        source: yaml_serde::Error,
+        source: Box<serde_saphyr::Error>,
+    },
+    /// YAML front matter exceeded its configured byte limit.
+    FrontMatterTooLarge {
+        /// The Markdown payload path.
+        path: PayloadPath,
+        /// The configured maximum byte length.
+        maximum: usize,
+        /// The observed bytes before parsing stopped.
+        actual: usize,
     },
     /// Typed front-matter validation failed.
     InvalidMetadata {
@@ -229,6 +287,14 @@ impl fmt::Display for MarkdownValidationError {
             Self::InvalidYaml { path, source } => {
                 write!(formatter, "`{path}` contains invalid YAML: {source}")
             }
+            Self::FrontMatterTooLarge {
+                path,
+                maximum,
+                actual,
+            } => write!(
+                formatter,
+                "`{path}` front matter is {actual} bytes; configured maximum is {maximum}"
+            ),
             Self::InvalidMetadata { path, source } => {
                 write!(formatter, "`{path}` contains invalid metadata: {source}")
             }
@@ -268,7 +334,7 @@ impl std::error::Error for MarkdownValidationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::InvalidYaml { source, .. } => Some(source),
+            Self::InvalidYaml { source, .. } => Some(source.as_ref()),
             Self::InvalidMetadata { source, .. } => Some(source),
             _ => None,
         }

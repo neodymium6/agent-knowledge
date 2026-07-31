@@ -281,12 +281,34 @@ impl AcceptanceHook for FailAfterRename {
     }
 }
 
+struct FailAfterExistingDirectoriesSynchronized;
+
+impl AcceptanceHook for FailAfterExistingDirectoriesSynchronized {
+    fn reached(&mut self, phase: AcceptancePhase) -> io::Result<()> {
+        if phase == AcceptancePhase::ExistingQueueDirectoriesSynchronized {
+            Err(io::Error::other(
+                "fictional interruption after existing-state synchronization",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[test]
 fn retry_recovers_after_interruption_following_atomic_rename() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path(), PackagePolicy::default());
     let error = match stage_package(&queue, RESULTS).accept_with_hook(&mut FailAfterRename) {
         Ok(_) => panic!("injected interruption must fail the first response"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, QueueError::Io(_)));
+
+    let error = match stage_package(&queue, RESULTS)
+        .accept_with_hook(&mut FailAfterExistingDirectoriesSynchronized)
+    {
+        Ok(_) => panic!("injected interruption must fail the second response"),
         Err(error) => error,
     };
     assert!(matches!(error, QueueError::Io(_)));

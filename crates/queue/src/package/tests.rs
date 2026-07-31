@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use agent_knowledge_core::ErrorCode;
 
 use super::{
-    PackageLimit, PackageLimits, PackagePolicy, PackageValidationError, validate_accepted_package,
-    validate_package,
+    MarkdownValidationError, PackageLimit, PackageLimits, PackagePolicy, PackageValidationError,
+    validate_accepted_package, validate_package,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -212,6 +212,30 @@ fn rejects_disallowed_attachment_extensions() {
 }
 
 #[test]
+fn classifies_protocol_and_typed_path_failures() {
+    let protocol = TestDirectory::create();
+    let unsupported = REQUEST_JSON.replace("\"protocol_version\": 1", "\"protocol_version\": 2");
+    write_fixture(protocol.path(), &unsupported, false);
+    let error = match validate_package(protocol.path(), &PackagePolicy::default()) {
+        Ok(_) => panic!("unsupported protocol must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.error_code(), ErrorCode::InvalidProtocol);
+
+    let path = TestDirectory::create();
+    let traversal = REQUEST_JSON.replace(
+        "\"content\": \"benchmark/index.md\"",
+        "\"content\": \"../index.md\"",
+    );
+    write_fixture(path.path(), &traversal, false);
+    let error = match validate_package(path.path(), &PackagePolicy::default()) {
+        Ok(_) => panic!("traversal path must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.error_code(), ErrorCode::InvalidPath);
+}
+
+#[test]
 fn rejects_incomplete_or_inconsistent_front_matter() {
     let incomplete = TestDirectory::create();
     write_fixture(incomplete.path(), REQUEST_JSON, false);
@@ -268,6 +292,55 @@ fn rejects_incomplete_or_inconsistent_front_matter() {
 }
 
 #[test]
+fn limits_front_matter_before_yaml_deserialization() {
+    let oversized = TestDirectory::create();
+    write_fixture(oversized.path(), REQUEST_JSON, false);
+    let policy = match PackagePolicy::new(
+        PackageLimits {
+            maximum_front_matter_bytes: 32,
+            ..PackageLimits::default()
+        },
+        ["csv"],
+    ) {
+        Ok(policy) => policy,
+        Err(error) => panic!("test policy must be valid: {error}"),
+    };
+    let error = match validate_package(oversized.path(), &policy) {
+        Ok(_) => panic!("oversized front matter must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        PackageValidationError::InvalidFrontMatter(MarkdownValidationError::FrontMatterTooLarge {
+            maximum: 32,
+            ..
+        })
+    ));
+
+    let aliases = TestDirectory::create();
+    write_fixture(aliases.path(), REQUEST_JSON, false);
+    let markdown_path = aliases.path().join("payload/benchmark/index.md");
+    let markdown = match fs::read_to_string(&markdown_path) {
+        Ok(markdown) => markdown,
+        Err(error) => panic!("fixture Markdown must be readable: {error}"),
+    }
+    .replace(
+        "title: Fictional benchmark",
+        "title: &fictional_title Fictional benchmark",
+    )
+    .replace("  - benchmark", "  - *fictional_title");
+    if let Err(error) = fs::write(markdown_path, markdown) {
+        panic!("alias fixture Markdown must be written: {error}");
+    }
+    assert!(matches!(
+        validate_package(aliases.path(), &PackagePolicy::default()),
+        Err(PackageValidationError::InvalidFrontMatter(
+            MarkdownValidationError::InvalidYaml { .. }
+        ))
+    ));
+}
+
+#[test]
 fn updated_documents_require_updated_metadata() {
     let root = TestDirectory::create();
     let update_request = REQUEST_JSON.replace(
@@ -313,6 +386,42 @@ fn rejects_symbolic_links() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn rejects_hard_links_and_executable_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let linked = TestDirectory::create();
+    write_fixture(linked.path(), REQUEST_JSON, false);
+    let target = linked.path().join("payload/benchmark/results.csv");
+    if let Err(error) = fs::hard_link(
+        &target,
+        linked.path().join("payload/benchmark/hard-link.csv"),
+    ) {
+        panic!("fixture hard link must be created: {error}");
+    }
+    assert!(matches!(
+        validate_package(linked.path(), &PackagePolicy::default()),
+        Err(PackageValidationError::HardLinkedFile { .. })
+    ));
+
+    let executable = TestDirectory::create();
+    write_fixture(executable.path(), REQUEST_JSON, false);
+    let target = executable.path().join("payload/benchmark/results.csv");
+    let mut permissions = match fs::metadata(&target) {
+        Ok(metadata) => metadata.permissions(),
+        Err(error) => panic!("fixture metadata must be readable: {error}"),
+    };
+    permissions.set_mode(0o755);
+    if let Err(error) = fs::set_permissions(&target, permissions) {
+        panic!("fixture executable mode must be set: {error}");
+    }
+    assert!(matches!(
+        validate_package(executable.path(), &PackagePolicy::default()),
+        Err(PackageValidationError::ExecutableFile { .. })
+    ));
+}
+
 #[test]
 fn revalidates_accepted_digest_and_detects_changed_contents() {
     let root = TestDirectory::create();
@@ -350,4 +459,37 @@ fn revalidates_accepted_digest_and_detects_changed_contents() {
         PackageValidationError::StoredDigestMismatch { .. }
     ));
     assert_eq!(error.error_code(), ErrorCode::ContentValidationFailed);
+}
+
+#[test]
+fn accepted_packages_allow_only_defined_worker_sidecars() {
+    let root = TestDirectory::create();
+    write_fixture(root.path(), REQUEST_JSON, false);
+    let package = match validate_package(root.path(), &PackagePolicy::default()) {
+        Ok(package) => package,
+        Err(error) => panic!("incoming fixture package must validate: {error}"),
+    };
+    if let Err(error) = fs::write(
+        root.path().join("digest"),
+        format!("{}\n", package.digest()),
+    ) {
+        panic!("fixture digest must be written: {error}");
+    }
+    for sidecar in ["phase.json", "result.json"] {
+        if let Err(error) = fs::write(root.path().join(sidecar), "{}\n") {
+            panic!("fixture sidecar must be written: {error}");
+        }
+    }
+    if let Err(error) = validate_accepted_package(root.path(), &PackagePolicy::default()) {
+        panic!("defined Worker sidecars must validate: {error}");
+    }
+
+    if let Err(error) = fs::write(root.path().join("worker-note.json"), "{}\n") {
+        panic!("unknown sidecar fixture must be written: {error}");
+    }
+    assert!(matches!(
+        validate_accepted_package(root.path(), &PackagePolicy::default()),
+        Err(PackageValidationError::UnexpectedTopLevelEntry(name))
+            if name == "worker-note.json"
+    ));
 }

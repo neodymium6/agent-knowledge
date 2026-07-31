@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use agent_knowledge_core::{
-    ChangeRequest, DocumentLimits, ErrorCode, Operation, PayloadPath, RequestLimits,
-    RequestValidationError, Revision, RevisionParseError,
+    ChangeRequest, DocumentLimits, ErrorCode, Operation, PayloadPath, RequestDecodeError,
+    RequestLimits, RequestValidationError, Revision, RevisionParseError,
 };
 use sha2::{Digest, Sha256};
 
@@ -17,6 +17,8 @@ pub use markdown::MarkdownValidationError;
 const REQUEST_FILE_NAME: &str = "request.json";
 const PAYLOAD_DIRECTORY_NAME: &str = "payload";
 const DIGEST_FILE_NAME: &str = "digest";
+const PHASE_FILE_NAME: &str = "phase.json";
+const RESULT_FILE_NAME: &str = "result.json";
 const DIGEST_DOMAIN: &[u8] = b"agent-knowledge-request-package-v1\0";
 const HASH_BUFFER_LENGTH: usize = 64 * 1024;
 const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
@@ -30,6 +32,8 @@ pub struct PackageLimits {
     pub maximum_file_bytes: u64,
     /// Maximum number of files, including `request.json`.
     pub maximum_file_count: usize,
+    /// Maximum bytes in one Markdown document's YAML front matter.
+    pub maximum_front_matter_bytes: usize,
     /// Validation limits for the decoded change request.
     pub request: RequestLimits,
     /// Validation limits for Markdown document front matter.
@@ -42,6 +46,7 @@ impl Default for PackageLimits {
             maximum_total_bytes: 64 * 1024 * 1024,
             maximum_file_bytes: 32 * 1024 * 1024,
             maximum_file_count: 256,
+            maximum_front_matter_bytes: 64 * 1024,
             request: RequestLimits::default(),
             document: DocumentLimits::default(),
         }
@@ -260,11 +265,11 @@ fn validate_package_contents(
     let mut file_count = 1_usize;
     enforce_totals(total_bytes, file_count, policy.limits)?;
 
-    let request = serde_json::from_slice::<ChangeRequest>(&request_bytes)
-        .map_err(PackageValidationError::InvalidRequestJson)?;
+    let request = ChangeRequest::decode_json(&request_bytes)
+        .map_err(PackageValidationError::InvalidRequest)?;
     request
         .validate(policy.limits.request)
-        .map_err(PackageValidationError::InvalidRequest)?;
+        .map_err(PackageValidationError::InvalidRequestMetadata)?;
 
     let payload_root = package_root.join(PAYLOAD_DIRECTORY_NAME);
     let mut payload_files = Vec::new();
@@ -279,11 +284,16 @@ fn validate_package_contents(
     payload_files.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
 
     validate_payload_references(&request, &payload_files, policy)?;
-    markdown::validate_documents(&request, &payload_root, policy.limits.document)
-        .map_err(PackageValidationError::InvalidFrontMatter)?;
+    markdown::validate_documents(
+        &request,
+        &payload_root,
+        policy.limits.document,
+        policy.limits.maximum_front_matter_bytes,
+    )
+    .map_err(PackageValidationError::InvalidFrontMatter)?;
 
     let canonical_request =
-        serde_json::to_vec(&request).map_err(PackageValidationError::InvalidRequestJson)?;
+        serde_json::to_vec(&request).map_err(PackageValidationError::CanonicalRequestJson)?;
     let digest = calculate_digest(&canonical_request, &payload_root, &payload_files)?;
 
     Ok(ValidatedPackage {
@@ -314,6 +324,8 @@ fn validate_package_root(
         if name != REQUEST_FILE_NAME
             && name != PAYLOAD_DIRECTORY_NAME
             && !(accepted && name == DIGEST_FILE_NAME)
+            && !(accepted && name == PHASE_FILE_NAME)
+            && !(accepted && name == RESULT_FILE_NAME)
         {
             return Err(PackageValidationError::UnexpectedTopLevelEntry(name));
         }
@@ -338,11 +350,7 @@ fn validate_package_root(
 
     let request_metadata = fs::symlink_metadata(package_root.join(REQUEST_FILE_NAME))
         .map_err(PackageValidationError::Io)?;
-    if !request_metadata.file_type().is_file() {
-        return Err(PackageValidationError::InvalidEntryType {
-            path: PathBuf::from(REQUEST_FILE_NAME),
-        });
-    }
+    validate_regular_file(&request_metadata, Path::new(REQUEST_FILE_NAME))?;
 
     let payload_metadata = fs::symlink_metadata(package_root.join(PAYLOAD_DIRECTORY_NAME))
         .map_err(PackageValidationError::Io)?;
@@ -354,10 +362,13 @@ fn validate_package_root(
     if accepted {
         let digest_metadata = fs::symlink_metadata(package_root.join(DIGEST_FILE_NAME))
             .map_err(PackageValidationError::Io)?;
-        if !digest_metadata.file_type().is_file() {
-            return Err(PackageValidationError::InvalidEntryType {
-                path: PathBuf::from(DIGEST_FILE_NAME),
-            });
+        validate_regular_file(&digest_metadata, Path::new(DIGEST_FILE_NAME))?;
+        for sidecar in [PHASE_FILE_NAME, RESULT_FILE_NAME] {
+            if names.contains(sidecar) {
+                let metadata = fs::symlink_metadata(package_root.join(sidecar))
+                    .map_err(PackageValidationError::Io)?;
+                validate_regular_file(&metadata, Path::new(sidecar))?;
+            }
         }
     }
 
@@ -426,11 +437,10 @@ fn scan_payload_directory(
             continue;
         }
 
-        if !metadata.file_type().is_file() {
-            return Err(PackageValidationError::InvalidEntryType {
-                path: PathBuf::from(PAYLOAD_DIRECTORY_NAME).join(relative),
-            });
-        }
+        validate_regular_file(
+            &metadata,
+            &PathBuf::from(PAYLOAD_DIRECTORY_NAME).join(&relative),
+        )?;
 
         enforce_file_size(metadata.len(), limits.maximum_file_bytes, path.as_str())?;
         *total_bytes = total_bytes.checked_add(metadata.len()).ok_or(
@@ -457,6 +467,35 @@ fn scan_payload_directory(
     }
 
     Ok(descendant_files)
+}
+
+fn validate_regular_file(
+    metadata: &fs::Metadata,
+    relative_path: &Path,
+) -> Result<(), PackageValidationError> {
+    if !metadata.file_type().is_file() {
+        return Err(PackageValidationError::InvalidEntryType {
+            path: relative_path.into(),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.nlink() > 1 {
+            return Err(PackageValidationError::HardLinkedFile {
+                path: relative_path.into(),
+            });
+        }
+        if metadata.mode() & 0o111 != 0 {
+            return Err(PackageValidationError::ExecutableFile {
+                path: relative_path.into(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_payload_references(
@@ -668,10 +707,22 @@ pub enum PackageValidationError {
     InvalidPayloadPath(String),
     /// A nested payload directory contained no files.
     EmptyPayloadDirectory(PayloadPath),
-    /// JSON decoding failed.
-    InvalidRequestJson(serde_json::Error),
+    /// Request JSON decoding or typed path conversion failed.
+    InvalidRequest(RequestDecodeError),
     /// Request-level deterministic validation failed.
-    InvalidRequest(RequestValidationError),
+    InvalidRequestMetadata(RequestValidationError),
+    /// Serializing an already typed request for digest calculation failed.
+    CanonicalRequestJson(serde_json::Error),
+    /// A regular file had more than one hard link.
+    HardLinkedFile {
+        /// The package-relative entry path.
+        path: PathBuf,
+    },
+    /// A regular file had one or more executable mode bits.
+    ExecutableFile {
+        /// The package-relative entry path.
+        path: PathBuf,
+    },
     /// A configured limit was exceeded.
     LimitExceeded {
         /// The rejected limit.
@@ -719,7 +770,13 @@ impl PackageValidationError {
     pub const fn error_code(&self) -> ErrorCode {
         match self {
             Self::Io(_) => ErrorCode::TemporaryFailure,
-            Self::InvalidPayloadPath(_) => ErrorCode::InvalidPath,
+            Self::InvalidPayloadPath(_)
+            | Self::InvalidRequest(RequestDecodeError::InvalidPath { .. }) => {
+                ErrorCode::InvalidPath
+            }
+            Self::InvalidRequestMetadata(RequestValidationError::UnsupportedProtocolVersion {
+                ..
+            }) => ErrorCode::InvalidProtocol,
             Self::LimitExceeded { .. } | Self::FileTooLarge { .. } => ErrorCode::LimitExceeded,
             Self::UnsupportedAttachment(_) => ErrorCode::UnsupportedFileType,
             Self::InvalidFrontMatter(error) => error.error_code(),
@@ -727,13 +784,16 @@ impl PackageValidationError {
             | Self::MissingTopLevelEntry(_)
             | Self::UnexpectedTopLevelEntry(_)
             | Self::InvalidEntryType { .. }
+            | Self::HardLinkedFile { .. }
+            | Self::ExecutableFile { .. }
             | Self::EmptyPayloadDirectory(_)
-            | Self::InvalidRequestJson(_)
             | Self::InvalidRequest(_)
+            | Self::InvalidRequestMetadata(_)
             | Self::MarkdownExtensionRequired(_)
             | Self::MissingPayload(_)
             | Self::UnexpectedPayload(_)
             | Self::FileChangedDuringValidation(_) => ErrorCode::InvalidRequest,
+            Self::CanonicalRequestJson(_) => ErrorCode::InternalError,
             Self::InvalidStoredDigest | Self::StoredDigestMismatch { .. } => {
                 ErrorCode::ContentValidationFailed
             }
@@ -768,10 +828,27 @@ impl fmt::Display for PackageValidationError {
             Self::EmptyPayloadDirectory(path) => {
                 write!(formatter, "payload directory `{path}` contains no files")
             }
-            Self::InvalidRequestJson(error) => {
-                write!(formatter, "request JSON is invalid: {error}")
-            }
             Self::InvalidRequest(error) => write!(formatter, "request is invalid: {error}"),
+            Self::InvalidRequestMetadata(error) => {
+                write!(formatter, "request metadata is invalid: {error}")
+            }
+            Self::CanonicalRequestJson(error) => {
+                write!(formatter, "canonical request serialization failed: {error}")
+            }
+            Self::HardLinkedFile { path } => {
+                write!(
+                    formatter,
+                    "package file `{}` must not be hard-linked",
+                    path.display()
+                )
+            }
+            Self::ExecutableFile { path } => {
+                write!(
+                    formatter,
+                    "package file `{}` must not be executable",
+                    path.display()
+                )
+            }
             Self::LimitExceeded {
                 limit,
                 maximum,
@@ -830,8 +907,9 @@ impl std::error::Error for PackageValidationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::InvalidRequestJson(error) => Some(error),
             Self::InvalidRequest(error) => Some(error),
+            Self::InvalidRequestMetadata(error) => Some(error),
+            Self::CanonicalRequestJson(error) => Some(error),
             Self::InvalidFrontMatter(error) => Some(error),
             _ => None,
         }

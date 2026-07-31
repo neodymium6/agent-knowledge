@@ -384,6 +384,12 @@ impl IncomingPackage {
         let digest = validated.digest();
         if let Some((state, existing_digest)) = self.queue.find_existing(request_id)? {
             if existing_digest == digest {
+                sync_directory(&self.queue.queue_root.join("incoming"))?;
+                for accepted_state in QueueState::ALL {
+                    sync_directory(&self.queue.queue_root.join(accepted_state.directory_name()))?;
+                }
+                hook.reached(AcceptancePhase::ExistingQueueDirectoriesSynchronized)
+                    .map_err(QueueError::Io)?;
                 return Ok(EnqueueOutcome::Existing {
                     request_id,
                     digest,
@@ -563,6 +569,7 @@ enum AcceptancePhase {
     PackageSynchronized,
     Renamed,
     QueueDirectoriesSynchronized,
+    ExistingQueueDirectoriesSynchronized,
 }
 
 trait AcceptanceHook {

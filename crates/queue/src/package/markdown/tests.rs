@@ -11,27 +11,28 @@ fn path() -> PayloadPath {
 
 #[test]
 fn extracts_lf_and_crlf_front_matter() {
-    let lf = match extract_front_matter("---\ntitle: Fictional\n---\nBody\n", &path()) {
+    let lf = match extract_front_matter("---\ntitle: Fictional\n---\nBody\n", &path(), 1024) {
         Ok(yaml) => yaml,
         Err(error) => panic!("LF front matter must parse: {error}"),
     };
     assert_eq!(lf, "title: Fictional\n");
 
-    let crlf = match extract_front_matter("---\r\ntitle: Fictional\r\n---\r\nBody\r\n", &path()) {
-        Ok(yaml) => yaml,
-        Err(error) => panic!("CRLF front matter must parse: {error}"),
-    };
+    let crlf =
+        match extract_front_matter("---\r\ntitle: Fictional\r\n---\r\nBody\r\n", &path(), 1024) {
+            Ok(yaml) => yaml,
+            Err(error) => panic!("CRLF front matter must parse: {error}"),
+        };
     assert_eq!(crlf, "title: Fictional\r\n");
 }
 
 #[test]
 fn rejects_missing_front_matter_delimiters() {
     assert!(matches!(
-        extract_front_matter("title: Fictional\n", &path()),
+        extract_front_matter("title: Fictional\n", &path(), 1024),
         Err(MarkdownValidationError::MissingOpeningDelimiter(_))
     ));
     assert!(matches!(
-        extract_front_matter("---\ntitle: Fictional\n", &path()),
+        extract_front_matter("---\ntitle: Fictional\n", &path(), 1024),
         Err(MarkdownValidationError::MissingClosingDelimiter(_))
     ));
 }

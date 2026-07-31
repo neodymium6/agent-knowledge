@@ -594,14 +594,20 @@ pending/
 └── 01K00000000000000000000000/
     ├── request.json
     ├── digest
+    ├── phase.json       # optional Worker-owned sidecar
+    ├── result.json      # optional Worker-owned sidecar
     └── payload/
         ├── index.md
         ├── graph.png
         └── results.csv
 ```
 
-Worker state and results are separate files next to the immutable request
-data. They are written through temporary files and atomic rename.
+`request.json`, `digest`, and `payload/` are immutable. Worker state and
+results use only the optional `phase.json` and `result.json` sidecars next to
+that immutable data. The Gateway never creates these sidecars. The Worker
+writes them through temporary files and atomic rename; package revalidation
+excludes their bytes from the immutable package digest but still rejects
+links, executable files, and any unknown top-level entry.
 
 ### 16.2 Durable acceptance
 
