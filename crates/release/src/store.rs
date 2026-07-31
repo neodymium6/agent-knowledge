@@ -19,6 +19,7 @@ const STAGING_DIRECTORY: &str = ".staging";
 const SITE_DIRECTORY: &str = "site";
 const CURRENT_ENTRY: &str = "current";
 const BINDING_FILE: &str = ".release-store-binding-v5";
+const LEGACY_BINDING_FILE: &str = ".release-store-binding-v4";
 const MANIFEST_FILE: &str = ".agent-knowledge-release.json";
 const CLEANUP_MARKER_FILE: &str = ".agent-knowledge-cleanup";
 const MANIFEST_SCHEMA_VERSION: u16 = 2;
@@ -150,8 +151,9 @@ impl ReleaseStore {
     pub fn open(root: impl AsRef<Path>, policy: ReleasePolicy) -> Result<Self, ReleaseError> {
         let policy = policy.validate()?;
         ensure_or_create_directory(root.as_ref())?;
+        let root_handle = Arc::new(open_directory(root.as_ref())?);
         let configured_root = fs::canonicalize(root).map_err(ReleaseError::Io)?;
-        let root_handle = Arc::new(File::open(&configured_root).map_err(ReleaseError::Io)?);
+        validate_pinned_directory(&configured_root, &root_handle)?;
         let root = stable_directory_path(&root_handle, &configured_root)?;
         ensure_or_create_directory(&root.join(BY_ID_DIRECTORY))?;
         ensure_or_create_directory(&root.join(BY_COMMIT_DIRECTORY))?;
@@ -320,7 +322,7 @@ impl ReleaseStore {
                 if manifest.release_id != release_id || manifest.commit != commit {
                     return Err(ReleaseError::InvalidBatchIntent);
                 }
-                validate_release(&destination, &manifest, self.policy)?;
+                validate_release(&destination, &self.by_id.handle, &manifest, self.policy)?;
                 sync_directory(&self.by_id.stable)?;
                 self.ensure_commit_reference(&manifest)?;
                 if let Some(batch) = batch.as_ref() {
@@ -370,8 +372,9 @@ impl ReleaseStore {
             {
                 return Err(ReleaseError::InvalidManifest);
             }
-            validate_release(&destination, &manifest, self.policy)?;
-            if validate_release_tree(&destination, self.policy, true)? != manifest.content_revision
+            validate_release(&destination, &self.by_id.handle, &manifest, self.policy)?;
+            if validate_release_tree_at(&destination, &self.by_id.handle, self.policy, true)?
+                != manifest.content_revision
             {
                 return Err(ReleaseError::InvalidManifest);
             }
@@ -385,7 +388,8 @@ impl ReleaseStore {
             });
         }
         let staging = batch.stable.join(SITE_DIRECTORY);
-        let content_revision = validate_release_tree(&staging, self.policy, false)?;
+        let content_revision =
+            validate_release_tree_at(&staging, &batch.handle, self.policy, false)?;
         let manifest = ReleaseManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             release_id: release_id.clone(),
@@ -395,7 +399,9 @@ impl ReleaseStore {
         };
         ensure_real_directory(&staging)?;
         ensure_manifest(&staging.join(MANIFEST_FILE), &manifest)?;
-        if validate_release_tree(&staging, self.policy, true)? != manifest.content_revision {
+        if validate_release_tree_at(&staging, &batch.handle, self.policy, true)?
+            != manifest.content_revision
+        {
             return Err(ReleaseError::OutputChanged);
         }
         self.ensure_batch_intent(batch_id, &manifest)?;
@@ -407,7 +413,7 @@ impl ReleaseStore {
         self.remove_batch_directory(batch_id, &batch)?;
         self.remove_batch_intent(batch_id)?;
         self.validate_live_storage()?;
-        validate_release(&destination, &manifest, self.policy)?;
+        validate_release(&destination, &self.by_id.handle, &manifest, self.policy)?;
         Ok(PreparedRelease {
             release_id,
             commit: commit.into(),
@@ -420,7 +426,7 @@ impl ReleaseStore {
         self.validate_live_storage()?;
         let release_path = self.by_id.stable.join(&release.release_id);
         let manifest = read_manifest(&release_path)?;
-        validate_release(&release_path, &manifest, self.policy)?;
+        validate_release(&release_path, &self.by_id.handle, &manifest, self.policy)?;
         if manifest.release_id != release.release_id || manifest.commit != release.commit {
             return Err(ReleaseError::InvalidManifest);
         }
@@ -484,7 +490,12 @@ impl ReleaseStore {
             return Err(ReleaseError::InvalidManifest);
         }
         validate_commit(&manifest.commit)?;
-        validate_release(&self.by_id.stable.join(active_id), &manifest, self.policy)?;
+        validate_release(
+            &self.by_id.stable.join(active_id),
+            &self.by_id.handle,
+            &manifest,
+            self.policy,
+        )?;
         Ok(Some(ActiveRelease {
             release_id: manifest.release_id,
             commit: manifest.commit,
@@ -514,7 +525,7 @@ impl ReleaseStore {
         if manifest.commit != commit || manifest.release_id != release_id {
             return Err(ReleaseError::InvalidCommitReference);
         }
-        validate_release(&release_path, &manifest, self.policy)?;
+        validate_release(&release_path, &self.by_id.handle, &manifest, self.policy)?;
         Ok(Some(PreparedRelease {
             release_id: manifest.release_id,
             commit: manifest.commit,
@@ -534,7 +545,7 @@ impl ReleaseStore {
         if manifest.release_id != release_id {
             return Err(ReleaseError::InvalidManifest);
         }
-        validate_release(&release_path, &manifest, self.policy)?;
+        validate_release(&release_path, &self.by_id.handle, &manifest, self.policy)?;
         self.ensure_commit_reference(&manifest)?;
         Ok(PreparedRelease {
             release_id: manifest.release_id,
@@ -562,7 +573,7 @@ impl ReleaseStore {
                 {
                     return Err(ReleaseError::RecoveredBuildConflict);
                 }
-                validate_release(&entry.path(), expected, self.policy)?;
+                validate_release(&entry.path(), &batch.handle, expected, self.policy)?;
             }
             Some(_) => return Err(ReleaseError::RecoveredBuildConflict),
             None => {}
@@ -766,7 +777,12 @@ impl ReleaseStore {
                                 if existing.commit == manifest.commit
                                     && existing.release_id == existing_id =>
                             {
-                                match validate_release(&existing_path, &existing, self.policy) {
+                                match validate_release(
+                                    &existing_path,
+                                    &self.by_id.handle,
+                                    &existing,
+                                    self.policy,
+                                ) {
                                     Ok(()) if existing.release_id > manifest.release_id => {
                                         sync_directory(&self.by_commit.stable)?;
                                         self.validate_live_storage()?;
@@ -792,26 +808,79 @@ impl ReleaseStore {
     }
 
     fn ensure_binding(&self) -> Result<(), ReleaseError> {
-        let expected = binding_bytes(
-            &self.configured_root,
-            &self.root_handle,
-            [
-                &self.by_id,
-                &self.by_commit,
-                &self.by_batch,
-                &self.cleanup_intent,
-                &self.staging,
-            ],
-        )?;
+        let directories = [
+            &self.by_id,
+            &self.by_commit,
+            &self.by_batch,
+            &self.cleanup_intent,
+            &self.staging,
+        ];
+        let expected = binding_bytes(&self.configured_root, &self.root_handle, directories)?;
         let path = self.root.join(BINDING_FILE);
         match fs::symlink_metadata(&path) {
             Ok(_) => validate_binding(&path, &expected),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let legacy = self.root.join(LEGACY_BINDING_FILE);
+                match fs::symlink_metadata(&legacy) {
+                    Ok(_) => validate_legacy_binding(
+                        &legacy,
+                        &self.configured_root,
+                        &self.root_handle,
+                        directories,
+                    )?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        if !self.is_fresh_unbound_store()? {
+                            return Err(ReleaseError::StorageBindingMismatch);
+                        }
+                    }
+                    Err(error) => return Err(ReleaseError::Io(error)),
+                }
                 replace_regular_file(&self.root, &path, &expected, "store-binding")?;
                 validate_binding(&path, &expected)
             }
             Err(error) => Err(ReleaseError::Io(error)),
         }
+    }
+
+    fn is_fresh_unbound_store(&self) -> Result<bool, ReleaseError> {
+        for directory in [
+            &self.by_id,
+            &self.by_commit,
+            &self.by_batch,
+            &self.cleanup_intent,
+            &self.staging,
+        ] {
+            if fs::read_dir(&directory.stable)
+                .map_err(ReleaseError::Io)?
+                .next()
+                .transpose()
+                .map_err(ReleaseError::Io)?
+                .is_some()
+            {
+                return Ok(false);
+            }
+        }
+        for entry in fs::read_dir(&self.root).map_err(ReleaseError::Io)? {
+            let entry = entry.map_err(ReleaseError::Io)?;
+            let name = entry.file_name();
+            let allowed_directory = [
+                BY_ID_DIRECTORY,
+                BY_COMMIT_DIRECTORY,
+                BY_BATCH_DIRECTORY,
+                CLEANUP_INTENT_DIRECTORY,
+                STAGING_DIRECTORY,
+            ]
+            .into_iter()
+            .any(|allowed| name.as_os_str() == std::ffi::OsStr::new(allowed));
+            let interrupted_binding = name
+                .to_str()
+                .is_some_and(|name| name.starts_with(".store-binding-"))
+                && entry.file_type().map_err(ReleaseError::Io)?.is_file();
+            if !allowed_directory && !interrupted_binding {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn validate_live_storage(&self) -> Result<(), ReleaseError> {
@@ -1041,13 +1110,14 @@ fn read_manifest(release: &Path) -> Result<ReleaseManifest, ReleaseError> {
 
 fn validate_release(
     release: &Path,
+    parent: &File,
     expected: &ReleaseManifest,
     policy: ReleasePolicy,
 ) -> Result<(), ReleaseError> {
     let actual = read_manifest(release)?;
     if actual != *expected
         || release_id(actual.created_at, &actual.commit) != actual.release_id
-        || validate_release_tree(release, policy, false)? != actual.content_revision
+        || validate_release_tree_at(release, parent, policy, false)? != actual.content_revision
     {
         Err(ReleaseError::InvalidManifest)
     } else {
@@ -1055,20 +1125,46 @@ fn validate_release(
     }
 }
 
+#[cfg(test)]
 fn validate_release_tree(
     root: &Path,
     policy: ReleasePolicy,
     synchronize: bool,
 ) -> Result<Revision, ReleaseError> {
-    ensure_real_directory(root)?;
-    let listed = fs::symlink_metadata(root).map_err(ReleaseError::Io)?;
-    let root_handle = open_directory(root)?;
+    let parent_path = root
+        .parent()
+        .ok_or_else(|| ReleaseError::UnsafeOutput(root.into()))?;
+    let parent = open_directory(parent_path)?;
+    validate_release_tree_at(root, &parent, policy, synchronize)
+}
+
+fn validate_release_tree_at(
+    root: &Path,
+    parent: &File,
+    policy: ReleasePolicy,
+    synchronize: bool,
+) -> Result<Revision, ReleaseError> {
+    let name = root
+        .file_name()
+        .ok_or_else(|| ReleaseError::UnsafeOutput(root.into()))?;
+    let stable_parent = stable_directory_path(
+        parent,
+        root.parent()
+            .ok_or_else(|| ReleaseError::UnsafeOutput(root.into()))?,
+    )?;
+    let anchored_root = stable_parent.join(name);
+    let listed = fs::symlink_metadata(&anchored_root).map_err(ReleaseError::Io)?;
+    if !listed.file_type().is_dir() {
+        return Err(ReleaseError::UnsafeOutput(root.into()));
+    }
+    let root_handle = open_directory(&anchored_root)?;
     let opened = root_handle.metadata().map_err(ReleaseError::Io)?;
     if !opened.file_type().is_dir() || !same_metadata(&listed, &opened) {
         return Err(ReleaseError::UnsafeOutput(root.into()));
     }
+    validate_same_mount(parent, &root_handle)?;
     let mut validation = TreeValidation {
-        root,
+        root: &anchored_root,
         root_handle,
         policy,
         synchronize,
@@ -1085,10 +1181,13 @@ fn validate_release_tree(
         .try_clone()
         .map_err(ReleaseError::Io)?;
     validation.directory(&root_directory, Path::new(""), true, 0)?;
-    validate_pinned_directory(root, &validation.root_handle).map_err(|error| match error {
-        ReleaseError::StorageBindingMismatch => ReleaseError::UnsafeOutput(root.into()),
-        error => error,
-    })?;
+    validate_pinned_directory(&anchored_root, &validation.root_handle).map_err(
+        |error| match error {
+            ReleaseError::StorageBindingMismatch => ReleaseError::UnsafeOutput(root.into()),
+            error => error,
+        },
+    )?;
+    validate_same_mount(parent, &validation.root_handle)?;
     if validation.site_files == 0 {
         return Err(ReleaseError::EmptyOutput);
     }
@@ -1660,9 +1759,9 @@ fn lock_file(file: &File) -> Result<(), ReleaseError> {
 }
 
 fn pin_directory(configured: PathBuf, stable: PathBuf) -> Result<PinnedDirectory, ReleaseError> {
-    ensure_directory_target(&stable)?;
-    let handle = Arc::new(File::open(&stable).map_err(ReleaseError::Io)?);
+    let handle = Arc::new(open_directory(&stable)?);
     let stable = stable_directory_path(&handle, &configured)?;
+    validate_pinned_directory(&configured, &handle)?;
     Ok(PinnedDirectory {
         handle,
         configured,
@@ -1809,6 +1908,59 @@ fn binding_bytes<'a>(
 }
 
 fn validate_binding(path: &Path, expected: &[u8]) -> Result<(), ReleaseError> {
+    if read_binding_file(path)? == expected {
+        Ok(())
+    } else {
+        Err(ReleaseError::StorageBindingMismatch)
+    }
+}
+
+fn validate_legacy_binding<'a>(
+    path: &Path,
+    root: &Path,
+    root_handle: &File,
+    directories: impl IntoIterator<Item = &'a PinnedDirectory>,
+) -> Result<(), ReleaseError> {
+    let actual = read_binding_file(path)?;
+    let mut prefix = b"agent-knowledge-release-store-v4\0".to_vec();
+    prefix.extend_from_slice(root.as_os_str().as_encoded_bytes());
+    if !actual.starts_with(&prefix) {
+        return Err(ReleaseError::StorageBindingMismatch);
+    }
+    let remainder = &actual[prefix.len()..];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let handles: Vec<&File> = std::iter::once(root_handle)
+            .chain(
+                directories
+                    .into_iter()
+                    .map(|directory| directory.handle.as_ref()),
+            )
+            .collect();
+        if remainder.len() != handles.len() * 17 {
+            return Err(ReleaseError::StorageBindingMismatch);
+        }
+        for (encoded, handle) in remainder.chunks_exact(17).zip(handles) {
+            let inode = handle.metadata().map_err(ReleaseError::Io)?.ino();
+            if encoded[0] != 0 || encoded[9..] != inode.to_le_bytes() {
+                return Err(ReleaseError::StorageBindingMismatch);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root_handle;
+        let _ = directories;
+        if !remainder.is_empty() {
+            return Err(ReleaseError::StorageBindingMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn read_binding_file(path: &Path) -> Result<Vec<u8>, ReleaseError> {
     const MAXIMUM_BINDING_BYTES: u64 = 64 * 1024;
     let listed = fs::symlink_metadata(path).map_err(ReleaseError::Io)?;
     if !listed.file_type().is_file() || listed.len() > MAXIMUM_BINDING_BYTES {
@@ -1829,12 +1981,11 @@ fn validate_binding(path: &Path, expected: &[u8]) -> Result<(), ReleaseError> {
         .read_to_end(&mut actual)
         .map_err(ReleaseError::Io)?;
     let current = fs::symlink_metadata(path).map_err(ReleaseError::Io)?;
-    if actual == expected
-        && current.file_type().is_file()
+    if current.file_type().is_file()
         && same_metadata(&current, &opened)
         && actual.len() as u64 == opened.len()
     {
-        Ok(())
+        Ok(actual)
     } else {
         Err(ReleaseError::StorageBindingMismatch)
     }

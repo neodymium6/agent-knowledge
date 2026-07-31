@@ -1098,7 +1098,10 @@ The release store pins the release root, `.staging/`, `by-id/`, `by-commit/`,
 share one Linux mount. Its durable binding records the canonical path and
 stable inode identities, while live mount IDs are checked separately so a
 valid persistent volume can recover after a reboot or remount. The binding is
-published from a synchronized temporary file by atomic rename.
+published from a synchronized temporary file by atomic rename. A missing
+binding is initialized only when every fixed directory is empty. Populated
+stores fail closed, while the previous binding schema is migrated only after
+its canonical path and inode identities have been validated.
 
 Generated output is bounded by entry count, directory depth, individual-file
 bytes, and total bytes during validation and synchronization. Validation walks

@@ -11,11 +11,11 @@ use ulid::Ulid;
 #[cfg(unix)]
 use super::unix_mode_is_directory;
 use super::{
-    BuildDirectory, CLEANUP_MARKER_FILE, MANIFEST_FILE, MANIFEST_SCHEMA_VERSION,
-    MAXIMUM_CLEANUP_ACTIONS, MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH, MAXIMUM_RELEASE_TREE_DEPTH,
-    ReleaseError, ReleaseManifest, ReleasePolicy, ReleaseStore, cleanup_name,
-    derived_reference_is_repairable, ensure_cleanup_marker, ensure_manifest, read_manifest,
-    release_id, validate_release_tree,
+    BINDING_FILE, BuildDirectory, CLEANUP_MARKER_FILE, LEGACY_BINDING_FILE, MANIFEST_FILE,
+    MANIFEST_SCHEMA_VERSION, MAXIMUM_CLEANUP_ACTIONS, MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH,
+    MAXIMUM_RELEASE_TREE_DEPTH, ReleaseError, ReleaseManifest, ReleasePolicy, ReleaseStore,
+    cleanup_name, derived_reference_is_repairable, ensure_cleanup_marker, ensure_manifest,
+    read_manifest, release_id, validate_release_tree, validate_release_tree_at,
 };
 
 const FIRST_BATCH: &str = "01K00000000000000000000001";
@@ -225,8 +225,13 @@ fn resumes_from_a_durable_batch_intent_before_promotion() {
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
     let output = build(&store, batch(FIRST_BATCH), "fictional output\n");
     let created_at = timestamp("2026-07-31T04:00:00Z");
-    let content_revision = validate_release_tree(output.path(), ReleasePolicy::default(), false)
-        .unwrap_or_else(|error| panic!("staged output must validate: {error}"));
+    let content_revision = validate_release_tree_at(
+        output.path(),
+        &output.batch_handle,
+        ReleasePolicy::default(),
+        false,
+    )
+    .unwrap_or_else(|error| panic!("staged output must validate: {error}"));
     let manifest = ReleaseManifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
         release_id: release_id(created_at, FIRST_COMMIT),
@@ -1143,4 +1148,68 @@ fn rejects_replaced_fixed_release_directories() {
         store.begin_build(batch(FIRST_BATCH)),
         Err(ReleaseError::StorageBindingMismatch)
     ));
+}
+
+#[test]
+fn missing_binding_does_not_rebind_a_populated_store() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    {
+        let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+            .unwrap_or_else(|error| panic!("release store must open: {error}"));
+        store
+            .prepare(
+                build(&store, batch(FIRST_BATCH), "fictional output\n"),
+                FIRST_COMMIT,
+                timestamp("2026-07-31T04:00:00Z"),
+            )
+            .unwrap_or_else(|error| panic!("release must prepare: {error}"));
+    }
+    fs::remove_file(releases.join(BINDING_FILE))
+        .unwrap_or_else(|error| panic!("binding fixture must be removed: {error}"));
+
+    assert!(matches!(
+        ReleaseStore::open(&releases, ReleasePolicy::default()),
+        Err(ReleaseError::StorageBindingMismatch)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_binding_migrates_by_stable_inode_identity() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let mut legacy = b"agent-knowledge-release-store-v4\0".to_vec();
+    legacy.extend_from_slice(store.configured_root.as_os_str().as_encoded_bytes());
+    for handle in [
+        store.root_handle.as_ref(),
+        store.by_id.handle.as_ref(),
+        store.by_commit.handle.as_ref(),
+        store.by_batch.handle.as_ref(),
+        store.cleanup_intent.handle.as_ref(),
+        store.staging.handle.as_ref(),
+    ] {
+        legacy.push(0);
+        legacy.extend_from_slice(&u64::MAX.to_le_bytes());
+        legacy.extend_from_slice(
+            &handle
+                .metadata()
+                .unwrap_or_else(|error| panic!("pinned directory must have metadata: {error}"))
+                .ino()
+                .to_le_bytes(),
+        );
+    }
+    fs::write(releases.join(LEGACY_BINDING_FILE), legacy)
+        .unwrap_or_else(|error| panic!("legacy binding fixture must be written: {error}"));
+    fs::remove_file(releases.join(BINDING_FILE))
+        .unwrap_or_else(|error| panic!("current binding fixture must be removed: {error}"));
+    drop(store);
+
+    ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("legacy binding must migrate by inode: {error}"));
+    assert!(releases.join(BINDING_FILE).is_file());
 }
