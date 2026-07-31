@@ -146,7 +146,7 @@ impl QuartzBuilder {
             .stderr(Stdio::null());
         #[cfg(unix)]
         command.process_group(0);
-        let child = command.spawn().map_err(QuartzBuildError::Io)?;
+        let child = spawn_quartz(&mut command, deadline, self.timeout)?;
         let mut child = ChildGuard::new(child)?;
         let status = loop {
             if let Some(status) = child.try_wait()? {
@@ -177,6 +177,35 @@ impl QuartzBuilder {
             &self.integration_handle,
         )
     }
+}
+
+fn spawn_quartz(
+    command: &mut Command,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<Child, QuartzBuildError> {
+    loop {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if text_file_busy(&error) => {
+                check_build_deadline(deadline, timeout)?;
+                thread::sleep(
+                    POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => return Err(QuartzBuildError::Io(error)),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn text_file_busy(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(nix::libc::ETXTBSY)
+}
+
+#[cfg(not(unix))]
+fn text_file_busy(_error: &io::Error) -> bool {
+    false
 }
 
 struct ChildGuard {

@@ -52,6 +52,15 @@ fn executable(path: &Path, script: &str) {
     permissions.set_mode(0o700);
     fs::set_permissions(path, permissions)
         .unwrap_or_else(|error| panic!("fake Quartz command must be executable: {error}"));
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .unwrap_or_else(|error| panic!("fake Quartz command must be durable: {error}"));
+    fs::File::open(
+        path.parent()
+            .unwrap_or_else(|| panic!("fake Quartz command must have a parent")),
+    )
+    .and_then(|directory| directory.sync_all())
+    .unwrap_or_else(|error| panic!("fake Quartz directory must be durable: {error}"));
 }
 
 #[cfg(unix)]
@@ -93,6 +102,43 @@ fn invokes_quartz_with_fixed_content_and_output_arguments() {
             .unwrap_or_else(|error| panic!("fake output must be readable: {error}")),
         "<p>fictional release</p>\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn retries_a_temporarily_busy_quartz_executable() {
+    use std::fs::OpenOptions;
+
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    let output = root.0.join("output");
+    for directory in [&integration, &content, &output] {
+        fs::create_dir(directory)
+            .unwrap_or_else(|error| panic!("fixture directory must be created: {error}"));
+    }
+    let program = root.0.join("fake-busy-quartz");
+    executable(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' safe > \"$5/index.html\"\n",
+    );
+    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+    let writer = OpenOptions::new()
+        .write(true)
+        .open(&program)
+        .unwrap_or_else(|error| panic!("Quartz executable must be held busy: {error}"));
+    let release_writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(writer);
+    });
+
+    builder
+        .build_path(&content, &output)
+        .unwrap_or_else(|error| panic!("temporarily busy Quartz must retry: {error}"));
+    release_writer
+        .join()
+        .unwrap_or_else(|_| panic!("busy executable writer must close"));
 }
 
 #[cfg(unix)]
