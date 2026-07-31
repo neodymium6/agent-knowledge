@@ -1068,6 +1068,7 @@ Each successful build is immutable:
 releases/
 ├── .staging/
 │   └── <batch-id>/
+│       └── site/
 ├── by-id/
 │   ├── 20260731T040000Z-<commit>/
 │   └── 20260731T040500Z-<commit>/
@@ -1098,12 +1099,20 @@ synchronized, versioned
 ID, UTC creation time, and a deterministic SHA-256 revision of the generated
 tree. The tree revision is checked again before activation, so a changed
 prepared release cannot become current. Promotion from
-`.staging/<batch-id>/` to `by-id/` and replacement of `current` are separately
-atomic and idempotent. After a restart, the Worker can recover a validated
-prepared release through the bounded `by-commit/<commit>` lookup and resume
-after either rename without replacing the previously active site. The
+`.staging/<batch-id>/site/` to `by-id/` and replacement of `current` are
+separately atomic and idempotent. After a restart, the Worker can recover a
+validated prepared release through the bounded `by-commit/<commit>` lookup and
+resume after either rename without replacing the previously active site. The
 `by-commit/` references are derived indexes and may be rebuilt from validated
 release manifests.
+
+The batch directory is pinned and exclusively leased for the build lifetime.
+Quartz receives its replaceable `site/` child as the output path, allowing the
+CLI to remove and recreate the output root without invalidating the batch
+lease. Before promotion, the Worker durably writes the `by-commit/` intent;
+the reference may be temporarily dangling until the atomic `site/` promotion,
+but a crash cannot leave a durable prepared release without its recovery key.
+
 Failed or interrupted output may be removed only through a batch-scoped
 staging cleanup operation; prepared `by-id/` releases are never removed by the
 publication path.

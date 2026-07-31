@@ -86,6 +86,46 @@ fn invokes_quartz_with_fixed_content_and_output_arguments() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn allows_quartz_to_replace_output_below_a_pinned_container() {
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    let container = root.0.join("container");
+    for directory in [&integration, &content, &container] {
+        fs::create_dir(directory)
+            .unwrap_or_else(|error| panic!("fixture directory must be created: {error}"));
+    }
+    let container_handle = File::open(&container)
+        .unwrap_or_else(|error| panic!("container directory must be pinned: {error}"));
+    let output = PathBuf::from(format!(
+        "/proc/{}/fd/{}/site",
+        std::process::id(),
+        container_handle.as_raw_fd()
+    ));
+    fs::create_dir(&output)
+        .unwrap_or_else(|error| panic!("initial output directory must be created: {error}"));
+    let program = root.0.join("fake-replacing-quartz");
+    executable(
+        &program,
+        "#!/bin/sh\n\
+         rm -rf \"$5\" || exit 21\n\
+         mkdir \"$5\" || exit 22\n\
+         printf '%s\\n' '<p>fictional replaced release</p>' > \"$5/index.html\"\n",
+    );
+    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+
+    builder
+        .build(&content, &output)
+        .unwrap_or_else(|error| panic!("Quartz-style output replacement must succeed: {error}"));
+    assert!(container.join("site").join("index.html").is_file());
+}
+
 #[cfg(unix)]
 #[test]
 fn terminates_a_quartz_command_after_its_deadline() {

@@ -13,6 +13,7 @@ use ulid::Ulid;
 const BY_ID_DIRECTORY: &str = "by-id";
 const BY_COMMIT_DIRECTORY: &str = "by-commit";
 const STAGING_DIRECTORY: &str = ".staging";
+const SITE_DIRECTORY: &str = "site";
 const CURRENT_ENTRY: &str = "current";
 const BINDING_FILE: &str = ".release-store-binding-v2";
 const MANIFEST_FILE: &str = ".agent-knowledge-release.json";
@@ -93,7 +94,7 @@ impl ActiveRelease {
 #[derive(Clone, Debug)]
 pub struct BuildDirectory {
     path: PathBuf,
-    _directory_lease: Arc<File>,
+    _batch_lease: Arc<File>,
 }
 
 impl BuildDirectory {
@@ -121,6 +122,12 @@ struct PinnedDirectory {
     configured: PathBuf,
     stable: PathBuf,
     handle: Arc<File>,
+}
+
+struct BatchLease {
+    configured: PathBuf,
+    stable: PathBuf,
+    handle: File,
 }
 
 impl ReleaseStore {
@@ -168,15 +175,22 @@ impl ReleaseStore {
     pub fn begin_build(&self, batch_id: BatchId) -> Result<BuildDirectory, ReleaseError> {
         let _mutation = self.lock_mutation()?;
         self.validate_live_storage()?;
+        let configured = self
+            .configured_root
+            .join(STAGING_DIRECTORY)
+            .join(batch_id.to_string());
         let path = self.staging.stable.join(batch_id.to_string());
         match fs::create_dir(&path) {
             Ok(()) => {
-                sync_directory(&self.staging.stable)?;
                 let handle = Arc::new(File::open(&path).map_err(ReleaseError::Io)?);
-                let path = stable_directory_path(&handle, &path)?;
+                lock_file(&handle)?;
+                let stable = stable_directory_path(&handle, &configured)?;
+                fs::create_dir(stable.join(SITE_DIRECTORY)).map_err(ReleaseError::Io)?;
+                sync_directory(&stable)?;
+                sync_directory(&self.staging.stable)?;
                 Ok(BuildDirectory {
-                    path,
-                    _directory_lease: handle,
+                    path: stable.join(SITE_DIRECTORY),
+                    _batch_lease: handle,
                 })
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -190,15 +204,24 @@ impl ReleaseStore {
     pub fn discard_build(&self, batch_id: BatchId) -> Result<(), ReleaseError> {
         let _mutation = self.lock_mutation()?;
         self.validate_live_storage()?;
+        let configured = self
+            .configured_root
+            .join(STAGING_DIRECTORY)
+            .join(batch_id.to_string());
         let path = self.staging.stable.join(batch_id.to_string());
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_dir() => {
-                fs::remove_dir_all(path).map_err(ReleaseError::Io)?;
+                let batch = lock_batch_directory(&configured, &path)?;
+                validate_pinned_directory(&batch.configured, &batch.handle)?;
+                fs::remove_dir_all(&configured).map_err(ReleaseError::Io)?;
                 sync_directory(&self.staging.stable)?;
                 self.validate_live_storage()
             }
             Ok(_) => Err(ReleaseError::InvalidDirectory(path)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                sync_directory(&self.staging.stable)?;
+                self.validate_live_storage()
+            }
             Err(error) => Err(ReleaseError::Io(error)),
         }
     }
@@ -214,7 +237,11 @@ impl ReleaseStore {
         self.validate_live_storage()?;
         validate_commit(commit)?;
         let release_id = release_id(created_at, commit);
-        let staging = self.staging.stable.join(batch_id.to_string());
+        let batch_configured = self
+            .configured_root
+            .join(STAGING_DIRECTORY)
+            .join(batch_id.to_string());
+        let batch_path = self.staging.stable.join(batch_id.to_string());
         let destination = self.by_id.stable.join(&release_id);
         let created_at = created_at.to_offset(UtcOffset::UTC);
         if path_exists(&destination)? {
@@ -231,13 +258,15 @@ impl ReleaseStore {
                 return Err(ReleaseError::InvalidManifest);
             }
             sync_directory(&self.by_id.stable)?;
-            self.cleanup_recovered_staging(&staging, &manifest)?;
             self.ensure_commit_reference(&manifest)?;
+            self.cleanup_recovered_staging(&batch_configured, &batch_path, &manifest)?;
             return Ok(PreparedRelease {
                 release_id,
                 commit: commit.into(),
             });
         }
+        let batch = lock_batch_directory(&batch_configured, &batch_path)?;
+        let staging = batch.stable.join(SITE_DIRECTORY);
         let content_revision = validate_release_tree(&staging, self.policy, false)?;
         let manifest = ReleaseManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -251,14 +280,17 @@ impl ReleaseStore {
         if validate_release_tree(&staging, self.policy, true)? != manifest.content_revision {
             return Err(ReleaseError::OutputChanged);
         }
+        self.ensure_commit_reference(&manifest)?;
         fs::rename(&staging, &destination).map_err(ReleaseError::Io)?;
         // A recovered process must observe the destination before it may
         // observe the source removal as durable.
         sync_directory(&self.by_id.stable)?;
+        sync_directory(&batch.stable)?;
+        validate_pinned_directory(&batch.configured, &batch.handle)?;
+        fs::remove_dir(&batch.configured).map_err(ReleaseError::Io)?;
         sync_directory(&self.staging.stable)?;
         self.validate_live_storage()?;
         validate_release(&destination, &manifest, self.policy)?;
-        self.ensure_commit_reference(&manifest)?;
         Ok(PreparedRelease {
             release_id,
             commit: commit.into(),
@@ -281,6 +313,8 @@ impl ReleaseStore {
             && active.release_id == release.release_id
             && active.commit == release.commit
         {
+            sync_directory(&self.root)?;
+            self.validate_live_storage()?;
             return Ok(active);
         }
         let temporary = self.root.join(format!(".current-{}", Ulid::generate()));
@@ -372,15 +406,36 @@ impl ReleaseStore {
 
     fn cleanup_recovered_staging(
         &self,
-        staging: &Path,
+        batch_configured: &Path,
+        batch_path: &Path,
         expected: &ReleaseManifest,
     ) -> Result<(), ReleaseError> {
-        if !path_exists(staging)? {
+        if !path_exists(batch_path)? {
+            sync_directory(&self.staging.stable)?;
+            self.validate_live_storage()?;
             return Ok(());
         }
-        validate_release(staging, expected, self.policy)?;
-        fs::remove_dir_all(staging).map_err(ReleaseError::Io)?;
-        sync_directory(&self.staging.stable)
+        let batch = lock_batch_directory(batch_configured, batch_path)?;
+        let mut entries = fs::read_dir(&batch.stable).map_err(ReleaseError::Io)?;
+        match entries.next().transpose().map_err(ReleaseError::Io)? {
+            Some(entry) if entry.file_name().as_os_str() == SITE_DIRECTORY => {
+                if entries
+                    .next()
+                    .transpose()
+                    .map_err(ReleaseError::Io)?
+                    .is_some()
+                {
+                    return Err(ReleaseError::RecoveredBuildConflict);
+                }
+                validate_release(&entry.path(), expected, self.policy)?;
+            }
+            Some(_) => return Err(ReleaseError::RecoveredBuildConflict),
+            None => {}
+        }
+        validate_pinned_directory(&batch.configured, &batch.handle)?;
+        fs::remove_dir_all(&batch.configured).map_err(ReleaseError::Io)?;
+        sync_directory(&self.staging.stable)?;
+        self.validate_live_storage()
     }
 
     fn ensure_commit_reference(&self, manifest: &ReleaseManifest) -> Result<(), ReleaseError> {
@@ -393,7 +448,22 @@ impl ReleaseStore {
                 if !metadata.file_type().is_symlink() {
                     return Err(ReleaseError::InvalidCommitReference);
                 }
-                if fs::read_link(&reference).map_err(ReleaseError::Io)? == target {
+                let existing_target = fs::read_link(&reference).map_err(ReleaseError::Io)?;
+                if existing_target == target {
+                    sync_directory(&self.by_commit.stable)?;
+                    self.validate_live_storage()?;
+                    return Ok(());
+                }
+                let existing_id = release_id_from_commit_target(&existing_target)?;
+                let existing_path = self.by_id.stable.join(existing_id);
+                let existing = read_manifest(&existing_path)?;
+                if existing.commit != manifest.commit || existing.release_id != existing_id {
+                    return Err(ReleaseError::InvalidCommitReference);
+                }
+                validate_release(&existing_path, &existing, self.policy)?;
+                if existing.release_id > manifest.release_id {
+                    sync_directory(&self.by_commit.stable)?;
+                    self.validate_live_storage()?;
                     return Ok(());
                 }
             }
@@ -789,6 +859,27 @@ fn validate_regular_file(path: &Path, metadata: &fs::Metadata) -> Result<(), Rel
     Ok(())
 }
 
+fn lock_batch_directory(configured: &Path, path: &Path) -> Result<BatchLease, ReleaseError> {
+    ensure_real_directory(path)?;
+    let handle = File::open(path).map_err(ReleaseError::Io)?;
+    lock_file(&handle)?;
+    let stable = stable_directory_path(&handle, configured)?;
+    validate_pinned_directory(configured, &handle)?;
+    Ok(BatchLease {
+        configured: configured.into(),
+        stable,
+        handle,
+    })
+}
+
+fn lock_file(file: &File) -> Result<(), ReleaseError> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(ReleaseError::BuildInProgress),
+        Err(TryLockError::Error(error)) => Err(ReleaseError::Io(error)),
+    }
+}
+
 fn pin_directory(configured: PathBuf, stable: PathBuf) -> Result<PinnedDirectory, ReleaseError> {
     ensure_directory_target(&stable)?;
     let handle = Arc::new(File::open(&stable).map_err(ReleaseError::Io)?);
@@ -1003,6 +1094,8 @@ pub enum ReleaseError {
     StorageBindingMismatch,
     MutationLockPoisoned,
     ReleaseStoreBusy,
+    BuildInProgress,
+    RecoveredBuildConflict,
     BuildAlreadyExists(BatchId),
     OutputTooLarge,
     OutputChanged,
@@ -1039,6 +1132,10 @@ impl fmt::Display for ReleaseError {
             Self::StorageBindingMismatch => formatter.write_str("release storage binding changed"),
             Self::MutationLockPoisoned => formatter.write_str("release mutation lock is poisoned"),
             Self::ReleaseStoreBusy => formatter.write_str("release store is busy"),
+            Self::BuildInProgress => formatter.write_str("release build is still in progress"),
+            Self::RecoveredBuildConflict => {
+                formatter.write_str("recovered release build conflicts with its prepared release")
+            }
             Self::BuildAlreadyExists(batch_id) => {
                 write!(
                     formatter,

@@ -173,10 +173,11 @@ fn preparation_removes_a_recovered_duplicate_staging_tree() {
         .unwrap_or_else(|error| panic!("release must prepare: {error}"));
     let prepared = releases.join("by-id").join(release.release_id());
     let recovered_staging = releases.join(".staging").join(FIRST_BATCH);
-    fs::create_dir(&recovered_staging)
+    let recovered_site = recovered_staging.join("site");
+    fs::create_dir_all(&recovered_site)
         .unwrap_or_else(|error| panic!("recovered staging directory must be created: {error}"));
     for name in ["index.html", ".agent-knowledge-release.json"] {
-        fs::copy(prepared.join(name), recovered_staging.join(name))
+        fs::copy(prepared.join(name), recovered_site.join(name))
             .unwrap_or_else(|error| panic!("recovered staging file must be copied: {error}"));
     }
 
@@ -219,6 +220,37 @@ fn recovers_a_prepared_release_after_reopening_the_store() {
     );
 }
 
+#[test]
+fn retrying_an_older_release_does_not_regress_commit_lookup() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    build(&store, batch(FIRST_BATCH), "first fictional output\n");
+    let first_created_at = timestamp("2026-07-31T04:00:00Z");
+    let first = store
+        .prepare(batch(FIRST_BATCH), FIRST_COMMIT, first_created_at)
+        .unwrap_or_else(|error| panic!("first release must prepare: {error}"));
+    build(&store, batch(SECOND_BATCH), "second fictional output\n");
+    let second = store
+        .prepare(
+            batch(SECOND_BATCH),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:05:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("second release must prepare: {error}"));
+
+    store
+        .prepare(batch(FIRST_BATCH), FIRST_COMMIT, first_created_at)
+        .unwrap_or_else(|error| panic!("older release retry must succeed: {error}"));
+    let recovered = store
+        .prepared_for_commit(FIRST_COMMIT)
+        .unwrap_or_else(|error| panic!("prepared release lookup must succeed: {error}"))
+        .unwrap_or_else(|| panic!("newest release must remain indexed"));
+    assert_ne!(first, second);
+    assert_eq!(recovered, second);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn build_directory_keeps_its_directory_lease_after_store_drop() {
@@ -254,8 +286,41 @@ fn build_directory_keeps_its_identity_after_entry_replacement() {
 
     fs::write(output.path().join("index.html"), "fictional output\n")
         .unwrap_or_else(|error| panic!("pinned output must remain writable: {error}"));
-    assert!(detached.join("index.html").is_file());
-    assert!(!configured.join("index.html").exists());
+    assert!(detached.join("site").join("index.html").is_file());
+    assert!(!configured.join("site").join("index.html").exists());
+}
+
+#[test]
+fn active_build_lease_blocks_prepare_and_discard() {
+    let root = TestDirectory::new();
+    let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = store
+        .begin_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("release build must begin: {error}"));
+    fs::write(output.path().join("index.html"), "fictional output\n")
+        .unwrap_or_else(|error| panic!("release output must be written: {error}"));
+
+    assert!(matches!(
+        store.prepare(
+            batch(FIRST_BATCH),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z")
+        ),
+        Err(ReleaseError::BuildInProgress)
+    ));
+    assert!(matches!(
+        store.discard_build(batch(FIRST_BATCH)),
+        Err(ReleaseError::BuildInProgress)
+    ));
+    drop(output);
+    store
+        .prepare(
+            batch(FIRST_BATCH),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("finished build must prepare: {error}"));
 }
 
 #[test]
@@ -271,6 +336,7 @@ fn discarded_build_output_can_be_rebuilt_for_the_same_batch() {
         "partial fictional output\n",
     )
     .unwrap_or_else(|error| panic!("partial output must be written: {error}"));
+    drop(first);
 
     store
         .discard_build(batch(FIRST_BATCH))
@@ -301,6 +367,7 @@ fn rejects_generated_symlinks_before_publication() {
         .unwrap_or_else(|error| panic!("release output must be written: {error}"));
     symlink("/fictional/private", output.path().join("escape"))
         .unwrap_or_else(|error| panic!("unsafe fixture symlink must be created: {error}"));
+    drop(output);
 
     assert!(matches!(
         store.prepare(
@@ -348,6 +415,7 @@ fn invalid_new_output_keeps_the_previous_release_active() {
     .unwrap_or_else(|error| panic!("second output must be written: {error}"));
     symlink("/fictional/private", output.path().join("escape"))
         .unwrap_or_else(|error| panic!("unsafe fixture symlink must be created: {error}"));
+    drop(output);
     assert!(matches!(
         store.prepare(
             batch(SECOND_BATCH),
@@ -566,6 +634,7 @@ fn enforces_aggregate_generated_output_limit() {
         .unwrap_or_else(|error| panic!("first output file must be written: {error}"));
     fs::write(output.path().join("page.html"), "123456789012")
         .unwrap_or_else(|error| panic!("second output file must be written: {error}"));
+    drop(output);
 
     assert!(matches!(
         store.prepare(
