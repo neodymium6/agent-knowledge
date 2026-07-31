@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,7 @@ use std::os::unix::process::CommandExt;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(unix)]
 const TERMINATION_GRACE: Duration = Duration::from_secs(1);
+static BUILD_PROCESS_LEASE: Mutex<()> = Mutex::new(());
 
 /// A bounded invocation of the configured Quartz CLI.
 #[derive(Clone, Debug)]
@@ -116,7 +117,7 @@ impl QuartzBuilder {
             return Err(QuartzBuildError::OverlappingPaths);
         }
         self.validate_live_command()?;
-        enable_child_subreaper()?;
+        let _process_lease = BuildProcessLease::acquire()?;
         let deadline = Instant::now()
             .checked_add(self.timeout)
             .ok_or(QuartzBuildError::InvalidTimeout)?;
@@ -209,9 +210,7 @@ impl ChildGuard {
         #[cfg(unix)]
         match killpg(self.process_group, Signal::SIGKILL) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
-            Err(error) => Err(QuartzBuildError::Io(io::Error::from_raw_os_error(
-                error as i32,
-            ))),
+            Err(error) => Err(process_error(error as i32)),
         }
         #[cfg(not(unix))]
         Ok(())
@@ -267,15 +266,42 @@ impl Drop for ChildGuard {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn enable_child_subreaper() -> Result<(), QuartzBuildError> {
-    nix::sys::prctl::set_child_subreaper(true)
-        .map_err(|error| QuartzBuildError::Io(io::Error::from_raw_os_error(error as i32)))
+struct BuildProcessLease {
+    _lock: MutexGuard<'static, ()>,
+    #[cfg(target_os = "linux")]
+    previous_subreaper: bool,
 }
 
-#[cfg(not(target_os = "linux"))]
-fn enable_child_subreaper() -> Result<(), QuartzBuildError> {
-    Ok(())
+impl BuildProcessLease {
+    fn acquire() -> Result<Self, QuartzBuildError> {
+        let lock = BUILD_PROCESS_LEASE
+            .lock()
+            .map_err(|_| QuartzBuildError::InvalidProcessState)?;
+        #[cfg(target_os = "linux")]
+        {
+            let previous_subreaper = nix::sys::prctl::get_child_subreaper()
+                .map_err(|error| process_error(error as i32))?;
+            if !previous_subreaper {
+                nix::sys::prctl::set_child_subreaper(true)
+                    .map_err(|error| process_error(error as i32))?;
+            }
+            Ok(Self {
+                _lock: lock,
+                previous_subreaper,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok(Self { _lock: lock })
+    }
+}
+
+impl Drop for BuildProcessLease {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if !self.previous_subreaper {
+            let _ = nix::sys::prctl::set_child_subreaper(false);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -289,11 +315,7 @@ fn wait_for_process_group(
         match killpg(process_group, None) {
             Err(Errno::ESRCH) => return Ok(()),
             Ok(()) => {}
-            Err(error) => {
-                return Err(QuartzBuildError::Io(io::Error::from_raw_os_error(
-                    error as i32,
-                )));
-            }
+            Err(error) => return Err(process_error(error as i32)),
         }
         check_build_deadline(deadline, timeout)?;
         thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
@@ -307,11 +329,7 @@ fn reap_process_group_children(process_group: Pid) -> Result<(), QuartzBuildErro
         match waitpid(group_selector, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => return Ok(()),
             Ok(_) | Err(Errno::EINTR) => {}
-            Err(error) => {
-                return Err(QuartzBuildError::Io(io::Error::from_raw_os_error(
-                    error as i32,
-                )));
-            }
+            Err(error) => return Err(process_error(error as i32)),
         }
     }
 }
@@ -319,6 +337,10 @@ fn reap_process_group_children(process_group: Pid) -> Result<(), QuartzBuildErro
 #[cfg(all(unix, not(target_os = "linux")))]
 fn reap_process_group_children(_process_group: Pid) -> Result<(), QuartzBuildError> {
     Ok(())
+}
+
+fn process_error(error: i32) -> QuartzBuildError {
+    QuartzBuildError::Io(io::Error::from_raw_os_error(error))
 }
 
 fn canonical_regular_file(path: &Path) -> Result<PathBuf, QuartzBuildError> {

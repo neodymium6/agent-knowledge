@@ -7,7 +7,7 @@ use std::time::Duration;
 use std::os::unix::fs::PermissionsExt;
 use ulid::Ulid;
 
-use super::{QuartzBuildError, QuartzBuilder, enforce_output_limits};
+use super::{BUILD_PROCESS_LEASE, QuartzBuildError, QuartzBuilder, enforce_output_limits};
 use crate::ReleasePolicy;
 
 struct TestDirectory(PathBuf);
@@ -220,6 +220,94 @@ fn reaps_descendants_before_scanning_successful_output() {
         .unwrap_or_else(|error| panic!("bounded Quartz build must succeed: {error}"));
     std::thread::sleep(Duration::from_millis(100));
     assert!(!output.join("escaped").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn restores_the_process_subreaper_setting_after_a_build() {
+    let original = {
+        let _lease = BUILD_PROCESS_LEASE
+            .lock()
+            .unwrap_or_else(|error| panic!("build process lease must be available: {error}"));
+        nix::sys::prctl::get_child_subreaper()
+            .unwrap_or_else(|error| panic!("subreaper setting must be readable: {error}"))
+    };
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    let output = root.0.join("output");
+    for directory in [&integration, &content, &output] {
+        fs::create_dir(directory)
+            .unwrap_or_else(|error| panic!("fixture directory must be created: {error}"));
+    }
+    let program = root.0.join("fake-quartz");
+    executable(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' safe > \"$5/index.html\"\n",
+    );
+    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+
+    builder
+        .build(&content, &output)
+        .unwrap_or_else(|error| panic!("Quartz build must succeed: {error}"));
+
+    let _lease = BUILD_PROCESS_LEASE
+        .lock()
+        .unwrap_or_else(|error| panic!("build process lease must be available: {error}"));
+    assert_eq!(
+        nix::sys::prctl::get_child_subreaper()
+            .unwrap_or_else(|error| panic!("subreaper setting must be readable: {error}")),
+        original
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn serializes_concurrent_quartz_process_ownership() {
+    use std::sync::{Arc, Barrier};
+
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    fs::create_dir(&integration)
+        .unwrap_or_else(|error| panic!("integration directory must be created: {error}"));
+    fs::create_dir(&content)
+        .unwrap_or_else(|error| panic!("content directory must be created: {error}"));
+    let program = root.0.join("fake-slow-quartz");
+    executable(
+        &program,
+        "#!/bin/sh\nsleep 0.1\nprintf '%s\\n' safe > \"$5/index.html\"\n",
+    );
+    let builder = Arc::new(
+        QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+            .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}")),
+    );
+    let barrier = Arc::new(Barrier::new(3));
+    let mut threads = Vec::new();
+    for index in 0..2 {
+        let output = root.0.join(format!("output-{index}"));
+        fs::create_dir(&output)
+            .unwrap_or_else(|error| panic!("output directory must be created: {error}"));
+        let builder = Arc::clone(&builder);
+        let barrier = Arc::clone(&barrier);
+        let content = content.clone();
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            builder
+                .build(&content, &output)
+                .unwrap_or_else(|error| panic!("serialized Quartz build must succeed: {error}"));
+        }));
+    }
+
+    let started = std::time::Instant::now();
+    barrier.wait();
+    for thread in threads {
+        thread
+            .join()
+            .unwrap_or_else(|_| panic!("Quartz build thread must finish"));
+    }
+    assert!(started.elapsed() >= Duration::from_millis(180));
 }
 
 #[cfg(unix)]
