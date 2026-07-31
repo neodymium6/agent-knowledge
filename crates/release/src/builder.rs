@@ -134,6 +134,8 @@ impl QuartzBuilder {
         let mut child = ChildGuard::new(child)?;
         let status = loop {
             if let Some(status) = child.try_wait()? {
+                child.terminate_group()?;
+                child.disarm();
                 enforce_output_limits(output, self.output_policy, deadline, self.timeout)?;
                 break status;
             }
@@ -146,8 +148,6 @@ impl QuartzBuilder {
             }
             thread::sleep(POLL_INTERVAL.min(self.timeout));
         };
-        child.terminate_group()?;
-        child.disarm();
         if !status.success() {
             return Err(QuartzBuildError::CommandFailed { status });
         }

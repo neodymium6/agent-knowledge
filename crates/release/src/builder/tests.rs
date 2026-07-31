@@ -188,6 +188,40 @@ fn terminates_quartz_descendants_after_a_timeout() {
     assert!(!output.join("escaped").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn terminates_descendants_before_scanning_successful_output() {
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    let output = root.0.join("output");
+    for directory in [&integration, &content, &output] {
+        fs::create_dir(directory)
+            .unwrap_or_else(|error| panic!("fixture directory must be created: {error}"));
+    }
+    let program = root.0.join("fake-successful-parent-quartz");
+    executable(
+        &program,
+        "#!/bin/sh\n\
+         parent=$$\n\
+         (while kill -0 \"$parent\" 2>/dev/null; do sleep 0.01; done\n\
+          printf '%s\\n' escaped > \"$5/escaped\") &\n\
+         index=0\n\
+         while test \"$index\" -lt 4000; do\n\
+           : > \"$5/page-$index.html\"\n\
+           index=$((index + 1))\n\
+         done\n",
+    );
+    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(5))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+
+    builder
+        .build(&content, &output)
+        .unwrap_or_else(|error| panic!("bounded Quartz build must succeed: {error}"));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!output.join("escaped").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn terminates_quartz_when_live_output_exceeds_policy() {
