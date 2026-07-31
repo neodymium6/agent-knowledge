@@ -8,11 +8,13 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use ulid::Ulid;
 
+#[cfg(unix)]
+use super::unix_mode_is_directory;
 use super::{
-    BuildDirectory, MANIFEST_FILE, MANIFEST_SCHEMA_VERSION, MAXIMUM_CLEANUP_ACTIONS,
-    MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH, ReleaseError, ReleaseManifest, ReleasePolicy, ReleaseStore,
-    cleanup_name, derived_reference_is_repairable, ensure_cleanup_marker, ensure_manifest,
-    read_manifest, release_id, validate_release_tree,
+    BuildDirectory, CLEANUP_MARKER_FILE, MANIFEST_FILE, MANIFEST_SCHEMA_VERSION,
+    MAXIMUM_CLEANUP_ACTIONS, MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH, ReleaseError, ReleaseManifest,
+    ReleasePolicy, ReleaseStore, cleanup_name, derived_reference_is_repairable,
+    ensure_cleanup_marker, ensure_manifest, read_manifest, release_id, validate_release_tree,
 };
 
 const FIRST_BATCH: &str = "01K00000000000000000000001";
@@ -349,6 +351,33 @@ fn discard_finishes_a_deterministic_cleanup_tombstone() {
 }
 
 #[test]
+fn discard_repairs_an_interrupted_cleanup_marker_write() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = build(&store, batch(FIRST_BATCH), "partial fictional output\n");
+    drop(output);
+    let staged = releases.join(".staging").join(FIRST_BATCH);
+    let staged_handle = fs::File::open(&staged)
+        .unwrap_or_else(|error| panic!("staged batch must be opened: {error}"));
+    store
+        .ensure_cleanup_intent(batch(FIRST_BATCH), &staged_handle)
+        .unwrap_or_else(|error| panic!("cleanup intent must be durable: {error}"));
+    fs::write(
+        staged.join(CLEANUP_MARKER_FILE),
+        "interrupted fictional marker",
+    )
+    .unwrap_or_else(|error| panic!("partial cleanup marker must be written: {error}"));
+
+    store
+        .discard_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("partial cleanup marker must be repaired: {error}"));
+    assert!(!staged.exists());
+    assert!(!releases.join("cleanup-intent").join(FIRST_BATCH).exists());
+}
+
+#[test]
 fn cleanup_intent_rejects_a_replaced_private_tombstone() {
     let root = TestDirectory::new();
     let releases = root.0.join("releases");
@@ -432,8 +461,11 @@ fn discard_removes_unix_sockets_as_non_directory_entries() {
         .join("fictional.sock");
     let short_socket =
         std::env::temp_dir().join(format!("agent-knowledge-socket-{}", Ulid::generate()));
-    let listener = UnixListener::bind(&short_socket)
-        .unwrap_or_else(|error| panic!("Unix socket fixture must bind: {error}"));
+    let listener = match UnixListener::bind(&short_socket) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("Unix socket fixture must bind: {error}"),
+    };
     fs::rename(&short_socket, &socket)
         .unwrap_or_else(|error| panic!("Unix socket fixture must move into staging: {error}"));
     drop(listener);
@@ -443,6 +475,16 @@ fn discard_removes_unix_sockets_as_non_directory_entries() {
         .discard_build(batch(FIRST_BATCH))
         .unwrap_or_else(|error| panic!("Unix socket output must be discarded: {error}"));
     assert!(!socket.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_classifies_only_directory_modes_as_directories() {
+    use nix::sys::stat::SFlag;
+
+    assert!(unix_mode_is_directory(SFlag::S_IFDIR.bits()));
+    assert!(!unix_mode_is_directory(SFlag::S_IFSOCK.bits()));
+    assert!(!unix_mode_is_directory(SFlag::S_IFREG.bits()));
 }
 
 #[test]

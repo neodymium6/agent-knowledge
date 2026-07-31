@@ -1121,17 +1121,19 @@ atomic `site/` promotion; the ready-only `by-commit/` index is updated after
 promotion and never points at an in-progress release.
 
 Failed or interrupted output may be removed only through a batch-scoped
-staging cleanup operation. Cleanup first records the pinned batch device,
-inode, and mount identity in `cleanup-intent/<batch-id>`, writes a marker, and
-moves the batch to the deterministic `.staging/.cleanup-<batch-id>/`
-tombstone. A retry validates the tombstone against that external intent before
-continuing, including after the marker has been removed. On Unix, recursive
-cleanup traverses from pinned directory descriptors, refuses child mount
-points, and removes entries relative to those descriptors. Work is split into
-bounded passes with a bounded descriptor stack; deep subtrees are atomically
-rehomed inside the tombstone so a later pass can continue without recursive
-call-stack growth. Prepared `by-id/` releases are never removed by the
-publication path.
+staging cleanup operation. Cleanup first records the pinned batch inode in
+`cleanup-intent/<batch-id>`, writes a marker, and moves the batch to the
+deterministic `.staging/.cleanup-<batch-id>/` tombstone. Both metadata files
+are published from synchronized temporary files by atomic rename. A retry
+validates the tombstone against that external intent before continuing,
+including after the marker has been removed. Durable inode identity is kept
+separate from live mount checks so recovery remains possible after a reboot or
+remount. On Unix, recursive cleanup traverses from pinned directory
+descriptors, refuses child mount points, and removes entries relative to those
+descriptors. Work is split into bounded passes with a bounded descriptor
+stack; deep subtrees are atomically rehomed inside the tombstone so a later
+pass can continue without recursive call-stack growth. Prepared `by-id/`
+releases are never removed by the publication path.
 
 Release retention is configurable. Removal of old derived releases is an
 administrative maintenance operation and never removes content or accepted

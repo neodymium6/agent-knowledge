@@ -618,11 +618,14 @@ impl ReleaseStore {
         }
         if ordinary_exists {
             let mut batch = lock_batch_directory(&configured, &path, false)?;
-            let marker = cleanup_marker_state(&batch.stable, batch_id)?;
             let intent = self.cleanup_intent_exists(batch_id)?;
-            if marker || intent {
+            let marker = cleanup_marker_exists(&batch.stable)?;
+            if intent {
                 self.validate_cleanup_intent(batch_id, &batch.handle)?;
+                ensure_cleanup_marker(&batch.stable, batch_id)?;
                 batch.cleanup_started = true;
+            } else if marker {
+                return Err(ReleaseError::InvalidCleanupIntent);
             }
             return Ok(Some(batch));
         }
@@ -649,14 +652,12 @@ impl ReleaseStore {
         match fs::symlink_metadata(&path) {
             Ok(_) => self.validate_cleanup_intent(batch_id, batch),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .map_err(ReleaseError::Io)?;
-                file.write_all(&expected).map_err(ReleaseError::Io)?;
-                file.sync_all().map_err(ReleaseError::Io)?;
-                sync_directory(&self.cleanup_intent.stable)?;
+                replace_regular_file(
+                    &self.cleanup_intent.stable,
+                    &path,
+                    &expected,
+                    &format!("cleanup-intent-{batch_id}"),
+                )?;
                 self.validate_cleanup_intent(batch_id, batch)
             }
             Err(error) => Err(ReleaseError::Io(error)),
@@ -1265,17 +1266,14 @@ fn cleanup_marker_bytes(batch_id: BatchId) -> Vec<u8> {
 }
 
 fn cleanup_identity(directory: &File) -> Result<Vec<u8>, ReleaseError> {
-    let mut bytes = b"agent-knowledge-release-cleanup-intent-v1\0".to_vec();
+    let mut bytes = b"agent-knowledge-release-cleanup-intent-v2\0".to_vec();
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
         let metadata = directory.metadata().map_err(ReleaseError::Io)?;
-        bytes.extend_from_slice(&metadata.dev().to_le_bytes());
         bytes.extend_from_slice(&metadata.ino().to_le_bytes());
     }
-    #[cfg(target_os = "linux")]
-    bytes.extend_from_slice(&mount_id(directory)?.to_le_bytes());
     Ok(bytes)
 }
 
@@ -1309,9 +1307,13 @@ fn ensure_cleanup_marker(directory: &Path, batch_id: BatchId) -> Result<(), Rele
     let expected = cleanup_marker_bytes(batch_id);
     match fs::symlink_metadata(&marker) {
         Ok(metadata) => {
-            validate_regular_file(&marker, &metadata)?;
-            if metadata.len() != expected.len() as u64 {
+            if !metadata.file_type().is_file() {
                 return Err(ReleaseError::RecoveredBuildConflict);
+            }
+            validate_regular_file(&marker, &metadata)
+                .map_err(|_| ReleaseError::RecoveredBuildConflict)?;
+            if metadata.len() != expected.len() as u64 {
+                return replace_regular_file(directory, &marker, &expected, "cleanup-marker");
             }
             let mut file = File::open(&marker).map_err(ReleaseError::Io)?;
             let opened = file.metadata().map_err(ReleaseError::Io)?;
@@ -1326,33 +1328,23 @@ fn ensure_cleanup_marker(directory: &Path, batch_id: BatchId) -> Result<(), Rele
             Read::by_ref(&mut file)
                 .take(expected.len() as u64 + 1)
                 .read_to_end(&mut actual)
-                .and_then(|_| file.sync_all())
                 .map_err(ReleaseError::Io)?;
             if actual != expected {
-                return Err(ReleaseError::RecoveredBuildConflict);
+                return replace_regular_file(directory, &marker, &expected, "cleanup-marker");
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&marker)
-                .map_err(ReleaseError::Io)?;
-            file.write_all(&expected).map_err(ReleaseError::Io)?;
-            file.sync_all().map_err(ReleaseError::Io)?;
+            return replace_regular_file(directory, &marker, &expected, "cleanup-marker");
         }
         Err(error) => return Err(ReleaseError::Io(error)),
     }
     sync_directory(directory)
 }
 
-fn cleanup_marker_state(directory: &Path, batch_id: BatchId) -> Result<bool, ReleaseError> {
+fn cleanup_marker_exists(directory: &Path) -> Result<bool, ReleaseError> {
     let marker = directory.join(CLEANUP_MARKER_FILE);
     match fs::symlink_metadata(&marker) {
-        Ok(_) => {
-            ensure_cleanup_marker(directory, batch_id)?;
-            Ok(true)
-        }
+        Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(ReleaseError::Io(error)),
     }
@@ -1385,7 +1377,7 @@ fn clear_cleanup_directory(directory: &File, _batch_id: BatchId) -> Result<(), R
 #[cfg(unix)]
 fn clear_directory_at(directory: &File, preserved_name: Option<&[u8]>) -> Result<(), ReleaseError> {
     use nix::fcntl::{AtFlags, OFlag, openat, renameat};
-    use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
+    use nix::sys::stat::{Mode, fstat, fstatat};
     use nix::unistd::{UnlinkatFlags, unlinkat};
     use std::ffi::CString;
 
@@ -1456,7 +1448,7 @@ fn clear_directory_at(directory: &File, preserved_name: Option<&[u8]>) -> Result
             .directory;
         let listed =
             fstatat(parent, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW).map_err(nix_io_error)?;
-        if listed.st_mode & SFlag::S_IFMT.bits() == SFlag::S_IFDIR.bits() {
+        if unix_mode_is_directory(listed.st_mode) {
             let child = openat(
                 parent,
                 name.as_c_str(),
@@ -1494,6 +1486,13 @@ fn clear_directory_at(directory: &File, preserved_name: Option<&[u8]>) -> Result
             actions += 1;
         }
     }
+}
+
+#[cfg(unix)]
+fn unix_mode_is_directory(mode: nix::libc::mode_t) -> bool {
+    use nix::sys::stat::SFlag;
+
+    mode & SFlag::S_IFMT.bits() == SFlag::S_IFDIR.bits()
 }
 
 #[cfg(unix)]
@@ -1787,6 +1786,37 @@ fn sync_directory(path: &Path) -> Result<(), ReleaseError> {
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(ReleaseError::Io)
+}
+
+fn replace_regular_file(
+    directory: &Path,
+    destination: &Path,
+    contents: &[u8],
+    kind: &str,
+) -> Result<(), ReleaseError> {
+    let temporary = directory.join(format!(".{kind}.pending"));
+    match fs::symlink_metadata(&temporary) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::remove_file(&temporary).map_err(ReleaseError::Io)?;
+        }
+        Ok(_) => return Err(ReleaseError::InvalidCleanupIntent),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ReleaseError::Io(error)),
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(ReleaseError::Io)?;
+    if let Err(error) = file
+        .write_all(contents)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&temporary, destination))
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(ReleaseError::Io(error));
+    }
+    sync_directory(directory)
 }
 
 fn replace_symlink(
