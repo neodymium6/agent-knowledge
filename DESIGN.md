@@ -1119,8 +1119,12 @@ atomic `site/` promotion; the ready-only `by-commit/` index is updated after
 promotion and never points at an in-progress release.
 
 Failed or interrupted output may be removed only through a batch-scoped
-staging cleanup operation; prepared `by-id/` releases are never removed by the
-publication path.
+staging cleanup operation. Cleanup first writes a durable marker and moves the
+batch to the deterministic `.staging/.cleanup-<batch-id>/` tombstone. A retry
+finishes that tombstone before acknowledging discard or removing the durable
+batch intent. On Unix, recursive cleanup traverses from pinned directory
+descriptors and removes entries relative to those descriptors. Prepared
+`by-id/` releases are never removed by the publication path.
 
 Release retention is configurable. Removal of old derived releases is an
 administrative maintenance operation and never removes content or accepted

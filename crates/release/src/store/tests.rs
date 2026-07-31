@@ -10,8 +10,8 @@ use ulid::Ulid;
 
 use super::{
     BuildDirectory, MANIFEST_FILE, MANIFEST_SCHEMA_VERSION, ReleaseError, ReleaseManifest,
-    ReleasePolicy, ReleaseStore, derived_reference_is_repairable, ensure_manifest, release_id,
-    validate_release_tree,
+    ReleasePolicy, ReleaseStore, cleanup_name, derived_reference_is_repairable,
+    ensure_cleanup_marker, ensure_manifest, read_manifest, release_id, validate_release_tree,
 };
 
 const FIRST_BATCH: &str = "01K00000000000000000000001";
@@ -258,6 +258,114 @@ fn resumes_from_a_durable_batch_intent_before_promotion() {
     );
 }
 
+#[test]
+fn resumes_cleanup_from_a_deterministic_batch_tombstone() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let prepared = store
+        .prepare(
+            build(&store, batch(FIRST_BATCH), "fictional output\n"),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("release must prepare: {error}"));
+    let recovered_batch = releases.join(".staging").join(FIRST_BATCH);
+    let recovered_site = recovered_batch.join("site");
+    fs::create_dir_all(&recovered_site)
+        .unwrap_or_else(|error| panic!("recovered staging directory must be created: {error}"));
+    for name in ["index.html", MANIFEST_FILE] {
+        fs::copy(
+            releases
+                .join("by-id")
+                .join(prepared.release_id())
+                .join(name),
+            recovered_site.join(name),
+        )
+        .unwrap_or_else(|error| panic!("recovered staged file must be copied: {error}"));
+    }
+    ensure_cleanup_marker(&recovered_batch, batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("cleanup marker must be durable: {error}"));
+    let tombstone = releases
+        .join(".staging")
+        .join(cleanup_name(batch(FIRST_BATCH)));
+    fs::rename(&recovered_batch, &tombstone)
+        .unwrap_or_else(|error| panic!("cleanup rename must be simulated: {error}"));
+    let manifest = read_manifest(&releases.join("by-id").join(prepared.release_id()))
+        .unwrap_or_else(|error| panic!("prepared manifest must be readable: {error}"));
+    store
+        .ensure_batch_intent(batch(FIRST_BATCH), &manifest)
+        .unwrap_or_else(|error| panic!("batch intent must be durable: {error}"));
+
+    let recovered = store
+        .resume_prepare(batch(FIRST_BATCH), FIRST_COMMIT)
+        .unwrap_or_else(|error| panic!("cleanup tombstone must recover: {error}"));
+    assert_eq!(recovered, prepared);
+    assert!(!tombstone.exists());
+    assert!(!releases.join("by-batch").join(FIRST_BATCH).exists());
+}
+
+#[test]
+fn discard_finishes_a_deterministic_cleanup_tombstone() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = build(&store, batch(FIRST_BATCH), "partial fictional output\n");
+    drop(output);
+    let staged = releases.join(".staging").join(FIRST_BATCH);
+    ensure_cleanup_marker(&staged, batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("cleanup marker must be durable: {error}"));
+    let tombstone = releases
+        .join(".staging")
+        .join(cleanup_name(batch(FIRST_BATCH)));
+    fs::rename(&staged, &tombstone)
+        .unwrap_or_else(|error| panic!("cleanup rename must be simulated: {error}"));
+
+    assert!(matches!(
+        store.begin_build(batch(FIRST_BATCH)),
+        Err(ReleaseError::BuildRecoveryRequired)
+    ));
+    store
+        .discard_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("cleanup tombstone must be discarded: {error}"));
+    assert!(!tombstone.exists());
+    let rebuilt = store
+        .begin_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("cleaned batch must be reusable: {error}"));
+    drop(rebuilt);
+}
+
+#[cfg(unix)]
+#[test]
+fn discard_does_not_follow_links_from_the_pinned_cleanup_tree() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let outside = root.0.join("fictional-outside");
+    fs::create_dir(&outside)
+        .unwrap_or_else(|error| panic!("outside fixture must be created: {error}"));
+    fs::write(outside.join("sentinel.txt"), "preserve fictional data\n")
+        .unwrap_or_else(|error| panic!("outside sentinel must be written: {error}"));
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = build(&store, batch(FIRST_BATCH), "partial fictional output\n");
+    symlink(&outside, output.path().join("outside-link"))
+        .unwrap_or_else(|error| panic!("cleanup symlink fixture must be created: {error}"));
+    drop(output);
+
+    store
+        .discard_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("linked partial build must be discarded: {error}"));
+    assert_eq!(
+        fs::read_to_string(outside.join("sentinel.txt"))
+            .unwrap_or_else(|error| panic!("outside sentinel must remain readable: {error}")),
+        "preserve fictional data\n"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_a_malformed_batch_intent_as_recovery_metadata() {
@@ -409,6 +517,45 @@ fn transient_io_errors_do_not_authorize_derived_reference_replacement() {
     assert!(derived_reference_is_repairable(&ReleaseError::Io(
         io::Error::new(io::ErrorKind::NotFound, "fictional missing release"),
     )));
+}
+
+#[test]
+fn tighter_policy_replaces_an_oversized_derived_commit_target() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    {
+        let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+            .unwrap_or_else(|error| panic!("release store must open: {error}"));
+        store
+            .prepare(
+                build(&store, batch(FIRST_BATCH), "oversized fictional output\n"),
+                FIRST_COMMIT,
+                timestamp("2026-07-31T04:00:00Z"),
+            )
+            .unwrap_or_else(|error| panic!("large release must prepare: {error}"));
+    }
+    let strict = ReleasePolicy {
+        maximum_entries: 10,
+        maximum_file_bytes: 8,
+        maximum_total_bytes: 8,
+    };
+    let reopened = ReleaseStore::open(&releases, strict)
+        .unwrap_or_else(|error| panic!("release store must reopen: {error}"));
+    let replacement = reopened
+        .prepare(
+            build(&reopened, batch(SECOND_BATCH), "small\n"),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:05:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("small replacement must prepare: {error}"));
+
+    assert_eq!(
+        reopened
+            .prepared_for_commit(FIRST_COMMIT)
+            .unwrap_or_else(|error| panic!("strict commit lookup must succeed: {error}"))
+            .unwrap_or_else(|| panic!("replacement release must be indexed")),
+        replacement
+    );
 }
 
 #[cfg(target_os = "linux")]
