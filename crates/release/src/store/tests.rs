@@ -288,6 +288,11 @@ fn resumes_cleanup_from_a_deterministic_batch_tombstone() {
     }
     ensure_cleanup_marker(&recovered_batch, batch(FIRST_BATCH))
         .unwrap_or_else(|error| panic!("cleanup marker must be durable: {error}"));
+    let recovered_handle = fs::File::open(&recovered_batch)
+        .unwrap_or_else(|error| panic!("recovered batch must be opened: {error}"));
+    store
+        .ensure_cleanup_intent(batch(FIRST_BATCH), &recovered_handle)
+        .unwrap_or_else(|error| panic!("cleanup intent must be durable: {error}"));
     let tombstone = releases
         .join(".staging")
         .join(cleanup_name(batch(FIRST_BATCH)));
@@ -318,6 +323,11 @@ fn discard_finishes_a_deterministic_cleanup_tombstone() {
     let staged = releases.join(".staging").join(FIRST_BATCH);
     ensure_cleanup_marker(&staged, batch(FIRST_BATCH))
         .unwrap_or_else(|error| panic!("cleanup marker must be durable: {error}"));
+    let staged_handle = fs::File::open(&staged)
+        .unwrap_or_else(|error| panic!("staged batch must be opened: {error}"));
+    store
+        .ensure_cleanup_intent(batch(FIRST_BATCH), &staged_handle)
+        .unwrap_or_else(|error| panic!("cleanup intent must be durable: {error}"));
     let tombstone = releases
         .join(".staging")
         .join(cleanup_name(batch(FIRST_BATCH)));
@@ -336,6 +346,43 @@ fn discard_finishes_a_deterministic_cleanup_tombstone() {
         .begin_build(batch(FIRST_BATCH))
         .unwrap_or_else(|error| panic!("cleaned batch must be reusable: {error}"));
     drop(rebuilt);
+}
+
+#[test]
+fn cleanup_intent_rejects_a_replaced_private_tombstone() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = build(&store, batch(FIRST_BATCH), "partial fictional output\n");
+    drop(output);
+    let staged = releases.join(".staging").join(FIRST_BATCH);
+    let staged_handle = fs::File::open(&staged)
+        .unwrap_or_else(|error| panic!("staged batch must be opened: {error}"));
+    store
+        .ensure_cleanup_intent(batch(FIRST_BATCH), &staged_handle)
+        .unwrap_or_else(|error| panic!("cleanup intent must be durable: {error}"));
+    ensure_cleanup_marker(&staged, batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("cleanup marker must be durable: {error}"));
+    let tombstone = releases
+        .join(".staging")
+        .join(cleanup_name(batch(FIRST_BATCH)));
+    fs::rename(&staged, &tombstone)
+        .unwrap_or_else(|error| panic!("cleanup tombstone must be created: {error}"));
+    let detached = releases.join(".staging").join("detached-fictional-cleanup");
+    fs::rename(&tombstone, &detached)
+        .unwrap_or_else(|error| panic!("cleanup tombstone must be detached: {error}"));
+    fs::create_dir(&tombstone)
+        .unwrap_or_else(|error| panic!("replacement tombstone must be created: {error}"));
+    fs::write(tombstone.join("preserve.txt"), "fictional replacement\n")
+        .unwrap_or_else(|error| panic!("replacement fixture must be written: {error}"));
+
+    assert!(matches!(
+        store.discard_build(batch(FIRST_BATCH)),
+        Err(ReleaseError::InvalidCleanupIntent)
+    ));
+    assert!(tombstone.join("preserve.txt").is_file());
+    assert!(detached.join("site").join("index.html").is_file());
 }
 
 #[cfg(unix)]
@@ -376,9 +423,19 @@ fn discard_removes_unix_sockets_as_non_directory_entries() {
     let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
     let output = build(&store, batch(FIRST_BATCH), "partial fictional output\n");
-    let socket = output.path().join("fictional.sock");
-    let listener = UnixListener::bind(&socket)
+    let socket = root
+        .0
+        .join("releases")
+        .join(".staging")
+        .join(FIRST_BATCH)
+        .join("site")
+        .join("fictional.sock");
+    let short_socket =
+        std::env::temp_dir().join(format!("agent-knowledge-socket-{}", Ulid::generate()));
+    let listener = UnixListener::bind(&short_socket)
         .unwrap_or_else(|error| panic!("Unix socket fixture must bind: {error}"));
+    fs::rename(&short_socket, &socket)
+        .unwrap_or_else(|error| panic!("Unix socket fixture must move into staging: {error}"));
     drop(listener);
     drop(output);
 

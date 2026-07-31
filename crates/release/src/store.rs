@@ -14,10 +14,11 @@ use ulid::Ulid;
 const BY_ID_DIRECTORY: &str = "by-id";
 const BY_COMMIT_DIRECTORY: &str = "by-commit";
 const BY_BATCH_DIRECTORY: &str = "by-batch";
+const CLEANUP_INTENT_DIRECTORY: &str = "cleanup-intent";
 const STAGING_DIRECTORY: &str = ".staging";
 const SITE_DIRECTORY: &str = "site";
 const CURRENT_ENTRY: &str = "current";
-const BINDING_FILE: &str = ".release-store-binding-v3";
+const BINDING_FILE: &str = ".release-store-binding-v4";
 const MANIFEST_FILE: &str = ".agent-knowledge-release.json";
 const CLEANUP_MARKER_FILE: &str = ".agent-knowledge-cleanup";
 const MANIFEST_SCHEMA_VERSION: u16 = 2;
@@ -122,6 +123,7 @@ pub struct ReleaseStore {
     by_id: PinnedDirectory,
     by_commit: PinnedDirectory,
     by_batch: PinnedDirectory,
+    cleanup_intent: PinnedDirectory,
     staging: PinnedDirectory,
     policy: ReleasePolicy,
     mutation_available: Arc<AtomicBool>,
@@ -153,6 +155,7 @@ impl ReleaseStore {
         ensure_or_create_directory(&root.join(BY_ID_DIRECTORY))?;
         ensure_or_create_directory(&root.join(BY_COMMIT_DIRECTORY))?;
         ensure_or_create_directory(&root.join(BY_BATCH_DIRECTORY))?;
+        ensure_or_create_directory(&root.join(CLEANUP_INTENT_DIRECTORY))?;
         ensure_or_create_directory(&root.join(STAGING_DIRECTORY))?;
         sync_directory(&root)?;
         let by_id = pin_directory(
@@ -167,11 +170,18 @@ impl ReleaseStore {
             configured_root.join(BY_BATCH_DIRECTORY),
             root.join(BY_BATCH_DIRECTORY),
         )?;
+        let cleanup_intent = pin_directory(
+            configured_root.join(CLEANUP_INTENT_DIRECTORY),
+            root.join(CLEANUP_INTENT_DIRECTORY),
+        )?;
         let staging = pin_directory(
             configured_root.join(STAGING_DIRECTORY),
             root.join(STAGING_DIRECTORY),
         )?;
-        validate_common_mount(&root_handle, [&by_id, &by_commit, &by_batch, &staging])?;
+        validate_common_mount(
+            &root_handle,
+            [&by_id, &by_commit, &by_batch, &cleanup_intent, &staging],
+        )?;
         let store = Self {
             configured_root,
             root,
@@ -179,6 +189,7 @@ impl ReleaseStore {
             by_id,
             by_commit,
             by_batch,
+            cleanup_intent,
             staging,
             policy,
             mutation_available: Arc::new(AtomicBool::new(true)),
@@ -198,7 +209,7 @@ impl ReleaseStore {
             .join(STAGING_DIRECTORY)
             .join(batch_id.to_string());
         let path = self.staging.stable.join(batch_id.to_string());
-        if path_exists(&self.cleanup_path(batch_id))? {
+        if path_exists(&self.cleanup_path(batch_id))? || self.cleanup_intent_exists(batch_id)? {
             return Err(ReleaseError::BuildRecoveryRequired);
         }
         match fs::create_dir(&path) {
@@ -239,6 +250,7 @@ impl ReleaseStore {
             }
             None => {
                 sync_directory(&self.staging.stable)?;
+                self.remove_cleanup_intent(batch_id)?;
                 self.validate_live_storage()
             }
         }
@@ -290,6 +302,7 @@ impl ReleaseStore {
                     self.cleanup_recovered_staging(batch_id, batch, &manifest)?;
                 } else {
                     sync_directory(&self.staging.stable)?;
+                    self.remove_cleanup_intent(batch_id)?;
                 }
                 self.remove_batch_intent(batch_id)?;
                 return Ok(prepared);
@@ -313,6 +326,7 @@ impl ReleaseStore {
                     self.cleanup_recovered_staging(batch_id, batch, &manifest)?;
                 } else {
                     sync_directory(&self.staging.stable)?;
+                    self.remove_cleanup_intent(batch_id)?;
                 }
                 self.remove_batch_intent(batch_id)?;
                 return Ok(PreparedRelease {
@@ -561,6 +575,7 @@ impl ReleaseStore {
         batch: &BatchLease,
     ) -> Result<(), ReleaseError> {
         let private = self.cleanup_path(batch_id);
+        self.ensure_cleanup_intent(batch_id, &batch.handle)?;
         if batch.private {
             validate_pinned_directory(&private, &batch.handle)?;
         } else {
@@ -573,10 +588,12 @@ impl ReleaseStore {
             sync_directory(&self.staging.stable)?;
             validate_pinned_directory(&private, &batch.handle)?;
         }
+        validate_cleanup_mount(&self.staging.handle, &batch.handle)?;
         clear_cleanup_directory(&batch.handle, batch_id)?;
         validate_pinned_directory(&private, &batch.handle)?;
         remove_empty_directory_at(&self.staging.handle, &cleanup_name(batch_id), &private)?;
         sync_directory(&self.staging.stable)?;
+        self.remove_cleanup_intent(batch_id)?;
         self.validate_live_storage()
     }
 
@@ -600,16 +617,80 @@ impl ReleaseStore {
             return Err(ReleaseError::RecoveredBuildConflict);
         }
         if ordinary_exists {
-            return lock_batch_directory(&configured, &path, batch_id, false).map(Some);
+            let mut batch = lock_batch_directory(&configured, &path, false)?;
+            let marker = cleanup_marker_state(&batch.stable, batch_id)?;
+            let intent = self.cleanup_intent_exists(batch_id)?;
+            if marker || intent {
+                self.validate_cleanup_intent(batch_id, &batch.handle)?;
+                batch.cleanup_started = true;
+            }
+            return Ok(Some(batch));
         }
         if cleanup_exists {
-            return lock_batch_directory(&cleanup_configured, &cleanup, batch_id, true).map(Some);
+            let mut batch = lock_batch_directory(&cleanup_configured, &cleanup, true)?;
+            self.validate_cleanup_intent(batch_id, &batch.handle)?;
+            batch.cleanup_started = true;
+            return Ok(Some(batch));
         }
         Ok(None)
     }
 
     fn cleanup_path(&self, batch_id: BatchId) -> PathBuf {
         self.staging.stable.join(cleanup_name(batch_id))
+    }
+
+    fn cleanup_intent_exists(&self, batch_id: BatchId) -> Result<bool, ReleaseError> {
+        path_exists(&self.cleanup_intent.stable.join(batch_id.to_string()))
+    }
+
+    fn ensure_cleanup_intent(&self, batch_id: BatchId, batch: &File) -> Result<(), ReleaseError> {
+        let path = self.cleanup_intent.stable.join(batch_id.to_string());
+        let expected = cleanup_identity(batch)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => self.validate_cleanup_intent(batch_id, batch),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map_err(ReleaseError::Io)?;
+                file.write_all(&expected).map_err(ReleaseError::Io)?;
+                file.sync_all().map_err(ReleaseError::Io)?;
+                sync_directory(&self.cleanup_intent.stable)?;
+                self.validate_cleanup_intent(batch_id, batch)
+            }
+            Err(error) => Err(ReleaseError::Io(error)),
+        }
+    }
+
+    fn validate_cleanup_intent(&self, batch_id: BatchId, batch: &File) -> Result<(), ReleaseError> {
+        let path = self.cleanup_intent.stable.join(batch_id.to_string());
+        let actual = match read_bounded_regular_file(&path, 256) {
+            Ok(actual) => actual,
+            Err(ReleaseError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ReleaseError::InvalidCleanupIntent);
+            }
+            Err(error) => return Err(error),
+        };
+        if actual == cleanup_identity(batch)? {
+            Ok(())
+        } else {
+            Err(ReleaseError::InvalidCleanupIntent)
+        }
+    }
+
+    fn remove_cleanup_intent(&self, batch_id: BatchId) -> Result<(), ReleaseError> {
+        let path = self.cleanup_intent.stable.join(batch_id.to_string());
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                fs::remove_file(path).map_err(ReleaseError::Io)?;
+            }
+            Ok(_) => return Err(ReleaseError::InvalidCleanupIntent),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ReleaseError::Io(error)),
+        }
+        sync_directory(&self.cleanup_intent.stable)?;
+        self.validate_live_storage()
     }
 
     fn batch_intent(&self, batch_id: BatchId) -> Result<Option<String>, ReleaseError> {
@@ -712,7 +793,13 @@ impl ReleaseStore {
         let expected = binding_bytes(
             &self.configured_root,
             &self.root_handle,
-            [&self.by_id, &self.by_commit, &self.by_batch, &self.staging],
+            [
+                &self.by_id,
+                &self.by_commit,
+                &self.by_batch,
+                &self.cleanup_intent,
+                &self.staging,
+            ],
         )?;
         let path = self.root.join(BINDING_FILE);
         match fs::symlink_metadata(&path) {
@@ -740,11 +827,18 @@ impl ReleaseStore {
         validate_pinned_directory(&self.by_id.configured, &self.by_id.handle)?;
         validate_pinned_directory(&self.by_commit.configured, &self.by_commit.handle)?;
         validate_pinned_directory(&self.by_batch.configured, &self.by_batch.handle)?;
+        validate_pinned_directory(&self.cleanup_intent.configured, &self.cleanup_intent.handle)?;
         validate_pinned_directory(&self.staging.configured, &self.staging.handle)?;
         let expected = binding_bytes(
             &self.configured_root,
             &self.root_handle,
-            [&self.by_id, &self.by_commit, &self.by_batch, &self.staging],
+            [
+                &self.by_id,
+                &self.by_commit,
+                &self.by_batch,
+                &self.cleanup_intent,
+                &self.staging,
+            ],
         )?;
         validate_binding(&self.root.join(BINDING_FILE), &expected)
     }
@@ -1146,7 +1240,6 @@ fn validate_regular_file(path: &Path, metadata: &fs::Metadata) -> Result<(), Rel
 fn lock_batch_directory(
     configured: &Path,
     path: &Path,
-    batch_id: BatchId,
     private: bool,
 ) -> Result<BatchLease, ReleaseError> {
     ensure_real_directory(path)?;
@@ -1154,12 +1247,11 @@ fn lock_batch_directory(
     lock_file(&handle)?;
     let stable = stable_directory_path(&handle, configured)?;
     validate_pinned_directory(configured, &handle)?;
-    let cleanup_started = cleanup_marker_state(&stable, batch_id, private)?;
     Ok(BatchLease {
         configured: configured.into(),
         stable,
         handle,
-        cleanup_started,
+        cleanup_started: false,
         private,
     })
 }
@@ -1170,6 +1262,46 @@ fn cleanup_name(batch_id: BatchId) -> String {
 
 fn cleanup_marker_bytes(batch_id: BatchId) -> Vec<u8> {
     format!("agent-knowledge-release-cleanup-v1\nbatch-id={batch_id}\n").into_bytes()
+}
+
+fn cleanup_identity(directory: &File) -> Result<Vec<u8>, ReleaseError> {
+    let mut bytes = b"agent-knowledge-release-cleanup-intent-v1\0".to_vec();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = directory.metadata().map_err(ReleaseError::Io)?;
+        bytes.extend_from_slice(&metadata.dev().to_le_bytes());
+        bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+    }
+    #[cfg(target_os = "linux")]
+    bytes.extend_from_slice(&mount_id(directory)?.to_le_bytes());
+    Ok(bytes)
+}
+
+fn read_bounded_regular_file(path: &Path, maximum: u64) -> Result<Vec<u8>, ReleaseError> {
+    let listed = fs::symlink_metadata(path).map_err(ReleaseError::Io)?;
+    if !listed.file_type().is_file() || listed.len() > maximum {
+        return Err(ReleaseError::InvalidCleanupIntent);
+    }
+    validate_regular_file(path, &listed).map_err(|_| ReleaseError::InvalidCleanupIntent)?;
+    let file = File::open(path).map_err(ReleaseError::Io)?;
+    let opened = file.metadata().map_err(ReleaseError::Io)?;
+    if !opened.file_type().is_file()
+        || opened.len() != listed.len()
+        || !same_metadata(&listed, &opened)
+    {
+        return Err(ReleaseError::InvalidCleanupIntent);
+    }
+    validate_regular_file(path, &opened).map_err(|_| ReleaseError::InvalidCleanupIntent)?;
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(ReleaseError::Io)?;
+    if bytes.len() as u64 != opened.len() {
+        return Err(ReleaseError::InvalidCleanupIntent);
+    }
+    Ok(bytes)
 }
 
 fn ensure_cleanup_marker(directory: &Path, batch_id: BatchId) -> Result<(), ReleaseError> {
@@ -1214,27 +1346,20 @@ fn ensure_cleanup_marker(directory: &Path, batch_id: BatchId) -> Result<(), Rele
     sync_directory(directory)
 }
 
-fn cleanup_marker_state(
-    directory: &Path,
-    batch_id: BatchId,
-    private: bool,
-) -> Result<bool, ReleaseError> {
+fn cleanup_marker_state(directory: &Path, batch_id: BatchId) -> Result<bool, ReleaseError> {
     let marker = directory.join(CLEANUP_MARKER_FILE);
     match fs::symlink_metadata(&marker) {
         Ok(_) => {
             ensure_cleanup_marker(directory, batch_id)?;
             Ok(true)
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound && !private => Ok(false),
-        // The deterministic tombstone is itself durable cleanup state. It can
-        // be non-empty without its marker if a writer raced final removal.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(ReleaseError::Io(error)),
     }
 }
 
 #[cfg(unix)]
-fn clear_cleanup_directory(directory: &File, batch_id: BatchId) -> Result<(), ReleaseError> {
+fn clear_cleanup_directory(directory: &File, _batch_id: BatchId) -> Result<(), ReleaseError> {
     use nix::errno::Errno;
     use nix::unistd::{UnlinkatFlags, unlinkat};
 
@@ -1245,16 +1370,14 @@ fn clear_cleanup_directory(directory: &File, batch_id: BatchId) -> Result<(), Re
     }
     directory.sync_all().map_err(ReleaseError::Io)?;
     let stable = stable_directory_path(directory, Path::new(""))?;
-    if cleanup_marker_state(&stable, batch_id, true)? {
-        let mut entries = fs::read_dir(&stable).map_err(ReleaseError::Io)?;
-        if entries
-            .next()
-            .transpose()
-            .map_err(ReleaseError::Io)?
-            .is_some()
-        {
-            return Err(ReleaseError::RecoveredBuildConflict);
-        }
+    let mut entries = fs::read_dir(&stable).map_err(ReleaseError::Io)?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(ReleaseError::Io)?
+        .is_some()
+    {
+        return Err(ReleaseError::RecoveredBuildConflict);
     }
     Ok(())
 }
@@ -1423,7 +1546,7 @@ fn nix_io_error(error: nix::errno::Errno) -> ReleaseError {
 }
 
 #[cfg(not(unix))]
-fn clear_cleanup_directory(directory: &File, batch_id: BatchId) -> Result<(), ReleaseError> {
+fn clear_cleanup_directory(directory: &File, _batch_id: BatchId) -> Result<(), ReleaseError> {
     let stable = stable_directory_path(directory, Path::new(""))?;
     let marker = stable.join(CLEANUP_MARKER_FILE);
     for entry in fs::read_dir(&stable).map_err(ReleaseError::Io)? {
@@ -1443,7 +1566,13 @@ fn clear_cleanup_directory(directory: &File, batch_id: BatchId) -> Result<(), Re
         Err(error) => return Err(ReleaseError::Io(error)),
     }
     sync_directory(&stable)?;
-    if cleanup_marker_state(&stable, batch_id, true)? {
+    if fs::read_dir(&stable)
+        .map_err(ReleaseError::Io)?
+        .next()
+        .transpose()
+        .map_err(ReleaseError::Io)?
+        .is_none()
+    {
         Ok(())
     } else {
         Err(ReleaseError::RecoveredBuildConflict)
@@ -1569,7 +1698,7 @@ fn binding_bytes<'a>(
     root_handle: &File,
     directories: impl IntoIterator<Item = &'a PinnedDirectory>,
 ) -> Result<Vec<u8>, ReleaseError> {
-    let mut bytes = b"agent-knowledge-release-store-v3\0".to_vec();
+    let mut bytes = b"agent-knowledge-release-store-v4\0".to_vec();
     bytes.extend_from_slice(root.as_os_str().as_encoded_bytes());
     for handle in std::iter::once(root_handle).chain(
         directories
@@ -1703,6 +1832,7 @@ pub enum ReleaseError {
     CleanupIncomplete,
     RecoveredBuildConflict,
     InvalidBatchIntent,
+    InvalidCleanupIntent,
     MissingRecoveryState,
     BuildAlreadyExists(BatchId),
     OutputTooLarge,
@@ -1750,6 +1880,7 @@ impl fmt::Display for ReleaseError {
                 formatter.write_str("recovered release build conflicts with its prepared release")
             }
             Self::InvalidBatchIntent => formatter.write_str("release batch intent is invalid"),
+            Self::InvalidCleanupIntent => formatter.write_str("release cleanup intent is invalid"),
             Self::MissingRecoveryState => formatter.write_str("release recovery state is missing"),
             Self::BuildAlreadyExists(batch_id) => {
                 write!(

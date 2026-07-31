@@ -1076,6 +1076,8 @@ releases/
 │   └── <commit> -> ../by-id/<release-id>/
 ├── by-batch/
 │   └── <batch-id> -> ../by-id/<release-id>/
+├── cleanup-intent/
+│   └── <batch-id>
 └── current -> by-id/20260731T040500Z-<commit>/
 ```
 
@@ -1092,11 +1094,11 @@ If a build or activation fails, the previous `current` release remains
 available.
 
 The release store pins the release root, `.staging/`, `by-id/`, `by-commit/`,
-and `by-batch/` directory identities and requires them to share one Linux
-mount. Generated output is bounded by entry count, individual-file bytes, and
-total bytes during validation and synchronization; symbolic links, special
-files, and hard-linked files are rejected. Before promotion, each release
-receives a synchronized, versioned
+`by-batch/`, and `cleanup-intent/` directory identities and requires them to
+share one Linux mount. Generated output is bounded by entry count,
+individual-file bytes, and total bytes during validation and synchronization;
+symbolic links, special files, and hard-linked files are rejected. Before
+promotion, each release receives a synchronized, versioned
 `.agent-knowledge-release.json` manifest binding its release ID, full commit
 ID, UTC creation time, and a deterministic SHA-256 revision of the generated
 tree. The tree revision is checked again before activation, so a changed
@@ -1119,15 +1121,17 @@ atomic `site/` promotion; the ready-only `by-commit/` index is updated after
 promotion and never points at an in-progress release.
 
 Failed or interrupted output may be removed only through a batch-scoped
-staging cleanup operation. Cleanup first writes a durable marker and moves the
-batch to the deterministic `.staging/.cleanup-<batch-id>/` tombstone. A retry
-finishes that tombstone before acknowledging discard or removing the durable
-batch intent. On Unix, recursive cleanup traverses from pinned directory
-descriptors, refuses child mount points, and removes entries relative to those
-descriptors. Work is split into bounded passes with a bounded descriptor stack;
-deep subtrees are atomically rehomed inside the tombstone so a later pass can
-continue without recursive call-stack growth. Prepared `by-id/` releases are
-never removed by the publication path.
+staging cleanup operation. Cleanup first records the pinned batch device,
+inode, and mount identity in `cleanup-intent/<batch-id>`, writes a marker, and
+moves the batch to the deterministic `.staging/.cleanup-<batch-id>/`
+tombstone. A retry validates the tombstone against that external intent before
+continuing, including after the marker has been removed. On Unix, recursive
+cleanup traverses from pinned directory descriptors, refuses child mount
+points, and removes entries relative to those descriptors. Work is split into
+bounded passes with a bounded descriptor stack; deep subtrees are atomically
+rehomed inside the tombstone so a later pass can continue without recursive
+call-stack growth. Prepared `by-id/` releases are never removed by the
+publication path.
 
 Release retention is configurable. Removal of old derived releases is an
 administrative maintenance operation and never removes content or accepted
