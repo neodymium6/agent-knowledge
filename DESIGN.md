@@ -98,6 +98,20 @@ agent-knowledge worker ...
 agent-knowledge admin ...
 ```
 
+The implementation bootstrap exposes one local-only administrative intake
+command before the SSH Gateway is added:
+
+```text
+agent-knowledge admin submit \
+  --queue-root /srv/agent-knowledge/queue \
+  --package-root ./fictional-request
+```
+
+`package-root` contains extracted `request.json` and `payload/` entries. The
+command validates that directory, restreams every permitted file through the
+same `FileQueue` limits as the future Gateway, and prints one JSON acceptance
+result. It never copies an unchecked directory into an accepted queue state.
+
 The same executable can be used with different entry-point arguments in a
 container. Separate binaries may be produced from the same workspace later,
 without changing protocol or domain logic.
@@ -249,13 +263,13 @@ knowledge/
 │   ├── pending/
 │   ├── processing/
 │   ├── completed/
-│   └── failed/
+│   ├── failed/
+│   └── .locks/                # fixed queue and Worker lock identities
 ├── repository/              # bare Git repository
 ├── releases/
 │   ├── by-id/
 │   └── current -> by-id/<release-id>/
-├── work/                    # disposable worktrees and builds
-└── locks/
+└── work/                    # disposable worktrees and builds
 ```
 
 `repository/` is a bare Git repository. `content/` is its canonical linked
@@ -686,6 +700,66 @@ examines interrupted entries, commit trailers, the official branch, and
 release metadata. It either resumes the next idempotent phase or returns the
 request to `pending/`.
 
+Every Worker queue transition requires an exclusive Worker session. Session
+creation takes the fixed `queue/.locks/repository-writer.lock` without waiting
+and fails if another Worker owns it. This lock is separate from the fixed,
+short-lived `queue/.locks/queue.lock`. Because both identities are derived from
+the queue root rather than supplied by callers, independently initialized
+handles for the same queue cannot select different lock files. The Gateway can
+continue accepting requests while the Worker is otherwise idle or applying a
+batch.
+
+Pending selection takes a fixed acceptance-sequence snapshot and incrementally
+walks the pending directory. Each call has a maximum number of directory
+entries to inspect, and the scanner retains only the earliest configured number
+of candidates in memory. Selection finishes the complete snapshot before
+claiming, then orders retained requests by acceptance sequence and request ID.
+The queue lock is held only while taking the snapshot and while performing
+state transitions, not while reading and hashing immutable packages. Requests
+accepted after the snapshot began remain pending for the next batch.
+
+A pending package that has a canonical request ID but fails deterministic
+immutable validation is given an atomic `result.json` and moved to `failed/`.
+The scanner then continues, so one damaged request cannot indefinitely block
+unrelated valid work. Structurally invalid queue entries that cannot be safely
+identified as requests remain operator-visible corruption and stop the scan.
+
+The initial claim record is a bounded, versioned `phase.json` sidecar:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "01K00000000000000000000000",
+  "batch_id": "01K00000000000000000000010",
+  "attempt": 1,
+  "phase": "claimed",
+  "updated_at": "2026-07-31T04:00:00Z"
+}
+```
+
+Claiming one request validates and hashes the accepted package before taking the
+queue lock. While holding the lock it rechecks the state, digest, and bounded
+phase metadata, atomically writes and synchronizes this record through
+`queue/worker-tmp/`, renames `pending/<request-id>/` to
+`processing/<request-id>/`, and synchronizes both state directories. Batch
+claims acquire and release the queue lock per request. A retry after a
+phase-only interrupted claim advances the attempt number. A request already
+renamed to `processing/` keeps enough durable ownership metadata to be
+recovered.
+
+Returning a claimed request to `pending/` requires an exact token containing
+the request ID, batch ID, and attempt. This prevents a stale Worker from
+requeueing a later attempt owned by another batch. The phase record remains in
+the package so the next claim can advance the attempt monotonically.
+
+After acquiring the writer lock, a replacement Worker incrementally scans
+`processing/` with an explicit entry limit. It reconstructs exact claim tokens
+from validated packages and durable phase records. No other Worker transition
+is allowed until that recovery scan completes successfully; an error leaves the
+session recovery-gated. This also recovers requests for which rename succeeded
+but the previous process failed before returning a token or completing
+directory synchronization.
+
 ## 17. Revisions and conflicts
 
 Mutable Markdown updates use an exact SHA-256 digest of the current file bytes:
@@ -904,7 +978,9 @@ A failed request is retained:
 
 ```json
 {
+  "schema_version": 1,
   "request_id": "01K00000000000000000000000",
+  "batch_id": "01K00000000000000000000010",
   "status": "failed",
   "error_code": "REVISION_CONFLICT",
   "failed_at": "2026-07-31T04:00:00+09:00"

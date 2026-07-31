@@ -15,11 +15,22 @@ use crate::{
     validate_accepted_package, validate_package,
 };
 
+mod worker;
+pub use worker::{
+    BatchClaimOutcome, CURRENT_WORKER_PHASE_SCHEMA_VERSION, CURRENT_WORKER_RESULT_SCHEMA_VERSION,
+    ClaimToken, ClaimedPackage, ProcessingScanOutcome, WorkerPhase, WorkerPhaseRecord,
+    WorkerQueueError, WorkerResultRecord, WorkerResultStatus, WorkerSession,
+};
+
 const REQUEST_FILE_NAME: &str = "request.json";
 const DIGEST_FILE_NAME: &str = "digest";
 const ACCEPTANCE_FILE_NAME: &str = "acceptance.json";
 const NEXT_SEQUENCE_FILE_NAME: &str = "next-sequence";
 const QUARANTINE_MARKER_FILE_NAME: &str = ".quarantined-at";
+const WORKER_TEMP_DIRECTORY_NAME: &str = "worker-tmp";
+const LOCK_DIRECTORY_NAME: &str = ".locks";
+const QUEUE_LOCK_FILE_NAME: &str = "queue.lock";
+const WORKER_LOCK_FILE_NAME: &str = "repository-writer.lock";
 const PAYLOAD_DIRECTORY_NAME: &str = "payload";
 const COPY_BUFFER_LENGTH: usize = 64 * 1024;
 const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
@@ -92,6 +103,7 @@ pub enum EnqueueOutcome {
 pub struct FileQueue {
     queue_root: PathBuf,
     lock_file: PathBuf,
+    worker_lock_file: PathBuf,
     policy: PackagePolicy,
     maintenance_scanners: Arc<Mutex<MaintenanceScanners>>,
 }
@@ -100,34 +112,34 @@ impl FileQueue {
     /// Creates missing queue-state directories and opens a queue handle.
     ///
     /// The queue root and all state directories must reside on the same file
-    /// system. The lock path may be placed in the storage tree's `locks/`
-    /// directory.
+    /// system. Queue and Repository Worker locks use fixed names below the queue
+    /// root's `.locks/` directory, so independently initialized handles for the
+    /// same queue cannot select different lock identities.
     ///
     /// # Errors
     ///
-    /// Returns an error when the configured paths cannot be initialized as
-    /// regular directories and a regular lock file.
+    /// Returns an error when the configured queue root cannot be initialized
+    /// with regular state and lock directories and regular lock files.
     pub fn initialize(
         queue_root: impl Into<PathBuf>,
-        lock_file: impl Into<PathBuf>,
         policy: PackagePolicy,
     ) -> Result<Self, QueueError> {
         let queue_root = queue_root.into();
-        let lock_file = lock_file.into();
+        let lock_root = queue_root.join(LOCK_DIRECTORY_NAME);
+        let lock_file = lock_root.join(QUEUE_LOCK_FILE_NAME);
+        let worker_lock_file = lock_root.join(WORKER_LOCK_FILE_NAME);
 
         ensure_directory(&queue_root)?;
+        ensure_directory(&lock_root)?;
         ensure_directory(&queue_root.join("incoming"))?;
         ensure_directory(&queue_root.join("quarantine"))?;
+        ensure_directory(&queue_root.join(WORKER_TEMP_DIRECTORY_NAME))?;
         for state in QueueState::ALL {
             ensure_directory(&queue_root.join(state.directory_name()))?;
         }
 
-        if let Some(parent) = lock_file.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            ensure_directory(parent)?;
-        }
         ensure_lock_file(&lock_file)?;
+        ensure_lock_file(&worker_lock_file)?;
         let initialization_lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -136,21 +148,17 @@ impl FileQueue {
         initialization_lock.lock().map_err(QueueError::Io)?;
         ensure_sequence_file(&queue_root.join(NEXT_SEQUENCE_FILE_NAME), &queue_root)?;
 
+        sync_directory(&lock_root)?;
         sync_directory(&queue_root)?;
         if let Some(parent) = queue_root.parent()
             && !parent.as_os_str().is_empty()
         {
             sync_directory(parent)?;
         }
-        if let Some(parent) = lock_file.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            sync_directory(parent)?;
-        }
-
         Ok(Self {
             queue_root,
             lock_file,
+            worker_lock_file,
             policy,
             maintenance_scanners: Arc::new(Mutex::new(MaintenanceScanners::default())),
         })

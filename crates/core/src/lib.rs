@@ -11,7 +11,7 @@ pub use document::{
     CURRENT_DOCUMENT_SCHEMA_VERSION, DocumentLimits, DocumentMetadata, DocumentValidationError,
 };
 pub use error_code::{DocumentStatus, ErrorCode};
-pub use id::{DocumentId, RequestId, SessionId};
+pub use id::{BatchId, DocumentId, RequestId, SessionId};
 pub use path::{AttachmentName, PathValidationError, PayloadPath, ProjectId};
 pub use request::{
     CURRENT_PROTOCOL_VERSION, ChangeRequest, DocumentType, Operation, RequestDecodeError,
