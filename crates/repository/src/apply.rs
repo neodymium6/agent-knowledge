@@ -100,7 +100,14 @@ fn apply_request_with_policy(
 ) -> Result<ApplyOutcome, ApplyError> {
     let index = ContentIndex::build(content_root, policy, package_policy)
         .map_err(ApplyError::ContentIndex)?;
-    let plan = build_plan(content_root, package_root, package, &index, policy)?;
+    let plan = build_plan(
+        content_root,
+        package_root,
+        package,
+        &index,
+        policy,
+        package_policy.limits().maximum_total_bytes,
+    )?;
     #[cfg(test)]
     let operations_applied = package.request().operations.len();
     let moves = execute_plan(content_root, plan)?;
@@ -116,6 +123,7 @@ fn apply_request_with_policy(
 #[derive(Clone, Debug)]
 struct VirtualDocument {
     relative_path: PathBuf,
+    canonical_path: PathBuf,
     document_type: DocumentType,
     project: Option<ProjectId>,
     created: OffsetDateTime,
@@ -123,7 +131,7 @@ struct VirtualDocument {
     archived: bool,
     status: DocumentStatus,
     revision: Revision,
-    markdown: Vec<u8>,
+    markdown: Option<Vec<u8>>,
 }
 
 enum PlannedMutation {
@@ -147,6 +155,7 @@ fn build_plan(
     package: &ValidatedPackage,
     index: &ContentIndex,
     policy: ContentPolicy,
+    maximum_planned_bytes: u64,
 ) -> Result<Vec<PlannedMutation>, ApplyError> {
     let request = package.request();
     let operation_time = package
@@ -158,6 +167,7 @@ fn build_plan(
     let mut plan = Vec::with_capacity(request.operations.len());
     let mut documents = HashMap::<DocumentId, VirtualDocument>::new();
     let mut occupancy = VirtualOccupancy::new(content_root);
+    let mut planned_bytes = 0_u64;
 
     for operation in &request.operations {
         match operation {
@@ -195,6 +205,7 @@ fn build_plan(
                     *document_id,
                 );
                 occupancy.reserve(&bundle_path(&relative_path, request.document_type))?;
+                reserve_planned_bytes(&mut planned_bytes, bytes.len(), maximum_planned_bytes)?;
                 plan.push(PlannedMutation::WriteNew {
                     relative_path: relative_path.clone(),
                     bytes: bytes.clone(),
@@ -202,6 +213,7 @@ fn build_plan(
                 documents.insert(
                     *document_id,
                     VirtualDocument {
+                        canonical_path: relative_path.clone(),
                         relative_path,
                         document_type: request.document_type,
                         project: request.project.clone(),
@@ -210,7 +222,7 @@ fn build_plan(
                         archived: false,
                         status: metadata.status,
                         revision: revision(&bytes),
-                        markdown: bytes,
+                        markdown: Some(bytes),
                     },
                 );
             }
@@ -261,6 +273,7 @@ fn build_plan(
                         detail: "document update time must increase",
                     });
                 }
+                reserve_planned_bytes(&mut planned_bytes, bytes.len(), maximum_planned_bytes)?;
                 plan.push(PlannedMutation::Replace {
                     relative_path: document.relative_path.clone(),
                     bytes: bytes.clone(),
@@ -268,7 +281,7 @@ fn build_plan(
                 document.status = metadata.status;
                 document.updated = metadata.updated;
                 document.revision = revision(&bytes);
-                document.markdown = bytes;
+                document.markdown = Some(bytes);
             }
             Operation::MoveDocument {
                 document_id,
@@ -327,16 +340,28 @@ fn build_plan(
                 let destination_bundle = bundle_path(&destination, document.document_type);
                 let source_bundle = bundle_path(&document.relative_path, document.document_type);
                 occupancy.move_path(&source_bundle, &destination_bundle)?;
+                if document.markdown.is_none() {
+                    document.markdown = Some(read_canonical_markdown(
+                        content_root,
+                        &document.canonical_path,
+                        policy.maximum_markdown_bytes,
+                        document.revision,
+                    )?);
+                }
                 let archived = archived_markdown(
-                    &document.markdown,
+                    document
+                        .markdown
+                        .as_deref()
+                        .ok_or(ApplyError::ContentChangedDuringApply)?,
                     policy,
                     request.request_id,
                     operation_time,
                 )?;
                 let archived_revision = revision(&archived);
+                reserve_planned_bytes(&mut planned_bytes, archived.len(), maximum_planned_bytes)?;
                 plan.push(PlannedMutation::Replace {
                     relative_path: document.relative_path.clone(),
-                    bytes: archived.clone(),
+                    bytes: archived,
                 });
                 plan.push(PlannedMutation::Move {
                     source: source_bundle,
@@ -347,7 +372,7 @@ fn build_plan(
                 document.status = DocumentStatus::Archived;
                 document.updated = Some(operation_time);
                 document.revision = archived_revision;
-                document.markdown = archived;
+                document.markdown = None;
             }
             Operation::AddAttachment {
                 document_id,
@@ -374,9 +399,11 @@ fn build_plan(
                     .unwrap_or_else(|| Path::new(""))
                     .join(name.as_str());
                 occupancy.reserve(&relative_path)?;
+                let bytes = read_payload(package_root, package, source.as_str())?;
+                reserve_planned_bytes(&mut planned_bytes, bytes.len(), maximum_planned_bytes)?;
                 plan.push(PlannedMutation::WriteNew {
                     relative_path,
-                    bytes: read_payload(package_root, package, source.as_str())?,
+                    bytes,
                 });
             }
         }
@@ -388,8 +415,8 @@ fn build_plan(
 fn resolve_document<'a>(
     documents: &'a mut HashMap<DocumentId, VirtualDocument>,
     index: &ContentIndex,
-    content_root: &Path,
-    policy: ContentPolicy,
+    _content_root: &Path,
+    _policy: ContentPolicy,
     document_id: DocumentId,
 ) -> Result<&'a mut VirtualDocument, ApplyError> {
     match documents.entry(document_id) {
@@ -398,14 +425,9 @@ fn resolve_document<'a>(
             let record = index
                 .get(document_id)
                 .ok_or(ApplyError::DocumentNotFound { document_id })?;
-            let markdown = read_canonical_markdown(
-                content_root,
-                record.relative_path(),
-                policy.maximum_markdown_bytes,
-                record.revision(),
-            )?;
             Ok(entry.insert(VirtualDocument {
                 relative_path: record.relative_path().to_path_buf(),
+                canonical_path: record.relative_path().to_path_buf(),
                 document_type: record.location().document_type(),
                 project: record.location().project().cloned(),
                 created: record.metadata().created,
@@ -413,10 +435,26 @@ fn resolve_document<'a>(
                 archived: record.location().is_archived(),
                 status: record.metadata().status,
                 revision: record.revision(),
-                markdown,
+                markdown: None,
             }))
         }
     }
+}
+
+fn reserve_planned_bytes(
+    total: &mut u64,
+    additional: usize,
+    maximum: u64,
+) -> Result<(), ApplyError> {
+    let additional =
+        u64::try_from(additional).map_err(|_| ApplyError::PlanningBytesExceeded { maximum })?;
+    *total = total
+        .checked_add(additional)
+        .ok_or(ApplyError::PlanningBytesExceeded { maximum })?;
+    if *total > maximum {
+        return Err(ApplyError::PlanningBytesExceeded { maximum });
+    }
+    Ok(())
 }
 
 fn read_canonical_markdown(
@@ -873,6 +911,11 @@ pub enum ApplyError {
         /// Conflicting relative content path.
         path: PathBuf,
     },
+    /// Planned output bytes exceeded the configured per-request package bound.
+    PlanningBytesExceeded {
+        /// Configured maximum planned bytes.
+        maximum: u64,
+    },
     /// A referenced Markdown payload could not be decoded.
     InvalidPayloadDocument {
         /// Payload-relative path.
@@ -933,6 +976,9 @@ impl fmt::Display for ApplyError {
             Self::DestinationExists { path } => {
                 write!(formatter, "destination `{}` already exists", path.display())
             }
+            Self::PlanningBytesExceeded { maximum } => {
+                write!(formatter, "planned output exceeds the {maximum}-byte limit")
+            }
             Self::InvalidPayloadDocument { path, source } => {
                 write!(
                     formatter,
@@ -989,6 +1035,7 @@ impl ApplyError {
             Self::OperationForbidden { .. } | Self::DestinationExists { .. } => {
                 Some(ErrorCode::OperationForbidden)
             }
+            Self::PlanningBytesExceeded { .. } => Some(ErrorCode::LimitExceeded),
             Self::ResultingContent(ContentIndexError::Io(_)) => None,
             Self::ResultingContent(_) => Some(ErrorCode::ContentValidationFailed),
             Self::InvalidPayloadDocument { .. } | Self::InvalidPayloadMetadata { .. } => {

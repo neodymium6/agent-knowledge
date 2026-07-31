@@ -97,7 +97,6 @@ pub struct GitRepository {
     journal_root: PathBuf,
     worktree_root: PathBuf,
     writer_lock: PathBuf,
-    canonical_index: PathBuf,
     official_ref: String,
     identity: GitIdentity,
 }
@@ -209,25 +208,22 @@ impl GitRepository {
         if parse_text(&symbolic_head.stdout)? != official_ref {
             return Err(GitTransactionError::CanonicalWorktreeBranchMismatch);
         }
-        let canonical_index = run_git(
-            Some(canonical_worktree),
-            None,
-            [
-                OsStr::new("rev-parse"),
-                OsStr::new("--path-format=absolute"),
-                OsStr::new("--git-path"),
-                OsStr::new("index"),
-            ],
-        )?;
-        let canonical_index = PathBuf::from(parse_text(&canonical_index.stdout)?);
         validate_nonoverlapping_paths(git_directory, canonical_worktree, work_root)?;
         let journal_root = work_root.join("transactions");
         let worktree_root = work_root.join("worktrees");
         ensure_or_create_real_directory(&journal_root)?;
         ensure_or_create_real_directory(&worktree_root)?;
-        let writer_lock = work_root.join("repository-writer.lock");
+        let repository_state = git_directory.join("agent-knowledge");
+        ensure_or_create_real_directory(&repository_state)?;
+        let writer_lock = repository_state.join("writer.lock");
         ensure_regular_file(&writer_lock)?;
-        sync_directory(work_root).map_err(GitTransactionError::Io)?;
+        let writer = lock_file(&writer_lock)?;
+        ensure_work_root_binding(
+            &repository_state.join("work-root"),
+            &fs::canonicalize(work_root).map_err(GitTransactionError::Io)?,
+        )?;
+        drop(writer);
+        sync_directory(&repository_state).map_err(GitTransactionError::Io)?;
 
         Ok(Self {
             git_directory: git_directory.into(),
@@ -235,7 +231,6 @@ impl GitRepository {
             journal_root,
             worktree_root,
             writer_lock,
-            canonical_index,
             official_ref,
             identity,
         })
@@ -308,10 +303,6 @@ impl GitRepository {
             validate_worker_identity(&journal, worker)?;
             match journal.state {
                 JournalState::Preparing => {
-                    remove_stale_lock(&ref_lock_path(
-                        &self.git_directory,
-                        &transaction_ref(batch_id),
-                    )?)?;
                     let actual = self.resolve_commit(&self.official_ref)?;
                     if actual != journal.base_commit {
                         return Err(GitTransactionError::OfficialBranchChanged {
@@ -536,10 +527,6 @@ impl GitRepository {
                 actual,
             });
         }
-        remove_stale_lock(&ref_lock_path(
-            &self.git_directory,
-            &transaction_ref(batch_id),
-        )?)?;
         self.remove_worktree(&self.worktree_path(batch_id))?;
         self.remove_preparing_ref(batch_id, &journal.base_commit)?;
         remove_journal(&journal_path)
@@ -625,9 +612,7 @@ impl GitRepository {
         };
         if let Some((commit, publication_started)) = committed {
             self.validate_committed_journal(&journal)?;
-            if publication_started {
-                self.remove_stale_publication_locks(batch_id)?;
-            } else {
+            if !publication_started {
                 let actual = self.resolve_commit(&self.official_ref)?;
                 if actual != journal.base_commit {
                     return Err(GitTransactionError::OfficialBranchChanged {
@@ -700,28 +685,9 @@ impl GitRepository {
     }
 
     fn lock_writer(&self) -> Result<RepositoryWriter, GitTransactionError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.writer_lock)
-            .map_err(GitTransactionError::Io)?;
-        match file.try_lock() {
-            Ok(()) => Ok(RepositoryWriter(file)),
-            Err(TryLockError::WouldBlock) => Err(GitTransactionError::RepositoryBusy(
-                self.writer_lock.clone(),
-            )),
-            Err(TryLockError::Error(error)) => Err(GitTransactionError::Io(error)),
-        }
-    }
-
-    fn remove_stale_publication_locks(&self, batch_id: BatchId) -> Result<(), GitTransactionError> {
-        let official = ref_lock_path(&self.git_directory, &self.official_ref)?;
-        let transaction = ref_lock_path(&self.git_directory, &transaction_ref(batch_id))?;
-        let index_lock = self.canonical_index.with_extension("lock");
-        for path in [&official, &transaction, &index_lock] {
-            remove_stale_lock(path)?;
-        }
-        Ok(())
+        let writer = lock_file(&self.writer_lock)?;
+        validate_local_git_config(&self.git_directory)?;
+        Ok(writer)
     }
 
     fn validate_committed_journal(
@@ -1428,30 +1394,44 @@ fn ensure_regular_file(path: &Path) -> Result<(), GitTransactionError> {
     }
 }
 
-fn ref_lock_path(git_directory: &Path, reference: &str) -> Result<PathBuf, GitTransactionError> {
-    let relative = reference
-        .strip_prefix("refs/")
-        .ok_or(GitTransactionError::InvalidGitOutput)?;
-    let reference_path = git_directory.join("refs").join(relative);
-    let name = reference_path
-        .file_name()
-        .ok_or(GitTransactionError::InvalidGitOutput)?;
-    let mut lock_name = name.to_os_string();
-    lock_name.push(".lock");
-    Ok(reference_path.with_file_name(lock_name))
+fn lock_file(path: &Path) -> Result<RepositoryWriter, GitTransactionError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(GitTransactionError::Io)?;
+    match file.try_lock() {
+        Ok(()) => Ok(RepositoryWriter(file)),
+        Err(TryLockError::WouldBlock) => {
+            Err(GitTransactionError::RepositoryBusy(path.to_path_buf()))
+        }
+        Err(TryLockError::Error(error)) => Err(GitTransactionError::Io(error)),
+    }
 }
 
-fn remove_stale_lock(path: &Path) -> Result<(), GitTransactionError> {
+fn ensure_work_root_binding(path: &Path, work_root: &Path) -> Result<(), GitTransactionError> {
+    let expected = work_root.as_os_str().as_encoded_bytes();
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            fs::remove_file(path).map_err(GitTransactionError::Io)?;
-            let parent = path
-                .parent()
-                .ok_or_else(|| GitTransactionError::UnsafeGitLock(path.into()))?;
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 16 * 1024 => {
+            let actual = fs::read(path).map_err(GitTransactionError::Io)?;
+            if actual == expected {
+                Ok(())
+            } else {
+                Err(GitTransactionError::WorkRootMismatch)
+            }
+        }
+        Ok(_) => Err(GitTransactionError::WorkRootMismatch),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(GitTransactionError::Io)?;
+            file.write_all(expected).map_err(GitTransactionError::Io)?;
+            file.sync_all().map_err(GitTransactionError::Io)?;
+            let parent = path.parent().ok_or(GitTransactionError::WorkRootMismatch)?;
             sync_directory(parent).map_err(GitTransactionError::Io)
         }
-        Ok(_) => Err(GitTransactionError::UnsafeGitLock(path.into())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(GitTransactionError::Io(error)),
     }
 }
@@ -1763,7 +1743,6 @@ fn validate_local_git_config(git_directory: &Path) -> Result<(), GitTransactionE
                 | "core.ignorecase"
                 | "core.precomposeunicode"
                 | "extensions.objectformat"
-                | "extensions.worktreeconfig"
         ) || safe_remote_or_branch_config(key);
         if !allowed {
             return Err(GitTransactionError::UnsafeGitConfig);
@@ -1972,8 +1951,8 @@ pub enum GitTransactionError {
     OverlappingRepositoryPaths,
     /// Another process holds the repository-scoped writer lock.
     RepositoryBusy(PathBuf),
-    /// A journal-proven stale Git lock was not a removable regular file.
-    UnsafeGitLock(PathBuf),
+    /// The repository was already bound to another disposable work root.
+    WorkRootMismatch,
     /// Repository-local Git configuration contained a non-allowlisted key.
     UnsafeGitConfig,
     /// A required directory was a link or non-directory entry.
@@ -2074,12 +2053,8 @@ impl fmt::Display for GitTransactionError {
                 "repository writer lock `{}` is already held",
                 path.display()
             ),
-            Self::UnsafeGitLock(path) => {
-                write!(
-                    formatter,
-                    "Git lock `{}` is not a regular file",
-                    path.display()
-                )
+            Self::WorkRootMismatch => {
+                formatter.write_str("repository is bound to a different work root")
             }
             Self::UnsafeGitConfig => {
                 formatter.write_str("repository-local Git configuration is not allowlisted")

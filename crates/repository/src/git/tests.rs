@@ -643,6 +643,53 @@ fn rejects_executable_repository_local_git_configuration() {
 }
 
 #[test]
+fn rejects_worktree_config_and_a_second_work_root() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let repository = fixture.open();
+    drop(repository);
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+    let other_work = root.path().join("other-work");
+    fs::create_dir(&other_work)
+        .unwrap_or_else(|error| panic!("other work root must be created: {error}"));
+    assert!(matches!(
+        GitRepository::open(
+            &fixture.repository,
+            &fixture.canonical,
+            &other_work,
+            "main",
+            identity.clone(),
+        ),
+        Err(GitTransactionError::WorkRootMismatch)
+    ));
+    git(
+        None,
+        [
+            "--git-dir",
+            fixture
+                .repository
+                .to_str()
+                .unwrap_or("invalid-fictional-repository"),
+            "config",
+            "extensions.worktreeConfig",
+            "true",
+        ],
+        None,
+    );
+    assert!(matches!(
+        GitRepository::open(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity,
+        ),
+        Err(GitTransactionError::UnsafeGitConfig)
+    ));
+}
+
+#[test]
 fn resumes_publication_from_a_committed_journal_after_interruption() {
     let root = TestDirectory::new();
     let git = GitFixture::initialize(root.path());
@@ -709,23 +756,10 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
         Err(GitTransactionError::JournalMismatch)
     ));
 
-    let mut publishing_journal: serde_json::Value = serde_json::from_slice(&original_journal)
-        .unwrap_or_else(|error| panic!("journal fixture must decode: {error}"));
-    publishing_journal["state"]["publication_started"] = serde_json::Value::Bool(true);
-    let publishing_journal = serde_json::to_vec(&publishing_journal)
-        .unwrap_or_else(|error| panic!("publishing journal must encode: {error}"));
-    if let Err(error) = fs::write(&journal_path, publishing_journal) {
-        panic!("publishing journal fixture must be written: {error}");
-    }
-    let official_lock = git.repository.join("refs/heads/main.lock");
-    if let Err(error) = fs::write(&official_lock, b"stale fictional lock\n") {
-        panic!("stale lock fixture must be written: {error}");
-    }
     let outcome = match repository.recover_batch(&worker, parse_batch_id()) {
         Ok(outcome) => outcome,
         Err(error) => panic!("committed journal must resume publication: {error}"),
     };
-    assert!(!official_lock.exists());
     let BatchCommitOutcome::Committed { commit, .. } = outcome else {
         panic!("resumed transaction must retain its commit outcome");
     };

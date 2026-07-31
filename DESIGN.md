@@ -866,9 +866,11 @@ overrides, disable system/global configuration, hooks, signing, fsmonitor, and
 line-ending conversion, and reject repository-local configuration outside a
 small data-only allowlist. Object and reference mutations run with Git fsync
 enabled. A repository-scoped file lock serializes all repository instances.
-During journal-proven recovery, the Worker removes only the known regular ref
-and canonical-index lockfiles that its interrupted Git commands could have
-left behind. Before
+The lock and an immutable binding to the configured work root live below the
+common bare Git directory, so two configurations cannot split the writer or
+journal identity. Recovery never guesses that a Git `.lock` file is stale:
+an orphaned but still-running Git child may own it, so automated recovery
+fails closed and requires verified operator intervention. Before
 publication or recovery, the Worker verifies that the journaled commit exists,
 has the pinned base as its sole direct parent, and contains the exact batch and
 successful-request trailers recorded by the journal. A stale `preparing`
@@ -905,6 +907,9 @@ must not make unrelated valid requests fail.
 The Worker applies and validates requests sequentially in a temporary
 worktree. A request that fails its own validation is rolled back in that
 worktree and moved to `failed/`. Remaining requests continue.
+Canonical Markdown bodies are loaded lazily only for archive operations.
+Payload output, generated archive bytes, and every other planned write share
+one checked per-request materialization bound.
 
 Operations within one request share an in-memory document view. For example,
 an update followed by archive archives the updated bytes, and a move followed

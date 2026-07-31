@@ -44,6 +44,7 @@ impl WorkerSession {
         &mut self,
         maximum_scan_entries: usize,
     ) -> Result<ProcessingScanOutcome, WorkerQueueError> {
+        self.queue_identity()?;
         if maximum_scan_entries == 0 {
             return Err(WorkerQueueError::InvalidProcessingScanLimit);
         }

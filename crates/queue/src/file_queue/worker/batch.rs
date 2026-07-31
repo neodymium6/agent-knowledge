@@ -118,6 +118,11 @@ impl WorkerSession {
     ///
     /// Returns an I/O error if the queue root can no longer be canonicalized.
     pub fn queue_identity(&self) -> Result<Revision, WorkerQueueError> {
+        let queue_lock = self
+            .queue
+            .open_queue_lock()
+            .map_err(WorkerQueueError::Queue)?;
+        queue_lock.lock().map_err(WorkerQueueError::Io)?;
         let identity = super::super::read_queue_identity(
             &self
                 .queue
@@ -141,6 +146,7 @@ impl WorkerSession {
     /// Returns an error until processing recovery is complete or while a
     /// pending or processing scan is active.
     pub fn ensure_transaction_ready(&self) -> Result<(), WorkerQueueError> {
+        self.queue_identity()?;
         self.ensure_no_active_scan()
     }
 
@@ -154,6 +160,7 @@ impl WorkerSession {
         &mut self,
         claim: &super::ClaimedPackage,
     ) -> Result<(), WorkerQueueError> {
+        self.queue_identity()?;
         self.ensure_no_active_scan()?;
         self.queue.validate_claimed(claim)
     }
@@ -168,6 +175,7 @@ impl WorkerSession {
         request_id: RequestId,
         batch_id: BatchId,
     ) -> Result<ClaimedPackage, WorkerQueueError> {
+        self.queue_identity()?;
         self.ensure_no_active_scan()?;
         let result = self.queue.claim(request_id, batch_id);
         if result.is_err() {
@@ -183,6 +191,7 @@ impl WorkerSession {
     /// Returns an error when the token is stale or the request cannot be
     /// durably moved.
     pub fn requeue_claimed(&mut self, token: super::ClaimToken) -> Result<(), WorkerQueueError> {
+        self.queue_identity()?;
         self.ensure_no_active_scan()?;
         let result = self.queue.requeue_claimed(token);
         if result.is_err() {
@@ -212,6 +221,7 @@ impl WorkerSession {
         maximum_scan_entries: usize,
         maximum_requests: usize,
     ) -> Result<BatchClaimOutcome, WorkerQueueError> {
+        self.queue_identity()?;
         if maximum_scan_entries == 0 || maximum_requests == 0 {
             return Err(WorkerQueueError::InvalidBatchLimits);
         }

@@ -751,11 +751,18 @@ fn queue_identity_rejects_replacement_at_the_same_path() {
     if let Err(error) = fs::rename(&queue_path, &replaced_path) {
         panic!("original queue must be moved aside: {error}");
     }
-    if let Err(error) = FileQueue::initialize(&queue_path, PackagePolicy::default()) {
-        panic!("replacement queue must initialize: {error}");
-    }
+    let replacement = FileQueue::initialize(&queue_path, PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("replacement queue must initialize: {error}"));
+    accept_fixture(&replacement);
     assert!(matches!(
         worker.queue_identity(),
+        Err(WorkerQueueError::Queue(
+            crate::QueueError::InvalidQueueIdentity
+        ))
+    ));
+    let mut worker = worker;
+    assert!(matches!(
+        worker.claim(parse_request_id(), parse_batch_id(FIRST_BATCH_ID)),
         Err(WorkerQueueError::Queue(
             crate::QueueError::InvalidQueueIdentity
         ))
