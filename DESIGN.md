@@ -1120,6 +1120,13 @@ and resume after either rename without replacing the previously active site.
 The ready-only `by-commit/` references are derived indexes and may be rebuilt
 from validated release manifests through the bounded repair operation.
 
+While Quartz is running, the Worker scans its output at a short fixed interval
+with the same entry, depth, per-file, and aggregate-byte policy and terminates
+the entire build process group on excess. This bounds normal runaway builds
+before final validation. Deployments should additionally place build staging
+on a quota-limited filesystem or apply an equivalent ephemeral-storage limit
+when a hard kernel-enforced capacity boundary is required.
+
 The batch directory is pinned while a store-wide exclusive lease spans the
 build and live preparation. `prepare` consumes that lease-bearing build handle,
 so the directory identity cannot be dropped and reopened between those phases.

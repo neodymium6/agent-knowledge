@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use ulid::Ulid;
 
 use super::{QuartzBuildError, QuartzBuilder};
+use crate::ReleasePolicy;
 
 struct TestDirectory(PathBuf);
 
@@ -185,6 +186,45 @@ fn terminates_quartz_descendants_after_a_timeout() {
     ));
     std::thread::sleep(Duration::from_millis(250));
     assert!(!output.join("escaped").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn terminates_quartz_when_live_output_exceeds_policy() {
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    let output = root.0.join("output");
+    for directory in [&integration, &content, &output] {
+        fs::create_dir(directory)
+            .unwrap_or_else(|error| panic!("fixture directory must be created: {error}"));
+    }
+    let program = root.0.join("fake-oversized-quartz");
+    executable(
+        &program,
+        "#!/bin/sh\n\
+         dd if=/dev/zero of=\"$5/oversized.bin\" bs=1024 count=64 2>/dev/null\n\
+         sleep 2\n",
+    );
+    let builder = QuartzBuilder::new_with_policy(
+        &program,
+        &integration,
+        Vec::new(),
+        Duration::from_secs(3),
+        ReleasePolicy {
+            maximum_entries: 10,
+            maximum_file_bytes: 32,
+            maximum_total_bytes: 32,
+        },
+    )
+    .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        builder.build(&content, &output),
+        Err(QuartzBuildError::OutputLimitExceeded)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[cfg(unix)]

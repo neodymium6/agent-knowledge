@@ -24,7 +24,7 @@ const MANIFEST_FILE: &str = ".agent-knowledge-release.json";
 const CLEANUP_MARKER_FILE: &str = ".agent-knowledge-cleanup";
 const MANIFEST_SCHEMA_VERSION: u16 = 2;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024;
-const MAXIMUM_RELEASE_TREE_DEPTH: usize = 64;
+pub(crate) const MAXIMUM_RELEASE_TREE_DEPTH: usize = 64;
 const MAXIMUM_CLEANUP_ACTIONS: usize = 256;
 const MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH: usize = 32;
 
@@ -47,7 +47,7 @@ impl Default for ReleasePolicy {
 }
 
 impl ReleasePolicy {
-    fn validate(self) -> Result<Self, ReleaseError> {
+    pub(crate) fn validate(self) -> Result<Self, ReleaseError> {
         if self.maximum_entries == 0
             || self.maximum_file_bytes == 0
             || self.maximum_total_bytes == 0

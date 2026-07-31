@@ -8,12 +8,16 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::store::{MAXIMUM_RELEASE_TREE_DEPTH, ReleasePolicy};
+
 #[cfg(unix)]
 use nix::errno::Errno;
 #[cfg(unix)]
 use nix::sys::signal::{Signal, killpg};
 #[cfg(unix)]
 use nix::unistd::Pid;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -30,6 +34,7 @@ pub struct QuartzBuilder {
     integration_handle: Arc<File>,
     prefix_arguments: Vec<OsString>,
     timeout: Duration,
+    output_policy: ReleasePolicy,
 }
 
 impl QuartzBuilder {
@@ -44,12 +49,32 @@ impl QuartzBuilder {
         prefix_arguments: Vec<OsString>,
         timeout: Duration,
     ) -> Result<Self, QuartzBuildError> {
+        Self::new_with_policy(
+            program,
+            integration_directory,
+            prefix_arguments,
+            timeout,
+            ReleasePolicy::default(),
+        )
+    }
+
+    /// Creates a builder with explicit live output limits.
+    pub fn new_with_policy(
+        program: impl AsRef<Path>,
+        integration_directory: impl AsRef<Path>,
+        prefix_arguments: Vec<OsString>,
+        timeout: Duration,
+        output_policy: ReleasePolicy,
+    ) -> Result<Self, QuartzBuildError> {
         if timeout.is_zero() {
             return Err(QuartzBuildError::InvalidTimeout);
         }
         Instant::now()
             .checked_add(timeout)
             .ok_or(QuartzBuildError::InvalidTimeout)?;
+        let output_policy = output_policy
+            .validate()
+            .map_err(|_| QuartzBuildError::InvalidOutputLimits)?;
         let configured_program = canonical_regular_file(program.as_ref())?;
         let program_handle =
             Arc::new(File::open(&configured_program).map_err(QuartzBuildError::Io)?);
@@ -68,6 +93,7 @@ impl QuartzBuilder {
             integration_handle,
             prefix_arguments,
             timeout,
+            output_policy,
         })
     }
 
@@ -108,8 +134,10 @@ impl QuartzBuilder {
         let mut child = ChildGuard::new(child)?;
         let status = loop {
             if let Some(status) = child.try_wait()? {
+                enforce_output_limits(output, self.output_policy)?;
                 break status;
             }
+            enforce_output_limits(output, self.output_policy)?;
             if Instant::now() >= deadline {
                 child.terminate();
                 return Err(QuartzBuildError::TimedOut {
@@ -353,6 +381,88 @@ fn ensure_nonempty_directory(path: &Path) -> Result<(), QuartzBuildError> {
     }
 }
 
+fn enforce_output_limits(output: &Path, policy: ReleasePolicy) -> Result<(), QuartzBuildError> {
+    let listed = match fs::symlink_metadata(output) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(QuartzBuildError::Io(error)),
+    };
+    if !listed.file_type().is_dir() {
+        return Err(QuartzBuildError::OutputLimitExceeded);
+    }
+    let root = match open_scan_directory(output) {
+        Ok(root) => root,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(QuartzBuildError::Io(error)),
+    };
+    if !same_metadata(&listed, &root.metadata().map_err(QuartzBuildError::Io)?) {
+        return Ok(());
+    }
+
+    let mut entries = 0_u64;
+    let mut total_bytes = 0_u64;
+    let mut directories = vec![(root, output.to_path_buf(), 0_usize)];
+    while let Some((directory, configured, depth)) = directories.pop() {
+        let stable = stable_file_path(&directory, &configured)?;
+        for entry in fs::read_dir(&stable).map_err(QuartzBuildError::Io)? {
+            let path = entry.map_err(QuartzBuildError::Io)?.path();
+            entries = entries
+                .checked_add(1)
+                .ok_or(QuartzBuildError::OutputLimitExceeded)?;
+            if entries > policy.maximum_entries {
+                return Err(QuartzBuildError::OutputLimitExceeded);
+            }
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(QuartzBuildError::Io(error)),
+            };
+            if metadata.file_type().is_dir() {
+                if depth == MAXIMUM_RELEASE_TREE_DEPTH {
+                    return Err(QuartzBuildError::OutputLimitExceeded);
+                }
+                let child = match open_scan_directory(&path) {
+                    Ok(child) => child,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(QuartzBuildError::Io(error)),
+                };
+                if !same_metadata(&metadata, &child.metadata().map_err(QuartzBuildError::Io)?) {
+                    continue;
+                }
+                directories.push((child, path, depth + 1));
+            } else if metadata.file_type().is_file() {
+                if metadata.len() > policy.maximum_file_bytes {
+                    return Err(QuartzBuildError::OutputLimitExceeded);
+                }
+                total_bytes = total_bytes
+                    .checked_add(metadata.len())
+                    .ok_or(QuartzBuildError::OutputLimitExceeded)?;
+                if total_bytes > policy.maximum_total_bytes {
+                    return Err(QuartzBuildError::OutputLimitExceeded);
+                }
+            } else {
+                return Err(QuartzBuildError::OutputLimitExceeded);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_scan_directory(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_scan_directory(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
 /// Quartz process or output validation failure.
 #[derive(Debug)]
 pub enum QuartzBuildError {
@@ -361,11 +471,13 @@ pub enum QuartzBuildError {
     InvalidDirectory,
     BuildPathsMustBeAbsolute,
     InvalidTimeout,
+    InvalidOutputLimits,
     InvalidProcessState,
     CommandIdentityChanged,
     OverlappingPaths,
     OutputNotEmpty,
     OutputEmpty,
+    OutputLimitExceeded,
     TimedOut { timeout: Duration },
     CommandFailed { status: ExitStatus },
     Io(io::Error),
@@ -383,6 +495,7 @@ impl fmt::Display for QuartzBuildError {
                 formatter.write_str("Quartz content and output paths must be absolute")
             }
             Self::InvalidTimeout => formatter.write_str("Quartz timeout must be positive"),
+            Self::InvalidOutputLimits => formatter.write_str("Quartz output limits are invalid"),
             Self::InvalidProcessState => formatter.write_str("Quartz process state is invalid"),
             Self::CommandIdentityChanged => formatter.write_str("Quartz command identity changed"),
             Self::OverlappingPaths => {
@@ -390,6 +503,9 @@ impl fmt::Display for QuartzBuildError {
             }
             Self::OutputNotEmpty => formatter.write_str("Quartz output directory is not empty"),
             Self::OutputEmpty => formatter.write_str("Quartz produced an empty output directory"),
+            Self::OutputLimitExceeded => {
+                formatter.write_str("Quartz output exceeded live build limits")
+            }
             Self::TimedOut { timeout } => {
                 write!(formatter, "Quartz build exceeded {timeout:?}")
             }
