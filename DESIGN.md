@@ -701,6 +701,19 @@ examines interrupted entries, commit trailers, the official branch, and
 release metadata. It either resumes the next idempotent phase or returns the
 request to `pending/`.
 
+Every Worker queue transition requires an exclusive Worker session. Session
+creation takes the configured repository writer lock without waiting and fails
+if another Worker owns it. This lock is separate from the short-lived queue
+lock, so the Gateway can continue accepting requests while the Worker is
+otherwise idle or applying a batch.
+
+Pending selection takes a fixed acceptance-sequence snapshot and incrementally
+walks the pending directory. Each call has a maximum number of directory
+entries to inspect, and the scanner retains only the earliest configured number
+of candidates in memory. Selection finishes the complete snapshot before
+claiming, then orders retained requests by acceptance sequence and request ID.
+Requests accepted after the snapshot began remain pending for the next batch.
+
 The initial claim record is a bounded, versioned `phase.json` sidecar:
 
 ```json

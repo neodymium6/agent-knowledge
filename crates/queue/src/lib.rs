@@ -4,9 +4,9 @@ mod file_queue;
 mod package;
 
 pub use file_queue::{
-    CURRENT_WORKER_PHASE_SCHEMA_VERSION, ClaimToken, ClaimedPackage, EnqueueOutcome, FileQueue,
-    IncomingPackage, QueueError, QueueLimit, QueueState, WorkerPhase, WorkerPhaseRecord,
-    WorkerQueueError,
+    BatchClaimOutcome, CURRENT_WORKER_PHASE_SCHEMA_VERSION, ClaimToken, ClaimedPackage,
+    EnqueueOutcome, FileQueue, IncomingPackage, QueueError, QueueLimit, QueueState, WorkerPhase,
+    WorkerPhaseRecord, WorkerQueueError, WorkerSession,
 };
 pub use package::{
     AcceptanceMetadata, MarkdownValidationError, PackageDigest, PackageLimit, PackageLimits,

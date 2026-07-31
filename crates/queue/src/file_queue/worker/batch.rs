@@ -1,0 +1,292 @@
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::path::Path;
+
+use agent_knowledge_core::{BatchId, RequestId};
+
+use super::{ClaimedPackage, NoopClaimHook, WorkerQueueError, next_attempt, revalidate_accepted};
+use crate::file_queue::{
+    FileQueue, NEXT_SEQUENCE_FILE_NAME, QueueState, ensure_directory, ensure_lock_file,
+    read_next_sequence, sync_directory,
+};
+
+/// Progress made while selecting and claiming one bounded Worker batch.
+#[derive(Debug)]
+pub enum BatchClaimOutcome {
+    /// The bounded scan has more pending entries to inspect.
+    Scanning {
+        /// Directory entries inspected by this invocation.
+        scanned_entries: usize,
+        /// Earliest eligible requests retained for the batch.
+        retained_candidates: usize,
+    },
+    /// The complete snapshot was scanned and its earliest requests were claimed.
+    Claimed(Vec<ClaimedPackage>),
+}
+
+/// Exclusive Repository Worker access to one file queue.
+#[derive(Debug)]
+pub struct WorkerSession {
+    queue: FileQueue,
+    _writer_lock: File,
+    pending_scan: PendingBatchScan,
+}
+
+#[derive(Debug, Default)]
+struct PendingBatchScan {
+    entries: Option<fs::ReadDir>,
+    candidates: BinaryHeap<PendingCandidate>,
+    batch_id: Option<BatchId>,
+    maximum_requests: usize,
+    maximum_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingCandidate {
+    sequence: u64,
+    request_id: RequestId,
+}
+
+impl Ord for PendingCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.sequence
+            .cmp(&other.sequence)
+            .then_with(|| self.request_id.cmp(&other.request_id))
+    }
+}
+
+impl PartialOrd for PendingCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl FileQueue {
+    /// Acquires exclusive Repository Worker ownership for this queue.
+    ///
+    /// The writer lock is distinct from the short-lived queue lock used by the
+    /// Gateway, so accepted requests can continue arriving while one Worker
+    /// owns processing transitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerQueueError::WorkerAlreadyRunning`] without waiting when
+    /// another process owns the writer lock, or an I/O error when the lock path
+    /// cannot be initialized.
+    pub fn try_worker_session(
+        &self,
+        writer_lock_file: impl AsRef<Path>,
+    ) -> Result<WorkerSession, WorkerQueueError> {
+        let writer_lock_file = writer_lock_file.as_ref();
+        if let Some(parent) = writer_lock_file.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            ensure_directory(parent).map_err(WorkerQueueError::Queue)?;
+        }
+        ensure_lock_file(writer_lock_file).map_err(WorkerQueueError::Queue)?;
+        let writer_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(writer_lock_file)
+            .map_err(WorkerQueueError::Io)?;
+        match writer_lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(WorkerQueueError::WorkerAlreadyRunning);
+            }
+            Err(TryLockError::Error(error)) => return Err(WorkerQueueError::Io(error)),
+        }
+        if let Some(parent) = writer_lock_file.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            sync_directory(parent).map_err(WorkerQueueError::Queue)?;
+        }
+        Ok(WorkerSession {
+            queue: self.clone(),
+            _writer_lock: writer_lock,
+            pending_scan: PendingBatchScan::default(),
+        })
+    }
+}
+
+impl WorkerSession {
+    /// Claims one known pending request while holding Worker ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request cannot be durably claimed.
+    pub fn claim(
+        &self,
+        request_id: RequestId,
+        batch_id: BatchId,
+    ) -> Result<ClaimedPackage, WorkerQueueError> {
+        self.queue.claim(request_id, batch_id)
+    }
+
+    /// Returns one still-owned processing request to `pending/`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token is stale or the request cannot be
+    /// durably moved.
+    pub fn requeue_claimed(&self, token: super::ClaimToken) -> Result<(), WorkerQueueError> {
+        self.queue.requeue_claimed(token)
+    }
+
+    /// Incrementally scans a fixed pending snapshot and claims its earliest requests.
+    ///
+    /// Each invocation inspects at most `maximum_scan_entries` directory
+    /// entries and retains at most `maximum_requests` candidates. Call again
+    /// with the same batch ID and request limit while [`BatchClaimOutcome::Scanning`]
+    /// is returned. New requests accepted after the first call are left for a
+    /// later batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero limits, changed scan parameters, malformed
+    /// pending entries, corrupt accepted packages, or failed durable claims.
+    pub fn claim_next_batch(
+        &mut self,
+        batch_id: BatchId,
+        maximum_scan_entries: usize,
+        maximum_requests: usize,
+    ) -> Result<BatchClaimOutcome, WorkerQueueError> {
+        if maximum_scan_entries == 0 || maximum_requests == 0 {
+            return Err(WorkerQueueError::InvalidBatchLimits);
+        }
+        if let Some(active_batch_id) = self.pending_scan.batch_id
+            && (active_batch_id != batch_id
+                || self.pending_scan.maximum_requests != maximum_requests)
+        {
+            return Err(WorkerQueueError::BatchScanChanged { active_batch_id });
+        }
+
+        let queue_lock = self
+            .queue
+            .open_queue_lock()
+            .map_err(WorkerQueueError::Queue)?;
+        queue_lock.lock().map_err(WorkerQueueError::Io)?;
+
+        if self.pending_scan.entries.is_none() {
+            let next_sequence =
+                read_next_sequence(&self.queue.queue_root.join(NEXT_SEQUENCE_FILE_NAME))
+                    .map_err(WorkerQueueError::Queue)?;
+            self.pending_scan.entries = Some(
+                fs::read_dir(
+                    self.queue
+                        .queue_root
+                        .join(QueueState::Pending.directory_name()),
+                )
+                .map_err(WorkerQueueError::Io)?,
+            );
+            self.pending_scan.batch_id = Some(batch_id);
+            self.pending_scan.maximum_requests = maximum_requests;
+            self.pending_scan.maximum_sequence = next_sequence - 1;
+        }
+
+        let mut scanned_entries = 0_usize;
+        let mut complete = false;
+        while scanned_entries < maximum_scan_entries {
+            let entry = match self.pending_scan.entries.as_mut() {
+                Some(entries) => entries.next(),
+                None => None,
+            };
+            let Some(entry) = entry else {
+                complete = true;
+                break;
+            };
+            scanned_entries += 1;
+            let result = entry.map_err(WorkerQueueError::Io).and_then(|entry| {
+                retain_pending_candidate(
+                    &self.queue,
+                    &mut self.pending_scan,
+                    entry,
+                    maximum_requests,
+                )
+            });
+            if let Err(error) = result {
+                self.pending_scan = PendingBatchScan::default();
+                return Err(error);
+            }
+        }
+
+        if !complete {
+            return Ok(BatchClaimOutcome::Scanning {
+                scanned_entries,
+                retained_candidates: self.pending_scan.candidates.len(),
+            });
+        }
+
+        let candidates = std::mem::take(&mut self.pending_scan.candidates).into_sorted_vec();
+        self.pending_scan = PendingBatchScan::default();
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            claimed.push(self.queue.claim_locked(
+                candidate.request_id,
+                batch_id,
+                &mut NoopClaimHook,
+            )?);
+        }
+        Ok(BatchClaimOutcome::Claimed(claimed))
+    }
+}
+
+fn retain_pending_candidate(
+    queue: &FileQueue,
+    scan: &mut PendingBatchScan,
+    entry: fs::DirEntry,
+    maximum_requests: usize,
+) -> Result<(), WorkerQueueError> {
+    let path = entry.path();
+    if !entry.file_type().map_err(WorkerQueueError::Io)?.is_dir() {
+        return Err(WorkerQueueError::InvalidPendingEntry {
+            path,
+            detail: "entry is not a directory",
+        });
+    }
+    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        return Err(WorkerQueueError::InvalidPendingEntry {
+            path,
+            detail: "entry name is not UTF-8",
+        });
+    };
+    let request_id: RequestId =
+        name.parse()
+            .map_err(|_| WorkerQueueError::InvalidPendingEntry {
+                path: path.clone(),
+                detail: "entry name is not a canonical request ID",
+            })?;
+    if request_id.to_string() != name {
+        return Err(WorkerQueueError::InvalidPendingEntry {
+            path,
+            detail: "entry name is not a canonical request ID",
+        });
+    }
+    let package = revalidate_accepted(&path, request_id, QueueState::Pending, &queue.policy)?;
+    if package.request().request_id != request_id {
+        return Err(WorkerQueueError::CorruptState {
+            request_id,
+            state: QueueState::Pending,
+            detail: "accepted package identity does not match its queue entry",
+        });
+    }
+    let acceptance = package.acceptance().ok_or(WorkerQueueError::CorruptState {
+        request_id,
+        state: QueueState::Pending,
+        detail: "accepted package is missing acceptance metadata",
+    })?;
+    let sequence = acceptance.sequence.get();
+    if sequence > scan.maximum_sequence {
+        return Ok(());
+    }
+    let _ = next_attempt(&path, request_id, QueueState::Pending)?;
+    scan.candidates.push(PendingCandidate {
+        sequence,
+        request_id,
+    });
+    if scan.candidates.len() > maximum_requests {
+        let _ = scan.candidates.pop();
+    }
+    Ok(())
+}

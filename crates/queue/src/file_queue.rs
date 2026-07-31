@@ -17,8 +17,8 @@ use crate::{
 
 mod worker;
 pub use worker::{
-    CURRENT_WORKER_PHASE_SCHEMA_VERSION, ClaimToken, ClaimedPackage, WorkerPhase,
-    WorkerPhaseRecord, WorkerQueueError,
+    BatchClaimOutcome, CURRENT_WORKER_PHASE_SCHEMA_VERSION, ClaimToken, ClaimedPackage,
+    WorkerPhase, WorkerPhaseRecord, WorkerQueueError, WorkerSession,
 };
 
 const REQUEST_FILE_NAME: &str = "request.json";

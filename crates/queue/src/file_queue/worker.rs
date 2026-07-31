@@ -2,7 +2,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agent_knowledge_core::{BatchId, ErrorCode, RequestId};
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,9 @@ use ulid::Ulid;
 
 use super::{FileQueue, QueueError, QueueState, WORKER_TEMP_DIRECTORY_NAME, sync_directory};
 use crate::{PackageValidationError, ValidatedPackage, validate_accepted_package};
+
+mod batch;
+pub use batch::{BatchClaimOutcome, WorkerSession};
 
 const PHASE_FILE_NAME: &str = "phase.json";
 const MAXIMUM_PHASE_FILE_BYTES: u64 = 1_024;
@@ -106,7 +109,7 @@ impl FileQueue {
     /// Returns an error when the request is absent, is not pending, contains
     /// corrupt immutable data or phase metadata, exhausts its attempt counter,
     /// or cannot be durably moved.
-    pub fn claim(
+    fn claim(
         &self,
         request_id: RequestId,
         batch_id: BatchId,
@@ -122,7 +125,15 @@ impl FileQueue {
     ) -> Result<ClaimedPackage, WorkerQueueError> {
         let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
         lock.lock().map_err(WorkerQueueError::Io)?;
+        self.claim_locked(request_id, batch_id, hook)
+    }
 
+    fn claim_locked(
+        &self,
+        request_id: RequestId,
+        batch_id: BatchId,
+        hook: &mut dyn ClaimHook,
+    ) -> Result<ClaimedPackage, WorkerQueueError> {
         let Some((state, _)) = self
             .find_existing(request_id)
             .map_err(WorkerQueueError::Queue)?
@@ -195,7 +206,7 @@ impl FileQueue {
     /// Returns an error when the request is absent, is not processing, no
     /// longer matches the token, has corrupt phase metadata, or cannot be
     /// durably moved.
-    pub fn requeue_claimed(&self, token: ClaimToken) -> Result<(), WorkerQueueError> {
+    fn requeue_claimed(&self, token: ClaimToken) -> Result<(), WorkerQueueError> {
         let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
         lock.lock().map_err(WorkerQueueError::Io)?;
 
@@ -406,6 +417,22 @@ pub enum WorkerQueueError {
     PhaseEncoding(serde_json::Error),
     /// Stored Worker phase JSON was malformed.
     InvalidPhaseMetadata(serde_json::Error),
+    /// Another process currently owns the Repository Worker lock.
+    WorkerAlreadyRunning,
+    /// A batch scan limit was zero.
+    InvalidBatchLimits,
+    /// A caller changed the identity or capacity of an active batch scan.
+    BatchScanChanged {
+        /// Batch identifier that owns the active scan.
+        active_batch_id: BatchId,
+    },
+    /// A pending directory entry did not have the required queue shape.
+    InvalidPendingEntry {
+        /// Invalid entry path.
+        path: PathBuf,
+        /// Non-sensitive diagnostic.
+        detail: &'static str,
+    },
     /// No accepted request exists with this ID.
     RequestNotFound {
         /// Missing request identifier.
@@ -456,12 +483,15 @@ impl WorkerQueueError {
     pub const fn error_code(&self) -> ErrorCode {
         match self {
             Self::Queue(error) => error.error_code(),
-            Self::Io(_) => ErrorCode::TemporaryFailure,
+            Self::Io(_) | Self::WorkerAlreadyRunning => ErrorCode::TemporaryFailure,
             Self::RequestNotFound { .. }
             | Self::InvalidState { .. }
-            | Self::ClaimChanged { .. } => ErrorCode::InvalidRequest,
+            | Self::ClaimChanged { .. }
+            | Self::InvalidBatchLimits
+            | Self::BatchScanChanged { .. } => ErrorCode::InvalidRequest,
             Self::CorruptPackage { .. }
             | Self::CorruptState { .. }
+            | Self::InvalidPendingEntry { .. }
             | Self::InvalidPhaseMetadata(_) => ErrorCode::ContentValidationFailed,
             Self::PhaseEncoding(_) | Self::AttemptExhausted { .. } => ErrorCode::InternalError,
         }
@@ -479,6 +509,21 @@ impl fmt::Display for WorkerQueueError {
             Self::InvalidPhaseMetadata(error) => {
                 write!(formatter, "stored phase metadata JSON is invalid: {error}")
             }
+            Self::WorkerAlreadyRunning => {
+                formatter.write_str("another Repository Worker owns the writer lock")
+            }
+            Self::InvalidBatchLimits => {
+                formatter.write_str("batch scan and request limits must be greater than zero")
+            }
+            Self::BatchScanChanged { active_batch_id } => write!(
+                formatter,
+                "batch scan for `{active_batch_id}` must finish before its parameters change"
+            ),
+            Self::InvalidPendingEntry { path, detail } => write!(
+                formatter,
+                "pending queue entry `{}` is invalid: {detail}",
+                path.display()
+            ),
             Self::RequestNotFound { request_id } => {
                 write!(formatter, "request `{request_id}` was not found")
             }

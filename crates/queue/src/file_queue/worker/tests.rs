@@ -8,7 +8,8 @@ use std::thread;
 use agent_knowledge_core::{BatchId, ErrorCode, PayloadPath, RequestId};
 
 use super::{
-    ClaimHook, ClaimPhase, ClaimToken, WorkerPhase, WorkerQueueError, read_required_phase_record,
+    BatchClaimOutcome, ClaimHook, ClaimPhase, ClaimToken, WorkerPhase, WorkerQueueError,
+    WorkerSession, read_required_phase_record,
 };
 use crate::{EnqueueOutcome, FileQueue, PackagePolicy, QueueState};
 
@@ -115,20 +116,35 @@ fn initialize_queue(root: &Path) -> FileQueue {
 }
 
 fn accept_fixture(queue: &FileQueue) {
+    accept_fixture_with_id(queue, REQUEST_ID);
+}
+
+fn accept_fixture_with_id(queue: &FileQueue, request_id: &str) {
     let mut incoming = match queue.begin() {
         Ok(incoming) => incoming,
         Err(error) => panic!("fixture package must begin: {error}"),
     };
-    if let Err(error) = incoming.write_request(REQUEST_JSON.as_bytes()) {
+    let request = REQUEST_JSON.replace(REQUEST_ID, request_id);
+    if let Err(error) = incoming.write_request(request.as_bytes()) {
         panic!("fixture request must be written: {error}");
     }
-    if let Err(error) = incoming.add_payload(payload_path("benchmark/index.md"), MARKDOWN) {
+    let markdown = String::from_utf8_lossy(MARKDOWN).replace(REQUEST_ID, request_id);
+    if let Err(error) =
+        incoming.add_payload(payload_path("benchmark/index.md"), markdown.as_bytes())
+    {
         panic!("fixture Markdown must be written: {error}");
     }
     match incoming.accept() {
         Ok(EnqueueOutcome::Accepted { .. }) => {}
         Ok(EnqueueOutcome::Existing { .. }) => panic!("fixture request must be newly accepted"),
         Err(error) => panic!("fixture request must be accepted: {error}"),
+    }
+}
+
+fn open_worker(queue: &FileQueue, root: &Path) -> WorkerSession {
+    match queue.try_worker_session(root.join("locks/repository-writer.lock")) {
+        Ok(worker) => worker,
+        Err(error) => panic!("fixture Worker must acquire its lock: {error}"),
     }
 }
 
@@ -139,8 +155,9 @@ fn claims_pending_package_with_durable_phase_record() {
     accept_fixture(&queue);
     let request_id = parse_request_id();
     let batch_id = parse_batch_id(FIRST_BATCH_ID);
+    let worker = open_worker(&queue, root.path());
 
-    let claimed = match queue.claim(request_id, batch_id) {
+    let claimed = match worker.claim(request_id, batch_id) {
         Ok(claimed) => claimed,
         Err(error) => panic!("pending request must be claimed: {error}"),
     };
@@ -352,4 +369,157 @@ fn concurrent_claimers_produce_one_processing_owner() {
         .count();
     assert_eq!(successes, 1);
     assert_eq!(invalid_states, 1);
+}
+
+#[test]
+fn bounded_batch_claims_globally_earliest_acceptance_sequences() {
+    const FIRST_ACCEPTED: &str = "01K00000000000000000000022";
+    const SECOND_ACCEPTED: &str = "01K00000000000000000000020";
+    const THIRD_ACCEPTED: &str = "01K00000000000000000000021";
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture_with_id(&queue, FIRST_ACCEPTED);
+    accept_fixture_with_id(&queue, SECOND_ACCEPTED);
+    accept_fixture_with_id(&queue, THIRD_ACCEPTED);
+    let mut worker = open_worker(&queue, root.path());
+    let batch_id = parse_batch_id(FIRST_BATCH_ID);
+
+    let claimed = loop {
+        match worker.claim_next_batch(batch_id, 1, 2) {
+            Ok(BatchClaimOutcome::Scanning {
+                scanned_entries,
+                retained_candidates,
+            }) => {
+                assert_eq!(scanned_entries, 1);
+                assert!(retained_candidates <= 2);
+            }
+            Ok(BatchClaimOutcome::Claimed(claimed)) => break claimed,
+            Err(error) => panic!("bounded batch scan must succeed: {error}"),
+        }
+    };
+
+    let claimed_ids: Vec<_> = claimed
+        .iter()
+        .map(|package| package.token().request_id().to_string())
+        .collect();
+    assert_eq!(claimed_ids, [FIRST_ACCEPTED, SECOND_ACCEPTED]);
+    assert!(
+        root.path()
+            .join(format!("queue/pending/{THIRD_ACCEPTED}"))
+            .is_dir()
+    );
+}
+
+#[test]
+fn batch_snapshot_excludes_requests_accepted_during_its_scan() {
+    const SECOND_INITIAL: &str = "01K00000000000000000000020";
+    const LATER_ACCEPTED: &str = "01K00000000000000000000021";
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    accept_fixture_with_id(&queue, SECOND_INITIAL);
+    let mut worker = open_worker(&queue, root.path());
+    let batch_id = parse_batch_id(FIRST_BATCH_ID);
+    match worker.claim_next_batch(batch_id, 1, 10) {
+        Ok(BatchClaimOutcome::Scanning { .. }) => {}
+        Ok(BatchClaimOutcome::Claimed(_)) => panic!("one-entry scan must remain resumable"),
+        Err(error) => panic!("first scan step must succeed: {error}"),
+    }
+
+    accept_fixture_with_id(&queue, LATER_ACCEPTED);
+    let claimed = loop {
+        match worker.claim_next_batch(batch_id, 1, 10) {
+            Ok(BatchClaimOutcome::Scanning { .. }) => {}
+            Ok(BatchClaimOutcome::Claimed(claimed)) => break claimed,
+            Err(error) => panic!("snapshot scan must finish: {error}"),
+        }
+    };
+
+    assert_eq!(claimed.len(), 2);
+    assert!(
+        root.path()
+            .join(format!("queue/pending/{LATER_ACCEPTED}"))
+            .is_dir()
+    );
+}
+
+#[test]
+fn worker_writer_lock_is_exclusive_and_released_on_drop() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    let lock_path = root.path().join("locks/repository-writer.lock");
+    let worker = match queue.try_worker_session(&lock_path) {
+        Ok(worker) => worker,
+        Err(error) => panic!("first Worker must acquire the writer lock: {error}"),
+    };
+
+    let error = match queue.try_worker_session(&lock_path) {
+        Ok(_) => panic!("second Worker must not share the writer lock"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, WorkerQueueError::WorkerAlreadyRunning));
+    assert_eq!(error.error_code(), ErrorCode::TemporaryFailure);
+
+    drop(worker);
+    if let Err(error) = queue.try_worker_session(&lock_path) {
+        panic!("dropping the Worker must release its writer lock: {error}");
+    }
+}
+
+#[test]
+fn active_batch_scan_rejects_changed_identity_or_capacity() {
+    const OTHER_REQUEST_ID: &str = "01K00000000000000000000020";
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    accept_fixture_with_id(&queue, OTHER_REQUEST_ID);
+    let mut worker = open_worker(&queue, root.path());
+    let first_batch = parse_batch_id(FIRST_BATCH_ID);
+    match worker.claim_next_batch(first_batch, 1, 1) {
+        Ok(BatchClaimOutcome::Scanning { .. }) => {}
+        Ok(BatchClaimOutcome::Claimed(_)) => panic!("one-entry scan must remain resumable"),
+        Err(error) => panic!("first scan step must succeed: {error}"),
+    }
+
+    let error = match worker.claim_next_batch(parse_batch_id(SECOND_BATCH_ID), 1, 1) {
+        Ok(_) => panic!("active scan must retain its batch identity"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        WorkerQueueError::BatchScanChanged {
+            active_batch_id
+        } if active_batch_id == first_batch
+    ));
+
+    let error = match worker.claim_next_batch(first_batch, 1, 2) {
+        Ok(_) => panic!("active scan must retain its request capacity"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        WorkerQueueError::BatchScanChanged {
+            active_batch_id
+        } if active_batch_id == first_batch
+    ));
+}
+
+#[test]
+fn batch_scan_rejects_zero_limits() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    let mut worker = open_worker(&queue, root.path());
+    let batch_id = parse_batch_id(FIRST_BATCH_ID);
+
+    for (scan_limit, request_limit) in [(0, 1), (1, 0)] {
+        let error = match worker.claim_next_batch(batch_id, scan_limit, request_limit) {
+            Ok(_) => panic!("zero batch limit must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, WorkerQueueError::InvalidBatchLimits));
+        assert_eq!(error.error_code(), ErrorCode::InvalidRequest);
+    }
 }
