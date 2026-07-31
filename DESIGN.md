@@ -772,21 +772,24 @@ cannot adopt replacement lock files after a restart. The Gateway can continue
 accepting requests while the Worker is otherwise idle or applying a batch.
 
 On Linux, each live queue handle retains an open descriptor for the initialized
-queue root and performs queue I/O through `/proc/self/fd/<fd>`. It also compares
-the configured path's device, inode, directory type, and immutable `queue-id`
-with the pinned root before Gateway staging, immediately before and after
-acceptance promotion, and before every Worker transition. Renaming, copying, or
-snapshotting a queue into the same path therefore invalidates old handles
-without redirecting writes or acknowledging acceptance into the detached queue.
-Every returned claim retains a shared lease on the root descriptor for as long
-as it exposes a `/proc/self/fd/<fd>` package path.
+queue root and each fixed child directory, and performs queue I/O through
+`/proc/self/fd/<fd>`. It also compares every configured directory entry's
+device, inode, and type, plus the immutable `queue-id`, with the pinned objects
+before Gateway staging, immediately before and after acceptance promotion, and
+before every Worker transition. Renaming, copying, or snapshotting a queue or
+one of its fixed directories therefore invalidates old handles without
+redirecting writes or acknowledging acceptance into a detached queue. Every
+returned claim retains a shared lease on the pinned `processing/` descriptor
+for as long as it exposes a `/proc/self/fd/<fd>` package path.
 
 The queue stores an immutable root binding containing its configured canonical
-path and filesystem device/inode identity. A byte-for-byte copy is not accepted
-as a second live queue even when it preserves `queue-id`. Restoring storage onto
-a different filesystem identity is not accepted by the initial implementation;
-a future offline migration procedure must deliberately rewrite the binding
-before such restores are supported.
+path and the filesystem device/inode identities of the root, fixed lock files,
+and fixed child directories. A byte-for-byte copy is not accepted as a second
+live queue even when it preserves `queue-id`. On first initialization, fixed
+directory entries and both lock entries are synchronized before this binding is
+created. Restoring storage onto a different filesystem identity is not accepted
+by the initial implementation; a future offline migration procedure must
+deliberately rewrite the binding before such restores are supported.
 
 Pending selection takes a fixed acceptance-sequence snapshot and incrementally
 walks the pending directory. Each call has a maximum number of directory

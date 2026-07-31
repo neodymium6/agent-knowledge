@@ -55,12 +55,8 @@ impl WorkerSession {
         if self.processing_scan.is_none() {
             self.processing_recovery_complete = false;
             self.processing_scan = Some(
-                fs::read_dir(
-                    self.queue
-                        .queue_root
-                        .join(QueueState::Processing.directory_name()),
-                )
-                .map_err(WorkerQueueError::Io)?,
+                fs::read_dir(self.queue.state_root(QueueState::Processing))
+                    .map_err(WorkerQueueError::Io)?,
             );
         }
 
@@ -160,6 +156,6 @@ fn recover_processing_claim(
         },
         package,
         package_root: path,
-        _root_lease: Arc::clone(&queue.root_handle),
+        _directory_lease: Arc::clone(&queue.directories.state(QueueState::Processing).handle),
     })
 }

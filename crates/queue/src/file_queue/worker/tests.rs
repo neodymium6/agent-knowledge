@@ -209,7 +209,7 @@ fn claims_pending_package_with_durable_phase_record() {
 }
 
 #[test]
-fn a_claim_retains_its_pinned_queue_root_lease() {
+fn a_claim_retains_its_pinned_processing_directory_lease() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path());
     accept_fixture(&queue);

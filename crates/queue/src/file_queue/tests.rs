@@ -273,6 +273,38 @@ fn rejects_replaced_fixed_lock_files() {
 }
 
 #[test]
+fn rejects_replaced_fixed_queue_directories() {
+    for directory in [
+        ".locks",
+        "incoming",
+        "quarantine",
+        "worker-tmp",
+        "pending",
+        "processing",
+        "completed",
+        "failed",
+    ] {
+        let root = TestDirectory::create();
+        let queue = initialize_queue(root.path(), PackagePolicy::default());
+        let entry = root.path().join("queue").join(directory);
+        let detached = root.path().join(format!("detached-{directory}"));
+        fs::rename(&entry, &detached)
+            .unwrap_or_else(|error| panic!("{directory} must be moved aside: {error}"));
+        fs::create_dir(&entry)
+            .unwrap_or_else(|error| panic!("replacement {directory} must be created: {error}"));
+
+        assert!(matches!(
+            queue.begin(),
+            Err(QueueError::InvalidQueueIdentity)
+        ));
+        assert!(matches!(
+            FileQueue::initialize(root.path().join("queue"), PackagePolicy::default()),
+            Err(QueueError::InvalidQueueIdentity)
+        ));
+    }
+}
+
+#[test]
 fn accepts_new_package_and_returns_existing_for_an_identical_retry() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path(), PackagePolicy::default());

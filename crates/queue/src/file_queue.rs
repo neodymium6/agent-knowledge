@@ -73,6 +73,15 @@ impl QueueState {
             Self::Failed => "failed",
         }
     }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Pending => 0,
+            Self::Processing => 1,
+            Self::Completed => 2,
+            Self::Failed => 3,
+        }
+    }
 }
 
 impl fmt::Display for QueueState {
@@ -108,6 +117,7 @@ pub struct FileQueue {
     queue_root: PathBuf,
     configured_queue_root: PathBuf,
     root_handle: Arc<File>,
+    directories: Arc<QueueDirectories>,
     identity: Revision,
     lock_file: PathBuf,
     stable_lock_file: PathBuf,
@@ -117,6 +127,39 @@ pub struct FileQueue {
     worker_lock_handle: Arc<File>,
     policy: PackagePolicy,
     maintenance_scanners: Arc<Mutex<MaintenanceScanners>>,
+}
+
+#[derive(Debug)]
+struct QueueDirectories {
+    lock: PinnedDirectory,
+    incoming: PinnedDirectory,
+    quarantine: PinnedDirectory,
+    worker_temporary: PinnedDirectory,
+    states: [PinnedDirectory; 4],
+}
+
+impl QueueDirectories {
+    fn state(&self, state: QueueState) -> &PinnedDirectory {
+        &self.states[state.index()]
+    }
+
+    fn all(&self) -> impl Iterator<Item = &PinnedDirectory> {
+        [
+            &self.lock,
+            &self.incoming,
+            &self.quarantine,
+            &self.worker_temporary,
+        ]
+        .into_iter()
+        .chain(self.states.iter())
+    }
+}
+
+#[derive(Debug)]
+struct PinnedDirectory {
+    entry: PathBuf,
+    stable: PathBuf,
+    handle: Arc<File>,
 }
 
 impl FileQueue {
@@ -157,17 +200,28 @@ impl FileQueue {
         let queue_root = configured_queue_root.clone();
         fs::metadata(&queue_root).map_err(QueueError::Io)?;
 
-        let lock_root = queue_root.join(LOCK_DIRECTORY_NAME);
-        let lock_file = lock_root.join(QUEUE_LOCK_FILE_NAME);
-        let worker_lock_file = lock_root.join(WORKER_LOCK_FILE_NAME);
-
-        ensure_directory(&lock_root)?;
+        ensure_directory(&queue_root.join(LOCK_DIRECTORY_NAME))?;
         ensure_directory(&queue_root.join("incoming"))?;
         ensure_directory(&queue_root.join("quarantine"))?;
         ensure_directory(&queue_root.join(WORKER_TEMP_DIRECTORY_NAME))?;
         for state in QueueState::ALL {
             ensure_directory(&queue_root.join(state.directory_name()))?;
         }
+        sync_directory(&queue_root)?;
+        let directories = Arc::new(QueueDirectories {
+            lock: pin_directory(&queue_root.join(LOCK_DIRECTORY_NAME))?,
+            incoming: pin_directory(&queue_root.join("incoming"))?,
+            quarantine: pin_directory(&queue_root.join("quarantine"))?,
+            worker_temporary: pin_directory(&queue_root.join(WORKER_TEMP_DIRECTORY_NAME))?,
+            states: [
+                pin_directory(&queue_root.join(QueueState::Pending.directory_name()))?,
+                pin_directory(&queue_root.join(QueueState::Processing.directory_name()))?,
+                pin_directory(&queue_root.join(QueueState::Completed.directory_name()))?,
+                pin_directory(&queue_root.join(QueueState::Failed.directory_name()))?,
+            ],
+        });
+        let lock_file = directories.lock.stable.join(QUEUE_LOCK_FILE_NAME);
+        let worker_lock_file = directories.lock.stable.join(WORKER_LOCK_FILE_NAME);
 
         ensure_lock_file(&lock_file)?;
         ensure_lock_file(&worker_lock_file)?;
@@ -187,6 +241,9 @@ impl FileQueue {
         );
         let stable_lock_file = stable_file_path(&queue_lock_handle, &lock_file)?;
         let stable_worker_lock_file = stable_file_path(&worker_lock_handle, &worker_lock_file)?;
+        queue_lock_handle.sync_all().map_err(QueueError::Io)?;
+        worker_lock_handle.sync_all().map_err(QueueError::Io)?;
+        sync_directory(&directories.lock.stable)?;
         let initialization_lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -197,6 +254,7 @@ impl FileQueue {
             &queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
             &configured_queue_root,
             &root_handle,
+            &directories,
             &queue_lock_handle,
             &worker_lock_handle,
             &queue_root,
@@ -205,7 +263,6 @@ impl FileQueue {
             ensure_queue_identity_file(&queue_root.join(QUEUE_IDENTITY_FILE_NAME), &queue_root)?;
         ensure_sequence_file(&queue_root.join(NEXT_SEQUENCE_FILE_NAME), &queue_root)?;
 
-        sync_directory(&lock_root)?;
         sync_directory(&queue_root)?;
         if let Some(parent) = configured_queue_root.parent()
             && !parent.as_os_str().is_empty()
@@ -214,6 +271,7 @@ impl FileQueue {
         }
         let queue = Self {
             configured_queue_root,
+            directories,
             identity,
             lock_file,
             stable_lock_file,
@@ -239,7 +297,7 @@ impl FileQueue {
         let queue_lock = self.open_queue_lock()?;
         queue_lock.lock().map_err(QueueError::Io)?;
         self.current_identity_locked()?;
-        let incoming_root = self.queue_root.join("incoming");
+        let incoming_root = &self.directories.incoming.stable;
         for _ in 0..MAXIMUM_STAGING_NAME_ATTEMPTS {
             let staging_name = format!(".incoming-{}", Ulid::generate());
             let staging_path = incoming_root.join(staging_name);
@@ -287,9 +345,15 @@ impl FileQueue {
     }
 
     fn state_path(&self, state: QueueState, request_id: RequestId) -> PathBuf {
-        self.queue_root
-            .join(state.directory_name())
-            .join(request_id.to_string())
+        self.state_root(state).join(request_id.to_string())
+    }
+
+    fn state_root(&self, state: QueueState) -> &Path {
+        &self.directories.state(state).stable
+    }
+
+    fn worker_temporary_root(&self) -> &Path {
+        &self.directories.worker_temporary.stable
     }
 
     /// Moves inactive stale staging directories into `quarantine/`.
@@ -311,15 +375,15 @@ impl FileQueue {
         lock.lock().map_err(QueueError::Io)?;
         self.current_identity_locked()?;
 
-        let incoming_root = self.queue_root.join("incoming");
-        let quarantine_root = self.queue_root.join("quarantine");
+        let incoming_root = &self.directories.incoming.stable;
+        let quarantine_root = &self.directories.quarantine.stable;
         let candidates = {
             let mut scanners = self
                 .maintenance_scanners
                 .lock()
                 .map_err(|_| QueueError::MaintenanceScannerPoisoned)?;
             inactive_stale_directories(
-                &incoming_root,
+                incoming_root,
                 minimum_age,
                 maximum_scan_entries,
                 maximum_actions,
@@ -336,15 +400,15 @@ impl FileQueue {
             let destination = quarantine_root.join(name);
             fs::rename(&candidate, &destination).map_err(QueueError::Io)?;
             if let Err(error) = replace_quarantine_marker(&destination) {
-                sync_directory(&quarantine_root)?;
-                sync_directory(&incoming_root)?;
+                sync_directory(quarantine_root)?;
+                sync_directory(incoming_root)?;
                 return Err(error);
             }
             moved += 1;
         }
         if moved > 0 {
-            sync_directory(&quarantine_root)?;
-            sync_directory(&incoming_root)?;
+            sync_directory(quarantine_root)?;
+            sync_directory(incoming_root)?;
         }
         self.current_identity_locked()?;
         Ok(moved)
@@ -368,14 +432,14 @@ impl FileQueue {
         lock.lock().map_err(QueueError::Io)?;
         self.current_identity_locked()?;
 
-        let quarantine_root = self.queue_root.join("quarantine");
+        let quarantine_root = &self.directories.quarantine.stable;
         let candidates = {
             let mut scanners = self
                 .maintenance_scanners
                 .lock()
                 .map_err(|_| QueueError::MaintenanceScannerPoisoned)?;
             inactive_stale_directories(
-                &quarantine_root,
+                quarantine_root,
                 minimum_age,
                 maximum_scan_entries,
                 maximum_actions,
@@ -388,7 +452,7 @@ impl FileQueue {
             fs::remove_dir_all(candidate).map_err(QueueError::Io)?;
         }
         if removed > 0 {
-            sync_directory(&quarantine_root)?;
+            sync_directory(quarantine_root)?;
         }
         self.current_identity_locked()?;
         Ok(removed)
@@ -416,12 +480,16 @@ impl FileQueue {
                 return Err(QueueError::InvalidQueueIdentity);
             }
         }
+        for directory in self.directories.all() {
+            validate_pinned_directory(directory)?;
+        }
         validate_pinned_lock(&self.lock_file, &self.queue_lock_handle)?;
         validate_pinned_lock(&self.worker_lock_file, &self.worker_lock_handle)?;
         validate_queue_root_binding(
             &self.queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
             &self.configured_queue_root,
             &self.root_handle,
+            &self.directories,
             &self.queue_lock_handle,
             &self.worker_lock_handle,
         )?;
@@ -758,9 +826,9 @@ impl IncomingPackage {
                 });
             }
             if existing.digest() == digest {
-                sync_directory(&self.queue.queue_root.join("incoming"))?;
+                sync_directory(&self.queue.directories.incoming.stable)?;
                 for accepted_state in QueueState::ALL {
-                    sync_directory(&self.queue.queue_root.join(accepted_state.directory_name()))?;
+                    sync_directory(self.queue.state_root(accepted_state))?;
                 }
                 hook.reached(AcceptancePhase::ExistingQueueDirectoriesSynchronized)
                     .map_err(QueueError::Io)?;
@@ -792,8 +860,8 @@ impl IncomingPackage {
         hook.reached(AcceptancePhase::Renamed)
             .map_err(QueueError::Io)?;
 
-        sync_directory(&self.queue.queue_root.join("pending"))?;
-        sync_directory(&self.queue.queue_root.join("incoming"))?;
+        sync_directory(self.queue.state_root(QueueState::Pending))?;
+        sync_directory(&self.queue.directories.incoming.stable)?;
         hook.reached(AcceptancePhase::QueueDirectoriesSynchronized)
             .map_err(QueueError::Io)?;
         self.queue.current_identity_locked()?;
@@ -1085,6 +1153,7 @@ fn ensure_queue_root_binding(
     path: &Path,
     configured_root: &Path,
     root_handle: &File,
+    directories: &QueueDirectories,
     queue_lock_handle: &File,
     worker_lock_handle: &File,
     queue_root: &Path,
@@ -1092,6 +1161,7 @@ fn ensure_queue_root_binding(
     let expected = queue_root_binding(
         configured_root,
         root_handle,
+        directories,
         queue_lock_handle,
         worker_lock_handle,
     )?;
@@ -1100,6 +1170,7 @@ fn ensure_queue_root_binding(
             path,
             configured_root,
             root_handle,
+            directories,
             queue_lock_handle,
             worker_lock_handle,
         ),
@@ -1123,6 +1194,7 @@ fn ensure_queue_root_binding(
 fn queue_root_binding(
     configured_root: &Path,
     root_handle: &File,
+    directories: &QueueDirectories,
     queue_lock_handle: &File,
     worker_lock_handle: &File,
 ) -> Result<Vec<u8>, QueueError> {
@@ -1130,7 +1202,10 @@ fn queue_root_binding(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        for handle in [root_handle, queue_lock_handle, worker_lock_handle] {
+        let handles = std::iter::once(root_handle)
+            .chain(directories.all().map(|directory| directory.handle.as_ref()))
+            .chain([queue_lock_handle, worker_lock_handle]);
+        for handle in handles {
             let metadata = handle.metadata().map_err(QueueError::Io)?;
             expected.push(0);
             expected.extend_from_slice(&metadata.dev().to_le_bytes());
@@ -1144,12 +1219,14 @@ fn validate_queue_root_binding(
     path: &Path,
     configured_root: &Path,
     root_handle: &File,
+    directories: &QueueDirectories,
     queue_lock_handle: &File,
     worker_lock_handle: &File,
 ) -> Result<(), QueueError> {
     let expected = queue_root_binding(
         configured_root,
         root_handle,
+        directories,
         queue_lock_handle,
         worker_lock_handle,
     )?;
@@ -1179,6 +1256,36 @@ fn validate_pinned_lock(path: &Path, pinned: &File) -> Result<(), QueueError> {
     {
         use std::os::unix::fs::MetadataExt;
         if configured.dev() != pinned.dev() || configured.ino() != pinned.ino() {
+            return Err(QueueError::InvalidQueueIdentity);
+        }
+    }
+    Ok(())
+}
+
+fn pin_directory(path: &Path) -> Result<PinnedDirectory, QueueError> {
+    let metadata = fs::symlink_metadata(path).map_err(QueueError::Io)?;
+    if !metadata.file_type().is_dir() {
+        return Err(QueueError::InvalidStoragePath(path.into()));
+    }
+    let handle = Arc::new(File::open(path).map_err(QueueError::Io)?);
+    let stable = stable_file_path(&handle, path)?;
+    Ok(PinnedDirectory {
+        entry: path.into(),
+        stable,
+        handle,
+    })
+}
+
+fn validate_pinned_directory(directory: &PinnedDirectory) -> Result<(), QueueError> {
+    let entry = fs::metadata(&directory.entry).map_err(QueueError::Io)?;
+    let pinned = directory.handle.metadata().map_err(QueueError::Io)?;
+    if !entry.is_dir() {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if entry.dev() != pinned.dev() || entry.ino() != pinned.ino() {
             return Err(QueueError::InvalidQueueIdentity);
         }
     }

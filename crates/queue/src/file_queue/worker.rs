@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use super::{FileQueue, QueueError, QueueState, WORKER_TEMP_DIRECTORY_NAME, sync_directory};
+use super::{FileQueue, QueueError, QueueState, sync_directory};
 use crate::{PackageValidationError, ValidatedPackage, validate_accepted_package};
 
 mod batch;
@@ -104,7 +104,7 @@ pub struct ClaimedPackage {
     token: ClaimToken,
     package: ValidatedPackage,
     package_root: PathBuf,
-    _root_lease: Arc<File>,
+    _directory_lease: Arc<File>,
 }
 
 impl PartialEq for ClaimedPackage {
@@ -258,14 +258,8 @@ impl FileQueue {
         hook.reached(ClaimPhase::Renamed)
             .map_err(WorkerQueueError::Io)?;
 
-        sync_directory(
-            &self
-                .queue_root
-                .join(QueueState::Processing.directory_name()),
-        )
-        .map_err(WorkerQueueError::Queue)?;
-        sync_directory(&self.queue_root.join(QueueState::Pending.directory_name()))
-            .map_err(WorkerQueueError::Queue)?;
+        sync_directory(self.state_root(QueueState::Processing)).map_err(WorkerQueueError::Queue)?;
+        sync_directory(self.state_root(QueueState::Pending)).map_err(WorkerQueueError::Queue)?;
         hook.reached(ClaimPhase::QueueDirectoriesSynchronized)
             .map_err(WorkerQueueError::Io)?;
         self.current_identity_locked()
@@ -279,7 +273,7 @@ impl FileQueue {
             },
             package: prepared.package,
             package_root: processing_path,
-            _root_lease: Arc::clone(&self.root_handle),
+            _directory_lease: Arc::clone(&self.directories.state(QueueState::Processing).handle),
         })
     }
 
@@ -346,14 +340,8 @@ impl FileQueue {
         self.current_identity_locked()
             .map_err(WorkerQueueError::Queue)?;
         fs::rename(&processing_path, pending_path).map_err(WorkerQueueError::Io)?;
-        sync_directory(&self.queue_root.join(QueueState::Pending.directory_name()))
-            .map_err(WorkerQueueError::Queue)?;
-        sync_directory(
-            &self
-                .queue_root
-                .join(QueueState::Processing.directory_name()),
-        )
-        .map_err(WorkerQueueError::Queue)?;
+        sync_directory(self.state_root(QueueState::Pending)).map_err(WorkerQueueError::Queue)?;
+        sync_directory(self.state_root(QueueState::Processing)).map_err(WorkerQueueError::Queue)?;
         self.current_identity_locked()
             .map_err(WorkerQueueError::Queue)?;
         Ok(())
@@ -500,7 +488,7 @@ fn write_phase_record(
     package_root: &Path,
     record: &WorkerPhaseRecord,
 ) -> Result<(), WorkerQueueError> {
-    let temporary_root = queue.queue_root.join(WORKER_TEMP_DIRECTORY_NAME);
+    let temporary_root = queue.worker_temporary_root();
     let temporary_path = temporary_root.join(format!(".phase-{}", Ulid::generate()));
     let destination = package_root.join(PHASE_FILE_NAME);
     match fs::symlink_metadata(&destination) {
@@ -528,7 +516,7 @@ fn write_phase_record(
         drop(temporary);
         fs::rename(&temporary_path, destination).map_err(WorkerQueueError::Io)?;
         sync_directory(package_root).map_err(WorkerQueueError::Queue)?;
-        sync_directory(&temporary_root).map_err(WorkerQueueError::Queue)
+        sync_directory(temporary_root).map_err(WorkerQueueError::Queue)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);

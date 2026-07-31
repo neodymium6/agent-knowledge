@@ -225,12 +225,8 @@ impl WorkerSession {
                 read_next_sequence(&self.queue.queue_root.join(NEXT_SEQUENCE_FILE_NAME))
                     .map_err(WorkerQueueError::Queue)?;
             self.pending_scan.entries = Some(
-                fs::read_dir(
-                    self.queue
-                        .queue_root
-                        .join(QueueState::Pending.directory_name()),
-                )
-                .map_err(WorkerQueueError::Io)?,
+                fs::read_dir(self.queue.state_root(QueueState::Pending))
+                    .map_err(WorkerQueueError::Io)?,
             );
             self.pending_scan.batch_id = Some(batch_id);
             self.pending_scan.maximum_requests = maximum_requests;
