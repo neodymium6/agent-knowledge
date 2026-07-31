@@ -94,9 +94,11 @@ pub enum BatchCommitOutcome {
 pub struct GitRepository {
     git_directory: PathBuf,
     canonical_worktree: PathBuf,
+    work_root: PathBuf,
     journal_root: PathBuf,
     worktree_root: PathBuf,
     writer_lock: PathBuf,
+    binding_file: PathBuf,
     official_ref: String,
     identity: GitIdentity,
 }
@@ -158,57 +160,24 @@ impl GitRepository {
     ) -> Result<Self, GitTransactionError> {
         ensure_supported_git()?;
         ensure_real_directory(git_directory)?;
+        let git_directory = fs::canonicalize(git_directory).map_err(GitTransactionError::Io)?;
         if official_branch.is_empty() || official_branch.chars().any(char::is_control) {
             return Err(GitTransactionError::InvalidOfficialBranch);
         }
         let official_ref = format!("refs/heads/{official_branch}");
         run_git(
             None,
-            Some(git_directory),
+            Some(&git_directory),
             [OsStr::new("check-ref-format"), OsStr::new(&official_ref)],
         )?;
-        let bare = run_git(
-            None,
-            Some(git_directory),
-            [OsStr::new("rev-parse"), OsStr::new("--is-bare-repository")],
-        )?;
-        if parse_text(&bare.stdout)? != "true" {
-            return Err(GitTransactionError::RepositoryNotBare);
-        }
-        validate_local_git_config(git_directory)?;
+        validate_local_git_config(&git_directory)?;
         ensure_real_directory(canonical_worktree)?;
-        run_git(
-            Some(canonical_worktree),
-            None,
-            [OsStr::new("rev-parse"), OsStr::new("--is-inside-work-tree")],
-        )?;
+        let canonical_worktree =
+            fs::canonicalize(canonical_worktree).map_err(GitTransactionError::Io)?;
         ensure_or_create_real_directory(work_root)?;
-        let common_directory = run_git(
-            Some(canonical_worktree),
-            None,
-            [
-                OsStr::new("rev-parse"),
-                OsStr::new("--path-format=absolute"),
-                OsStr::new("--git-common-dir"),
-            ],
-        )?;
-        let common_directory = PathBuf::from(parse_text(&common_directory.stdout)?);
-        let configured_repository =
-            fs::canonicalize(git_directory).map_err(GitTransactionError::Io)?;
-        let common_directory =
-            fs::canonicalize(common_directory).map_err(GitTransactionError::Io)?;
-        if configured_repository != common_directory {
-            return Err(GitTransactionError::CanonicalWorktreeMismatch);
-        }
-        let symbolic_head = run_git(
-            Some(canonical_worktree),
-            None,
-            [OsStr::new("symbolic-ref"), OsStr::new("HEAD")],
-        )?;
-        if parse_text(&symbolic_head.stdout)? != official_ref {
-            return Err(GitTransactionError::CanonicalWorktreeBranchMismatch);
-        }
-        validate_nonoverlapping_paths(git_directory, canonical_worktree, work_root)?;
+        let work_root = fs::canonicalize(work_root).map_err(GitTransactionError::Io)?;
+        validate_repository_layout(&git_directory, &canonical_worktree, &official_ref)?;
+        validate_nonoverlapping_paths(&git_directory, &canonical_worktree, &work_root)?;
         let journal_root = work_root.join("transactions");
         let worktree_root = work_root.join("worktrees");
         ensure_or_create_real_directory(&journal_root)?;
@@ -218,23 +187,24 @@ impl GitRepository {
         let writer_lock = repository_state.join("writer.lock");
         ensure_regular_file(&writer_lock)?;
         let writer = lock_file(&writer_lock)?;
-        let canonical_worktree_binding =
-            fs::canonicalize(canonical_worktree).map_err(GitTransactionError::Io)?;
+        let binding_file = repository_state.join("binding-v1");
         ensure_repository_binding(
-            &repository_state.join("binding-v1"),
-            &fs::canonicalize(work_root).map_err(GitTransactionError::Io)?,
-            &canonical_worktree_binding,
+            &binding_file,
+            &work_root,
+            &canonical_worktree,
             &official_ref,
         )?;
         drop(writer);
         sync_directory(&repository_state).map_err(GitTransactionError::Io)?;
 
         Ok(Self {
-            git_directory: git_directory.into(),
-            canonical_worktree: canonical_worktree.into(),
+            git_directory,
+            canonical_worktree,
+            work_root,
             journal_root,
             worktree_root,
             writer_lock,
+            binding_file,
             official_ref,
             identity,
         })
@@ -691,6 +661,17 @@ impl GitRepository {
     fn lock_writer(&self) -> Result<RepositoryWriter, GitTransactionError> {
         let writer = lock_file(&self.writer_lock)?;
         validate_local_git_config(&self.git_directory)?;
+        validate_repository_layout(
+            &self.git_directory,
+            &self.canonical_worktree,
+            &self.official_ref,
+        )?;
+        ensure_repository_binding(
+            &self.binding_file,
+            &self.work_root,
+            &self.canonical_worktree,
+            &self.official_ref,
+        )?;
         Ok(writer)
     }
 
@@ -1460,6 +1441,66 @@ fn ensure_repository_binding(
     }
 }
 
+fn validate_repository_layout(
+    git_directory: &Path,
+    canonical_worktree: &Path,
+    official_ref: &str,
+) -> Result<(), GitTransactionError> {
+    let bare = run_git(
+        None,
+        Some(git_directory),
+        [OsStr::new("rev-parse"), OsStr::new("--is-bare-repository")],
+    )?;
+    if parse_text(&bare.stdout)? != "true" {
+        return Err(GitTransactionError::RepositoryNotBare);
+    }
+    let inside = run_git(
+        Some(canonical_worktree),
+        None,
+        [OsStr::new("rev-parse"), OsStr::new("--is-inside-work-tree")],
+    )?;
+    if parse_text(&inside.stdout)? != "true" {
+        return Err(GitTransactionError::CanonicalWorktreeMismatch);
+    }
+    let top_level = run_git(
+        Some(canonical_worktree),
+        None,
+        [
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--show-toplevel"),
+        ],
+    )?;
+    let top_level =
+        fs::canonicalize(parse_git_path(&top_level.stdout)?).map_err(GitTransactionError::Io)?;
+    if top_level != canonical_worktree {
+        return Err(GitTransactionError::CanonicalWorktreeMismatch);
+    }
+    let common_directory = run_git(
+        Some(canonical_worktree),
+        None,
+        [
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--git-common-dir"),
+        ],
+    )?;
+    let common_directory = fs::canonicalize(parse_git_path(&common_directory.stdout)?)
+        .map_err(GitTransactionError::Io)?;
+    if common_directory != git_directory {
+        return Err(GitTransactionError::CanonicalWorktreeMismatch);
+    }
+    let symbolic_head = run_git(
+        Some(canonical_worktree),
+        None,
+        [OsStr::new("symbolic-ref"), OsStr::new("HEAD")],
+    )?;
+    if parse_text(&symbolic_head.stdout)? != official_ref {
+        return Err(GitTransactionError::CanonicalWorktreeBranchMismatch);
+    }
+    Ok(())
+}
+
 fn validate_nonoverlapping_paths(
     git_directory: &Path,
     canonical_worktree: &Path,
@@ -1770,15 +1811,38 @@ fn validate_local_git_config(git_directory: &Path) -> Result<(), GitTransactionE
                 | "core.filemode"
                 | "core.bare"
                 | "core.logallrefupdates"
-                | "core.ignorecase"
-                | "core.precomposeunicode"
                 | "extensions.objectformat"
         ) || safe_remote_or_branch_config(key);
         if !allowed {
             return Err(GitTransactionError::UnsafeGitConfig);
         }
     }
+    require_local_boolean(git_directory, "core.bare", true)?;
+    require_local_boolean(git_directory, "core.filemode", true)?;
     Ok(())
+}
+
+fn require_local_boolean(
+    git_directory: &Path,
+    key: &str,
+    expected: bool,
+) -> Result<(), GitTransactionError> {
+    let output = run_git(
+        None,
+        Some(git_directory),
+        [
+            OsStr::new("config"),
+            OsStr::new("--local"),
+            OsStr::new("--type=bool"),
+            OsStr::new("--get"),
+            OsStr::new(key),
+        ],
+    )?;
+    if parse_text(&output.stdout)? == if expected { "true" } else { "false" } {
+        Ok(())
+    } else {
+        Err(GitTransactionError::UnsafeGitConfig)
+    }
 }
 
 fn safe_remote_or_branch_config(key: &str) -> bool {
@@ -1934,6 +1998,26 @@ fn parse_text(output: &[u8]) -> Result<&str, GitTransactionError> {
         return Err(GitTransactionError::InvalidGitOutput);
     }
     Ok(value)
+}
+
+fn parse_git_path(output: &[u8]) -> Result<PathBuf, GitTransactionError> {
+    let value = output
+        .strip_suffix(b"\n")
+        .ok_or(GitTransactionError::InvalidGitOutput)?;
+    if value.is_empty() || value.contains(&b'\n') {
+        return Err(GitTransactionError::InvalidGitOutput);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(OsString::from_vec(value.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        let value =
+            std::str::from_utf8(value).map_err(|_| GitTransactionError::InvalidGitOutput)?;
+        Ok(PathBuf::from(value))
+    }
 }
 
 fn parse_object_id(output: &[u8]) -> Result<String, GitTransactionError> {

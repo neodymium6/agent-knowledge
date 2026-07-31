@@ -148,7 +148,10 @@ requires:
 - a mounted `/proc` file system exposing `/proc/self/fd`.
 
 All durable paths are configurable. Processes handle termination signals and
-shut down at transaction boundaries.
+shut down at transaction boundaries. The configured queue root may be created
+by the application, but its parent directory must already exist so the
+application can durably synchronize the new root entry without recursively
+creating unsynchronized ancestors.
 
 A future Kubernetes deployment uses one StatefulSet replica and one persistent
 volume mounted by a single Pod. The volume must provide the file-system
@@ -754,10 +757,11 @@ batch.
 
 On Linux, each live queue handle retains an open descriptor for the initialized
 queue root and performs queue I/O through `/proc/self/fd/<fd>`. It also compares
-the identity reachable at the configured canonical path before every Worker
+the identity reachable at the configured canonical path before Gateway staging,
+immediately before and after acceptance promotion, and before every Worker
 transition. Renaming the queue root and creating a replacement at the same path
-therefore invalidates the old Worker without redirecting any of its writes into
-the replacement.
+therefore invalidates old handles without redirecting writes or acknowledging
+acceptance into the detached queue.
 
 Pending selection takes a fixed acceptance-sequence snapshot and incrementally
 walks the pending directory. Each call has a maximum number of directory
@@ -885,6 +889,14 @@ has the pinned base as its sole direct parent, and contains the exact batch and
 successful-request trailers recorded by the journal. A stale `preparing`
 journal never silently rebases onto a changed official branch.
 
+The repository, canonical worktree, and disposable work root are canonicalized
+once during startup, and only those canonical paths are retained. The configured
+canonical worktree must be exactly Git's reported worktree root, not one of its
+subdirectories. After taking the repository writer lock, the Worker revalidates
+the local Git configuration, bare-repository state, common directory, worktree
+root, checked-out official branch, and immutable repository binding before
+starting or recovering a transaction.
+
 An all-failed batch records the same durable claim tokens and failure outcomes
 in a `no_changes` journal even though it creates no Git commit.
 
@@ -917,10 +929,11 @@ The Worker applies and validates requests sequentially in a temporary
 worktree. A request that fails its own validation is rolled back in that
 worktree and moved to `failed/`. Remaining requests continue.
 Canonical Markdown bodies are loaded lazily only for archive operations.
-Payload output buffers are shared between the virtual document view and the
-mutation plan. Payload output, generated archive bytes, and every other planned
-write share one checked per-request materialization bound; one bounded document
-scratch buffer may additionally exist while archive front matter is generated.
+Payload output buffers use one no-copy shared allocation between the virtual
+document view and the mutation plan. Payload output, generated archive bytes,
+and every other planned write share one checked per-request materialization
+bound; one bounded document scratch buffer may additionally exist while archive
+front matter is generated.
 Worker-generated Markdown is validated against document and front-matter limits
 before any filesystem mutation.
 

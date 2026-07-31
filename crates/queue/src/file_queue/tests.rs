@@ -149,6 +149,49 @@ fn incoming_is_empty(root: &Path) -> bool {
 }
 
 #[test]
+fn initialization_requires_an_existing_parent_directory() {
+    let root = TestDirectory::create();
+    let queue_root = root.path().join("missing-parent").join("queue");
+    assert!(matches!(
+        FileQueue::initialize(&queue_root, PackagePolicy::default()),
+        Err(QueueError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+    ));
+    assert!(!queue_root.exists());
+}
+
+#[test]
+fn a_replaced_queue_invalidates_gateway_staging_and_acceptance() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let staged = stage_package(&queue, RESULTS);
+    let queue_path = root.path().join("queue");
+    let detached_path = root.path().join("detached-queue");
+    if let Err(error) = fs::rename(&queue_path, &detached_path) {
+        panic!("original queue must be moved aside: {error}");
+    }
+    let replacement = match FileQueue::initialize(&queue_path, PackagePolicy::default()) {
+        Ok(queue) => queue,
+        Err(error) => panic!("replacement queue must initialize: {error}"),
+    };
+
+    assert!(matches!(
+        queue.begin(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+    assert!(matches!(
+        staged.accept(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+    assert!(incoming_is_empty(root.path()));
+    assert!(
+        fs::read_dir(detached_path.join("pending"))
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+    );
+    drop(replacement);
+}
+
+#[test]
 fn accepts_new_package_and_returns_existing_for_an_identical_retry() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path(), PackagePolicy::default());
@@ -549,7 +592,10 @@ fn enforces_directory_and_path_component_limits_before_writing() {
         Ok(policy) => policy,
         Err(error) => panic!("fixture policy must be valid: {error}"),
     };
-    let entry_queue = initialize_queue(&root.path().join("entry-limit"), entry_policy);
+    let entry_root = root.path().join("entry-limit");
+    fs::create_dir(&entry_root)
+        .unwrap_or_else(|error| panic!("entry-limit queue parent must be created: {error}"));
+    let entry_queue = initialize_queue(&entry_root, entry_policy);
     let mut entry_package = match entry_queue.begin() {
         Ok(package) => package,
         Err(error) => panic!("entry-limit package must begin: {error}"),
@@ -592,6 +638,42 @@ impl AcceptanceHook for FailAfterExistingDirectoriesSynchronized {
             Ok(())
         }
     }
+}
+
+struct ReplaceQueueAfterSynchronization {
+    configured: PathBuf,
+    detached: PathBuf,
+}
+
+impl AcceptanceHook for ReplaceQueueAfterSynchronization {
+    fn reached(&mut self, phase: AcceptancePhase) -> io::Result<()> {
+        if phase == AcceptancePhase::QueueDirectoriesSynchronized {
+            fs::rename(&self.configured, &self.detached)?;
+            FileQueue::initialize(&self.configured, PackagePolicy::default())
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn queue_replacement_before_acceptance_response_prevents_acknowledgement() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let mut hook = ReplaceQueueAfterSynchronization {
+        configured: root.path().join("queue"),
+        detached: root.path().join("detached-queue"),
+    };
+
+    assert!(matches!(
+        stage_package(&queue, RESULTS).accept_with_hook(&mut hook),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+    assert!(
+        fs::read_dir(root.path().join("queue/pending"))
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+    );
 }
 
 #[test]

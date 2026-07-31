@@ -132,7 +132,16 @@ impl FileQueue {
         policy: PackagePolicy,
     ) -> Result<Self, QueueError> {
         let configured_path = queue_root.into();
+        let configured_parent = configured_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent_metadata = fs::metadata(configured_parent).map_err(QueueError::Io)?;
+        if !parent_metadata.is_dir() {
+            return Err(QueueError::InvalidStoragePath(configured_parent.into()));
+        }
         ensure_directory(&configured_path)?;
+        sync_directory(configured_parent)?;
         let configured_queue_root = fs::canonicalize(&configured_path).map_err(QueueError::Io)?;
         #[cfg(target_os = "linux")]
         let (queue_root, root_handle) = {
@@ -178,7 +187,7 @@ impl FileQueue {
         {
             sync_directory(parent)?;
         }
-        Ok(Self {
+        let queue = Self {
             configured_queue_root,
             identity,
             lock_file,
@@ -188,7 +197,9 @@ impl FileQueue {
             _root_handle: root_handle,
             policy,
             maintenance_scanners: Arc::new(Mutex::new(MaintenanceScanners::default())),
-        })
+        };
+        queue.current_identity_locked()?;
+        Ok(queue)
     }
 
     /// Creates an exclusive random package directory below `incoming/`.
@@ -199,6 +210,7 @@ impl FileQueue {
     pub fn begin(&self) -> Result<IncomingPackage, QueueError> {
         let queue_lock = self.open_queue_lock()?;
         queue_lock.lock().map_err(QueueError::Io)?;
+        self.current_identity_locked()?;
         let incoming_root = self.queue_root.join("incoming");
         for _ in 0..MAXIMUM_STAGING_NAME_ATTEMPTS {
             let staging_name = format!(".incoming-{}", Ulid::generate());
@@ -264,6 +276,7 @@ impl FileQueue {
     ) -> Result<usize, QueueError> {
         let lock = self.open_queue_lock()?;
         lock.lock().map_err(QueueError::Io)?;
+        self.current_identity_locked()?;
 
         let incoming_root = self.queue_root.join("incoming");
         let quarantine_root = self.queue_root.join("quarantine");
@@ -319,6 +332,7 @@ impl FileQueue {
     ) -> Result<usize, QueueError> {
         let lock = self.open_queue_lock()?;
         lock.lock().map_err(QueueError::Io)?;
+        self.current_identity_locked()?;
 
         let quarantine_root = self.queue_root.join("quarantine");
         let candidates = {
@@ -351,6 +365,17 @@ impl FileQueue {
             .write(true)
             .open(&self.lock_file)
             .map_err(QueueError::Io)
+    }
+
+    fn current_identity_locked(&self) -> Result<Revision, QueueError> {
+        let stable_identity = read_queue_identity(&self.queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
+        let configured_identity =
+            read_queue_identity(&self.configured_queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
+        if stable_identity == self.identity && configured_identity == self.identity {
+            Ok(stable_identity)
+        } else {
+            Err(QueueError::InvalidQueueIdentity)
+        }
     }
 
     fn find_existing(
@@ -651,6 +676,7 @@ impl IncomingPackage {
 
         let lock = self.queue.open_queue_lock()?;
         lock.lock().map_err(QueueError::Io)?;
+        self.queue.current_identity_locked()?;
 
         let request_id = validated.request().request_id;
         let digest = validated.digest();
@@ -681,6 +707,7 @@ impl IncomingPackage {
                 }
                 hook.reached(AcceptancePhase::ExistingQueueDirectoriesSynchronized)
                     .map_err(QueueError::Io)?;
+                self.queue.current_identity_locked()?;
                 return Ok(EnqueueOutcome::Existing {
                     request_id,
                     digest,
@@ -702,6 +729,7 @@ impl IncomingPackage {
             .map_err(QueueError::Io)?;
 
         let pending_path = self.queue.state_path(QueueState::Pending, request_id);
+        self.queue.current_identity_locked()?;
         fs::rename(&self.staging_path, &pending_path).map_err(QueueError::Io)?;
         self.promoted = true;
         hook.reached(AcceptancePhase::Renamed)
@@ -711,6 +739,7 @@ impl IncomingPackage {
         sync_directory(&self.queue.queue_root.join("incoming"))?;
         hook.reached(AcceptancePhase::QueueDirectoriesSynchronized)
             .map_err(QueueError::Io)?;
+        self.queue.current_identity_locked()?;
 
         Ok(EnqueueOutcome::Accepted { request_id, digest })
     }
@@ -911,9 +940,17 @@ fn ensure_directory(path: &Path) -> Result<(), QueueError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
         Ok(_) => Err(QueueError::InvalidStoragePath(path.into())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(path).map_err(QueueError::Io)
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                match fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+                    Ok(_) => Err(QueueError::InvalidStoragePath(path.into())),
+                    Err(error) => Err(QueueError::Io(error)),
+                }
+            }
+            Err(error) => Err(QueueError::Io(error)),
+        },
         Err(error) => Err(QueueError::Io(error)),
     }
 }

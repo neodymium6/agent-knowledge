@@ -123,27 +123,9 @@ impl WorkerSession {
             .open_queue_lock()
             .map_err(WorkerQueueError::Queue)?;
         queue_lock.lock().map_err(WorkerQueueError::Io)?;
-        let identity = super::super::read_queue_identity(
-            &self
-                .queue
-                .queue_root
-                .join(super::super::QUEUE_IDENTITY_FILE_NAME),
-        )
-        .map_err(WorkerQueueError::Queue)?;
-        let configured_identity = super::super::read_queue_identity(
-            &self
-                .queue
-                .configured_queue_root
-                .join(super::super::QUEUE_IDENTITY_FILE_NAME),
-        )
-        .map_err(WorkerQueueError::Queue)?;
-        if identity == self.queue.identity && configured_identity == self.queue.identity {
-            Ok(identity)
-        } else {
-            Err(WorkerQueueError::Queue(
-                super::super::QueueError::InvalidQueueIdentity,
-            ))
-        }
+        self.queue
+            .current_identity_locked()
+            .map_err(WorkerQueueError::Queue)
     }
 
     /// Verifies that this live Worker can perform one repository transaction.

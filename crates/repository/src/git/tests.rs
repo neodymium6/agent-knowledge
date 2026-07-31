@@ -98,7 +98,7 @@ impl GitFixture {
         git(Some(&seed), ["remote", "add", "origin"], Some(&repository));
         git(Some(&seed), ["push", "origin", "main"], None);
         let status = Command::new("git")
-            .arg(format!("--git-dir={}", repository.display()))
+            .arg(super::git_directory_argument(&repository))
             .args(["worktree", "add"])
             .arg(&canonical)
             .arg("main")
@@ -744,6 +744,54 @@ fn rejects_worktree_config_and_a_second_work_root() {
     ));
 }
 
+#[test]
+fn rejects_a_canonical_worktree_subdirectory() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let nested = fixture.canonical.join("nested");
+    fs::create_dir(&nested)
+        .unwrap_or_else(|error| panic!("nested worktree directory must be created: {error}"));
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+
+    assert!(matches!(
+        GitRepository::open(
+            &fixture.repository,
+            &nested,
+            &fixture.work,
+            "main",
+            identity,
+        ),
+        Err(GitTransactionError::CanonicalWorktreeMismatch)
+    ));
+}
+
+#[test]
+fn revalidates_core_repository_configuration_under_the_writer_lock() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let repository = fixture.open();
+    git(
+        None,
+        [
+            "--git-dir",
+            fixture
+                .repository
+                .to_str()
+                .unwrap_or("invalid-fictional-repository"),
+            "config",
+            "core.filemode",
+            "false",
+        ],
+        None,
+    );
+
+    assert!(matches!(
+        repository.lock_writer(),
+        Err(GitTransactionError::UnsafeGitConfig)
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn preserves_non_utf8_git_directory_arguments() {
@@ -754,6 +802,58 @@ fn preserves_non_utf8_git_directory_arguments() {
     let mut expected = b"--git-dir=".to_vec();
     expected.extend_from_slice(path.as_os_str().as_bytes());
     assert_eq!(argument.as_os_str().as_bytes(), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn opens_a_repository_below_a_non_utf8_path() {
+    let root = TestDirectory::new();
+    let parent = root
+        .path()
+        .join(OsString::from_vec(b"fictional-repository-\xff".to_vec()));
+    fs::create_dir(&parent)
+        .unwrap_or_else(|error| panic!("non-UTF-8 fixture parent must be created: {error}"));
+    let fixture = GitFixture::initialize(&parent);
+    drop(fixture.open());
+}
+
+#[cfg(unix)]
+#[test]
+fn stores_only_canonical_repository_paths() {
+    let root = TestDirectory::new();
+    let actual = root.path().join("actual");
+    fs::create_dir(&actual)
+        .unwrap_or_else(|error| panic!("actual fixture directory must be created: {error}"));
+    let fixture = GitFixture::initialize(&actual);
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&actual, &alias)
+        .unwrap_or_else(|error| panic!("fixture alias must be created: {error}"));
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+    let repository = GitRepository::open(
+        &alias.join("repository"),
+        &alias.join("content"),
+        &alias.join("work"),
+        "main",
+        identity,
+    )
+    .unwrap_or_else(|error| panic!("repository must open through a path alias: {error}"));
+
+    assert_eq!(
+        repository.git_directory,
+        fs::canonicalize(&fixture.repository)
+            .unwrap_or_else(|error| panic!("repository path must canonicalize: {error}"))
+    );
+    assert_eq!(
+        repository.canonical_worktree,
+        fs::canonicalize(&fixture.canonical)
+            .unwrap_or_else(|error| panic!("worktree path must canonicalize: {error}"))
+    );
+    assert_eq!(
+        repository.work_root,
+        fs::canonicalize(&fixture.work)
+            .unwrap_or_else(|error| panic!("work root must canonicalize: {error}"))
+    );
 }
 
 #[test]

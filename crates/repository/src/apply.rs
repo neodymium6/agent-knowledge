@@ -132,17 +132,17 @@ struct VirtualDocument {
     archived: bool,
     status: DocumentStatus,
     revision: Revision,
-    markdown: Option<Arc<[u8]>>,
+    markdown: Option<Arc<Vec<u8>>>,
 }
 
 enum PlannedMutation {
     WriteNew {
         relative_path: PathBuf,
-        bytes: Arc<[u8]>,
+        bytes: Arc<Vec<u8>>,
     },
     Replace {
         relative_path: PathBuf,
-        bytes: Arc<[u8]>,
+        bytes: Arc<Vec<u8>>,
     },
     Move {
         source: PathBuf,
@@ -181,8 +181,7 @@ fn build_plan(
                         document_id: *document_id,
                     });
                 }
-                let bytes =
-                    Arc::<[u8]>::from(read_payload(package_root, package, content.as_str())?);
+                let bytes = Arc::new(read_payload(package_root, package, content.as_str())?);
                 let metadata = decode_payload_metadata(&bytes, policy, content.as_str())?;
                 if metadata.created > operation_time
                     || metadata
@@ -242,8 +241,7 @@ fn build_plan(
                     request.project.as_ref(),
                     request.document_type,
                 )?;
-                let bytes =
-                    Arc::<[u8]>::from(read_payload(package_root, package, content.as_str())?);
+                let bytes = Arc::new(read_payload(package_root, package, content.as_str())?);
                 let metadata = decode_payload_metadata(&bytes, policy, content.as_str())?;
                 if metadata.created != document.created {
                     return Err(ApplyError::OperationForbidden {
@@ -344,7 +342,7 @@ fn build_plan(
                 let source_bundle = bundle_path(&document.relative_path, document.document_type);
                 occupancy.move_path(&source_bundle, &destination_bundle)?;
                 if document.markdown.is_none() {
-                    document.markdown = Some(Arc::from(read_canonical_markdown(
+                    document.markdown = Some(Arc::new(read_canonical_markdown(
                         content_root,
                         &document.canonical_path,
                         policy.maximum_markdown_bytes,
@@ -360,15 +358,14 @@ fn build_plan(
                     request.request_id,
                     operation_time,
                 )?;
-                if archived.len() as u64 > policy.maximum_markdown_bytes
-                    || decode_document_metadata(&archived, policy.maximum_front_matter_bytes)
-                        .is_err()
-                {
+                if archived.len() as u64 > policy.maximum_markdown_bytes {
                     return Err(ApplyError::PlanningBytesExceeded {
                         maximum: policy.maximum_markdown_bytes,
                     });
                 }
-                let archived = Arc::<[u8]>::from(archived);
+                decode_document_metadata(&archived, policy.maximum_front_matter_bytes)
+                    .map_err(ApplyError::GeneratedDocument)?;
+                let archived = Arc::new(archived);
                 let archived_revision = revision(&archived);
                 reserve_planned_bytes(&mut planned_bytes, archived.len(), maximum_planned_bytes)?;
                 plan.push(PlannedMutation::Replace {
@@ -411,8 +408,7 @@ fn build_plan(
                     .unwrap_or_else(|| Path::new(""))
                     .join(name.as_str());
                 occupancy.reserve(&relative_path)?;
-                let bytes =
-                    Arc::<[u8]>::from(read_payload(package_root, package, source.as_str())?);
+                let bytes = Arc::new(read_payload(package_root, package, source.as_str())?);
                 reserve_planned_bytes(&mut planned_bytes, bytes.len(), maximum_planned_bytes)?;
                 plan.push(PlannedMutation::WriteNew {
                     relative_path,
@@ -852,13 +848,14 @@ fn execute_plan(
                     .create_new(true)
                     .open(path)
                     .map_err(ApplyError::Io)?;
-                file.write_all(&bytes).map_err(ApplyError::Io)?;
+                file.write_all(bytes.as_slice()).map_err(ApplyError::Io)?;
             }
             PlannedMutation::Replace {
                 relative_path,
                 bytes,
             } => {
-                fs::write(content_root.join(relative_path), bytes).map_err(ApplyError::Io)?;
+                fs::write(content_root.join(relative_path), bytes.as_slice())
+                    .map_err(ApplyError::Io)?;
             }
             PlannedMutation::Move {
                 source,
@@ -943,6 +940,8 @@ pub enum ApplyError {
         /// Validation failure.
         source: DocumentValidationError,
     },
+    /// Worker-generated Markdown could not be decoded within configured limits.
+    GeneratedDocument(DocumentParseError),
     /// The accepted package no longer matched its claim-time validation.
     ClaimPackageChanged,
     /// Canonical content changed after the base index was built.
@@ -1004,6 +1003,9 @@ impl fmt::Display for ApplyError {
                 "payload `{}` metadata is invalid: {source}",
                 path.display()
             ),
+            Self::GeneratedDocument(error) => {
+                write!(formatter, "generated document is invalid: {error}")
+            }
             Self::ClaimPackageChanged => {
                 formatter.write_str("claimed package changed after claim-time validation")
             }
@@ -1028,7 +1030,9 @@ impl std::error::Error for ApplyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ContentIndex(error) | Self::ResultingContent(error) => Some(error),
-            Self::InvalidPayloadDocument { source, .. } => Some(source),
+            Self::InvalidPayloadDocument { source, .. } | Self::GeneratedDocument(source) => {
+                Some(source)
+            }
             Self::InvalidPayloadMetadata { source, .. } => Some(source),
             Self::PackageValidation(error) => Some(error),
             Self::MetadataEncoding(error) => Some(error),
@@ -1054,9 +1058,13 @@ impl ApplyError {
             Self::InvalidPayloadDocument { .. } | Self::InvalidPayloadMetadata { .. } => {
                 Some(ErrorCode::InvalidFrontMatter)
             }
+            Self::GeneratedDocument(DocumentParseError::FrontMatterTooLarge { .. }) => {
+                Some(ErrorCode::LimitExceeded)
+            }
             Self::ContentIndex(_)
             | Self::ClaimPackageChanged
             | Self::ContentChangedDuringApply
+            | Self::GeneratedDocument(_)
             | Self::MetadataEncoding(_)
             | Self::PackageValidation(_)
             | Self::Io(_) => None,

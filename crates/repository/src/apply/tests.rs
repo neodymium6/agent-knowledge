@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use agent_knowledge_core::Revision;
+use agent_knowledge_core::{DocumentParseError, Revision};
 use agent_knowledge_queue::{PackagePolicy, ValidatedPackage, validate_package};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -505,6 +505,57 @@ fn rejects_an_oversized_generated_archive_before_moving_the_bundle() {
         Err(ApplyError::PlanningBytesExceeded {
             maximum: actual_maximum
         }) if actual_maximum == maximum
+    ));
+    assert_eq!(
+        read_file(&content_root.join(relative)),
+        original.into_bytes()
+    );
+}
+
+#[test]
+fn reports_the_generated_archive_front_matter_limit() {
+    let root = TestDirectory::new();
+    let content_root = root.path().join("content");
+    let relative = format!("projects/fictional-project/runbooks/2026-07-31-{DOCUMENT_ID}/index.md");
+    let original = document(
+        DOCUMENT_ID,
+        ORIGINAL_REQUEST_ID,
+        "Bounded front matter",
+        None,
+    );
+    write_file(&content_root, &relative, original.as_bytes());
+    let package_root = root.path().join("front-matter-limit-package");
+    let archive = package(
+        &package_root,
+        request(
+            ARCHIVE_REQUEST_ID,
+            Some("fictional-project"),
+            "runbook",
+            json!([{
+                "type": "archive_document",
+                "document_id": DOCUMENT_ID,
+                "expected_revision": revision(&original).to_string()
+            }]),
+        ),
+        &[],
+    );
+    let maximum = original
+        .strip_prefix("---\n")
+        .and_then(|remainder| remainder.find("---\n"))
+        .unwrap_or_else(|| panic!("fixture front matter must have a closing delimiter"));
+    let policy = ContentPolicy {
+        maximum_front_matter_bytes: maximum,
+        ..ContentPolicy::default()
+    };
+
+    assert!(matches!(
+        apply_request(&content_root, &package_root, &archive, policy),
+        Err(ApplyError::GeneratedDocument(
+            DocumentParseError::FrontMatterTooLarge {
+                maximum: actual_maximum,
+                ..
+            }
+        )) if actual_maximum == maximum
     ));
     assert_eq!(
         read_file(&content_root.join(relative)),
