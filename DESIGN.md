@@ -1162,7 +1162,9 @@ not-yet-promoted release until the atomic `site/` promotion; the ready-only
 in-progress release. A reserved manifest produced by Quartz is rejected before
 the intent is written. After an intent exists, the store publishes or repairs
 the staging manifest by atomic rename from the pinned batch container, making
-partial manifest writes recoverable.
+partial manifest writes recoverable. The store uses a deterministic reserved
+temporary name, removes an interrupted regular temporary during recovery, and
+synchronizes both sides of the manifest rename.
 
 Failed or interrupted output may be removed only through a batch-scoped
 staging cleanup operation. Cleanup first records the pinned batch inode in

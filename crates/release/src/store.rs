@@ -21,6 +21,7 @@ const CURRENT_ENTRY: &str = "current";
 const BINDING_FILE: &str = ".release-store-binding-v5";
 const LEGACY_BINDING_FILE: &str = ".release-store-binding-v4";
 const MANIFEST_FILE: &str = ".agent-knowledge-release.json";
+const MANIFEST_TEMPORARY_FILE: &str = ".agent-knowledge-release.json.next";
 const CLEANUP_MARKER_FILE: &str = ".agent-knowledge-cleanup";
 const MANIFEST_SCHEMA_VERSION: u16 = 2;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024;
@@ -415,6 +416,7 @@ impl ReleaseStore {
             Some(_) => return Err(ReleaseError::InvalidBatchIntent),
             None => {
                 ensure_reserved_manifest_absent(&staging)?;
+                ensure_manifest_temporary_absent(&batch.stable)?;
                 self.ensure_batch_intent(batch_id, &manifest)?;
             }
         }
@@ -581,6 +583,7 @@ impl ReleaseStore {
         if batch.cleanup_started {
             return self.remove_batch_directory(batch_id, batch);
         }
+        remove_stale_manifest_temporary(&batch.stable)?;
         let mut entries = fs::read_dir(&batch.stable).map_err(ReleaseError::Io)?;
         match entries.next().transpose().map_err(ReleaseError::Io)? {
             Some(entry) if entry.file_name().as_os_str() == SITE_DIRECTORY => {
@@ -1107,6 +1110,27 @@ fn ensure_reserved_manifest_absent(staging: &Path) -> Result<(), ReleaseError> {
     }
 }
 
+fn ensure_manifest_temporary_absent(batch: &Path) -> Result<(), ReleaseError> {
+    match fs::symlink_metadata(batch.join(MANIFEST_TEMPORARY_FILE)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(ReleaseError::InvalidManifest),
+        Err(error) => Err(ReleaseError::Io(error)),
+    }
+}
+
+fn remove_stale_manifest_temporary(batch: &Path) -> Result<(), ReleaseError> {
+    let temporary = batch.join(MANIFEST_TEMPORARY_FILE);
+    match fs::symlink_metadata(&temporary) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::remove_file(&temporary).map_err(ReleaseError::Io)?;
+            sync_directory(batch)
+        }
+        Ok(_) => Err(ReleaseError::InvalidManifest),
+        Err(error) => Err(ReleaseError::Io(error)),
+    }
+}
+
 fn publish_trusted_manifest(
     batch: &Path,
     path: &Path,
@@ -1114,7 +1138,23 @@ fn publish_trusted_manifest(
 ) -> Result<(), ReleaseError> {
     let mut contents = serde_json::to_vec(manifest).map_err(ReleaseError::ManifestEncoding)?;
     contents.push(b'\n');
-    replace_regular_file(batch, path, &contents, "manifest")
+    remove_stale_manifest_temporary(batch)?;
+    let temporary = batch.join(MANIFEST_TEMPORARY_FILE);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(ReleaseError::Io)?;
+    if let Err(error) = file
+        .write_all(&contents)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&temporary, path))
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(ReleaseError::Io(error));
+    }
+    sync_directory(path.parent().ok_or(ReleaseError::InvalidManifest)?)?;
+    sync_directory(batch)
 }
 
 fn read_manifest(release: &Path) -> Result<ReleaseManifest, ReleaseError> {

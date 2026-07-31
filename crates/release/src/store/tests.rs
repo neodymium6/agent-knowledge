@@ -12,7 +12,7 @@ use ulid::Ulid;
 use super::unix_mode_is_directory;
 use super::{
     BINDING_FILE, BuildDirectory, BuiltDirectory, CLEANUP_MARKER_FILE, LEGACY_BINDING_FILE,
-    MANIFEST_FILE, MANIFEST_SCHEMA_VERSION, MAXIMUM_CLEANUP_ACTIONS,
+    MANIFEST_FILE, MANIFEST_SCHEMA_VERSION, MANIFEST_TEMPORARY_FILE, MAXIMUM_CLEANUP_ACTIONS,
     MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH, MAXIMUM_RELEASE_TREE_DEPTH, ReleaseError, ReleaseManifest,
     ReleasePolicy, ReleaseStore, cleanup_name, derived_reference_is_repairable,
     ensure_cleanup_marker, ensure_manifest, read_manifest, release_id, validate_release_tree,
@@ -186,6 +186,8 @@ fn preparation_removes_a_recovered_duplicate_staging_tree() {
         fs::copy(prepared.join(name), recovered_site.join(name))
             .unwrap_or_else(|error| panic!("recovered staging file must be copied: {error}"));
     }
+    fs::write(recovered_staging.join(MANIFEST_TEMPORARY_FILE), b"{")
+        .unwrap_or_else(|error| panic!("interrupted manifest temporary must be written: {error}"));
 
     store
         .resume_prepare(batch(FIRST_BATCH), FIRST_COMMIT)
@@ -306,6 +308,53 @@ fn repairs_a_partial_staging_manifest_from_durable_intent() {
         read_manifest(&releases.join("by-id").join(recovered.release_id()))
             .unwrap_or_else(|error| panic!("repaired manifest must be readable: {error}")),
         manifest
+    );
+}
+
+#[test]
+fn removes_an_interrupted_manifest_temporary_from_durable_intent() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = build(&store, batch(FIRST_BATCH), "fictional output\n");
+    let created_at = timestamp("2026-07-31T04:00:00Z");
+    let manifest = ReleaseManifest {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        release_id: release_id(created_at, FIRST_COMMIT),
+        commit: FIRST_COMMIT.into(),
+        content_revision: validate_release_tree_at(
+            output.path(),
+            &output.0.batch_handle,
+            ReleasePolicy::default(),
+            false,
+        )
+        .unwrap_or_else(|error| panic!("staged output must validate: {error}")),
+        created_at,
+    };
+    store
+        .ensure_batch_intent(batch(FIRST_BATCH), &manifest)
+        .unwrap_or_else(|error| panic!("batch intent must be durable: {error}"));
+    fs::write(
+        releases
+            .join(".staging")
+            .join(FIRST_BATCH)
+            .join(MANIFEST_TEMPORARY_FILE),
+        b"{",
+    )
+    .unwrap_or_else(|error| panic!("interrupted manifest temporary must be written: {error}"));
+    drop(output);
+
+    let recovered = store
+        .resume_prepare(batch(FIRST_BATCH), FIRST_COMMIT)
+        .unwrap_or_else(|error| panic!("manifest publication must resume: {error}"));
+    assert_eq!(recovered.release_id(), manifest.release_id);
+    assert!(
+        !releases
+            .join(".staging")
+            .join(FIRST_BATCH)
+            .join(MANIFEST_TEMPORARY_FILE)
+            .exists()
     );
 }
 
