@@ -9,7 +9,10 @@ use agent_knowledge_core::{
     ChangeRequest, DocumentId, DocumentMetadata, DocumentParseError, DocumentStatus, DocumentType,
     DocumentValidationError, ErrorCode, Operation, ProjectId, Revision, decode_document_metadata,
 };
-use agent_knowledge_queue::{ClaimedPackage, ValidatedPackage};
+use agent_knowledge_queue::{
+    ClaimedPackage, PackagePolicy, PackageValidationError, ValidatedPackage,
+    validate_accepted_package,
+};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
@@ -43,17 +46,47 @@ pub fn apply_claimed(
     content_root: &Path,
     claim: &ClaimedPackage,
     policy: ContentPolicy,
+    package_policy: &PackagePolicy,
 ) -> Result<ApplyOutcome, ApplyError> {
-    apply_request(content_root, claim.package_root(), claim.package(), policy)
+    let revalidated = validate_accepted_package(claim.package_root(), package_policy)
+        .map_err(ApplyError::PackageValidation)?;
+    if &revalidated != claim.package() {
+        return Err(ApplyError::ClaimPackageChanged);
+    }
+    apply_request_with_policy(
+        content_root,
+        claim.package_root(),
+        &revalidated,
+        policy,
+        package_policy,
+    )
 }
 
+#[cfg(test)]
 fn apply_request(
     content_root: &Path,
     package_root: &Path,
     package: &ValidatedPackage,
     policy: ContentPolicy,
 ) -> Result<ApplyOutcome, ApplyError> {
-    let index = ContentIndex::build(content_root, policy).map_err(ApplyError::ContentIndex)?;
+    apply_request_with_policy(
+        content_root,
+        package_root,
+        package,
+        policy,
+        &PackagePolicy::default(),
+    )
+}
+
+fn apply_request_with_policy(
+    content_root: &Path,
+    package_root: &Path,
+    package: &ValidatedPackage,
+    policy: ContentPolicy,
+    package_policy: &PackagePolicy,
+) -> Result<ApplyOutcome, ApplyError> {
+    let index = ContentIndex::build(content_root, policy, package_policy)
+        .map_err(ApplyError::ContentIndex)?;
     let plan = build_plan(
         content_root,
         package_root,
@@ -63,7 +96,8 @@ fn apply_request(
     )?;
     let operations_applied = package.request().operations.len();
     execute_plan(content_root, plan)?;
-    ContentIndex::build(content_root, policy).map_err(ApplyError::ResultingContent)?;
+    ContentIndex::build(content_root, policy, package_policy)
+        .map_err(ApplyError::ResultingContent)?;
     Ok(ApplyOutcome { operations_applied })
 }
 
@@ -160,6 +194,18 @@ fn build_plan(
                 )?;
                 let bytes = read_payload(package_root, content.as_str())?;
                 let metadata = decode_payload_metadata(&bytes, policy, content.as_str())?;
+                if metadata.created != document.created {
+                    return Err(ApplyError::OperationForbidden {
+                        document_id: *document_id,
+                        detail: "document creation time is immutable",
+                    });
+                }
+                if metadata.status == DocumentStatus::Archived {
+                    return Err(ApplyError::OperationForbidden {
+                        document_id: *document_id,
+                        detail: "archive status requires an archive operation",
+                    });
+                }
                 plan.push(PlannedMutation::Replace {
                     relative_path: document.relative_path.clone(),
                     bytes: bytes.clone(),
@@ -177,6 +223,12 @@ fn build_plan(
                     return Err(ApplyError::OperationForbidden {
                         document_id: *document_id,
                         detail: "move destination differs from request classification",
+                    });
+                }
+                if matches!(document_type, DocumentType::Log | DocumentType::Index) {
+                    return Err(ApplyError::OperationForbidden {
+                        document_id: *document_id,
+                        detail: "documents cannot be moved into log or index classification",
                     });
                 }
                 let document = resolve_document(&mut documents, index, *document_id)?;
@@ -234,6 +286,12 @@ fn build_plan(
                     request.project.as_ref(),
                     request.document_type,
                 )?;
+                if document.status != DocumentStatus::Active {
+                    return Err(ApplyError::OperationForbidden {
+                        document_id: *document_id,
+                        detail: "attachments require an active document",
+                    });
+                }
                 let relative_path = document
                     .relative_path
                     .parent()
@@ -603,6 +661,10 @@ pub enum ApplyError {
         /// Validation failure.
         source: DocumentValidationError,
     },
+    /// The accepted package no longer matched its claim-time validation.
+    ClaimPackageChanged,
+    /// Live accepted-package revalidation failed.
+    PackageValidation(PackageValidationError),
     /// A filesystem operation failed.
     Io(io::Error),
 }
@@ -650,6 +712,12 @@ impl fmt::Display for ApplyError {
                 "payload `{}` metadata is invalid: {source}",
                 path.display()
             ),
+            Self::ClaimPackageChanged => {
+                formatter.write_str("claimed package changed after claim-time validation")
+            }
+            Self::PackageValidation(error) => {
+                write!(formatter, "claimed package revalidation failed: {error}")
+            }
             Self::Io(error) => write!(formatter, "content mutation I/O failed: {error}"),
         }
     }
@@ -661,6 +729,7 @@ impl std::error::Error for ApplyError {
             Self::ContentIndex(error) | Self::ResultingContent(error) => Some(error),
             Self::InvalidPayloadDocument { source, .. } => Some(source),
             Self::InvalidPayloadMetadata { source, .. } => Some(source),
+            Self::PackageValidation(error) => Some(error),
             Self::Io(error) => Some(error),
             _ => None,
         }
@@ -676,10 +745,13 @@ impl ApplyError {
             Self::OperationForbidden { .. } | Self::DestinationExists { .. } => {
                 Some(ErrorCode::OperationForbidden)
             }
+            Self::ResultingContent(_) => Some(ErrorCode::ContentValidationFailed),
+            Self::InvalidPayloadDocument { .. } | Self::InvalidPayloadMetadata { .. } => {
+                Some(ErrorCode::InvalidFrontMatter)
+            }
             Self::ContentIndex(_)
-            | Self::ResultingContent(_)
-            | Self::InvalidPayloadDocument { .. }
-            | Self::InvalidPayloadMetadata { .. }
+            | Self::ClaimPackageChanged
+            | Self::PackageValidation(_)
             | Self::Io(_) => None,
         }
     }

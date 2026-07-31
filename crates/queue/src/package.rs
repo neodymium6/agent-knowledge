@@ -126,7 +126,9 @@ impl PackagePolicy {
         self.limits
     }
 
-    fn allows_attachment(&self, name: &str) -> bool {
+    /// Returns whether a file name uses one configured attachment extension.
+    #[must_use]
+    pub fn allows_attachment_name(&self, name: &str) -> bool {
         Path::new(name)
             .extension()
             .and_then(|extension| extension.to_str())
@@ -634,7 +636,7 @@ fn validate_payload_references(
                 referenced.insert(content.as_str());
             }
             Operation::AddAttachment { source, name, .. } => {
-                if !policy.allows_attachment(name.as_str()) {
+                if !policy.allows_attachment_name(name.as_str()) {
                     return Err(PackageValidationError::UnsupportedAttachment(
                         name.to_string(),
                     ));

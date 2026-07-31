@@ -137,6 +137,20 @@ impl GitFixture {
             ],
         )
     }
+
+    fn transaction_count(&self) -> usize {
+        directory_entry_count(&self.work.join("transactions"))
+    }
+
+    fn worktree_count(&self) -> usize {
+        directory_entry_count(&self.work.join("worktrees"))
+    }
+}
+
+fn directory_entry_count(path: &Path) -> usize {
+    fs::read_dir(path)
+        .map(|entries| entries.count())
+        .unwrap_or(usize::MAX)
 }
 
 fn git<const N: usize>(
@@ -328,14 +342,17 @@ fn commits_successes_and_isolates_a_conflicting_request() {
         &markdown(SECOND_REQUEST_ID, "Conflicting experiment"),
     );
 
-    let outcome =
-        match git
-            .open()
-            .apply_batch(parse_batch_id(), &[first, second], ContentPolicy::default())
-        {
-            Ok(outcome) => outcome,
-            Err(error) => panic!("mixed batch must commit healthy requests: {error}"),
-        };
+    let repository = git.open();
+    let outcome = match repository.apply_batch(
+        &mut worker,
+        parse_batch_id(),
+        &[first, second],
+        ContentPolicy::default(),
+        &PackagePolicy::default(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => panic!("mixed batch must commit healthy requests: {error}"),
+    };
     let BatchCommitOutcome::Committed {
         commit,
         successful,
@@ -370,18 +387,18 @@ fn commits_successes_and_isolates_a_conflicting_request() {
             "show".into(),
             "-s".into(),
             "--format=%B".into(),
-            commit,
+            commit.clone(),
         ],
     );
     assert!(message.contains("knowledge snapshot: 1 changes"));
-    assert!(message.contains(&format!("Request-ID: {FIRST_REQUEST_ID}")));
-    assert!(!message.contains(&format!("Request-ID: {SECOND_REQUEST_ID}")));
-    assert_eq!(
-        fs::read_dir(&git.work)
-            .map(|entries| entries.count())
-            .unwrap_or(usize::MAX),
-        0
-    );
+    assert!(message.contains(&format!("Knowledge-Request: {FIRST_REQUEST_ID}")));
+    assert!(!message.contains(&format!("Knowledge-Request: {SECOND_REQUEST_ID}")));
+    assert_eq!(git.worktree_count(), 0);
+    assert_eq!(git.transaction_count(), 1);
+    if let Err(error) = repository.finalize_batch(parse_batch_id(), &commit) {
+        panic!("durably reconciled batch must finalize: {error}");
+    }
+    assert_eq!(git.transaction_count(), 0);
 }
 
 #[test]
@@ -392,10 +409,13 @@ fn all_request_failures_leave_the_official_commit_unchanged() {
     let (queue, mut worker) = queue_and_worker(&root.path().join("queue"));
     let (request, payload) = missing_update_request();
     let claim = enqueue_and_claim(&queue, &mut worker, FIRST_REQUEST_ID, &request, &payload);
-    let outcome = match git
-        .open()
-        .apply_batch(parse_batch_id(), &[claim], ContentPolicy::default())
-    {
+    let outcome = match git.open().apply_batch(
+        &mut worker,
+        parse_batch_id(),
+        &[claim],
+        ContentPolicy::default(),
+        &PackagePolicy::default(),
+    ) {
         Ok(outcome) => outcome,
         Err(error) => panic!("missing document must be isolated: {error}"),
     };
@@ -406,12 +426,137 @@ fn all_request_failures_leave_the_official_commit_unchanged() {
                 && failures[0].error_code() == ErrorCode::DocumentNotFound
     ));
     assert_eq!(git.official_commit(), base);
-    assert_eq!(
-        fs::read_dir(&git.work)
-            .map(|entries| entries.count())
-            .unwrap_or(usize::MAX),
-        0
+    assert_eq!(git.worktree_count(), 0);
+    assert_eq!(git.transaction_count(), 0);
+}
+
+#[test]
+fn resumes_publication_from_a_committed_journal_after_interruption() {
+    let root = TestDirectory::new();
+    let git = GitFixture::initialize(root.path());
+    let base = git.official_commit();
+    let (queue, mut worker) = queue_and_worker(&root.path().join("queue"));
+    let claim = enqueue_and_claim(
+        &queue,
+        &mut worker,
+        FIRST_REQUEST_ID,
+        &create_request(
+            FIRST_REQUEST_ID,
+            "Create a recoverable fictional experiment",
+        ),
+        &markdown(FIRST_REQUEST_ID, "Recoverable fictional experiment"),
     );
+    let repository = git.open();
+    let interrupted = repository.apply_batch_with_hook(
+        &mut worker,
+        parse_batch_id(),
+        std::slice::from_ref(&claim),
+        ContentPolicy::default(),
+        &PackagePolicy::default(),
+        |_, _| Err(GitTransactionError::InvalidGitOutput),
+    );
+    assert!(matches!(
+        interrupted,
+        Err(GitTransactionError::InvalidGitOutput)
+    ));
+    assert_eq!(git.official_commit(), base);
+    assert_eq!(git.transaction_count(), 1);
+    assert_eq!(git.worktree_count(), 1);
+
+    let outcome = match repository.apply_batch(
+        &mut worker,
+        parse_batch_id(),
+        &[claim],
+        ContentPolicy::default(),
+        &PackagePolicy::default(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => panic!("committed journal must resume publication: {error}"),
+    };
+    let BatchCommitOutcome::Committed { commit, .. } = outcome else {
+        panic!("resumed transaction must retain its commit outcome");
+    };
+    assert_ne!(commit, base);
+    assert_eq!(git.official_commit(), commit);
+    assert_eq!(git.worktree_count(), 0);
+    assert_eq!(git.transaction_count(), 1);
+    if let Err(error) = repository.finalize_batch(parse_batch_id(), &commit) {
+        panic!("resumed batch must finalize: {error}");
+    }
+    assert_eq!(git.transaction_count(), 0);
+}
+
+#[test]
+fn rejects_unordered_and_duplicate_batch_claims_before_writing() {
+    let root = TestDirectory::new();
+    let git = GitFixture::initialize(root.path());
+    let (queue, mut worker) = queue_and_worker(&root.path().join("queue"));
+    let first = enqueue_and_claim(
+        &queue,
+        &mut worker,
+        FIRST_REQUEST_ID,
+        &create_request(FIRST_REQUEST_ID, "Create the first fictional experiment"),
+        &markdown(FIRST_REQUEST_ID, "First fictional experiment"),
+    );
+    let second = enqueue_and_claim(
+        &queue,
+        &mut worker,
+        SECOND_REQUEST_ID,
+        &create_request(SECOND_REQUEST_ID, "Create the second fictional experiment"),
+        &markdown(SECOND_REQUEST_ID, "Second fictional experiment"),
+    );
+    let repository = git.open();
+    assert!(matches!(
+        repository.apply_batch(
+            &mut worker,
+            parse_batch_id(),
+            &[second.clone(), first.clone()],
+            ContentPolicy::default(),
+            &PackagePolicy::default(),
+        ),
+        Err(GitTransactionError::InvalidClaims)
+    ));
+    assert!(matches!(
+        repository.apply_batch(
+            &mut worker,
+            parse_batch_id(),
+            &[first.clone(), first],
+            ContentPolicy::default(),
+            &PackagePolicy::default(),
+        ),
+        Err(GitTransactionError::InvalidClaims)
+    ));
+    assert_eq!(git.transaction_count(), 0);
+    assert_eq!(git.worktree_count(), 0);
+}
+
+#[test]
+fn refuses_to_start_with_a_dirty_canonical_worktree() {
+    let root = TestDirectory::new();
+    let git = GitFixture::initialize(root.path());
+    let (queue, mut worker) = queue_and_worker(&root.path().join("queue"));
+    let claim = enqueue_and_claim(
+        &queue,
+        &mut worker,
+        FIRST_REQUEST_ID,
+        &create_request(FIRST_REQUEST_ID, "Create a fictional experiment"),
+        &markdown(FIRST_REQUEST_ID, "Fictional experiment"),
+    );
+    if let Err(error) = fs::write(git.canonical.join("untracked.json"), b"{}\n") {
+        panic!("dirty canonical fixture must be written: {error}");
+    }
+    assert!(matches!(
+        git.open().apply_batch(
+            &mut worker,
+            parse_batch_id(),
+            &[claim],
+            ContentPolicy::default(),
+            &PackagePolicy::default(),
+        ),
+        Err(GitTransactionError::CanonicalWorktreeDirty)
+    ));
+    assert_eq!(git.transaction_count(), 0);
+    assert_eq!(git.worktree_count(), 0);
 }
 
 #[test]
@@ -429,9 +574,11 @@ fn compare_and_swap_refuses_a_concurrent_official_update() {
     );
     let repository_path = git.repository.clone();
     let result = git.open().apply_batch_with_hook(
+        &mut worker,
         parse_batch_id(),
         &[claim],
         ContentPolicy::default(),
+        &PackagePolicy::default(),
         move |expected, _| {
             let tree = git_output(
                 None,

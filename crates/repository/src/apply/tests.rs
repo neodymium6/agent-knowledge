@@ -277,6 +277,54 @@ fn update_requires_the_exact_revision_before_replacing_bytes() {
 }
 
 #[test]
+fn update_preserves_immutable_creation_time() {
+    let root = TestDirectory::new();
+    let content_root = root.path().join("content");
+    let relative = format!("projects/fictional-project/runbooks/2026-07-31-{DOCUMENT_ID}/index.md");
+    let original = document(DOCUMENT_ID, ORIGINAL_REQUEST_ID, "Fictional runbook", None);
+    write_file(&content_root, &relative, original.as_bytes());
+    let replacement = document(
+        DOCUMENT_ID,
+        UPDATE_REQUEST_ID,
+        "Retimed fictional runbook",
+        Some("2026-07-31T04:00:00Z"),
+    )
+    .replace(
+        "created: 2026-07-31T03:50:00Z",
+        "created: 2026-07-30T03:50:00Z",
+    );
+    let package_root = root.path().join("package");
+    let package = package(
+        &package_root,
+        request(
+            UPDATE_REQUEST_ID,
+            Some("fictional-project"),
+            "runbook",
+            json!([{
+                "type": "update_document",
+                "document_id": DOCUMENT_ID,
+                "expected_revision": revision(&original).to_string(),
+                "content": "index.md"
+            }]),
+        ),
+        &[("index.md", replacement.as_bytes())],
+    );
+    assert!(matches!(
+        apply_request(
+            &content_root,
+            &package_root,
+            &package,
+            ContentPolicy::default()
+        ),
+        Err(ApplyError::OperationForbidden { .. })
+    ));
+    assert_eq!(
+        read_file(&content_root.join(relative)),
+        original.into_bytes()
+    );
+}
+
+#[test]
 fn moves_and_archives_complete_document_bundles() {
     let root = TestDirectory::new();
     let content_root = root.path().join("content");

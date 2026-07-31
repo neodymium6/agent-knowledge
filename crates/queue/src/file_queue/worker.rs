@@ -311,6 +311,39 @@ impl FileQueue {
         )
         .map_err(WorkerQueueError::Queue)
     }
+
+    fn validate_claimed(&self, claim: &ClaimedPackage) -> Result<(), WorkerQueueError> {
+        let token = claim.token;
+        let request_id = token.request_id;
+        let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
+        lock.lock().map_err(WorkerQueueError::Io)?;
+        let processing_path = self.state_path(QueueState::Processing, request_id);
+        if claim.package_root != processing_path {
+            return Err(WorkerQueueError::ClaimChanged { request_id });
+        }
+        let Some((state, digest)) = self
+            .find_existing(request_id)
+            .map_err(WorkerQueueError::Queue)?
+        else {
+            return Err(WorkerQueueError::RequestNotFound { request_id });
+        };
+        if state != QueueState::Processing {
+            return Err(WorkerQueueError::InvalidState {
+                request_id,
+                expected: QueueState::Processing,
+                actual: state,
+            });
+        }
+        let record = read_required_phase_record(&processing_path, request_id, state)?;
+        if record.batch_id != token.batch_id
+            || record.attempt != token.attempt
+            || record.phase != WorkerPhase::Claimed
+            || digest != claim.package.digest()
+        {
+            return Err(WorkerQueueError::ClaimChanged { request_id });
+        }
+        Ok(())
+    }
 }
 
 fn revalidate_accepted(

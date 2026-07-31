@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -8,6 +8,7 @@ use agent_knowledge_core::{
     DocumentId, DocumentLimits, DocumentMetadata, DocumentParseError, DocumentType,
     DocumentValidationError, ProjectId, Revision, decode_document_metadata,
 };
+use agent_knowledge_queue::PackagePolicy;
 use sha2::{Digest, Sha256};
 
 /// Limits used while indexing one committed content tree.
@@ -106,27 +107,40 @@ pub struct ContentIndex {
 impl ContentIndex {
     /// Builds an index while rejecting unsafe entries and duplicate identities.
     ///
-    /// Non-Markdown regular files are counted but are not decoded. Symbolic
-    /// links and other special filesystem entries are rejected.
+    /// Non-Markdown regular files must use an allowed attachment type and
+    /// canonical location. Links, executable files, hard links, and other
+    /// special filesystem entries are rejected.
     ///
     /// # Errors
     ///
     /// Returns the first I/O, hierarchy, Markdown, metadata, or duplicate-ID
     /// failure.
-    pub fn build(content_root: &Path, policy: ContentPolicy) -> Result<Self, ContentIndexError> {
+    pub fn build(
+        content_root: &Path,
+        policy: ContentPolicy,
+        package_policy: &PackagePolicy,
+    ) -> Result<Self, ContentIndexError> {
         let root_metadata = fs::symlink_metadata(content_root).map_err(ContentIndexError::Io)?;
         if !root_metadata.file_type().is_dir() {
             return Err(ContentIndexError::InvalidRoot);
         }
 
-        let mut documents = HashMap::new();
+        let mut documents = HashMap::<DocumentId, DocumentRecord>::new();
+        let mut attachments = Vec::new();
         let mut pending = vec![content_root.to_path_buf()];
         let mut entry_count = 0_usize;
         while let Some(directory) = pending.pop() {
+            let remaining = policy.maximum_entry_count.saturating_sub(entry_count);
             let mut entries = fs::read_dir(&directory)
                 .map_err(ContentIndexError::Io)?
+                .take(remaining.saturating_add(1))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(ContentIndexError::Io)?;
+            if entries.len() > remaining {
+                return Err(ContentIndexError::EntryLimitExceeded {
+                    maximum: policy.maximum_entry_count,
+                });
+            }
             entries.sort_by_key(fs::DirEntry::file_name);
             let mut child_directories = Vec::new();
             for entry in entries {
@@ -150,6 +164,9 @@ impl ContentIndex {
                 if relative_path.to_str().is_none() {
                     return Err(ContentIndexError::InvalidPathEncoding(relative_path));
                 }
+                if relative_path == Path::new(".git") {
+                    continue;
+                }
 
                 let metadata = fs::symlink_metadata(&path).map_err(ContentIndexError::Io)?;
                 if metadata.file_type().is_dir() {
@@ -159,7 +176,15 @@ impl ContentIndex {
                 if !metadata.file_type().is_file() {
                     return Err(ContentIndexError::InvalidEntryType(relative_path));
                 }
+                validate_regular_file_metadata(&relative_path, &metadata)?;
                 if path.extension().and_then(|value| value.to_str()) != Some("md") {
+                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                        return Err(ContentIndexError::InvalidPathEncoding(relative_path));
+                    };
+                    if !package_policy.allows_attachment_name(name) {
+                        return Err(ContentIndexError::UnsupportedAttachment(relative_path));
+                    }
+                    attachments.push(relative_path);
                     continue;
                 }
                 if metadata.len() > policy.maximum_markdown_bytes {
@@ -177,6 +202,7 @@ impl ContentIndex {
                         source,
                     })?;
                 let location = classify_document_path(&relative_path)?;
+                validate_canonical_document_path(&relative_path, &location, &document)?;
                 document
                     .validate(location.document_type, policy.document)
                     .map_err(|source| ContentIndexError::InvalidMetadata {
@@ -201,6 +227,8 @@ impl ContentIndex {
             }
             pending.extend(child_directories.into_iter().rev());
         }
+
+        validate_attachment_locations(&attachments, &documents)?;
 
         Ok(Self { documents })
     }
@@ -246,6 +274,61 @@ impl ContentIndex {
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
     }
+}
+
+fn validate_attachment_locations(
+    attachments: &[PathBuf],
+    documents: &HashMap<DocumentId, DocumentRecord>,
+) -> Result<(), ContentIndexError> {
+    let document_directories = documents
+        .values()
+        .filter_map(|document| document.relative_path.parent().map(Path::to_path_buf))
+        .collect::<HashSet<_>>();
+    for attachment in attachments {
+        let beside_document = attachment
+            .parent()
+            .is_some_and(|parent| document_directories.contains(parent));
+        if !beside_document && !is_project_asset(attachment) {
+            return Err(ContentIndexError::OrphanAttachment(attachment.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn is_project_asset(path: &Path) -> bool {
+    let components = path
+        .iter()
+        .filter_map(|component| component.to_str())
+        .collect::<Vec<_>>();
+    matches!(
+        components.as_slice(),
+        ["projects", project, "assets", rest @ ..]
+            if !rest.is_empty() && project.parse::<ProjectId>().is_ok()
+    )
+}
+
+#[cfg(unix)]
+fn validate_regular_file_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ContentIndexError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if metadata.permissions().mode() & 0o111 != 0 {
+        return Err(ContentIndexError::ExecutableFile(path.to_path_buf()));
+    }
+    if metadata.nlink() > 1 {
+        return Err(ContentIndexError::HardLinkedFile(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_regular_file_metadata(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<(), ContentIndexError> {
+    Ok(())
 }
 
 fn classify_document_path(path: &Path) -> Result<DocumentLocation, ContentIndexError> {
@@ -300,6 +383,95 @@ fn classify_document_path(path: &Path) -> Result<DocumentLocation, ContentIndexE
             archived: true,
         }),
         _ => Err(invalid()),
+    }
+}
+
+fn validate_canonical_document_path(
+    path: &Path,
+    location: &DocumentLocation,
+    metadata: &DocumentMetadata,
+) -> Result<(), ContentIndexError> {
+    let expected = canonical_document_path(location, metadata);
+    if path != expected {
+        return Err(ContentIndexError::InvalidDocumentPath(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn canonical_document_path(location: &DocumentLocation, metadata: &DocumentMetadata) -> PathBuf {
+    if location.document_type == DocumentType::Index {
+        return location.project.as_ref().map_or_else(
+            || PathBuf::from("index.md"),
+            |project| {
+                PathBuf::from("projects")
+                    .join(project.as_str())
+                    .join("index.md")
+            },
+        );
+    }
+
+    let category = category_name(location.document_type);
+    let bundle = bundle_name(location.document_type, metadata);
+    if location.archived {
+        return if let Some(project) = location.project.as_ref() {
+            PathBuf::from("projects")
+                .join(project.as_str())
+                .join("archive")
+                .join(category)
+                .join(bundle)
+                .join("index.md")
+        } else {
+            PathBuf::from("archive")
+                .join(category)
+                .join(bundle)
+                .join("index.md")
+        };
+    }
+
+    let mut path = location.project.as_ref().map_or_else(
+        || PathBuf::from("inbox").join(category),
+        |project| {
+            PathBuf::from("projects")
+                .join(project.as_str())
+                .join(category)
+        },
+    );
+    if location.document_type == DocumentType::Log {
+        path.push(format!("{:04}", metadata.created.year()));
+        path.push(format!("{:02}", u8::from(metadata.created.month())));
+        path.push(format!("{:02}", metadata.created.day()));
+    }
+    path.join(bundle).join("index.md")
+}
+
+fn bundle_name(document_type: DocumentType, metadata: &DocumentMetadata) -> String {
+    if document_type == DocumentType::Log {
+        format!(
+            "{:02}{:02}{:02}-{}",
+            metadata.created.hour(),
+            metadata.created.minute(),
+            metadata.created.second(),
+            metadata.document_id
+        )
+    } else {
+        format!(
+            "{:04}-{:02}-{:02}-{}",
+            metadata.created.year(),
+            u8::from(metadata.created.month()),
+            metadata.created.day(),
+            metadata.document_id
+        )
+    }
+}
+
+const fn category_name(document_type: DocumentType) -> &'static str {
+    match document_type {
+        DocumentType::Index => "",
+        DocumentType::Log => "logs",
+        DocumentType::Experiment => "experiments",
+        DocumentType::Decision => "decisions",
+        DocumentType::Runbook => "runbooks",
+        DocumentType::Reference => "references",
     }
 }
 
@@ -368,6 +540,14 @@ pub enum ContentIndexError {
     InvalidDocumentPath(PathBuf),
     /// A symbolic link or other special filesystem entry was present.
     InvalidEntryType(PathBuf),
+    /// A regular file had an executable mode bit.
+    ExecutableFile(PathBuf),
+    /// A regular file had more than one hard link.
+    HardLinkedFile(PathBuf),
+    /// A non-Markdown file used a disallowed extension.
+    UnsupportedAttachment(PathBuf),
+    /// An attachment was neither beside a document nor in project assets.
+    OrphanAttachment(PathBuf),
     /// The hierarchy exceeded the configured entry limit.
     EntryLimitExceeded {
         /// Configured maximum entries.
@@ -424,6 +604,24 @@ impl fmt::Display for ContentIndexError {
             Self::InvalidEntryType(path) => write!(
                 formatter,
                 "content entry `{}` is not a regular file or directory",
+                path.display()
+            ),
+            Self::ExecutableFile(path) => {
+                write!(formatter, "content file `{}` is executable", path.display())
+            }
+            Self::HardLinkedFile(path) => write!(
+                formatter,
+                "content file `{}` has multiple hard links",
+                path.display()
+            ),
+            Self::UnsupportedAttachment(path) => write!(
+                formatter,
+                "content attachment `{}` has a disallowed extension",
+                path.display()
+            ),
+            Self::OrphanAttachment(path) => write!(
+                formatter,
+                "content attachment `{}` is outside a document bundle or project assets",
                 path.display()
             ),
             Self::EntryLimitExceeded { maximum } => {

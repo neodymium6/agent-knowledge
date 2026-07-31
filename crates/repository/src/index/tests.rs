@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_knowledge_core::{DocumentId, Revision};
+use agent_knowledge_queue::PackagePolicy;
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
@@ -10,6 +11,7 @@ use super::{ContentIndex, ContentIndexError, ContentPolicy, RevisionCheckError};
 const DOCUMENT_ID: &str = "01K00000000000000000000000";
 const OTHER_DOCUMENT_ID: &str = "01K00000000000000000000001";
 const REQUEST_ID: &str = "01K00000000000000000000002";
+const BUNDLE: &str = "2026-07-31-01K00000000000000000000000";
 
 struct TestDirectory {
     path: PathBuf,
@@ -79,16 +81,20 @@ fn indexes_documents_and_exact_byte_revisions() {
     let contents = markdown(DOCUMENT_ID, "Fictional runbook");
     write_document(
         root.path(),
-        "projects/fictional/runbooks/example/index.md",
+        &format!("projects/fictional/runbooks/{BUNDLE}/index.md"),
         &contents,
     );
     write_document(
         root.path(),
-        "projects/fictional/runbooks/example/report.json",
+        &format!("projects/fictional/runbooks/{BUNDLE}/report.json"),
         "{}\n",
     );
 
-    let index = match ContentIndex::build(root.path(), ContentPolicy::default()) {
+    let index = match ContentIndex::build(
+        root.path(),
+        ContentPolicy::default(),
+        &PackagePolicy::default(),
+    ) {
         Ok(index) => index,
         Err(error) => panic!("valid content must index: {error}"),
     };
@@ -100,7 +106,7 @@ fn indexes_documents_and_exact_byte_revisions() {
     };
     assert_eq!(
         record.relative_path(),
-        Path::new("projects/fictional/runbooks/example/index.md")
+        Path::new(&format!("projects/fictional/runbooks/{BUNDLE}/index.md"))
     );
     assert_eq!(record.metadata().title, "Fictional runbook");
     let revision = Revision::from_bytes(Sha256::digest(contents.as_bytes()).into());
@@ -114,10 +120,14 @@ fn optimistic_check_reports_missing_and_conflicting_documents() {
     let contents = markdown(DOCUMENT_ID, "Fictional decision");
     write_document(
         root.path(),
-        "projects/fictional/decisions/example/index.md",
+        &format!("projects/fictional/decisions/{BUNDLE}/index.md"),
         &contents,
     );
-    let index = match ContentIndex::build(root.path(), ContentPolicy::default()) {
+    let index = match ContentIndex::build(
+        root.path(),
+        ContentPolicy::default(),
+        &PackagePolicy::default(),
+    ) {
         Ok(index) => index,
         Err(error) => panic!("valid content must index: {error}"),
     };
@@ -147,24 +157,32 @@ fn duplicate_document_ids_fail_the_complete_index() {
     let contents = markdown(DOCUMENT_ID, "Fictional reference");
     write_document(
         root.path(),
-        "projects/fictional/references/first/index.md",
+        &format!("projects/fictional-a/references/{BUNDLE}/index.md"),
         &contents,
     );
     write_document(
         root.path(),
-        "projects/fictional/references/second/index.md",
+        &format!("projects/fictional-b/references/{BUNDLE}/index.md"),
         &contents,
     );
 
     assert!(matches!(
-        ContentIndex::build(root.path(), ContentPolicy::default()),
+        ContentIndex::build(
+            root.path(),
+            ContentPolicy::default(),
+            &PackagePolicy::default()
+        ),
         Err(ContentIndexError::DuplicateDocumentId {
             document_id,
             first_path,
             second_path,
         }) if document_id == parse_document_id(DOCUMENT_ID)
-            && first_path == Path::new("projects/fictional/references/first/index.md")
-            && second_path == Path::new("projects/fictional/references/second/index.md")
+            && first_path == Path::new(&format!(
+                "projects/fictional-a/references/{BUNDLE}/index.md"
+            ))
+            && second_path == Path::new(&format!(
+                "projects/fictional-b/references/{BUNDLE}/index.md"
+            ))
     ));
 }
 
@@ -173,7 +191,7 @@ fn rejects_unsafe_entries_and_enforces_bounds() {
     let root = TestDirectory::new();
     write_document(
         root.path(),
-        "projects/fictional/references/example/index.md",
+        &format!("projects/fictional/references/{BUNDLE}/index.md"),
         &markdown(DOCUMENT_ID, "Fictional reference"),
     );
     write_document(root.path(), "attachment.json", "{}\n");
@@ -183,7 +201,8 @@ fn rejects_unsafe_entries_and_enforces_bounds() {
             ContentPolicy {
                 maximum_entry_count: 1,
                 ..ContentPolicy::default()
-            }
+            },
+            &PackagePolicy::default()
         ),
         Err(ContentIndexError::EntryLimitExceeded { maximum: 1 })
     ));
@@ -194,7 +213,8 @@ fn rejects_unsafe_entries_and_enforces_bounds() {
             ContentPolicy {
                 maximum_markdown_bytes: 8,
                 ..ContentPolicy::default()
-            }
+            },
+            &PackagePolicy::default()
         ),
         Err(ContentIndexError::MarkdownTooLarge { maximum: 8, .. })
     ));
@@ -208,7 +228,7 @@ fn rejects_symbolic_links() {
     let root = TestDirectory::new();
     write_document(
         root.path(),
-        "projects/fictional/references/example/index.md",
+        &format!("projects/fictional/references/{BUNDLE}/index.md"),
         &markdown(DOCUMENT_ID, "Fictional reference"),
     );
     let link = root.path().join("projects/fictional/references/link.md");
@@ -221,8 +241,102 @@ fn rejects_symbolic_links() {
         panic!("symbolic-link fixture must be created: {error}");
     }
     assert!(matches!(
-        ContentIndex::build(root.path(), ContentPolicy::default()),
+        ContentIndex::build(
+            root.path(),
+            ContentPolicy::default(),
+            &PackagePolicy::default()
+        ),
         Err(ContentIndexError::InvalidEntryType(path))
             if path == Path::new("projects/fictional/references/link.md")
+    ));
+}
+
+#[test]
+fn rejects_noncanonical_document_and_attachment_paths() {
+    let root = TestDirectory::new();
+    write_document(
+        root.path(),
+        "projects/fictional/runbooks/arbitrary/index.md",
+        &markdown(DOCUMENT_ID, "Misplaced fictional runbook"),
+    );
+    assert!(matches!(
+        ContentIndex::build(
+            root.path(),
+            ContentPolicy::default(),
+            &PackagePolicy::default()
+        ),
+        Err(ContentIndexError::InvalidDocumentPath(path))
+            if path == Path::new("projects/fictional/runbooks/arbitrary/index.md")
+    ));
+
+    let root = TestDirectory::new();
+    write_document(root.path(), "orphan.json", "{}\n");
+    assert!(matches!(
+        ContentIndex::build(
+            root.path(),
+            ContentPolicy::default(),
+            &PackagePolicy::default()
+        ),
+        Err(ContentIndexError::OrphanAttachment(path))
+            if path == Path::new("orphan.json")
+    ));
+
+    let root = TestDirectory::new();
+    write_document(
+        root.path(),
+        "projects/fictional/assets/program.exe",
+        "fictional\n",
+    );
+    assert!(matches!(
+        ContentIndex::build(
+            root.path(),
+            ContentPolicy::default(),
+            &PackagePolicy::default()
+        ),
+        Err(ContentIndexError::UnsupportedAttachment(path))
+            if path == Path::new("projects/fictional/assets/program.exe")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_executable_and_hard_linked_regular_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDirectory::new();
+    let executable = root.path().join("projects/fictional/assets/report.json");
+    write_document(root.path(), "projects/fictional/assets/report.json", "{}\n");
+    let mut permissions = match fs::metadata(&executable) {
+        Ok(metadata) => metadata.permissions(),
+        Err(error) => panic!("executable fixture metadata must load: {error}"),
+    };
+    permissions.set_mode(0o755);
+    if let Err(error) = fs::set_permissions(&executable, permissions) {
+        panic!("executable fixture permissions must change: {error}");
+    }
+    assert!(matches!(
+        ContentIndex::build(
+            root.path(),
+            ContentPolicy::default(),
+            &PackagePolicy::default()
+        ),
+        Err(ContentIndexError::ExecutableFile(path))
+            if path == Path::new("projects/fictional/assets/report.json")
+    ));
+
+    let root = TestDirectory::new();
+    let first = root.path().join("projects/fictional/assets/first.json");
+    let second = root.path().join("projects/fictional/assets/second.json");
+    write_document(root.path(), "projects/fictional/assets/first.json", "{}\n");
+    if let Err(error) = fs::hard_link(&first, &second) {
+        panic!("hard-link fixture must be created: {error}");
+    }
+    assert!(matches!(
+        ContentIndex::build(
+            root.path(),
+            ContentPolicy::default(),
+            &PackagePolicy::default()
+        ),
+        Err(ContentIndexError::HardLinkedFile(_))
     ));
 }

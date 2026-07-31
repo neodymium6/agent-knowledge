@@ -246,6 +246,32 @@ fn requeue_requires_current_token_and_increments_the_next_attempt() {
 }
 
 #[test]
+fn live_worker_validation_rejects_a_requeued_claim() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    let request_id = parse_request_id();
+    let mut worker = open_worker(&queue);
+    let claim = match worker.claim(request_id, parse_batch_id(FIRST_BATCH_ID)) {
+        Ok(claim) => claim,
+        Err(error) => panic!("fixture claim must succeed: {error}"),
+    };
+    if let Err(error) = worker.validate_claimed(&claim) {
+        panic!("current claim must validate: {error}");
+    }
+    if let Err(error) = worker.requeue_claimed(claim.token()) {
+        panic!("current claim must requeue: {error}");
+    }
+    assert!(matches!(
+        worker.validate_claimed(&claim),
+        Err(WorkerQueueError::InvalidState {
+            request_id: changed,
+            ..
+        }) if changed == request_id
+    ));
+}
+
+#[test]
 fn claim_rejects_corrupt_stored_phase_metadata() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path());

@@ -112,6 +112,20 @@ impl FileQueue {
 }
 
 impl WorkerSession {
+    /// Revalidates that one claim is still owned by this live Worker session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when recovery is incomplete, another scan is active,
+    /// or the processing package no longer matches its exact claim token.
+    pub fn validate_claimed(
+        &mut self,
+        claim: &super::ClaimedPackage,
+    ) -> Result<(), WorkerQueueError> {
+        self.ensure_no_active_scan()?;
+        self.queue.validate_claimed(claim)
+    }
+
     /// Claims one known pending request while holding Worker ownership.
     ///
     /// # Errors
