@@ -1071,6 +1071,8 @@ releases/
 ├── by-id/
 │   ├── 20260731T040000Z-<commit>/
 │   └── 20260731T040500Z-<commit>/
+├── by-commit/
+│   └── <commit> -> ../by-id/<release-id>/
 └── current -> by-id/20260731T040500Z-<commit>/
 ```
 
@@ -1086,19 +1088,22 @@ The Worker:
 If a build or activation fails, the previous `current` release remains
 available.
 
-The release store pins the release root, `.staging/`, and `by-id/` directory
-identities and requires them to share one Linux mount. Generated output is
-bounded by entry count, individual-file bytes, and total bytes; symbolic links,
-special files, and hard-linked files are rejected. Before promotion, each
-release receives a synchronized, versioned
+The release store pins the release root, `.staging/`, `by-id/`, and
+`by-commit/` directory identities and requires them to share one Linux mount.
+Generated output is bounded by entry count, individual-file bytes, and total
+bytes during validation and synchronization; symbolic links, special files,
+and hard-linked files are rejected. Before promotion, each release receives a
+synchronized, versioned
 `.agent-knowledge-release.json` manifest binding its release ID, full commit
 ID, UTC creation time, and a deterministic SHA-256 revision of the generated
 tree. The tree revision is checked again before activation, so a changed
 prepared release cannot become current. Promotion from
 `.staging/<batch-id>/` to `by-id/` and replacement of `current` are separately
 atomic and idempotent. After a restart, the Worker can recover a validated
-prepared release by commit ID and resume after either rename without replacing
-the previously active site.
+prepared release through the bounded `by-commit/<commit>` lookup and resume
+after either rename without replacing the previously active site. The
+`by-commit/` references are derived indexes and may be rebuilt from validated
+release manifests.
 Failed or interrupted output may be removed only through a batch-scoped
 staging cleanup operation; prepared `by-id/` releases are never removed by the
 publication path.

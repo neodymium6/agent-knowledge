@@ -1,6 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
 
 use agent_knowledge_core::BatchId;
 use time::OffsetDateTime;
@@ -160,6 +161,32 @@ fn preparation_recovers_after_the_release_rename() {
 }
 
 #[test]
+fn preparation_removes_a_recovered_duplicate_staging_tree() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    build(&store, batch(FIRST_BATCH), "fictional output\n");
+    let created_at = timestamp("2026-07-31T04:00:00Z");
+    let release = store
+        .prepare(batch(FIRST_BATCH), FIRST_COMMIT, created_at)
+        .unwrap_or_else(|error| panic!("release must prepare: {error}"));
+    let prepared = releases.join("by-id").join(release.release_id());
+    let recovered_staging = releases.join(".staging").join(FIRST_BATCH);
+    fs::create_dir(&recovered_staging)
+        .unwrap_or_else(|error| panic!("recovered staging directory must be created: {error}"));
+    for name in ["index.html", ".agent-knowledge-release.json"] {
+        fs::copy(prepared.join(name), recovered_staging.join(name))
+            .unwrap_or_else(|error| panic!("recovered staging file must be copied: {error}"));
+    }
+
+    store
+        .prepare(batch(FIRST_BATCH), FIRST_COMMIT, created_at)
+        .unwrap_or_else(|error| panic!("duplicated staging state must recover: {error}"));
+    assert!(!recovered_staging.exists());
+}
+
+#[test]
 fn recovers_a_prepared_release_after_reopening_the_store() {
     let root = TestDirectory::new();
     let releases = root.0.join("releases");
@@ -194,7 +221,7 @@ fn recovers_a_prepared_release_after_reopening_the_store() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn build_directory_keeps_its_staging_lease_after_store_drop() {
+fn build_directory_keeps_its_directory_lease_after_store_drop() {
     let root = TestDirectory::new();
     let output = {
         let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
@@ -206,6 +233,29 @@ fn build_directory_keeps_its_staging_lease_after_store_drop() {
 
     fs::write(output.path().join("index.html"), "fictional output\n")
         .unwrap_or_else(|error| panic!("leased build output must remain writable: {error}"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn build_directory_keeps_its_identity_after_entry_replacement() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = store
+        .begin_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("release build must begin: {error}"));
+    let configured = releases.join(".staging").join(FIRST_BATCH);
+    let detached = releases.join(".staging").join("detached");
+    fs::rename(&configured, &detached)
+        .unwrap_or_else(|error| panic!("build directory must be moved: {error}"));
+    fs::create_dir(&configured)
+        .unwrap_or_else(|error| panic!("replacement build directory must be created: {error}"));
+
+    fs::write(output.path().join("index.html"), "fictional output\n")
+        .unwrap_or_else(|error| panic!("pinned output must remain writable: {error}"));
+    assert!(detached.join("index.html").is_file());
+    assert!(!configured.join("index.html").exists());
 }
 
 #[test]
@@ -365,6 +415,90 @@ fn changed_prepared_output_cannot_replace_the_active_release() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn hard_linked_manifest_cannot_be_activated() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    build(&store, batch(FIRST_BATCH), "fictional output\n");
+    let release = store
+        .prepare(
+            batch(FIRST_BATCH),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("release must prepare: {error}"));
+    fs::hard_link(
+        releases
+            .join("by-id")
+            .join(release.release_id())
+            .join(".agent-knowledge-release.json"),
+        root.0.join("linked-manifest.json"),
+    )
+    .unwrap_or_else(|error| panic!("manifest hard link fixture must be created: {error}"));
+
+    assert!(matches!(
+        store.activate(&release),
+        Err(ReleaseError::UnsafeOutput(_))
+    ));
+}
+
+#[test]
+fn cloned_stores_serialize_activation_results() {
+    let root = TestDirectory::new();
+    let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    build(&store, batch(FIRST_BATCH), "first fictional output\n");
+    let first = store
+        .prepare(
+            batch(FIRST_BATCH),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("first release must prepare: {error}"));
+    build(&store, batch(SECOND_BATCH), "second fictional output\n");
+    let second = store
+        .prepare(
+            batch(SECOND_BATCH),
+            SECOND_COMMIT,
+            timestamp("2026-07-31T04:05:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("second release must prepare: {error}"));
+    let barrier = Arc::new(Barrier::new(3));
+    let first_store = store.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first_thread = std::thread::spawn(move || {
+        first_barrier.wait();
+        first_store.activate(&first)
+    });
+    let second_store = store.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second_thread = std::thread::spawn(move || {
+        second_barrier.wait();
+        second_store.activate(&second)
+    });
+    barrier.wait();
+
+    assert_eq!(
+        first_thread
+            .join()
+            .unwrap_or_else(|_| panic!("first activation thread must not panic"))
+            .unwrap_or_else(|error| panic!("first activation must succeed: {error}"))
+            .commit(),
+        FIRST_COMMIT
+    );
+    assert_eq!(
+        second_thread
+            .join()
+            .unwrap_or_else(|_| panic!("second activation thread must not panic"))
+            .unwrap_or_else(|error| panic!("second activation must succeed: {error}"))
+            .commit(),
+        SECOND_COMMIT
+    );
+}
+
 #[test]
 fn root_manifest_does_not_consume_generated_entry_budget() {
     let root = TestDirectory::new();
@@ -404,6 +538,34 @@ fn enforces_generated_output_limits() {
         batch(FIRST_BATCH),
         "fictional output exceeds limit\n",
     );
+
+    assert!(matches!(
+        store.prepare(
+            batch(FIRST_BATCH),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z")
+        ),
+        Err(ReleaseError::OutputTooLarge)
+    ));
+}
+
+#[test]
+fn enforces_aggregate_generated_output_limit() {
+    let root = TestDirectory::new();
+    let policy = ReleasePolicy {
+        maximum_entries: 2,
+        maximum_file_bytes: 16,
+        maximum_total_bytes: 20,
+    };
+    let store = ReleaseStore::open(root.0.join("releases"), policy)
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = store
+        .begin_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("release build must begin: {error}"));
+    fs::write(output.path().join("index.html"), "123456789012")
+        .unwrap_or_else(|error| panic!("first output file must be written: {error}"));
+    fs::write(output.path().join("page.html"), "123456789012")
+        .unwrap_or_else(|error| panic!("second output file must be written: {error}"));
 
     assert!(matches!(
         store.prepare(
