@@ -22,6 +22,8 @@ const MANIFEST_FILE: &str = ".agent-knowledge-release.json";
 const CLEANUP_MARKER_FILE: &str = ".agent-knowledge-cleanup";
 const MANIFEST_SCHEMA_VERSION: u16 = 2;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024;
+const MAXIMUM_CLEANUP_ACTIONS: usize = 256;
+const MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH: usize = 32;
 
 /// Bounds applied to generated Quartz output before it can be published.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1179,12 +1181,20 @@ fn ensure_cleanup_marker(directory: &Path, batch_id: BatchId) -> Result<(), Rele
             if metadata.len() != expected.len() as u64 {
                 return Err(ReleaseError::RecoveredBuildConflict);
             }
+            let mut file = File::open(&marker).map_err(ReleaseError::Io)?;
+            let opened = file.metadata().map_err(ReleaseError::Io)?;
+            if !opened.file_type().is_file()
+                || !same_metadata(&metadata, &opened)
+                || opened.len() != expected.len() as u64
+            {
+                return Err(ReleaseError::RecoveredBuildConflict);
+            }
+            validate_regular_file(&marker, &opened)?;
             let mut actual = Vec::with_capacity(expected.len());
-            File::open(&marker)
-                .and_then(|mut file| {
-                    file.read_to_end(&mut actual)?;
-                    file.sync_all()
-                })
+            Read::by_ref(&mut file)
+                .take(expected.len() as u64 + 1)
+                .read_to_end(&mut actual)
+                .and_then(|_| file.sync_all())
                 .map_err(ReleaseError::Io)?;
             if actual != expected {
                 return Err(ReleaseError::RecoveredBuildConflict);
@@ -1216,19 +1226,9 @@ fn cleanup_marker_state(
             Ok(true)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound && !private => Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if fs::read_dir(directory)
-                .map_err(ReleaseError::Io)?
-                .next()
-                .transpose()
-                .map_err(ReleaseError::Io)?
-                .is_none()
-            {
-                Ok(true)
-            } else {
-                Err(ReleaseError::RecoveredBuildConflict)
-            }
-        }
+        // The deterministic tombstone is itself durable cleanup state. It can
+        // be non-empty without its marker if a writer raced final removal.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(ReleaseError::Io(error)),
     }
 }
@@ -1261,29 +1261,81 @@ fn clear_cleanup_directory(directory: &File, batch_id: BatchId) -> Result<(), Re
 
 #[cfg(unix)]
 fn clear_directory_at(directory: &File, preserved_name: Option<&[u8]>) -> Result<(), ReleaseError> {
-    use nix::dir::Dir;
-    use nix::fcntl::{AtFlags, OFlag, openat};
+    use nix::fcntl::{AtFlags, OFlag, openat, renameat};
     use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
     use nix::unistd::{UnlinkatFlags, unlinkat};
     use std::ffi::CString;
 
-    let cloned = directory.try_clone().map_err(ReleaseError::Io)?;
-    let mut entries = Dir::from_fd(cloned.into()).map_err(nix_io_error)?;
-    let mut names = Vec::new();
-    for entry in entries.iter() {
-        let entry = entry.map_err(nix_io_error)?;
-        let name = entry.file_name().to_bytes();
-        if name != b"." && name != b".." && preserved_name != Some(name) {
-            names.push(CString::new(name).map_err(|_| ReleaseError::RecoveredBuildConflict)?);
-        }
+    struct Frame {
+        directory: File,
+        name_in_parent: Option<CString>,
     }
-    for name in names {
-        let listed = fstatat(&entries, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
-            .map_err(nix_io_error)?;
-        let kind = SFlag::from_bits_truncate(listed.st_mode);
-        if kind.contains(SFlag::S_IFDIR) {
+
+    let root = directory.try_clone().map_err(ReleaseError::Io)?;
+    let mut frames = vec![Frame {
+        directory: root.try_clone().map_err(ReleaseError::Io)?,
+        name_in_parent: None,
+    }];
+    let mut actions = 0_usize;
+    loop {
+        let is_root = frames.len() == 1;
+        let entry_name = next_cleanup_entry(
+            &frames
+                .last()
+                .ok_or(ReleaseError::RecoveredBuildConflict)?
+                .directory,
+            if is_root { preserved_name } else { None },
+        )?;
+        let Some(name) = entry_name else {
+            frames
+                .last()
+                .ok_or(ReleaseError::RecoveredBuildConflict)?
+                .directory
+                .sync_all()
+                .map_err(ReleaseError::Io)?;
+            if is_root {
+                return Ok(());
+            }
+            if actions == MAXIMUM_CLEANUP_ACTIONS {
+                for frame in &frames {
+                    frame.directory.sync_all().map_err(ReleaseError::Io)?;
+                }
+                return Err(ReleaseError::CleanupIncomplete);
+            }
+            let child = frames.pop().ok_or(ReleaseError::RecoveredBuildConflict)?;
+            let name = child
+                .name_in_parent
+                .as_ref()
+                .ok_or(ReleaseError::RecoveredBuildConflict)?;
+            let parent = &frames
+                .last()
+                .ok_or(ReleaseError::RecoveredBuildConflict)?
+                .directory;
+            let opened = fstat(&child.directory).map_err(nix_io_error)?;
+            let current = fstatat(parent, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+                .map_err(nix_io_error)?;
+            if opened.st_dev != current.st_dev || opened.st_ino != current.st_ino {
+                return Err(ReleaseError::StorageBindingMismatch);
+            }
+            unlinkat(parent, name.as_c_str(), UnlinkatFlags::RemoveDir).map_err(nix_io_error)?;
+            actions += 1;
+            continue;
+        };
+        if actions == MAXIMUM_CLEANUP_ACTIONS {
+            for frame in &frames {
+                frame.directory.sync_all().map_err(ReleaseError::Io)?;
+            }
+            return Err(ReleaseError::CleanupIncomplete);
+        }
+        let parent = &frames
+            .last()
+            .ok_or(ReleaseError::RecoveredBuildConflict)?
+            .directory;
+        let listed =
+            fstatat(parent, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW).map_err(nix_io_error)?;
+        if listed.st_mode & SFlag::S_IFMT.bits() == SFlag::S_IFDIR.bits() {
             let child = openat(
-                &entries,
+                parent,
                 name.as_c_str(),
                 OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
                 Mode::empty(),
@@ -1294,19 +1346,75 @@ fn clear_directory_at(directory: &File, preserved_name: Option<&[u8]>) -> Result
             if listed.st_dev != opened.st_dev || listed.st_ino != opened.st_ino {
                 return Err(ReleaseError::StorageBindingMismatch);
             }
-            clear_directory_at(&child, None)?;
-            let current = fstatat(&entries, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
-                .map_err(nix_io_error)?;
-            if opened.st_dev != current.st_dev || opened.st_ino != current.st_ino {
-                return Err(ReleaseError::StorageBindingMismatch);
+            validate_cleanup_mount(&root, &child)?;
+            if frames.len() < MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH {
+                frames.push(Frame {
+                    directory: child,
+                    name_in_parent: Some(name),
+                });
+            } else {
+                let work_name = CString::new(format!(".work-{}", Ulid::generate()))
+                    .map_err(|_| ReleaseError::RecoveredBuildConflict)?;
+                renameat(parent, name.as_c_str(), &root, work_name.as_c_str())
+                    .map_err(nix_io_error)?;
+                let moved = fstatat(&root, work_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+                    .map_err(nix_io_error)?;
+                if opened.st_dev != moved.st_dev || opened.st_ino != moved.st_ino {
+                    return Err(ReleaseError::StorageBindingMismatch);
+                }
+                parent.sync_all().map_err(ReleaseError::Io)?;
+                root.sync_all().map_err(ReleaseError::Io)?;
+                actions += 1;
             }
-            unlinkat(&entries, name.as_c_str(), UnlinkatFlags::RemoveDir).map_err(nix_io_error)?;
         } else {
-            unlinkat(&entries, name.as_c_str(), UnlinkatFlags::NoRemoveDir)
-                .map_err(nix_io_error)?;
+            unlinkat(parent, name.as_c_str(), UnlinkatFlags::NoRemoveDir).map_err(nix_io_error)?;
+            actions += 1;
         }
     }
-    directory.sync_all().map_err(ReleaseError::Io)
+}
+
+#[cfg(unix)]
+fn next_cleanup_entry(
+    directory: &File,
+    preserved_name: Option<&[u8]>,
+) -> Result<Option<std::ffi::CString>, ReleaseError> {
+    use nix::dir::Dir;
+    use std::ffi::CString;
+
+    let cloned = directory.try_clone().map_err(ReleaseError::Io)?;
+    let mut entries = Dir::from_fd(cloned.into()).map_err(nix_io_error)?;
+    for entry in entries.iter() {
+        let entry = entry.map_err(nix_io_error)?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." && preserved_name != Some(name) {
+            return CString::new(name)
+                .map(Some)
+                .map_err(|_| ReleaseError::RecoveredBuildConflict);
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cleanup_mount(root: &File, child: &File) -> Result<(), ReleaseError> {
+    if mount_id(root)? == mount_id(child)? {
+        Ok(())
+    } else {
+        Err(ReleaseError::CrossMountStorage)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn validate_cleanup_mount(root: &File, child: &File) -> Result<(), ReleaseError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if root.metadata().map_err(ReleaseError::Io)?.dev()
+        == child.metadata().map_err(ReleaseError::Io)?.dev()
+    {
+        Ok(())
+    } else {
+        Err(ReleaseError::CrossMountStorage)
+    }
 }
 
 #[cfg(unix)]
@@ -1592,6 +1700,7 @@ pub enum ReleaseError {
     ReleaseStoreBusy,
     BuildInProgress,
     BuildRecoveryRequired,
+    CleanupIncomplete,
     RecoveredBuildConflict,
     InvalidBatchIntent,
     MissingRecoveryState,
@@ -1633,6 +1742,9 @@ impl fmt::Display for ReleaseError {
             Self::BuildInProgress => formatter.write_str("release build is still in progress"),
             Self::BuildRecoveryRequired => {
                 formatter.write_str("release build has a durable recovery intent")
+            }
+            Self::CleanupIncomplete => {
+                formatter.write_str("release cleanup requires another bounded pass")
             }
             Self::RecoveredBuildConflict => {
                 formatter.write_str("recovered release build conflicts with its prepared release")

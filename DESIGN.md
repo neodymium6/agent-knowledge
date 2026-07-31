@@ -1123,8 +1123,11 @@ staging cleanup operation. Cleanup first writes a durable marker and moves the
 batch to the deterministic `.staging/.cleanup-<batch-id>/` tombstone. A retry
 finishes that tombstone before acknowledging discard or removing the durable
 batch intent. On Unix, recursive cleanup traverses from pinned directory
-descriptors and removes entries relative to those descriptors. Prepared
-`by-id/` releases are never removed by the publication path.
+descriptors, refuses child mount points, and removes entries relative to those
+descriptors. Work is split into bounded passes with a bounded descriptor stack;
+deep subtrees are atomically rehomed inside the tombstone so a later pass can
+continue without recursive call-stack growth. Prepared `by-id/` releases are
+never removed by the publication path.
 
 Release retention is configurable. Removal of old derived releases is an
 administrative maintenance operation and never removes content or accepted

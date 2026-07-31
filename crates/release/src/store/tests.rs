@@ -9,9 +9,10 @@ use time::format_description::well_known::Rfc3339;
 use ulid::Ulid;
 
 use super::{
-    BuildDirectory, MANIFEST_FILE, MANIFEST_SCHEMA_VERSION, ReleaseError, ReleaseManifest,
-    ReleasePolicy, ReleaseStore, cleanup_name, derived_reference_is_repairable,
-    ensure_cleanup_marker, ensure_manifest, read_manifest, release_id, validate_release_tree,
+    BuildDirectory, MANIFEST_FILE, MANIFEST_SCHEMA_VERSION, MAXIMUM_CLEANUP_ACTIONS,
+    MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH, ReleaseError, ReleaseManifest, ReleasePolicy, ReleaseStore,
+    cleanup_name, derived_reference_is_repairable, ensure_cleanup_marker, ensure_manifest,
+    read_manifest, release_id, validate_release_tree,
 };
 
 const FIRST_BATCH: &str = "01K00000000000000000000001";
@@ -364,6 +365,80 @@ fn discard_does_not_follow_links_from_the_pinned_cleanup_tree() {
             .unwrap_or_else(|error| panic!("outside sentinel must remain readable: {error}")),
         "preserve fictional data\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn discard_removes_unix_sockets_as_non_directory_entries() {
+    use std::os::unix::net::UnixListener;
+
+    let root = TestDirectory::new();
+    let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = build(&store, batch(FIRST_BATCH), "partial fictional output\n");
+    let socket = output.path().join("fictional.sock");
+    let listener = UnixListener::bind(&socket)
+        .unwrap_or_else(|error| panic!("Unix socket fixture must bind: {error}"));
+    drop(listener);
+    drop(output);
+
+    store
+        .discard_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("Unix socket output must be discarded: {error}"));
+    assert!(!socket.exists());
+}
+
+#[test]
+fn discard_resumes_after_a_bounded_cleanup_pass() {
+    let root = TestDirectory::new();
+    let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = store
+        .begin_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("release build must begin: {error}"));
+    for index in 0..=MAXIMUM_CLEANUP_ACTIONS {
+        fs::write(
+            output.path().join(format!("partial-{index:04}.html")),
+            "fictional\n",
+        )
+        .unwrap_or_else(|error| panic!("partial output must be written: {error}"));
+    }
+    drop(output);
+
+    assert!(matches!(
+        store.discard_build(batch(FIRST_BATCH)),
+        Err(ReleaseError::CleanupIncomplete)
+    ));
+    store
+        .discard_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("bounded cleanup must resume: {error}"));
+}
+
+#[test]
+fn discard_flattens_trees_deeper_than_the_descriptor_budget() {
+    let root = TestDirectory::new();
+    let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = store
+        .begin_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("release build must begin: {error}"));
+    let mut deepest = output.path().to_path_buf();
+    for index in 0..=MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH {
+        deepest.push(format!("depth-{index:03}"));
+        fs::create_dir(&deepest)
+            .unwrap_or_else(|error| panic!("deep cleanup fixture must be created: {error}"));
+    }
+    fs::write(deepest.join("partial.html"), "fictional\n")
+        .unwrap_or_else(|error| panic!("deep output must be written: {error}"));
+    drop(output);
+
+    loop {
+        match store.discard_build(batch(FIRST_BATCH)) {
+            Ok(()) => break,
+            Err(ReleaseError::CleanupIncomplete) => {}
+            Err(error) => panic!("deep cleanup must remain resumable: {error}"),
+        }
+    }
 }
 
 #[cfg(unix)]
