@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -9,13 +9,13 @@ use std::process::{Command, Output, Stdio};
 
 use agent_knowledge_core::{BatchId, ErrorCode, RequestId, Revision};
 use agent_knowledge_queue::{
-    ClaimToken, ClaimedPackage, PackagePolicy, ReconciledBatch, WorkerQueueError, WorkerSession,
+    ClaimToken, ClaimedPackage, PackagePolicy, WorkerQueueError, WorkerSession,
 };
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::apply::AppliedFileMove;
-use crate::{ApplyError, ContentPolicy, apply_claimed};
+use crate::apply::{AppliedMove, apply_claimed};
+use crate::{ApplyError, ContentPolicy};
 
 const MAXIMUM_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const MAXIMUM_JOURNAL_BYTES: u64 = 1024 * 1024;
@@ -130,6 +130,7 @@ enum JournalState {
         commit: String,
         successful: Vec<RequestId>,
         failures: Vec<JournalFailure>,
+        publication_started: bool,
     },
 }
 
@@ -154,6 +155,7 @@ impl GitRepository {
         official_branch: &str,
         identity: GitIdentity,
     ) -> Result<Self, GitTransactionError> {
+        ensure_supported_git()?;
         ensure_real_directory(git_directory)?;
         if official_branch.is_empty() || official_branch.chars().any(char::is_control) {
             return Err(GitTransactionError::InvalidOfficialBranch);
@@ -220,43 +222,62 @@ impl GitRepository {
         })
     }
 
-    /// Applies a bounded ordered claim batch, creates one commit, and advances
-    /// the official branch with an expected-old-commit check.
+    /// Applies a bounded ordered claim batch, requires a successful trial build
+    /// of the exact prepared worktree, creates one commit, and advances the
+    /// official branch with an expected-old-commit check.
     ///
     /// Request-specific deterministic failures are rolled back to the last
     /// successful index tree and returned separately. Infrastructure or
-    /// content-store failures abort the batch without advancing the official
-    /// branch.
+    /// content-store or trial-build failures abort the batch without advancing
+    /// the official branch.
     ///
     /// # Errors
     ///
     /// Returns an error for an empty batch, Git or filesystem failure,
-    /// non-request content failure, or concurrent official-branch change.
-    pub fn apply_batch(
+    /// non-request content failure, failed trial build, or concurrent
+    /// official-branch change.
+    pub fn apply_batch<F>(
         &self,
         worker: &mut WorkerSession,
         batch_id: BatchId,
         claims: &[ClaimedPackage],
         policy: ContentPolicy,
         package_policy: &PackagePolicy,
-    ) -> Result<BatchCommitOutcome, GitTransactionError> {
-        self.apply_batch_with_hook(worker, batch_id, claims, policy, package_policy, |_, _| {
-            Ok(())
-        })
-    }
-
-    fn apply_batch_with_hook<F>(
-        &self,
-        worker: &mut WorkerSession,
-        batch_id: BatchId,
-        claims: &[ClaimedPackage],
-        policy: ContentPolicy,
-        package_policy: &PackagePolicy,
-        before_publish: F,
+        trial_build: F,
     ) -> Result<BatchCommitOutcome, GitTransactionError>
     where
-        F: FnOnce(&str, &str) -> Result<(), GitTransactionError>,
+        F: FnOnce(&Path) -> Result<(), GitTransactionError>,
     {
+        self.apply_batch_with_hook(
+            worker,
+            batch_id,
+            claims,
+            policy,
+            package_policy,
+            TransactionHooks {
+                trial_build,
+                before_publish: continue_publication,
+            },
+        )
+    }
+
+    fn apply_batch_with_hook<F, H>(
+        &self,
+        worker: &mut WorkerSession,
+        batch_id: BatchId,
+        claims: &[ClaimedPackage],
+        policy: ContentPolicy,
+        package_policy: &PackagePolicy,
+        hooks: TransactionHooks<F, H>,
+    ) -> Result<BatchCommitOutcome, GitTransactionError>
+    where
+        F: FnOnce(&Path) -> Result<(), GitTransactionError>,
+        H: FnOnce(&str, &str) -> Result<(), GitTransactionError>,
+    {
+        let TransactionHooks {
+            trial_build,
+            before_publish,
+        } = hooks;
         if claims.is_empty() {
             return Err(GitTransactionError::EmptyBatch);
         }
@@ -338,12 +359,20 @@ impl GitRepository {
             };
             write_journal(&journal_path, &no_changes)?;
             self.remove_worktree(&worktree)?;
+            let actual = self.resolve_commit(&self.official_ref)?;
+            if actual != base {
+                return Err(GitTransactionError::OfficialBranchChanged {
+                    expected: base,
+                    actual,
+                });
+            }
             return Ok(BatchCommitOutcome::NoChanges {
                 failures: prepared.failures,
             });
         }
 
-        let stats = staged_stats(&worktree, &base, &prepared.file_moves)?;
+        let stats = staged_stats(&worktree, &base, &prepared.moves)?;
+        trial_build(&worktree)?;
         let message = commit_message(batch_id, claims, &prepared.successful, stats);
         let commit = commit_tree(
             &self.git_directory,
@@ -353,7 +382,7 @@ impl GitRepository {
             &message,
         )?;
         self.create_transaction_ref(batch_id, &commit)?;
-        let committed = TransactionJournal {
+        let mut committed = TransactionJournal {
             state: JournalState::Committed {
                 commit: commit.clone(),
                 successful: prepared
@@ -369,13 +398,23 @@ impl GitRepository {
                         error_code: failure.error_code,
                     })
                     .collect(),
+                publication_started: false,
             },
             ..preparing
         };
         write_journal(&journal_path, &committed)?;
         self.validate_committed_journal(&committed)?;
         before_publish(&base, &commit)?;
-        self.publish_committed(batch_id, &base, &commit)?;
+        let JournalState::Committed {
+            publication_started,
+            ..
+        } = &mut committed.state
+        else {
+            return Err(GitTransactionError::JournalState);
+        };
+        *publication_started = true;
+        write_journal(&journal_path, &committed)?;
+        self.publish_committed(batch_id, &base, &commit, true)?;
         Ok(BatchCommitOutcome::Committed {
             commit,
             successful: prepared.successful,
@@ -394,7 +433,7 @@ impl GitRepository {
         let mut tree = resolve_in_worktree(worktree, "HEAD^{tree}")?;
         let mut successful = Vec::new();
         let mut failures = Vec::new();
-        let mut file_moves = Vec::new();
+        let mut moves = Vec::new();
 
         for claim in claims {
             worker
@@ -414,7 +453,7 @@ impl GitRepository {
                     let staged_tree = run_git(Some(worktree), None, [OsStr::new("write-tree")])?;
                     tree = parse_object_id(&staged_tree.stdout)?;
                     successful.push(claim.token());
-                    file_moves.extend_from_slice(outcome.file_moves());
+                    moves.extend_from_slice(outcome.moves());
                 }
                 Err(error) => {
                     reset_worktree(worktree, &tree)?;
@@ -436,57 +475,30 @@ impl GitRepository {
             tree,
             successful,
             failures,
-            file_moves,
+            moves,
         })
     }
 
-    /// Recovers publication, durably reconciles every queue result, and removes
-    /// the terminal transaction journal.
+    /// Removes a terminal transaction journal after the caller has durably
+    /// recorded every queue transition and activated the corresponding release.
     ///
     /// # Errors
     ///
-    /// Returns an error if recovery, a queue transition, or journal
-    /// finalization fails. A retry resumes from the durable journal and
-    /// idempotent terminal queue states.
-    pub fn reconcile_batch(
-        &self,
-        worker: &mut WorkerSession,
-        batch_id: BatchId,
-    ) -> Result<BatchCommitOutcome, GitTransactionError> {
-        let outcome = self.recover_batch(worker, batch_id)?;
-        let (commit, successful, failures) = match &outcome {
-            BatchCommitOutcome::Committed {
-                commit,
-                successful,
-                failures,
-            } => (
-                Some(commit.as_str()),
-                successful.as_slice(),
-                failures.as_slice(),
-            ),
-            BatchCommitOutcome::NoChanges { failures } => (None, &[][..], failures.as_slice()),
-        };
-        let failures = failures
-            .iter()
-            .map(|failure| (failure.token, failure.error_code))
-            .collect::<Vec<_>>();
-        let reconciliation = worker
-            .reconcile_batch(batch_id, successful, &failures)
-            .map_err(GitTransactionError::Queue)?;
-        self.finalize_batch(&reconciliation, batch_id, commit)?;
-        Ok(outcome)
-    }
-
+    /// Returns an error if the journal does not match the published outcome.
+    #[cfg(test)]
     fn finalize_batch(
         &self,
-        reconciliation: &ReconciledBatch,
+        worker: &WorkerSession,
         batch_id: BatchId,
         commit: Option<&str>,
     ) -> Result<(), GitTransactionError> {
+        worker
+            .ensure_transaction_ready()
+            .map_err(GitTransactionError::Queue)?;
         let journal_path = self.journal_path(batch_id);
         let journal = read_journal(&journal_path)?.ok_or(GitTransactionError::JournalMissing)?;
         validate_journal_structure(&journal, batch_id)?;
-        validate_reconciliation(&journal, reconciliation)?;
+        validate_worker_identity(&journal, worker)?;
         if matches!(&journal.state, JournalState::Committed { .. }) {
             self.validate_committed_journal(&journal)?;
         }
@@ -530,20 +542,58 @@ impl GitRepository {
             .ensure_transaction_ready()
             .map_err(GitTransactionError::Queue)?;
         self.ensure_no_other_journal(batch_id)?;
-        let journal = read_journal(&self.journal_path(batch_id))?
-            .ok_or(GitTransactionError::JournalMissing)?;
+        let journal_path = self.journal_path(batch_id);
+        let mut journal =
+            read_journal(&journal_path)?.ok_or(GitTransactionError::JournalMissing)?;
         validate_journal_structure(&journal, batch_id)?;
         validate_worker_identity(&journal, worker)?;
-        match &journal.state {
-            JournalState::Committed { commit, .. } => {
-                self.validate_committed_journal(&journal)?;
-                self.publish_committed(batch_id, &journal.base_commit, commit)?;
+        let committed = match &journal.state {
+            JournalState::Committed {
+                commit,
+                publication_started,
+                ..
+            } => Some((commit.clone(), *publication_started)),
+            _ => None,
+        };
+        if let Some((commit, publication_started)) = committed {
+            self.validate_committed_journal(&journal)?;
+            if !publication_started {
+                let actual = self.resolve_commit(&self.official_ref)?;
+                if actual != journal.base_commit {
+                    return Err(GitTransactionError::OfficialBranchChanged {
+                        expected: journal.base_commit.clone(),
+                        actual,
+                    });
+                }
+                let JournalState::Committed {
+                    publication_started,
+                    ..
+                } = &mut journal.state
+                else {
+                    return Err(GitTransactionError::JournalState);
+                };
+                *publication_started = true;
+                write_journal(&journal_path, &journal)?;
             }
-            JournalState::NoChanges { .. } => {
-                self.remove_worktree(&self.worktree_path(batch_id))?;
-                self.remove_preparing_ref(batch_id, &journal.base_commit)?;
+            self.publish_committed(batch_id, &journal.base_commit, &commit, true)?;
+        } else {
+            match &journal.state {
+                JournalState::NoChanges { .. } => {
+                    let actual = self.resolve_commit(&self.official_ref)?;
+                    if actual != journal.base_commit {
+                        return Err(GitTransactionError::OfficialBranchChanged {
+                            expected: journal.base_commit.clone(),
+                            actual,
+                        });
+                    }
+                    self.remove_worktree(&self.worktree_path(batch_id))?;
+                    self.remove_preparing_ref(batch_id, &journal.base_commit)?;
+                }
+                JournalState::Preparing => return Err(GitTransactionError::JournalState),
+                JournalState::Committed { .. } => {
+                    return Err(GitTransactionError::JournalState);
+                }
             }
-            JournalState::Preparing => return Err(GitTransactionError::JournalState),
         }
         outcome_from_journal(&journal)
     }
@@ -553,6 +603,7 @@ impl GitRepository {
         batch_id: BatchId,
         base: &str,
         commit: &str,
+        publication_started: bool,
     ) -> Result<(), GitTransactionError> {
         let actual = self.resolve_commit(&self.official_ref)?;
         if actual == base {
@@ -564,8 +615,10 @@ impl GitRepository {
                 expected: base.into(),
                 actual,
             });
+        } else if publication_started {
+            self.ensure_canonical_repairable()?;
         } else {
-            self.ensure_canonical_recoverable(base)?;
+            return Err(GitTransactionError::JournalMismatch);
         }
         self.sync_canonical(commit)?;
         self.remove_worktree(&self.worktree_path(batch_id))
@@ -658,32 +711,7 @@ impl GitRepository {
         }
     }
 
-    fn ensure_canonical_recoverable(&self, base: &str) -> Result<(), GitTransactionError> {
-        match self.ensure_canonical_clean() {
-            Ok(()) => return Ok(()),
-            Err(GitTransactionError::CanonicalWorktreeDirty) => {}
-            Err(error) => return Err(error),
-        }
-        let index_tree = run_git(
-            Some(&self.canonical_worktree),
-            None,
-            [OsStr::new("write-tree")],
-        )?;
-        let base_tree_output = run_git(
-            None,
-            Some(&self.git_directory),
-            [
-                OsStr::new("rev-parse"),
-                OsStr::new("--verify"),
-                OsStr::new(&format!("{base}^{{tree}}")),
-            ],
-        )?;
-        let base_tree = parse_object_id(&base_tree_output.stdout)?;
-        if parse_object_id(&index_tree.stdout)? != base_tree
-            || !git_diff_is_quiet(&self.canonical_worktree, base)?
-        {
-            return Err(GitTransactionError::CanonicalWorktreeDirty);
-        }
+    fn ensure_canonical_repairable(&self) -> Result<(), GitTransactionError> {
         let untracked = run_git(
             Some(&self.canonical_worktree),
             None,
@@ -691,9 +719,24 @@ impl GitRepository {
                 OsStr::new("ls-files"),
                 OsStr::new("--others"),
                 OsStr::new("-z"),
+                OsStr::new("--exclude-standard"),
             ],
         )?;
         if !untracked.stdout.is_empty() {
+            return Err(GitTransactionError::CanonicalWorktreeDirty);
+        }
+        let ignored = run_git(
+            Some(&self.canonical_worktree),
+            None,
+            [
+                OsStr::new("ls-files"),
+                OsStr::new("--others"),
+                OsStr::new("--ignored"),
+                OsStr::new("-z"),
+                OsStr::new("--exclude-standard"),
+            ],
+        )?;
+        if !ignored.stdout.is_empty() {
             return Err(GitTransactionError::CanonicalWorktreeDirty);
         }
         Ok(())
@@ -789,8 +832,7 @@ impl GitRepository {
         expected: &str,
         commit: &str,
     ) -> Result<(), GitTransactionError> {
-        let output = Command::new("git")
-            .args(["-c", "core.fsync=all"])
+        let output = git_command()
             .arg(format!("--git-dir={}", self.git_directory.display()))
             .args(["update-ref", &self.official_ref, commit, expected])
             .output()
@@ -926,7 +968,7 @@ impl GitRepository {
         revision: &str,
     ) -> Result<Option<String>, GitTransactionError> {
         let expression = format!("{revision}^{{commit}}");
-        let output = Command::new("git")
+        let output = git_command()
             .arg(format!("--git-dir={}", self.git_directory.display()))
             .args(["rev-parse", "--verify", "--quiet", &expression])
             .output()
@@ -951,7 +993,26 @@ struct PreparedBatch {
     tree: String,
     successful: Vec<ClaimToken>,
     failures: Vec<RequestFailure>,
-    file_moves: Vec<AppliedFileMove>,
+    moves: Vec<AppliedMove>,
+}
+
+struct TransactionHooks<F, H> {
+    trial_build: F,
+    before_publish: H,
+}
+
+fn continue_publication(_: &str, _: &str) -> Result<(), GitTransactionError> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn accept_trial_build(_: &Path) -> Result<(), GitTransactionError> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn interrupt_publication(_: &str, _: &str) -> Result<(), GitTransactionError> {
+    Err(GitTransactionError::InvalidGitOutput)
 }
 
 fn transaction_ref(batch_id: BatchId) -> String {
@@ -997,6 +1058,7 @@ fn validate_journal_structure(
             commit,
             successful,
             failures,
+            ..
         } => {
             if !valid_object_id(commit) {
                 return Err(GitTransactionError::JournalMismatch);
@@ -1047,39 +1109,6 @@ fn validate_worker_identity(
     }
 }
 
-fn validate_reconciliation(
-    journal: &TransactionJournal,
-    reconciliation: &ReconciledBatch,
-) -> Result<(), GitTransactionError> {
-    if reconciliation.queue_identity() != journal.queue_identity
-        || reconciliation.batch_id() != journal.batch_id
-    {
-        return Err(GitTransactionError::JournalMismatch);
-    }
-    let outcome = outcome_from_journal(journal)?;
-    let (successful, failures) = match outcome {
-        BatchCommitOutcome::Committed {
-            successful,
-            failures,
-            ..
-        } => (successful, failures),
-        BatchCommitOutcome::NoChanges { failures } => (Vec::new(), failures),
-    };
-    if reconciliation.successful() != successful
-        || reconciliation.failures().len() != failures.len()
-        || reconciliation
-            .failures()
-            .iter()
-            .zip(failures)
-            .any(|((token, error_code), failure)| {
-                *token != failure.token || *error_code != failure.error_code
-            })
-    {
-        return Err(GitTransactionError::JournalMismatch);
-    }
-    Ok(())
-}
-
 fn outcome_from_journal(
     journal: &TransactionJournal,
 ) -> Result<BatchCommitOutcome, GitTransactionError> {
@@ -1090,6 +1119,7 @@ fn outcome_from_journal(
             commit,
             successful,
             failures,
+            ..
         } => (
             Some(commit.as_str()),
             successful.as_slice(),
@@ -1242,24 +1272,6 @@ fn reset_worktree(worktree: &Path, tree: &str) -> Result<(), GitTransactionError
     Ok(())
 }
 
-fn git_diff_is_quiet(worktree: &Path, revision: &str) -> Result<bool, GitTransactionError> {
-    let arguments = ["diff", "--quiet", revision, "--"];
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(arguments)
-        .output()
-        .map_err(GitTransactionError::Io)?;
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(GitTransactionError::GitCommand {
-            arguments: arguments.into_iter().map(OsString::from).collect(),
-            stderr: diagnostic(&output.stderr),
-        }),
-    }
-}
-
 fn ensure_real_directory(path: &Path) -> Result<(), GitTransactionError> {
     let metadata = fs::symlink_metadata(path).map_err(GitTransactionError::Io)?;
     if !metadata.file_type().is_dir() {
@@ -1361,7 +1373,7 @@ struct FileStats {
 fn staged_stats(
     worktree: &Path,
     base: &str,
-    file_moves: &[AppliedFileMove],
+    moves: &[AppliedMove],
 ) -> Result<FileStats, GitTransactionError> {
     let output = run_git(
         Some(worktree),
@@ -1403,23 +1415,15 @@ fn staged_stats(
             _ => return Err(GitTransactionError::InvalidGitOutput),
         }
     }
-    let mut move_destinations = HashMap::with_capacity(file_moves.len());
-    for file_move in file_moves {
-        if move_destinations
-            .insert(file_move.source.clone(), file_move.destination.clone())
-            .is_some()
-        {
-            return Err(GitTransactionError::InvalidGitOutput);
-        }
-    }
     for source in deleted {
         let mut destination = source.clone();
-        let mut visited = HashSet::new();
-        while let Some(next) = move_destinations.get(&destination) {
-            if !visited.insert(destination.clone()) {
-                return Err(GitTransactionError::InvalidGitOutput);
+        for applied_move in moves {
+            if destination == applied_move.source {
+                destination.clone_from(&applied_move.destination);
+            } else if let Ok(suffix) = destination.strip_prefix(&applied_move.source) {
+                let suffix = suffix.to_path_buf();
+                destination = applied_move.destination.join(suffix);
             }
-            destination.clone_from(next);
         }
         if destination == source || !added.remove(&destination) {
             return Err(GitTransactionError::PhysicalDeletion);
@@ -1481,8 +1485,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = Command::new("git");
-    command.args(["-c", "core.fsync=all"]);
+    let mut command = git_command();
     if let Some(working_directory) = working_directory {
         command.arg("-C").arg(working_directory);
     }
@@ -1521,6 +1524,59 @@ where
     }
 }
 
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(name);
+        }
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["-c", "core.fsync=all", "-c", "core.hooksPath=/dev/null"]);
+    command
+}
+
+fn ensure_supported_git() -> Result<(), GitTransactionError> {
+    let output = git_command()
+        .arg("--version")
+        .output()
+        .map_err(GitTransactionError::Io)?;
+    if !output.status.success() {
+        return Err(GitTransactionError::GitCommand {
+            arguments: vec![OsString::from("--version")],
+            stderr: diagnostic(&output.stderr),
+        });
+    }
+    let version = parse_git_version(&output.stdout)?;
+    if version.0 > 2 || (version.0 == 2 && version.1 >= 36) {
+        Ok(())
+    } else {
+        Err(GitTransactionError::UnsupportedGitVersion {
+            found: String::from_utf8_lossy(&output.stdout).trim().into(),
+        })
+    }
+}
+
+fn parse_git_version(output: &[u8]) -> Result<(u64, u64), GitTransactionError> {
+    let version = std::str::from_utf8(output)
+        .map_err(|_| GitTransactionError::InvalidGitOutput)?
+        .trim()
+        .strip_prefix("git version ")
+        .ok_or(GitTransactionError::InvalidGitOutput)?;
+    let mut components = version.split('.');
+    let major = components
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or(GitTransactionError::InvalidGitOutput)?;
+    let minor = components
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or(GitTransactionError::InvalidGitOutput)?;
+    Ok((major, minor))
+}
+
 fn parse_text(output: &[u8]) -> Result<&str, GitTransactionError> {
     let value = std::str::from_utf8(output)
         .map_err(|_| GitTransactionError::InvalidGitOutput)?
@@ -1554,6 +1610,13 @@ fn diagnostic(stderr: &[u8]) -> String {
 /// A Git worktree transaction or publication failure.
 #[derive(Debug)]
 pub enum GitTransactionError {
+    /// The installed Git predates required fsync configuration support.
+    UnsupportedGitVersion {
+        /// Version string reported by Git.
+        found: String,
+    },
+    /// The caller's trial static-site build rejected the prepared worktree.
+    TrialBuildFailed,
     /// The configured author identity was empty or contained control characters.
     InvalidIdentity,
     /// The official branch name was empty or contained control characters.
@@ -1639,6 +1702,10 @@ pub enum GitTransactionError {
 impl fmt::Display for GitTransactionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedGitVersion { found } => {
+                write!(formatter, "Git 2.36 or newer is required; found `{found}`")
+            }
+            Self::TrialBuildFailed => formatter.write_str("trial static-site build failed"),
             Self::InvalidIdentity => {
                 formatter.write_str("Git identity values must be nonempty and contain no controls")
             }

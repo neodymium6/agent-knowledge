@@ -859,7 +859,9 @@ official branch can advance. A later batch cannot begin until this journal is
 reconciled and finalized. Each journal is bound to the canonical queue
 identity held by the live Worker session.
 
-Git object and reference mutations run with Git fsync enabled. Before
+Git 2.36 or newer is required. Git subprocesses discard inherited `GIT_*`
+overrides, disable system/global configuration and hooks, and run object and
+reference mutations with Git fsync enabled. Before
 publication or recovery, the Worker verifies that the journaled commit exists,
 has the pinned base as its sole direct parent, and contains the exact batch and
 successful-request trailers recorded by the journal. A stale `preparing`
@@ -875,11 +877,16 @@ queue result. This permits recovery after a crash partway through the
 successful and failed queue transitions. The journal is removed only after all
 of those transitions are durable. Queue reconciliation is idempotent and
 returns an opaque proof bound to the queue, batch, claim tokens, and failure
-codes; journal finalization accepts only that proof.
+codes; journal finalization accepts only that proof. Until release activation
+and this proof are implemented together, the repository crate does not expose
+terminal queue reconciliation or journal finalization.
 
-The canonical checkout and release can be repaired from the official commit
-after a crash. Normal readers use the pinned official commit, not an
-in-progress checkout update.
+A synchronized `publication_started` journal marker is written before the
+official ref can advance. It authorizes recovery to replace partially updated
+tracked checkout state after an interrupted reset, while unexpected untracked
+or ignored files still fail closed. The canonical checkout and release can be
+repaired from the official commit after a crash. Normal readers use the pinned
+official commit, not an in-progress checkout update.
 
 ## 19. Batch isolation
 
@@ -892,9 +899,10 @@ worktree and moved to `failed/`. Remaining requests continue.
 
 Operations within one request share an in-memory document view. For example,
 an update followed by archive archives the updated bytes, and a move followed
-by archive uses the moved path. The Worker also records every file move it
-executes and uses those exact source-to-destination pairs when rejecting
-physical deletions; it does not depend on Git's content-similarity heuristic.
+by archive uses the moved path. The Worker records ordered bundle-level moves
+and replays them when pairing base-tree deletions with final-tree additions.
+This remains bounded by operation count, supports path reuse, and does not
+depend on Git's content-similarity heuristic.
 
 If the final Quartz build fails:
 

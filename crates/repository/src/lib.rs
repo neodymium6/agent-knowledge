@@ -4,7 +4,7 @@ mod apply;
 mod git;
 mod index;
 
-pub use apply::{ApplyError, ApplyOutcome, apply_claimed};
+pub use apply::ApplyError;
 pub use git::{
     BatchCommitOutcome, GitIdentity, GitRepository, GitTransactionError, RequestFailure,
 };

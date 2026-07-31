@@ -10,10 +10,11 @@ use agent_knowledge_queue::{
 use ulid::Ulid;
 
 use super::{
-    BatchCommitOutcome, GitIdentity, GitRepository, GitTransactionError, parse_text, staged_stats,
+    BatchCommitOutcome, GitIdentity, GitRepository, GitTransactionError, TransactionHooks,
+    accept_trial_build, interrupt_publication, parse_git_version, parse_text, staged_stats,
 };
 use crate::ContentPolicy;
-use crate::apply::AppliedFileMove;
+use crate::apply::AppliedMove;
 
 const FIRST_REQUEST_ID: &str = "01K00000000000000000000001";
 const SECOND_REQUEST_ID: &str = "01K00000000000000000000002";
@@ -375,6 +376,7 @@ fn commits_successes_and_isolates_a_conflicting_request() {
         &[first, second],
         ContentPolicy::default(),
         &PackagePolicy::default(),
+        |_| Ok(()),
     ) {
         Ok(outcome) => outcome,
         Err(error) => panic!("mixed batch must commit healthy requests: {error}"),
@@ -421,32 +423,28 @@ fn commits_successes_and_isolates_a_conflicting_request() {
     assert!(!message.contains(&format!("Knowledge-Request: {SECOND_REQUEST_ID}")));
     assert_eq!(git.worktree_count(), 0);
     assert_eq!(git.transaction_count(), 1);
-    assert!(matches!(
-        repository.reconcile_batch(&mut worker, parse_batch_id()),
-        Ok(BatchCommitOutcome::Committed {
-            commit: reconciled,
-            ..
-        }) if reconciled == commit
+    let committed_document = git.canonical.join(format!(
+        "projects/fictional-project/experiments/2026-07-31-{DOCUMENT_ID}/index.md"
     ));
-    assert_eq!(git.transaction_count(), 0);
-    let repeated = worker.reconcile_batch(
-        parse_batch_id(),
-        &successful,
-        &[(failures[0].token(), failures[0].error_code())],
-    );
-    if let Err(error) = repeated {
-        panic!("terminal queue reconciliation must be idempotent: {error}");
+    if let Err(error) = fs::write(&committed_document, b"partial fictional checkout\n") {
+        panic!("partial canonical checkout fixture must be written: {error}");
     }
-    assert!(
-        root.path()
-            .join(format!("queue/completed/{FIRST_REQUEST_ID}"))
-            .is_dir()
+    assert!(matches!(
+        repository.recover_batch(&worker, parse_batch_id()),
+        Ok(BatchCommitOutcome::Committed {
+            commit: recovered,
+            ..
+        }) if recovered == commit
+    ));
+    assert_eq!(
+        fs::read_to_string(&committed_document)
+            .unwrap_or_else(|error| panic!("repaired document must be readable: {error}")),
+        markdown(FIRST_REQUEST_ID, "Fictional experiment")
     );
-    assert!(
-        root.path()
-            .join(format!("queue/failed/{SECOND_REQUEST_ID}/result.json"))
-            .is_file()
-    );
+    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), Some(&commit)) {
+        panic!("durably reconciled batch must finalize: {error}");
+    }
+    assert_eq!(git.transaction_count(), 0);
 }
 
 #[test]
@@ -463,6 +461,7 @@ fn all_request_failures_leave_the_official_commit_unchanged() {
         std::slice::from_ref(&claim),
         ContentPolicy::default(),
         &PackagePolicy::default(),
+        |_| Ok(()),
     ) {
         Ok(outcome) => outcome,
         Err(error) => panic!("missing document must be isolated: {error}"),
@@ -483,13 +482,37 @@ fn all_request_failures_leave_the_official_commit_unchanged() {
             if failures.len() == 1
                 && failures[0].error_code() == ErrorCode::DocumentNotFound
     ));
-    assert!(matches!(
-        repository.reconcile_batch(&mut worker, parse_batch_id()),
-        Ok(BatchCommitOutcome::NoChanges { failures })
-            if failures.len() == 1
-                && failures[0].error_code() == ErrorCode::DocumentNotFound
-    ));
+    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), None) {
+        panic!("durably failed batch must finalize: {error}");
+    }
     assert_eq!(git.transaction_count(), 0);
+}
+
+#[test]
+fn no_changes_recovery_rejects_a_stale_official_base() {
+    let root = TestDirectory::new();
+    let git = GitFixture::initialize(root.path());
+    let base = git.official_commit();
+    let (queue, mut worker) = queue_and_worker(&root.path().join("queue"));
+    let (request, payload) = missing_update_request();
+    let claim = enqueue_and_claim(&queue, &mut worker, FIRST_REQUEST_ID, &request, &payload);
+    assert!(matches!(
+        git.open().apply_batch(
+            &mut worker,
+            parse_batch_id(),
+            &[claim],
+            ContentPolicy::default(),
+            &PackagePolicy::default(),
+            |_| Ok(()),
+        ),
+        Ok(BatchCommitOutcome::NoChanges { .. })
+    ));
+    let concurrent = commit_empty_canonical(&git.canonical, "Advance fictional official state");
+    assert!(matches!(
+        git.open().recover_batch(&worker, parse_batch_id()),
+        Err(GitTransactionError::OfficialBranchChanged { expected, actual })
+            if expected == base && actual == concurrent
+    ));
 }
 
 #[test]
@@ -516,11 +539,44 @@ fn rejects_a_request_timestamp_after_durable_acceptance() {
             &[claim],
             ContentPolicy::default(),
             &PackagePolicy::default(),
+            |_| Ok(()),
         ),
         Ok(BatchCommitOutcome::NoChanges { failures })
             if failures.len() == 1
                 && failures[0].error_code() == ErrorCode::InvalidRequest
     ));
+}
+
+#[test]
+fn trial_build_failure_keeps_the_official_commit_unchanged() {
+    let root = TestDirectory::new();
+    let git = GitFixture::initialize(root.path());
+    let base = git.official_commit();
+    let (queue, mut worker) = queue_and_worker(&root.path().join("queue"));
+    let claim = enqueue_and_claim(
+        &queue,
+        &mut worker,
+        FIRST_REQUEST_ID,
+        &create_request(
+            FIRST_REQUEST_ID,
+            "Create a build-breaking fictional experiment",
+        ),
+        &markdown(FIRST_REQUEST_ID, "Build-breaking fictional experiment"),
+    );
+    assert!(matches!(
+        git.open().apply_batch(
+            &mut worker,
+            parse_batch_id(),
+            &[claim],
+            ContentPolicy::default(),
+            &PackagePolicy::default(),
+            |_| Err(GitTransactionError::TrialBuildFailed),
+        ),
+        Err(GitTransactionError::TrialBuildFailed)
+    ));
+    assert_eq!(git.official_commit(), base);
+    assert_eq!(git.transaction_count(), 1);
+    assert_eq!(git.worktree_count(), 1);
 }
 
 #[test]
@@ -546,7 +602,10 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
         std::slice::from_ref(&claim),
         ContentPolicy::default(),
         &PackagePolicy::default(),
-        |_, _| Err(GitTransactionError::InvalidGitOutput),
+        TransactionHooks {
+            trial_build: accept_trial_build,
+            before_publish: interrupt_publication,
+        },
     );
     assert!(matches!(
         interrupted,
@@ -598,13 +657,9 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
     assert_eq!(git.official_commit(), commit);
     assert_eq!(git.worktree_count(), 0);
     assert_eq!(git.transaction_count(), 1);
-    assert!(matches!(
-        repository.reconcile_batch(&mut worker, parse_batch_id()),
-        Ok(BatchCommitOutcome::Committed {
-            commit: reconciled,
-            ..
-        }) if reconciled == commit
-    ));
+    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), Some(&commit)) {
+        panic!("resumed batch must finalize: {error}");
+    }
     assert_eq!(git.transaction_count(), 0);
 }
 
@@ -612,8 +667,10 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
 fn counts_an_explicitly_moved_and_rewritten_file_without_git_rename_detection() {
     let root = TestDirectory::new();
     let fixture = GitFixture::initialize(root.path());
-    let source = PathBuf::from("projects/fictional-a/runbooks/source/index.md");
-    let destination = PathBuf::from("projects/fictional-a/archive/runbooks/source/index.md");
+    let source_bundle = PathBuf::from("projects/fictional-a/runbooks/source");
+    let destination_bundle = PathBuf::from("projects/fictional-a/archive/runbooks/source");
+    let source = source_bundle.join("index.md");
+    let destination = destination_bundle.join("index.md");
     write_tracked_fixture(
         &fixture.canonical,
         &source,
@@ -641,9 +698,9 @@ fn counts_an_explicitly_moved_and_rewritten_file_without_git_rename_detection() 
     let stats = match staged_stats(
         &fixture.canonical,
         &base,
-        &[AppliedFileMove {
-            source,
-            destination,
+        &[AppliedMove {
+            source: source_bundle,
+            destination: destination_bundle,
         }],
     ) {
         Ok(stats) => stats,
@@ -652,6 +709,66 @@ fn counts_an_explicitly_moved_and_rewritten_file_without_git_rename_detection() 
     assert_eq!(stats.added, 0);
     assert_eq!(stats.modified, 1);
     assert_eq!(stats.deleted, 0);
+}
+
+#[test]
+fn replays_ordered_moves_when_a_source_path_is_reused() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let first_bundle = PathBuf::from("projects/fictional-a/runbooks/source");
+    let second_bundle = PathBuf::from("projects/fictional-b/runbooks/source");
+    let final_bundle = PathBuf::from("projects/fictional-c/runbooks/source");
+    let first = first_bundle.join("index.md");
+    let second = second_bundle.join("index.md");
+    let final_path = final_bundle.join("index.md");
+    write_tracked_fixture(
+        &fixture.canonical,
+        &first,
+        b"Fictional repeatedly moved document.\n",
+    );
+    let base = commit_canonical_fixture(&fixture.canonical, "Add repeatedly moved document");
+
+    move_fixture(&fixture.canonical, &first, &second);
+    move_fixture(&fixture.canonical, &second, &first);
+    move_fixture(&fixture.canonical, &first, &final_path);
+    git(Some(&fixture.canonical), ["add", "--all"], None);
+
+    let stats = match staged_stats(
+        &fixture.canonical,
+        &base,
+        &[
+            AppliedMove {
+                source: first_bundle.clone(),
+                destination: second_bundle.clone(),
+            },
+            AppliedMove {
+                source: second_bundle,
+                destination: first_bundle.clone(),
+            },
+            AppliedMove {
+                source: first_bundle,
+                destination: final_bundle,
+            },
+        ],
+    ) {
+        Ok(stats) => stats,
+        Err(error) => panic!("ordered path reuse must remain a valid move: {error}"),
+    };
+    assert_eq!(stats.added, 0);
+    assert_eq!(stats.modified, 1);
+    assert_eq!(stats.deleted, 0);
+}
+
+fn move_fixture(worktree: &Path, source: &Path, destination: &Path) {
+    let destination = worktree.join(destination);
+    if let Some(parent) = destination.parent()
+        && let Err(error) = fs::create_dir_all(parent)
+    {
+        panic!("move fixture parent must be created: {error}");
+    }
+    if let Err(error) = fs::rename(worktree.join(source), destination) {
+        panic!("move fixture must be renamed: {error}");
+    }
 }
 
 fn write_tracked_fixture(worktree: &Path, relative_path: &Path, bytes: &[u8]) {
@@ -688,6 +805,28 @@ fn commit_canonical_fixture(worktree: &Path, message: &str) -> String {
     git_output(Some(worktree), ["rev-parse".into(), "HEAD".into()])
 }
 
+fn commit_empty_canonical(worktree: &Path, message: &str) -> String {
+    let status = Command::new("git")
+        .current_dir(worktree)
+        .args([
+            "-c",
+            "user.name=Agent Knowledge Test",
+            "-c",
+            "user.email=agent-knowledge@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+        ])
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!("empty canonical fixture commit failed with {status}"),
+        Err(error) => panic!("empty canonical fixture commit command failed: {error}"),
+    }
+    git_output(Some(worktree), ["rev-parse".into(), "HEAD".into()])
+}
+
 #[test]
 fn rejects_unordered_and_duplicate_batch_claims_before_writing() {
     let root = TestDirectory::new();
@@ -715,6 +854,7 @@ fn rejects_unordered_and_duplicate_batch_claims_before_writing() {
             &[second.clone(), first.clone()],
             ContentPolicy::default(),
             &PackagePolicy::default(),
+            |_| Ok(()),
         ),
         Err(GitTransactionError::InvalidClaims)
     ));
@@ -725,6 +865,7 @@ fn rejects_unordered_and_duplicate_batch_claims_before_writing() {
             &[first.clone(), first],
             ContentPolicy::default(),
             &PackagePolicy::default(),
+            |_| Ok(()),
         ),
         Err(GitTransactionError::InvalidClaims)
     ));
@@ -751,6 +892,7 @@ fn blocks_a_new_batch_until_the_published_journal_is_finalized() {
         &[first],
         ContentPolicy::default(),
         &PackagePolicy::default(),
+        |_| Ok(()),
     ) {
         Ok(outcome) => outcome,
         Err(error) => panic!("first batch must publish: {error}"),
@@ -779,13 +921,13 @@ fn blocks_a_new_batch_until_the_published_journal_is_finalized() {
             &[second],
             ContentPolicy::default(),
             &PackagePolicy::default(),
+            |_| Ok(()),
         ),
         Err(GitTransactionError::UnfinishedTransaction)
     ));
-    assert!(matches!(
-        repository.reconcile_batch(&mut worker, parse_batch_id()),
-        Ok(BatchCommitOutcome::Committed { commit, .. }) if commit == first_commit
-    ));
+    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), Some(&first_commit)) {
+        panic!("first batch must finalize before the next publication: {error}");
+    }
 }
 
 #[test]
@@ -810,6 +952,7 @@ fn refuses_to_start_with_a_dirty_canonical_worktree() {
             std::slice::from_ref(&claim),
             ContentPolicy::default(),
             &PackagePolicy::default(),
+            |_| Ok(()),
         ),
         Err(GitTransactionError::CanonicalWorktreeDirty)
     ));
@@ -832,6 +975,7 @@ fn refuses_to_start_with_a_dirty_canonical_worktree() {
             &[claim],
             ContentPolicy::default(),
             &PackagePolicy::default(),
+            |_| Ok(()),
         ),
         Err(GitTransactionError::CanonicalWorktreeDirty)
     ));
@@ -857,44 +1001,47 @@ fn compare_and_swap_refuses_a_concurrent_official_update() {
         &[claim],
         ContentPolicy::default(),
         &PackagePolicy::default(),
-        move |expected, _| {
-            let tree = git_output(
-                None,
-                [
-                    format!("--git-dir={}", repository_path.display()),
-                    "rev-parse".into(),
-                    format!("{expected}^{{tree}}"),
-                ],
-            );
-            let output = Command::new("git")
-                .arg(format!("--git-dir={}", repository_path.display()))
-                .args([
-                    "commit-tree",
-                    &tree,
-                    "-p",
-                    expected,
-                    "-m",
-                    "Concurrent commit",
-                ])
-                .env("GIT_AUTHOR_NAME", "Concurrent Test")
-                .env("GIT_AUTHOR_EMAIL", "concurrent@example.invalid")
-                .env("GIT_COMMITTER_NAME", "Concurrent Test")
-                .env("GIT_COMMITTER_EMAIL", "concurrent@example.invalid")
-                .output()
-                .map_err(GitTransactionError::Io)?;
-            if !output.status.success() {
-                return Err(GitTransactionError::InvalidGitOutput);
-            }
-            let competing = parse_text(&output.stdout)?;
-            let status = Command::new("git")
-                .arg(format!("--git-dir={}", repository_path.display()))
-                .args(["update-ref", "refs/heads/main", competing, expected])
-                .status()
-                .map_err(GitTransactionError::Io)?;
-            if !status.success() {
-                return Err(GitTransactionError::InvalidGitOutput);
-            }
-            Ok(())
+        TransactionHooks {
+            trial_build: accept_trial_build,
+            before_publish: move |expected: &str, _: &str| {
+                let tree = git_output(
+                    None,
+                    [
+                        format!("--git-dir={}", repository_path.display()),
+                        "rev-parse".into(),
+                        format!("{expected}^{{tree}}"),
+                    ],
+                );
+                let output = Command::new("git")
+                    .arg(format!("--git-dir={}", repository_path.display()))
+                    .args([
+                        "commit-tree",
+                        &tree,
+                        "-p",
+                        expected,
+                        "-m",
+                        "Concurrent commit",
+                    ])
+                    .env("GIT_AUTHOR_NAME", "Concurrent Test")
+                    .env("GIT_AUTHOR_EMAIL", "concurrent@example.invalid")
+                    .env("GIT_COMMITTER_NAME", "Concurrent Test")
+                    .env("GIT_COMMITTER_EMAIL", "concurrent@example.invalid")
+                    .output()
+                    .map_err(GitTransactionError::Io)?;
+                if !output.status.success() {
+                    return Err(GitTransactionError::InvalidGitOutput);
+                }
+                let competing = parse_text(&output.stdout)?;
+                let status = Command::new("git")
+                    .arg(format!("--git-dir={}", repository_path.display()))
+                    .args(["update-ref", "refs/heads/main", competing, expected])
+                    .status()
+                    .map_err(GitTransactionError::Io)?;
+                if !status.success() {
+                    return Err(GitTransactionError::InvalidGitOutput);
+                }
+                Ok(())
+            },
         },
     );
     assert!(matches!(
@@ -920,5 +1067,21 @@ fn rejects_unsafe_commit_identity_values() {
     assert!(matches!(
         GitIdentity::new("Worker\nInjected", "worker@example.invalid"),
         Err(GitTransactionError::InvalidIdentity)
+    ));
+}
+
+#[test]
+fn parses_supported_git_version_formats() {
+    assert!(matches!(
+        parse_git_version(b"git version 2.36.0\n"),
+        Ok((2, 36))
+    ));
+    assert!(matches!(
+        parse_git_version(b"git version 2.55.0.windows.1\n"),
+        Ok((2, 55))
+    ));
+    assert!(matches!(
+        parse_git_version(b"fictional version"),
+        Err(GitTransactionError::InvalidGitOutput)
     ));
 }

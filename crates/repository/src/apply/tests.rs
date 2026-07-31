@@ -469,7 +469,7 @@ fn archives_a_document_created_in_the_same_request() {
         "projects/fictional-project/archive/experiments/2026-07-31-{DOCUMENT_ID}/index.md"
     ));
     assert!(archived.is_file());
-    assert_eq!(outcome.file_moves().len(), 1);
+    assert_eq!(outcome.moves().len(), 1);
 }
 
 #[test]
@@ -582,7 +582,7 @@ fn archives_a_document_moved_in_the_same_request() {
         read_file(&archived.join("evidence.pdf")),
         b"fictional evidence\n"
     );
-    assert_eq!(outcome.file_moves().len(), 4);
+    assert_eq!(outcome.moves().len(), 2);
 }
 
 #[test]

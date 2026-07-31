@@ -20,25 +20,27 @@ use crate::{ContentIndex, ContentIndexError, ContentPolicy};
 
 /// Result of applying one complete request to an isolated content tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ApplyOutcome {
+pub(crate) struct ApplyOutcome {
+    #[cfg(test)]
     operations_applied: usize,
-    file_moves: Vec<AppliedFileMove>,
+    moves: Vec<AppliedMove>,
 }
 
 impl ApplyOutcome {
     /// Returns the number of request operations applied.
+    #[cfg(test)]
     #[must_use]
     pub const fn operations_applied(&self) -> usize {
         self.operations_applied
     }
 
-    pub(super) fn file_moves(&self) -> &[AppliedFileMove] {
-        &self.file_moves
+    pub(super) fn moves(&self) -> &[AppliedMove] {
+        &self.moves
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct AppliedFileMove {
+pub(super) struct AppliedMove {
     pub(super) source: PathBuf,
     pub(super) destination: PathBuf,
 }
@@ -53,7 +55,7 @@ pub(super) struct AppliedFileMove {
 /// # Errors
 ///
 /// Returns a deterministic request failure or a transient filesystem failure.
-pub fn apply_claimed(
+pub(crate) fn apply_claimed(
     content_root: &Path,
     claim: &ClaimedPackage,
     policy: ContentPolicy,
@@ -99,13 +101,15 @@ fn apply_request_with_policy(
     let index = ContentIndex::build(content_root, policy, package_policy)
         .map_err(ApplyError::ContentIndex)?;
     let plan = build_plan(content_root, package_root, package, &index, policy)?;
+    #[cfg(test)]
     let operations_applied = package.request().operations.len();
-    let file_moves = execute_plan(content_root, plan, policy.maximum_entry_count)?;
+    let moves = execute_plan(content_root, plan)?;
     ContentIndex::build(content_root, policy, package_policy)
         .map_err(ApplyError::ResultingContent)?;
     Ok(ApplyOutcome {
+        #[cfg(test)]
         operations_applied,
-        file_moves,
+        moves,
     })
 }
 
@@ -752,9 +756,8 @@ fn revision(bytes: &[u8]) -> Revision {
 fn execute_plan(
     content_root: &Path,
     plan: Vec<PlannedMutation>,
-    maximum_entry_count: usize,
-) -> Result<Vec<AppliedFileMove>, ApplyError> {
-    let mut file_moves = Vec::new();
+) -> Result<Vec<AppliedMove>, ApplyError> {
+    let mut moves = Vec::new();
     for mutation in plan {
         match mutation {
             PlannedMutation::WriteNew {
@@ -780,61 +783,13 @@ fn execute_plan(
                 source,
                 destination,
             } => {
-                file_moves.extend(collect_file_moves(
-                    content_root,
-                    &source,
-                    &destination,
-                    maximum_entry_count,
-                )?);
+                moves.push(AppliedMove {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                });
                 let destination_path = content_root.join(&destination);
                 create_parent(&destination_path)?;
                 fs::rename(content_root.join(source), destination_path).map_err(ApplyError::Io)?;
-            }
-        }
-    }
-    Ok(file_moves)
-}
-
-fn collect_file_moves(
-    content_root: &Path,
-    source: &Path,
-    destination: &Path,
-    maximum_entry_count: usize,
-) -> Result<Vec<AppliedFileMove>, ApplyError> {
-    let source_path = content_root.join(source);
-    let metadata = fs::symlink_metadata(&source_path).map_err(ApplyError::Io)?;
-    if metadata.file_type().is_file() {
-        return Ok(vec![AppliedFileMove {
-            source: source.to_path_buf(),
-            destination: destination.to_path_buf(),
-        }]);
-    }
-    if !metadata.file_type().is_dir() {
-        return Err(ApplyError::ContentChangedDuringApply);
-    }
-    let mut directories = vec![source.to_path_buf()];
-    let mut moves = Vec::new();
-    while let Some(relative_directory) = directories.pop() {
-        for entry in fs::read_dir(content_root.join(&relative_directory)).map_err(ApplyError::Io)? {
-            let entry = entry.map_err(ApplyError::Io)?;
-            let relative_path = relative_directory.join(entry.file_name());
-            if directories.len().saturating_add(moves.len()) >= maximum_entry_count {
-                return Err(ApplyError::ContentChangedDuringApply);
-            }
-            let file_type = entry.file_type().map_err(ApplyError::Io)?;
-            if file_type.is_dir() {
-                directories.push(relative_path);
-            } else if file_type.is_file() {
-                let suffix = relative_path
-                    .strip_prefix(source)
-                    .map_err(|_| ApplyError::ContentChangedDuringApply)?
-                    .to_path_buf();
-                moves.push(AppliedFileMove {
-                    source: relative_path,
-                    destination: destination.join(&suffix),
-                });
-            } else {
-                return Err(ApplyError::ContentChangedDuringApply);
             }
         }
     }
