@@ -197,6 +197,8 @@ impl FileQueue {
             &queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
             &configured_queue_root,
             &root_handle,
+            &queue_lock_handle,
+            &worker_lock_handle,
             &queue_root,
         )?;
         let identity =
@@ -420,6 +422,8 @@ impl FileQueue {
             &self.queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
             &self.configured_queue_root,
             &self.root_handle,
+            &self.queue_lock_handle,
+            &self.worker_lock_handle,
         )?;
         let stable_identity = read_queue_identity(&self.queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
         let configured_identity =
@@ -1081,11 +1085,24 @@ fn ensure_queue_root_binding(
     path: &Path,
     configured_root: &Path,
     root_handle: &File,
+    queue_lock_handle: &File,
+    worker_lock_handle: &File,
     queue_root: &Path,
 ) -> Result<(), QueueError> {
-    let expected = queue_root_binding(configured_root, root_handle)?;
+    let expected = queue_root_binding(
+        configured_root,
+        root_handle,
+        queue_lock_handle,
+        worker_lock_handle,
+    )?;
     match fs::symlink_metadata(path) {
-        Ok(_) => validate_queue_root_binding(path, configured_root, root_handle),
+        Ok(_) => validate_queue_root_binding(
+            path,
+            configured_root,
+            root_handle,
+            queue_lock_handle,
+            worker_lock_handle,
+        ),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             if !accepted_states_are_empty(queue_root)? {
                 return Err(QueueError::InvalidQueueIdentity);
@@ -1103,15 +1120,22 @@ fn ensure_queue_root_binding(
     }
 }
 
-fn queue_root_binding(configured_root: &Path, root_handle: &File) -> Result<Vec<u8>, QueueError> {
+fn queue_root_binding(
+    configured_root: &Path,
+    root_handle: &File,
+    queue_lock_handle: &File,
+    worker_lock_handle: &File,
+) -> Result<Vec<u8>, QueueError> {
     let mut expected = configured_root.as_os_str().as_encoded_bytes().to_vec();
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let metadata = root_handle.metadata().map_err(QueueError::Io)?;
-        expected.push(0);
-        expected.extend_from_slice(&metadata.dev().to_le_bytes());
-        expected.extend_from_slice(&metadata.ino().to_le_bytes());
+        for handle in [root_handle, queue_lock_handle, worker_lock_handle] {
+            let metadata = handle.metadata().map_err(QueueError::Io)?;
+            expected.push(0);
+            expected.extend_from_slice(&metadata.dev().to_le_bytes());
+            expected.extend_from_slice(&metadata.ino().to_le_bytes());
+        }
     }
     Ok(expected)
 }
@@ -1120,8 +1144,15 @@ fn validate_queue_root_binding(
     path: &Path,
     configured_root: &Path,
     root_handle: &File,
+    queue_lock_handle: &File,
+    worker_lock_handle: &File,
 ) -> Result<(), QueueError> {
-    let expected = queue_root_binding(configured_root, root_handle)?;
+    let expected = queue_root_binding(
+        configured_root,
+        root_handle,
+        queue_lock_handle,
+        worker_lock_handle,
+    )?;
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 16 * 1024 => {
             if fs::read(path).map_err(QueueError::Io)? == expected {

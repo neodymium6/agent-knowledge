@@ -143,7 +143,8 @@ requires:
 
 - atomic rename within a file system;
 - durable file and directory synchronization;
-- advisory file locking; and
+- advisory `flock` locking on regular files and read-only directory
+  descriptors;
 - normal POSIX file and directory semantics; and
 - a mounted `/proc` file system exposing `/proc/self/fd`.
 
@@ -162,8 +163,12 @@ still run is unsupported and must fail closed operationally.
 
 A future Kubernetes deployment uses one StatefulSet replica and one persistent
 volume mounted by a single Pod. The volume must provide the file-system
-semantics above. Kubernetes compatibility does not imply initial support for
-multiple Gateway or Worker replicas.
+semantics above and preserve inode identity across ordinary Pod restarts.
+Network filesystems that cannot take an exclusive `flock` on a read-only
+directory descriptor, including incompatible NFS configurations, are not
+supported as the transaction store. A local or block-backed filesystem with
+the required semantics is suitable. Kubernetes compatibility does not imply
+initial support for multiple Gateway or Worker replicas.
 
 SSH host keys, client public keys, Git credentials, and other secrets are
 deployment inputs. They are never stored in this repository or in committed
@@ -762,8 +767,9 @@ handles for the same queue cannot select different lock files. Each queue
 handle pins both lock-file inodes and opens an independent lock description
 through `/proc/self/fd` for every acquisition. Replacing either directory entry
 therefore invalidates the handle instead of creating a second lock universe.
-The Gateway can continue accepting requests while the Worker is otherwise idle
-or applying a batch.
+Both lock identities are also part of the durable root binding, so a new handle
+cannot adopt replacement lock files after a restart. The Gateway can continue
+accepting requests while the Worker is otherwise idle or applying a batch.
 
 On Linux, each live queue handle retains an open descriptor for the initialized
 queue root and performs queue I/O through `/proc/self/fd/<fd>`. It also compares
@@ -778,8 +784,9 @@ as it exposes a `/proc/self/fd/<fd>` package path.
 The queue stores an immutable root binding containing its configured canonical
 path and filesystem device/inode identity. A byte-for-byte copy is not accepted
 as a second live queue even when it preserves `queue-id`. Restoring storage onto
-a different filesystem identity is an explicit offline operator migration, not
-a live queue restart.
+a different filesystem identity is not accepted by the initial implementation;
+a future offline migration procedure must deliberately rewrite the binding
+before such restores are supported.
 
 Pending selection takes a fixed acceptance-sequence snapshot and incrementally
 walks the pending directory. Each call has a maximum number of directory
@@ -900,7 +907,8 @@ directory inodes serialize every repository instance and prevent replaceable
 lock files from creating a second writer universe. Reciprocal immutable
 bindings connect the bare repository and disposable work root to the same
 canonical worktree and official branch, including the configured paths and
-device/inode identities of all three roots. Recovery never
+device/inode identities of all three roots and the journal and disposable
+worktree directories. Recovery never
 guesses that a Git `.lock` file is stale:
 an orphaned but still-running Git child may own it, so automated recovery
 fails closed and requires verified operator intervention. The process

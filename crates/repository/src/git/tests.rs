@@ -848,6 +848,32 @@ fn rejects_live_transaction_directory_replacement() {
 }
 
 #[test]
+fn rejects_transaction_directory_replacement_after_restart() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    drop(fixture.open());
+    let transactions = fixture.work.join("transactions");
+    fs::rename(&transactions, fixture.work.join("detached-transactions"))
+        .unwrap_or_else(|error| panic!("transaction directory must be moved aside: {error}"));
+    fs::create_dir(&transactions).unwrap_or_else(|error| {
+        panic!("replacement transaction directory must be created: {error}")
+    });
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+
+    assert!(matches!(
+        GitRepository::open(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity,
+        ),
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+}
+
+#[test]
 fn rejects_a_work_root_bound_to_another_repository() {
     let root = TestDirectory::new();
     let first_root = root.path().join("first");

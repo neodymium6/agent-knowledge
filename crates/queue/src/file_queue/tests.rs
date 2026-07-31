@@ -245,9 +245,16 @@ fn rejects_replaced_fixed_lock_files() {
         queue.begin(),
         Err(QueueError::InvalidQueueIdentity)
     ));
+    assert!(matches!(
+        FileQueue::initialize(root.path().join("queue"), PackagePolicy::default()),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
 
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let worker = queue
+        .try_worker_session()
+        .unwrap_or_else(|error| panic!("original Worker lock must be held: {error}"));
     let worker_lock = root.path().join("queue/.locks/repository-writer.lock");
     fs::rename(&worker_lock, worker_lock.with_extension("detached"))
         .unwrap_or_else(|error| panic!("Worker lock must be moved aside: {error}"));
@@ -255,9 +262,14 @@ fn rejects_replaced_fixed_lock_files() {
         .unwrap_or_else(|error| panic!("replacement Worker lock must be created: {error}"));
 
     assert!(matches!(
-        queue.try_worker_session(),
+        worker.queue_identity(),
         Err(WorkerQueueError::Queue(QueueError::InvalidQueueIdentity))
     ));
+    assert!(matches!(
+        FileQueue::initialize(root.path().join("queue"), PackagePolicy::default()),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+    drop(worker);
 }
 
 #[test]

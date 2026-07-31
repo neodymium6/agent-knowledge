@@ -217,15 +217,23 @@ impl GitRepository {
             &work_root,
             &configured_work_root,
         )?;
-        let expected_binding = repository_binding(
-            &configured_git_directory,
-            &git_root_handle,
-            &configured_canonical_worktree,
-            &canonical_root_handle,
-            &configured_work_root,
-            &work_root_handle,
-            &official_ref,
-        )?;
+        let binding_directories = [
+            (configured_git_directory.as_path(), git_root_handle.as_ref()),
+            (
+                configured_canonical_worktree.as_path(),
+                canonical_root_handle.as_ref(),
+            ),
+            (configured_work_root.as_path(), work_root_handle.as_ref()),
+            (
+                configured_journal_root.as_path(),
+                journal_root_handle.as_ref(),
+            ),
+            (
+                configured_worktree_root.as_path(),
+                worktree_root_handle.as_ref(),
+            ),
+        ];
+        let expected_binding = repository_binding(&binding_directories, &official_ref)?;
         let binding_file = repository_state.join("binding-v2");
         ensure_binding(&binding_file, &expected_binding)?;
         let work_root_binding_file = work_root.join(".agent-knowledge-repository-binding-v2");
@@ -741,15 +749,29 @@ impl GitRepository {
             &self.canonical_worktree,
             &self.official_ref,
         )?;
-        let expected_binding = repository_binding(
-            &self.configured_git_directory,
-            &self.git_root_handle,
-            &self.configured_canonical_worktree,
-            &self.canonical_root_handle,
-            &self.configured_work_root,
-            &self.work_root_handle,
-            &self.official_ref,
-        )?;
+        let binding_directories = [
+            (
+                self.configured_git_directory.as_path(),
+                self.git_root_handle.as_ref(),
+            ),
+            (
+                self.configured_canonical_worktree.as_path(),
+                self.canonical_root_handle.as_ref(),
+            ),
+            (
+                self.configured_work_root.as_path(),
+                self.work_root_handle.as_ref(),
+            ),
+            (
+                self.configured_journal_root.as_path(),
+                self.journal_root_handle.as_ref(),
+            ),
+            (
+                self.configured_worktree_root.as_path(),
+                self.worktree_root_handle.as_ref(),
+            ),
+        ];
+        let expected_binding = repository_binding(&binding_directories, &self.official_ref)?;
         validate_binding(&self.binding_file, &expected_binding)?;
         validate_binding(&self.work_root_binding_file, &expected_binding)
     }
@@ -1600,18 +1622,13 @@ fn validate_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionEr
 }
 
 fn repository_binding(
-    git_directory: &Path,
-    git_root: &File,
-    canonical_worktree: &Path,
-    canonical_root: &File,
-    work_root: &Path,
-    work_root_handle: &File,
+    directories: &[(&Path, &File)],
     official_ref: &str,
 ) -> Result<Vec<u8>, GitTransactionError> {
     let mut binding = b"agent-knowledge-repository-binding-v2\0".to_vec();
-    append_directory_binding(&mut binding, git_directory, git_root)?;
-    append_directory_binding(&mut binding, canonical_worktree, canonical_root)?;
-    append_directory_binding(&mut binding, work_root, work_root_handle)?;
+    for (configured_path, handle) in directories {
+        append_directory_binding(&mut binding, configured_path, handle)?;
+    }
     binding.extend_from_slice(official_ref.as_bytes());
     Ok(binding)
 }
