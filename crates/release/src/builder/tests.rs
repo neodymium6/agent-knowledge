@@ -141,7 +141,7 @@ fn does_not_spawn_quartz_after_the_deadline() {
 
 #[cfg(unix)]
 #[test]
-fn keeps_group_cleanup_armed_when_waiting_fails() {
+fn waits_without_resignaling_when_group_waiting_fails() {
     use std::os::unix::process::CommandExt;
 
     let root = TestDirectory::new();
@@ -162,6 +162,11 @@ fn keeps_group_cleanup_armed_when_waiting_fails() {
     let mut guard = ChildGuard::new(child)
         .unwrap_or_else(|error| panic!("child guard must initialize: {error}"));
     let timeout = Duration::from_millis(1);
+    guard
+        .terminate_group()
+        .unwrap_or_else(|error| panic!("process group must be signaled: {error}"));
+    assert!(!guard.group_signal_armed);
+    assert!(guard.group_wait_armed);
 
     assert!(matches!(
         guard.wait_for_group_then_disarm(Instant::now(), timeout, |_, _, _| {
@@ -169,7 +174,8 @@ fn keeps_group_cleanup_armed_when_waiting_fails() {
         }),
         Err(QuartzBuildError::TimedOut { .. })
     ));
-    assert!(guard.group_armed);
+    assert!(!guard.group_signal_armed);
+    assert!(guard.group_wait_armed);
     drop(guard);
     std::thread::sleep(Duration::from_millis(150));
     assert!(!marker.exists());

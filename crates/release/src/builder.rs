@@ -188,7 +188,8 @@ fn spawn_quartz(
 
 struct ChildGuard {
     child: Option<Child>,
-    group_armed: bool,
+    group_signal_armed: bool,
+    group_wait_armed: bool,
     #[cfg(unix)]
     process_group: Pid,
 }
@@ -206,31 +207,41 @@ impl ChildGuard {
         };
         Ok(Self {
             child: Some(child),
-            group_armed: true,
+            group_signal_armed: true,
+            group_wait_armed: true,
             #[cfg(unix)]
             process_group,
         })
     }
 
     fn try_wait(&mut self) -> Result<Option<ExitStatus>, QuartzBuildError> {
-        self.child
+        let status = self
+            .child
             .as_mut()
             .ok_or(QuartzBuildError::InvalidProcessState)?
             .try_wait()
-            .map_err(QuartzBuildError::Io)
+            .map_err(QuartzBuildError::Io)?;
+        if status.is_some() {
+            self.child = None;
+        }
+        Ok(status)
     }
 
-    fn terminate_group(&self) -> Result<(), QuartzBuildError> {
-        if !self.group_armed {
+    fn terminate_group(&mut self) -> Result<(), QuartzBuildError> {
+        if !self.group_signal_armed {
             return Ok(());
         }
         #[cfg(unix)]
-        match killpg(self.process_group, Signal::SIGKILL) {
+        let result = match killpg(self.process_group, Signal::SIGKILL) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
             Err(error) => Err(process_error(error as i32)),
-        }
+        };
         #[cfg(not(unix))]
-        Ok(())
+        let result: Result<(), QuartzBuildError> = Ok(());
+        if result.is_ok() {
+            self.group_signal_armed = false;
+        }
+        result
     }
 
     fn terminate_group_and_wait(
@@ -262,29 +273,31 @@ impl ChildGuard {
     }
 
     fn terminate(&mut self) {
-        if !self.group_armed && self.child.is_none() {
+        if !self.group_signal_armed && !self.group_wait_armed && self.child.is_none() {
             return;
         }
         #[cfg(unix)]
         let process_group = self.process_group;
         let _ = self.terminate_group();
-        self.group_armed = false;
+        self.group_signal_armed = false;
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
         self.child = None;
         #[cfg(unix)]
-        {
+        if self.group_wait_armed {
             let deadline = Instant::now()
                 .checked_add(TERMINATION_GRACE)
                 .unwrap_or_else(Instant::now);
             let _ = wait_for_process_group(process_group, deadline, TERMINATION_GRACE);
         }
+        self.group_wait_armed = false;
     }
 
     fn disarm(&mut self) {
-        self.group_armed = false;
+        self.group_signal_armed = false;
+        self.group_wait_armed = false;
         self.child = None;
     }
 }
