@@ -104,8 +104,6 @@ command before the SSH Gateway is added:
 ```text
 agent-knowledge admin submit \
   --queue-root /srv/agent-knowledge/queue \
-  --lock-file /srv/agent-knowledge/locks/queue.lock \
-  --worker-lock-file /srv/agent-knowledge/locks/repository-writer.lock \
   --package-root ./fictional-request
 ```
 
@@ -265,13 +263,13 @@ knowledge/
 │   ├── pending/
 │   ├── processing/
 │   ├── completed/
-│   └── failed/
+│   ├── failed/
+│   └── .locks/                # fixed queue and Worker lock identities
 ├── repository/              # bare Git repository
 ├── releases/
 │   ├── by-id/
 │   └── current -> by-id/<release-id>/
-├── work/                    # disposable worktrees and builds
-└── locks/
+└── work/                    # disposable worktrees and builds
 ```
 
 `repository/` is a bare Git repository. `content/` is its canonical linked
@@ -703,12 +701,13 @@ release metadata. It either resumes the next idempotent phase or returns the
 request to `pending/`.
 
 Every Worker queue transition requires an exclusive Worker session. Session
-creation takes the configured repository writer lock without waiting and fails
-if another Worker owns it. This lock is separate from the short-lived queue
-lock and is stored in the queue configuration rather than supplied by each
-session caller. Two sessions for one queue therefore cannot select different
-lock files. The Gateway can continue accepting requests while the Worker is
-otherwise idle or applying a batch.
+creation takes the fixed `queue/.locks/repository-writer.lock` without waiting
+and fails if another Worker owns it. This lock is separate from the fixed,
+short-lived `queue/.locks/queue.lock`. Because both identities are derived from
+the queue root rather than supplied by callers, independently initialized
+handles for the same queue cannot select different lock files. The Gateway can
+continue accepting requests while the Worker is otherwise idle or applying a
+batch.
 
 Pending selection takes a fixed acceptance-sequence snapshot and incrementally
 walks the pending directory. Each call has a maximum number of directory

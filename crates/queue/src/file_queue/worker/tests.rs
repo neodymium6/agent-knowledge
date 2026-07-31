@@ -105,12 +105,7 @@ fn payload_path(value: &str) -> PayloadPath {
 }
 
 fn initialize_queue(root: &Path) -> FileQueue {
-    match FileQueue::initialize(
-        root.join("queue"),
-        root.join("locks/queue.lock"),
-        root.join("locks/repository-writer.lock"),
-        PackagePolicy::default(),
-    ) {
+    match FileQueue::initialize(root.join("queue"), PackagePolicy::default()) {
         Ok(queue) => queue,
         Err(error) => panic!("fixture queue must initialize: {error}"),
     }
@@ -529,12 +524,13 @@ fn corrupt_pending_request_is_failed_without_blocking_valid_candidates() {
 fn worker_writer_lock_is_exclusive_and_released_on_drop() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path());
+    let independently_initialized = initialize_queue(root.path());
     let worker = match queue.try_worker_session() {
         Ok(worker) => worker,
         Err(error) => panic!("first Worker must acquire the writer lock: {error}"),
     };
 
-    let error = match queue.try_worker_session() {
+    let error = match independently_initialized.try_worker_session() {
         Ok(_) => panic!("second Worker must not share the writer lock"),
         Err(error) => error,
     };
@@ -542,7 +538,7 @@ fn worker_writer_lock_is_exclusive_and_released_on_drop() {
     assert_eq!(error.error_code(), ErrorCode::TemporaryFailure);
 
     drop(worker);
-    if let Err(error) = queue.try_worker_session() {
+    if let Err(error) = independently_initialized.try_worker_session() {
         panic!("dropping the Worker must release its writer lock: {error}");
     }
 }

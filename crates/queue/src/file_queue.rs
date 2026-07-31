@@ -28,6 +28,9 @@ const ACCEPTANCE_FILE_NAME: &str = "acceptance.json";
 const NEXT_SEQUENCE_FILE_NAME: &str = "next-sequence";
 const QUARANTINE_MARKER_FILE_NAME: &str = ".quarantined-at";
 const WORKER_TEMP_DIRECTORY_NAME: &str = "worker-tmp";
+const LOCK_DIRECTORY_NAME: &str = ".locks";
+const QUEUE_LOCK_FILE_NAME: &str = "queue.lock";
+const WORKER_LOCK_FILE_NAME: &str = "repository-writer.lock";
 const PAYLOAD_DIRECTORY_NAME: &str = "payload";
 const COPY_BUFFER_LENGTH: usize = 64 * 1024;
 const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
@@ -109,28 +112,25 @@ impl FileQueue {
     /// Creates missing queue-state directories and opens a queue handle.
     ///
     /// The queue root and all state directories must reside on the same file
-    /// system. The queue and Repository Worker lock paths may be placed in the
-    /// storage tree's `locks/` directory. The Worker path is stored in this
-    /// handle so every session for the queue uses the same lock.
+    /// system. Queue and Repository Worker locks use fixed names below the queue
+    /// root's `.locks/` directory, so independently initialized handles for the
+    /// same queue cannot select different lock identities.
     ///
     /// # Errors
     ///
-    /// Returns an error when the configured paths cannot be initialized as
-    /// regular directories and a regular lock file.
+    /// Returns an error when the configured queue root cannot be initialized
+    /// with regular state and lock directories and regular lock files.
     pub fn initialize(
         queue_root: impl Into<PathBuf>,
-        lock_file: impl Into<PathBuf>,
-        worker_lock_file: impl Into<PathBuf>,
         policy: PackagePolicy,
     ) -> Result<Self, QueueError> {
         let queue_root = queue_root.into();
-        let lock_file = lock_file.into();
-        let worker_lock_file = worker_lock_file.into();
-        if lock_file == worker_lock_file {
-            return Err(QueueError::InvalidStoragePath(worker_lock_file));
-        }
+        let lock_root = queue_root.join(LOCK_DIRECTORY_NAME);
+        let lock_file = lock_root.join(QUEUE_LOCK_FILE_NAME);
+        let worker_lock_file = lock_root.join(WORKER_LOCK_FILE_NAME);
 
         ensure_directory(&queue_root)?;
+        ensure_directory(&lock_root)?;
         ensure_directory(&queue_root.join("incoming"))?;
         ensure_directory(&queue_root.join("quarantine"))?;
         ensure_directory(&queue_root.join(WORKER_TEMP_DIRECTORY_NAME))?;
@@ -138,17 +138,7 @@ impl FileQueue {
             ensure_directory(&queue_root.join(state.directory_name()))?;
         }
 
-        if let Some(parent) = lock_file.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            ensure_directory(parent)?;
-        }
         ensure_lock_file(&lock_file)?;
-        if let Some(parent) = worker_lock_file.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            ensure_directory(parent)?;
-        }
         ensure_lock_file(&worker_lock_file)?;
         let initialization_lock = OpenOptions::new()
             .read(true)
@@ -158,23 +148,13 @@ impl FileQueue {
         initialization_lock.lock().map_err(QueueError::Io)?;
         ensure_sequence_file(&queue_root.join(NEXT_SEQUENCE_FILE_NAME), &queue_root)?;
 
+        sync_directory(&lock_root)?;
         sync_directory(&queue_root)?;
         if let Some(parent) = queue_root.parent()
             && !parent.as_os_str().is_empty()
         {
             sync_directory(parent)?;
         }
-        if let Some(parent) = lock_file.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            sync_directory(parent)?;
-        }
-        if let Some(parent) = worker_lock_file.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            sync_directory(parent)?;
-        }
-
         Ok(Self {
             queue_root,
             lock_file,

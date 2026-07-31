@@ -91,12 +91,7 @@ impl Drop for TestDirectory {
 }
 
 fn initialize_queue(root: &Path, policy: PackagePolicy) -> FileQueue {
-    match FileQueue::initialize(
-        root.join("queue"),
-        root.join("locks/queue.lock"),
-        root.join("locks/repository-writer.lock"),
-        policy,
-    ) {
+    match FileQueue::initialize(root.join("queue"), policy) {
         Ok(queue) => queue,
         Err(error) => panic!("fixture queue must initialize: {error}"),
     }
@@ -331,12 +326,7 @@ fn missing_sequence_state_fails_closed_when_requests_exist() {
         panic!("fixture sequence state must be removed: {error}");
     }
 
-    let error = match FileQueue::initialize(
-        root.path().join("queue"),
-        root.path().join("locks/queue.lock"),
-        root.path().join("locks/repository-writer.lock"),
-        PackagePolicy::default(),
-    ) {
+    let error = match FileQueue::initialize(root.path().join("queue"), PackagePolicy::default()) {
         Ok(_) => panic!("missing sequence state with accepted requests must fail"),
         Err(error) => error,
     };
@@ -689,24 +679,14 @@ fn concurrent_queue_initialization_shares_one_lock_file() {
     let first_barrier = Arc::clone(&barrier);
     let first = thread::spawn(move || {
         first_barrier.wait();
-        FileQueue::initialize(
-            first_root.join("queue"),
-            first_root.join("locks/queue.lock"),
-            first_root.join("locks/repository-writer.lock"),
-            PackagePolicy::default(),
-        )
+        FileQueue::initialize(first_root.join("queue"), PackagePolicy::default())
     });
 
     let second_root = root.path().to_path_buf();
     let second_barrier = Arc::clone(&barrier);
     let second = thread::spawn(move || {
         second_barrier.wait();
-        FileQueue::initialize(
-            second_root.join("queue"),
-            second_root.join("locks/queue.lock"),
-            second_root.join("locks/repository-writer.lock"),
-            PackagePolicy::default(),
-        )
+        FileQueue::initialize(second_root.join("queue"), PackagePolicy::default())
     });
 
     for result in [first.join(), second.join()] {
@@ -716,7 +696,12 @@ fn concurrent_queue_initialization_shares_one_lock_file() {
             Err(_) => panic!("queue initialization thread must not panic"),
         }
     }
-    assert!(root.path().join("locks/queue.lock").is_file());
+    assert!(root.path().join("queue/.locks/queue.lock").is_file());
+    assert!(
+        root.path()
+            .join("queue/.locks/repository-writer.lock")
+            .is_file()
+    );
 }
 
 #[test]
