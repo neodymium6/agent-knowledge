@@ -1,5 +1,11 @@
 [workspace]
-members = [".", "crates/core", "crates/queue", "crates/repository"]
+members = [
+  ".",
+  "crates/core",
+  "crates/queue",
+  "crates/release",
+  "crates/repository",
+]
 resolver = "3"
 
 [workspace.package]

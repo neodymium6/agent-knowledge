@@ -265,7 +265,20 @@ temporary release directory. It never changes authoritative content.
 
 The Quartz command, configuration path, and integration directory are
 configuration values. A trial build must finish successfully before a release
-can become current.
+can become current. They are trusted deployment inputs, not request data. The
+configured program and complete integration tree, including plugins and
+runtime dependencies, must be versioned and deployed immutably for the
+Worker's lifetime; changing them requires constructing a new Worker.
+
+The Rust builder resolves a canonical absolute executable and integration
+directory at startup, preserves the executable's original path semantics,
+passes arguments without a shell, and appends Quartz's
+`build -d <content> -o <output>` interface. Standard input and process output
+are disconnected from request data and logs, and every invocation has a
+positive execution deadline. Each invocation runs in an isolated process
+group; the builder kills that group on timeout and after the command wrapper
+exits. The service supervisor remains responsible for terminating any process
+that escapes the group before restarting recovery.
 
 ### 7.4 Git remote
 
@@ -1057,9 +1070,18 @@ Each successful build is immutable:
 
 ```text
 releases/
+├── .staging/
+│   └── <batch-id>/
+│       └── site/
 ├── by-id/
 │   ├── 20260731T040000Z-<commit>/
 │   └── 20260731T040500Z-<commit>/
+├── by-commit/
+│   └── <commit> -> ../by-id/<release-id>/
+├── by-batch/
+│   └── <batch-id>  # durable release manifest intent
+├── cleanup-intent/
+│   └── <batch-id>
 └── current -> by-id/20260731T040500Z-<commit>/
 ```
 
@@ -1074,6 +1096,92 @@ The Worker:
 
 If a build or activation fails, the previous `current` release remains
 available.
+
+The release store pins the release root, `.staging/`, `by-id/`, `by-commit/`,
+`by-batch/`, and `cleanup-intent/` directory identities and requires them to
+share one Linux mount. Its durable binding records the canonical path and
+stable inode identities, while live mount IDs are checked separately so a
+valid persistent volume can recover after a reboot or remount. The binding is
+published from a synchronized temporary file by atomic rename. A missing
+binding is initialized only when every fixed directory is empty. Populated
+stores fail closed, while the previous binding schema is migrated only after
+its canonical path and inode identities have been validated.
+
+Generated output is bounded by entry count, directory depth, individual-file
+bytes, and total bytes during validation and synchronization. Validation walks
+from pinned directory descriptors, revalidates every parent entry against the
+opened child, and rejects nested mounts, symbolic links, special files, and
+hard-linked files. Before promotion, each release receives a synchronized,
+versioned
+`.agent-knowledge-release.json` manifest binding its release ID, full commit
+ID, UTC creation time, and a deterministic SHA-256 revision of the generated
+tree. The tree revision is checked again before activation, so a changed
+prepared release cannot become current. Promotion from
+`.staging/<batch-id>/site/` to `by-id/` and replacement of `current` are
+separately atomic and idempotent. After a restart, the Worker can recover a
+validated prepared release through its durable `by-batch/<batch-id>` intent
+and resume after either rename without replacing the previously active site.
+The ready-only `by-commit/` references are derived indexes and may be rebuilt
+from validated release manifests through the bounded repair operation.
+
+While Quartz is running, the Worker scans its output at a short fixed interval
+with the same entry, depth, per-file, and aggregate-byte policy and terminates
+the entire build process group on excess. The scan is depth-first, bounds open
+descriptors by the directory-depth limit, and checks the build deadline
+throughout traversal. This bounds normal runaway builds before final
+validation. When the Quartz leader exits, the Worker terminates the remaining
+process group and waits, within the build deadline, until the group has no
+signalable members before performing the final output scan. On Linux the Worker
+holds a process-wide build lease, temporarily acts as a child subreaper, and
+reaps orphaned group members, including when it is PID 1 in a container. The
+lease serializes Quartz invocations and restores the previous subreaper setting
+after cleanup, preventing child-status ownership from crossing builds. The
+Worker does not start unrelated subprocesses while this lease is held. It sends
+the termination signal only once and disarms the numeric process-group
+identifier before waiting, preventing a reused identifier from receiving a
+later signal. The configured Quartz process and its plugins must not detach
+from the assigned process group. Deployments that execute untrusted plugins
+require a cgroup or equivalent containment boundary. Deployments should
+additionally place build staging on a quota-limited filesystem or apply an
+equivalent ephemeral-storage limit when a hard kernel-enforced capacity
+boundary is required.
+
+The batch directory is pinned while a store-wide exclusive lease spans the
+build and live preparation. `QuartzBuilder::build` consumes the original
+`BuildDirectory` and returns an unforgeable `BuiltDirectory` capability only
+after command success and final validation. `prepare` accepts and consumes only
+that capability, so failed, timed-out, or partially validated output cannot be
+promoted through the public API. The capability retains the batch lease, so the
+directory identity cannot be dropped and reopened between building and
+preparation. Quartz receives its replaceable `site/` child as the output path,
+allowing the CLI to remove and recreate the output root without invalidating
+the batch container. Restart recovery uses the batch ID and the durable
+`by-batch/<batch-id>` manifest intent. The store publishes this intent outside
+Quartz-controlled staging before writing the matching staging manifest, so
+recovery never trusts staging metadata by itself. The intent may describe a
+not-yet-promoted release until the atomic `site/` promotion; the ready-only
+`by-commit/` index is updated after promotion and never points at an
+in-progress release. A reserved manifest produced by Quartz is rejected before
+the intent is written. After an intent exists, the store publishes or repairs
+the staging manifest by atomic rename from the pinned batch container, making
+partial manifest writes recoverable. The store uses a deterministic reserved
+temporary name, removes an interrupted regular temporary during recovery, and
+synchronizes both sides of the manifest rename.
+
+Failed or interrupted output may be removed only through a batch-scoped
+staging cleanup operation. Cleanup first records the pinned batch inode in
+`cleanup-intent/<batch-id>`, writes a marker, and moves the batch to the
+deterministic `.staging/.cleanup-<batch-id>/` tombstone. Both metadata files
+are published from synchronized temporary files by atomic rename. A retry
+validates the tombstone against that external intent before continuing,
+including after the marker has been removed. Durable inode identity is kept
+separate from live mount checks so recovery remains possible after a reboot or
+remount. On Unix, recursive cleanup traverses from pinned directory
+descriptors, refuses child mount points, and removes entries relative to those
+descriptors. Work is split into bounded passes with a bounded descriptor
+stack; deep subtrees are atomically rehomed inside the tombstone so a later
+pass can continue without recursive call-stack growth. Prepared `by-id/`
+releases are never removed by the publication path.
 
 Release retention is configurable. Removal of old derived releases is an
 administrative maintenance operation and never removes content or accepted
