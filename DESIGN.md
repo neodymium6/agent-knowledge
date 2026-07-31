@@ -105,6 +105,7 @@ command before the SSH Gateway is added:
 agent-knowledge admin submit \
   --queue-root /srv/agent-knowledge/queue \
   --lock-file /srv/agent-knowledge/locks/queue.lock \
+  --worker-lock-file /srv/agent-knowledge/locks/repository-writer.lock \
   --package-root ./fictional-request
 ```
 
@@ -704,7 +705,9 @@ request to `pending/`.
 Every Worker queue transition requires an exclusive Worker session. Session
 creation takes the configured repository writer lock without waiting and fails
 if another Worker owns it. This lock is separate from the short-lived queue
-lock, so the Gateway can continue accepting requests while the Worker is
+lock and is stored in the queue configuration rather than supplied by each
+session caller. Two sessions for one queue therefore cannot select different
+lock files. The Gateway can continue accepting requests while the Worker is
 otherwise idle or applying a batch.
 
 Pending selection takes a fixed acceptance-sequence snapshot and incrementally
@@ -735,12 +738,15 @@ The initial claim record is a bounded, versioned `phase.json` sidecar:
 }
 ```
 
-Claiming one request holds the queue lock, revalidates the accepted package,
-atomically writes and synchronizes this record through `queue/worker-tmp/`,
-renames `pending/<request-id>/` to `processing/<request-id>/`, and
-synchronizes both state directories. A retry after a phase-only interrupted
-claim advances the attempt number. A request already renamed to `processing/`
-keeps enough durable ownership metadata to be recovered.
+Claiming one request validates and hashes the accepted package before taking the
+queue lock. While holding the lock it rechecks the state, digest, and bounded
+phase metadata, atomically writes and synchronizes this record through
+`queue/worker-tmp/`, renames `pending/<request-id>/` to
+`processing/<request-id>/`, and synchronizes both state directories. Batch
+claims acquire and release the queue lock per request. A retry after a
+phase-only interrupted claim advances the attempt number. A request already
+renamed to `processing/` keeps enough durable ownership metadata to be
+recovered.
 
 Returning a claimed request to `pending/` requires an exact token containing
 the request ID, batch ID, and attempt. This prevents a stale Worker from
@@ -750,9 +756,10 @@ the package so the next claim can advance the attempt monotonically.
 After acquiring the writer lock, a replacement Worker incrementally scans
 `processing/` with an explicit entry limit. It reconstructs exact claim tokens
 from validated packages and durable phase records. No other Worker transition
-is allowed until that recovery scan completes. This also recovers requests for
-which rename succeeded but the previous process failed before returning a
-token or completing directory synchronization.
+is allowed until that recovery scan completes successfully; an error leaves the
+session recovery-gated. This also recovers requests for which rename succeeded
+but the previous process failed before returning a token or completing
+directory synchronization.
 
 ## 17. Revisions and conflicts
 

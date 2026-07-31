@@ -101,6 +101,10 @@ impl ClaimedPackage {
     }
 }
 
+pub(super) struct PreparedClaim {
+    package: ValidatedPackage,
+}
+
 impl FileQueue {
     /// Atomically claims one pending request for a Worker batch.
     ///
@@ -129,39 +133,70 @@ impl FileQueue {
     ) -> Result<ClaimedPackage, WorkerQueueError> {
         let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
         lock.lock().map_err(WorkerQueueError::Io)?;
-        self.claim_locked(request_id, batch_id, hook)
+        self.ensure_pending_locked(request_id)?;
+        drop(lock);
+
+        let prepared = match self.prepare_claim(request_id) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
+                lock.lock().map_err(WorkerQueueError::Io)?;
+                match self.ensure_pending_locked(request_id) {
+                    Ok(_) => return Err(error),
+                    Err(state_error) => return Err(state_error),
+                }
+            }
+        };
+        self.claim_prepared_with_hook(request_id, batch_id, prepared, hook)
     }
 
-    fn claim_locked(
+    pub(super) fn prepare_claim(
+        &self,
+        request_id: RequestId,
+    ) -> Result<PreparedClaim, WorkerQueueError> {
+        let pending_path = self.state_path(QueueState::Pending, request_id);
+        let package =
+            revalidate_accepted(&pending_path, request_id, QueueState::Pending, &self.policy)?;
+        if package.request().request_id != request_id {
+            return Err(WorkerQueueError::CorruptState {
+                request_id,
+                state: QueueState::Pending,
+                detail: "accepted package identity does not match its queue entry",
+            });
+        }
+        let _ = next_attempt(&pending_path, request_id, QueueState::Pending)?;
+        Ok(PreparedClaim { package })
+    }
+
+    pub(super) fn claim_prepared(
         &self,
         request_id: RequestId,
         batch_id: BatchId,
+        prepared: PreparedClaim,
+    ) -> Result<ClaimedPackage, WorkerQueueError> {
+        self.claim_prepared_with_hook(request_id, batch_id, prepared, &mut NoopClaimHook)
+    }
+
+    fn claim_prepared_with_hook(
+        &self,
+        request_id: RequestId,
+        batch_id: BatchId,
+        prepared: PreparedClaim,
         hook: &mut dyn ClaimHook,
     ) -> Result<ClaimedPackage, WorkerQueueError> {
-        let Some((state, _)) = self
-            .find_existing(request_id)
-            .map_err(WorkerQueueError::Queue)?
-        else {
-            return Err(WorkerQueueError::RequestNotFound { request_id });
-        };
-        if state != QueueState::Pending {
-            return Err(WorkerQueueError::InvalidState {
+        let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
+        lock.lock().map_err(WorkerQueueError::Io)?;
+        let stored_digest = self.ensure_pending_locked(request_id)?;
+        if stored_digest != prepared.package.digest() {
+            return Err(WorkerQueueError::CorruptState {
                 request_id,
-                expected: QueueState::Pending,
-                actual: state,
+                state: QueueState::Pending,
+                detail: "accepted package changed after Worker validation",
             });
         }
 
         let pending_path = self.state_path(QueueState::Pending, request_id);
-        let package = revalidate_accepted(&pending_path, request_id, state, &self.policy)?;
-        if package.request().request_id != request_id {
-            return Err(WorkerQueueError::CorruptState {
-                request_id,
-                state,
-                detail: "accepted package identity does not match its queue entry",
-            });
-        }
-        let attempt = next_attempt(&pending_path, request_id, state)?;
+        let attempt = next_attempt(&pending_path, request_id, QueueState::Pending)?;
         let record = WorkerPhaseRecord {
             schema_version: CURRENT_WORKER_PHASE_SCHEMA_VERSION,
             request_id,
@@ -196,8 +231,28 @@ impl FileQueue {
                 batch_id,
                 attempt,
             },
-            package,
+            package: prepared.package,
         })
+    }
+
+    fn ensure_pending_locked(
+        &self,
+        request_id: RequestId,
+    ) -> Result<crate::PackageDigest, WorkerQueueError> {
+        let Some((state, digest)) = self
+            .find_existing(request_id)
+            .map_err(WorkerQueueError::Queue)?
+        else {
+            return Err(WorkerQueueError::RequestNotFound { request_id });
+        };
+        if state != QueueState::Pending {
+            return Err(WorkerQueueError::InvalidState {
+                request_id,
+                expected: QueueState::Pending,
+                actual: state,
+            });
+        }
+        Ok(digest)
     }
 
     /// Returns one still-claimed processing request to `pending/`.
@@ -439,6 +494,8 @@ pub enum WorkerQueueError {
     },
     /// A processing recovery scan was active during another transition.
     ProcessingScanInProgress,
+    /// A new Worker session has not completed processing recovery.
+    ProcessingRecoveryRequired,
     /// A processing recovery scan limit was zero.
     InvalidProcessingScanLimit,
     /// A pending directory entry did not have the required queue shape.
@@ -513,6 +570,7 @@ impl WorkerQueueError {
             | Self::BatchScanChanged { .. }
             | Self::BatchScanInProgress { .. }
             | Self::ProcessingScanInProgress
+            | Self::ProcessingRecoveryRequired
             | Self::InvalidProcessingScanLimit => ErrorCode::InvalidRequest,
             Self::CorruptPackage { .. }
             | Self::CorruptState { .. }
@@ -556,6 +614,9 @@ impl fmt::Display for WorkerQueueError {
             ),
             Self::ProcessingScanInProgress => formatter
                 .write_str("processing recovery scan must finish before another transition"),
+            Self::ProcessingRecoveryRequired => {
+                formatter.write_str("processing recovery must complete before Worker transitions")
+            }
             Self::InvalidProcessingScanLimit => {
                 formatter.write_str("processing recovery scan limit must be greater than zero")
             }

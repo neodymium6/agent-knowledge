@@ -100,6 +100,7 @@ pub enum EnqueueOutcome {
 pub struct FileQueue {
     queue_root: PathBuf,
     lock_file: PathBuf,
+    worker_lock_file: PathBuf,
     policy: PackagePolicy,
     maintenance_scanners: Arc<Mutex<MaintenanceScanners>>,
 }
@@ -108,8 +109,9 @@ impl FileQueue {
     /// Creates missing queue-state directories and opens a queue handle.
     ///
     /// The queue root and all state directories must reside on the same file
-    /// system. The lock path may be placed in the storage tree's `locks/`
-    /// directory.
+    /// system. The queue and Repository Worker lock paths may be placed in the
+    /// storage tree's `locks/` directory. The Worker path is stored in this
+    /// handle so every session for the queue uses the same lock.
     ///
     /// # Errors
     ///
@@ -118,10 +120,15 @@ impl FileQueue {
     pub fn initialize(
         queue_root: impl Into<PathBuf>,
         lock_file: impl Into<PathBuf>,
+        worker_lock_file: impl Into<PathBuf>,
         policy: PackagePolicy,
     ) -> Result<Self, QueueError> {
         let queue_root = queue_root.into();
         let lock_file = lock_file.into();
+        let worker_lock_file = worker_lock_file.into();
+        if lock_file == worker_lock_file {
+            return Err(QueueError::InvalidStoragePath(worker_lock_file));
+        }
 
         ensure_directory(&queue_root)?;
         ensure_directory(&queue_root.join("incoming"))?;
@@ -137,6 +144,12 @@ impl FileQueue {
             ensure_directory(parent)?;
         }
         ensure_lock_file(&lock_file)?;
+        if let Some(parent) = worker_lock_file.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            ensure_directory(parent)?;
+        }
+        ensure_lock_file(&worker_lock_file)?;
         let initialization_lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -156,10 +169,16 @@ impl FileQueue {
         {
             sync_directory(parent)?;
         }
+        if let Some(parent) = worker_lock_file.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            sync_directory(parent)?;
+        }
 
         Ok(Self {
             queue_root,
             lock_file,
+            worker_lock_file,
             policy,
             maintenance_scanners: Arc::new(Mutex::new(MaintenanceScanners::default())),
         })

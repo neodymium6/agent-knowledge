@@ -108,6 +108,7 @@ fn initialize_queue(root: &Path) -> FileQueue {
     match FileQueue::initialize(
         root.join("queue"),
         root.join("locks/queue.lock"),
+        root.join("locks/repository-writer.lock"),
         PackagePolicy::default(),
     ) {
         Ok(queue) => queue,
@@ -141,10 +142,24 @@ fn accept_fixture_with_id(queue: &FileQueue, request_id: &str) {
     }
 }
 
-fn open_worker(queue: &FileQueue, root: &Path) -> WorkerSession {
-    match queue.try_worker_session(root.join("locks/repository-writer.lock")) {
+fn open_unrecovered_worker(queue: &FileQueue) -> WorkerSession {
+    match queue.try_worker_session() {
         Ok(worker) => worker,
         Err(error) => panic!("fixture Worker must acquire its lock: {error}"),
+    }
+}
+
+fn open_worker(queue: &FileQueue) -> WorkerSession {
+    let mut worker = open_unrecovered_worker(queue);
+    match worker.scan_processing(16) {
+        Ok(ProcessingScanOutcome::Complete { claims, .. }) if claims.is_empty() => worker,
+        Ok(ProcessingScanOutcome::Complete { .. }) => {
+            panic!("ordinary Worker fixture must not contain interrupted claims")
+        }
+        Ok(ProcessingScanOutcome::Scanning { .. }) => {
+            panic!("ordinary Worker recovery must fit in one test scan")
+        }
+        Err(error) => panic!("ordinary Worker recovery must complete: {error}"),
     }
 }
 
@@ -155,8 +170,23 @@ fn claims_pending_package_with_durable_phase_record() {
     accept_fixture(&queue);
     let request_id = parse_request_id();
     let batch_id = parse_batch_id(FIRST_BATCH_ID);
-    let mut worker = open_worker(&queue, root.path());
+    let mut worker = open_unrecovered_worker(&queue);
 
+    let error = match worker.claim(request_id, batch_id) {
+        Ok(_) => panic!("new Worker must recover processing before claiming"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        WorkerQueueError::ProcessingRecoveryRequired
+    ));
+    match worker.scan_processing(10) {
+        Ok(ProcessingScanOutcome::Complete { claims, .. }) => assert!(claims.is_empty()),
+        Ok(ProcessingScanOutcome::Scanning { .. }) => {
+            panic!("empty processing recovery must complete immediately")
+        }
+        Err(error) => panic!("empty processing recovery must succeed: {error}"),
+    }
     let claimed = match worker.claim(request_id, batch_id) {
         Ok(claimed) => claimed,
         Err(error) => panic!("pending request must be claimed: {error}"),
@@ -308,7 +338,7 @@ fn rename_interruption_can_be_recovered_with_the_durable_claim() {
         Err(error) => error,
     };
     assert_eq!(error.error_code(), ErrorCode::TemporaryFailure);
-    let mut worker = open_worker(&queue, root.path());
+    let mut worker = open_unrecovered_worker(&queue);
     let recovered = match worker.scan_processing(10) {
         Ok(ProcessingScanOutcome::Complete { claims, .. }) => claims,
         Ok(ProcessingScanOutcome::Scanning { .. }) => {
@@ -384,7 +414,7 @@ fn bounded_batch_claims_globally_earliest_acceptance_sequences() {
     accept_fixture_with_id(&queue, FIRST_ACCEPTED);
     accept_fixture_with_id(&queue, SECOND_ACCEPTED);
     accept_fixture_with_id(&queue, THIRD_ACCEPTED);
-    let mut worker = open_worker(&queue, root.path());
+    let mut worker = open_worker(&queue);
     let batch_id = parse_batch_id(FIRST_BATCH_ID);
 
     let claimed = loop {
@@ -422,7 +452,7 @@ fn batch_snapshot_excludes_requests_accepted_during_its_scan() {
     let queue = initialize_queue(root.path());
     accept_fixture(&queue);
     accept_fixture_with_id(&queue, SECOND_INITIAL);
-    let mut worker = open_worker(&queue, root.path());
+    let mut worker = open_worker(&queue);
     let batch_id = parse_batch_id(FIRST_BATCH_ID);
     match worker.claim_next_batch(batch_id, 1, 10) {
         Ok(BatchClaimOutcome::Scanning { .. }) => {}
@@ -462,7 +492,7 @@ fn corrupt_pending_request_is_failed_without_blocking_valid_candidates() {
     if let Err(error) = fs::write(corrupt_digest, b"not-a-digest\n") {
         panic!("corrupt package fixture must be written: {error}");
     }
-    let mut worker = open_worker(&queue, root.path());
+    let mut worker = open_worker(&queue);
     let batch_id = parse_batch_id(FIRST_BATCH_ID);
 
     let claimed = loop {
@@ -499,13 +529,12 @@ fn corrupt_pending_request_is_failed_without_blocking_valid_candidates() {
 fn worker_writer_lock_is_exclusive_and_released_on_drop() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path());
-    let lock_path = root.path().join("locks/repository-writer.lock");
-    let worker = match queue.try_worker_session(&lock_path) {
+    let worker = match queue.try_worker_session() {
         Ok(worker) => worker,
         Err(error) => panic!("first Worker must acquire the writer lock: {error}"),
     };
 
-    let error = match queue.try_worker_session(&lock_path) {
+    let error = match queue.try_worker_session() {
         Ok(_) => panic!("second Worker must not share the writer lock"),
         Err(error) => error,
     };
@@ -513,7 +542,7 @@ fn worker_writer_lock_is_exclusive_and_released_on_drop() {
     assert_eq!(error.error_code(), ErrorCode::TemporaryFailure);
 
     drop(worker);
-    if let Err(error) = queue.try_worker_session(&lock_path) {
+    if let Err(error) = queue.try_worker_session() {
         panic!("dropping the Worker must release its writer lock: {error}");
     }
 }
@@ -526,7 +555,7 @@ fn active_batch_scan_rejects_changed_identity_or_capacity() {
     let queue = initialize_queue(root.path());
     accept_fixture(&queue);
     accept_fixture_with_id(&queue, OTHER_REQUEST_ID);
-    let mut worker = open_worker(&queue, root.path());
+    let mut worker = open_worker(&queue);
     let first_batch = parse_batch_id(FIRST_BATCH_ID);
     match worker.claim_next_batch(first_batch, 1, 1) {
         Ok(BatchClaimOutcome::Scanning { .. }) => {}
@@ -572,7 +601,7 @@ fn active_batch_scan_rejects_changed_identity_or_capacity() {
 fn batch_scan_rejects_zero_limits() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path());
-    let mut worker = open_worker(&queue, root.path());
+    let mut worker = open_worker(&queue);
     let batch_id = parse_batch_id(FIRST_BATCH_ID);
 
     for (scan_limit, request_limit) in [(0, 1), (1, 0)] {
@@ -604,7 +633,7 @@ fn processing_recovery_is_bounded_and_blocks_mutation_until_complete() {
     if let Err(error) = queue.claim(other_request_id, batch_id) {
         panic!("second recovery fixture must be claimed: {error}");
     }
-    let mut worker = open_worker(&queue, root.path());
+    let mut worker = open_unrecovered_worker(&queue);
 
     let mut recovered = match worker.scan_processing(1) {
         Ok(ProcessingScanOutcome::Scanning {
@@ -647,7 +676,7 @@ fn processing_recovery_is_bounded_and_blocks_mutation_until_complete() {
 fn processing_recovery_rejects_zero_scan_limit() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path());
-    let mut worker = open_worker(&queue, root.path());
+    let mut worker = open_worker(&queue);
 
     let error = match worker.scan_processing(0) {
         Ok(_) => panic!("zero recovery scan limit must be rejected"),
@@ -658,4 +687,34 @@ fn processing_recovery_rejects_zero_scan_limit() {
         WorkerQueueError::InvalidProcessingScanLimit
     ));
     assert_eq!(error.error_code(), ErrorCode::InvalidRequest);
+}
+
+#[test]
+fn processing_recovery_error_keeps_worker_transitions_gated() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    let invalid_entry = root.path().join("queue/processing/not-a-request");
+    if let Err(error) = fs::write(invalid_entry, b"invalid processing entry\n") {
+        panic!("invalid processing fixture must be written: {error}");
+    }
+    let mut worker = open_unrecovered_worker(&queue);
+
+    let error = match worker.scan_processing(10) {
+        Ok(_) => panic!("invalid processing entry must fail recovery"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        WorkerQueueError::InvalidProcessingEntry { .. }
+    ));
+
+    let error = match worker.claim_next_batch(parse_batch_id(FIRST_BATCH_ID), 10, 10) {
+        Ok(_) => panic!("failed recovery must keep batch claims gated"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        WorkerQueueError::ProcessingRecoveryRequired
+    ));
 }

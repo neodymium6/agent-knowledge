@@ -51,6 +51,7 @@ impl WorkerSession {
             return Err(WorkerQueueError::BatchScanInProgress { active_batch_id });
         }
         if self.processing_scan.is_none() {
+            self.processing_recovery_complete = false;
             self.processing_scan = Some(
                 fs::read_dir(
                     self.queue
@@ -81,6 +82,7 @@ impl WorkerSession {
                 Ok(claim) => claims.push(claim),
                 Err(error) => {
                     self.processing_scan = None;
+                    self.processing_recovery_complete = false;
                     return Err(error);
                 }
             }
@@ -88,6 +90,7 @@ impl WorkerSession {
 
         if complete {
             self.processing_scan = None;
+            self.processing_recovery_complete = true;
             Ok(ProcessingScanOutcome::Complete {
                 scanned_entries,
                 claims,

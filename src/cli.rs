@@ -10,7 +10,8 @@ use agent_knowledge_queue::{
 use serde::Serialize;
 
 const USAGE: &str = "usage: agent-knowledge admin submit \
---queue-root <path> --lock-file <path> --package-root <path>";
+    --queue-root <path> --lock-file <path> --worker-lock-file <path> \
+    --package-root <path>";
 
 pub fn run<I, W>(arguments: I, output: W) -> Result<(), CliError>
 where
@@ -21,8 +22,15 @@ where
         Command::Submit {
             queue_root,
             lock_file,
+            worker_lock_file,
             package_root,
-        } => submit_directory(&queue_root, &lock_file, &package_root, output),
+        } => submit_directory(
+            &queue_root,
+            &lock_file,
+            &worker_lock_file,
+            &package_root,
+            output,
+        ),
     }
 }
 
@@ -30,6 +38,7 @@ enum Command {
     Submit {
         queue_root: PathBuf,
         lock_file: PathBuf,
+        worker_lock_file: PathBuf,
         package_root: PathBuf,
     },
 }
@@ -48,12 +57,16 @@ where
 
     let mut queue_root = None;
     let mut lock_file = None;
+    let mut worker_lock_file = None;
     let mut package_root = None;
     while let Some(flag) = arguments.next() {
         let value = arguments.next().ok_or(CliError::Usage)?;
         match flag.to_str() {
             Some("--queue-root") if queue_root.is_none() => queue_root = Some(PathBuf::from(value)),
             Some("--lock-file") if lock_file.is_none() => lock_file = Some(PathBuf::from(value)),
+            Some("--worker-lock-file") if worker_lock_file.is_none() => {
+                worker_lock_file = Some(PathBuf::from(value));
+            }
             Some("--package-root") if package_root.is_none() => {
                 package_root = Some(PathBuf::from(value));
             }
@@ -64,6 +77,7 @@ where
     Ok(Command::Submit {
         queue_root: queue_root.ok_or(CliError::Usage)?,
         lock_file: lock_file.ok_or(CliError::Usage)?,
+        worker_lock_file: worker_lock_file.ok_or(CliError::Usage)?,
         package_root: package_root.ok_or(CliError::Usage)?,
     })
 }
@@ -71,6 +85,7 @@ where
 fn submit_directory<W>(
     queue_root: &Path,
     lock_file: &Path,
+    worker_lock_file: &Path,
     package_root: &Path,
     mut output: W,
 ) -> Result<(), CliError>
@@ -79,7 +94,8 @@ where
 {
     let policy = PackagePolicy::default();
     let validated = validate_package(package_root, &policy).map_err(CliError::PackageValidation)?;
-    let queue = FileQueue::initialize(queue_root, lock_file, policy).map_err(CliError::Queue)?;
+    let queue = FileQueue::initialize(queue_root, lock_file, worker_lock_file, policy)
+        .map_err(CliError::Queue)?;
     let mut incoming = queue.begin().map_err(CliError::Queue)?;
 
     let mut request = File::open(package_root.join("request.json")).map_err(CliError::Io)?;

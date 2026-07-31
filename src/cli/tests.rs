@@ -90,6 +90,8 @@ fn arguments(root: &Path, package: &Path) -> Vec<OsString> {
         root.join("queue").into_os_string(),
         "--lock-file".into(),
         root.join("locks/queue.lock").into_os_string(),
+        "--worker-lock-file".into(),
+        root.join("locks/repository-writer.lock").into_os_string(),
         "--package-root".into(),
         package.as_os_str().to_owned(),
     ]

@@ -91,7 +91,12 @@ impl Drop for TestDirectory {
 }
 
 fn initialize_queue(root: &Path, policy: PackagePolicy) -> FileQueue {
-    match FileQueue::initialize(root.join("queue"), root.join("locks/queue.lock"), policy) {
+    match FileQueue::initialize(
+        root.join("queue"),
+        root.join("locks/queue.lock"),
+        root.join("locks/repository-writer.lock"),
+        policy,
+    ) {
         Ok(queue) => queue,
         Err(error) => panic!("fixture queue must initialize: {error}"),
     }
@@ -329,6 +334,7 @@ fn missing_sequence_state_fails_closed_when_requests_exist() {
     let error = match FileQueue::initialize(
         root.path().join("queue"),
         root.path().join("locks/queue.lock"),
+        root.path().join("locks/repository-writer.lock"),
         PackagePolicy::default(),
     ) {
         Ok(_) => panic!("missing sequence state with accepted requests must fail"),
@@ -686,6 +692,7 @@ fn concurrent_queue_initialization_shares_one_lock_file() {
         FileQueue::initialize(
             first_root.join("queue"),
             first_root.join("locks/queue.lock"),
+            first_root.join("locks/repository-writer.lock"),
             PackagePolicy::default(),
         )
     });
@@ -697,6 +704,7 @@ fn concurrent_queue_initialization_shares_one_lock_file() {
         FileQueue::initialize(
             second_root.join("queue"),
             second_root.join("locks/queue.lock"),
+            second_root.join("locks/repository-writer.lock"),
             PackagePolicy::default(),
         )
     });

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use agent_knowledge_core::{BatchId, RequestId};
 
-use super::{ClaimedPackage, NoopClaimHook, WorkerQueueError, next_attempt, revalidate_accepted};
+use super::{ClaimedPackage, WorkerQueueError, next_attempt, revalidate_accepted};
 use crate::file_queue::{
     FileQueue, NEXT_SEQUENCE_FILE_NAME, QueueState, ensure_directory, ensure_lock_file,
     read_next_sequence, sync_directory,
@@ -32,6 +32,7 @@ pub struct WorkerSession {
     _writer_lock: File,
     pending_scan: PendingBatchScan,
     pub(super) processing_scan: Option<fs::ReadDir>,
+    pub(super) processing_recovery_complete: bool,
 }
 
 #[derive(Debug, Default)]
@@ -75,11 +76,8 @@ impl FileQueue {
     /// Returns [`WorkerQueueError::WorkerAlreadyRunning`] without waiting when
     /// another process owns the writer lock, or an I/O error when the lock path
     /// cannot be initialized.
-    pub fn try_worker_session(
-        &self,
-        writer_lock_file: impl AsRef<Path>,
-    ) -> Result<WorkerSession, WorkerQueueError> {
-        let writer_lock_file = writer_lock_file.as_ref();
+    pub fn try_worker_session(&self) -> Result<WorkerSession, WorkerQueueError> {
+        let writer_lock_file = &self.worker_lock_file;
         if let Some(parent) = writer_lock_file.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -108,6 +106,7 @@ impl FileQueue {
             _writer_lock: writer_lock,
             pending_scan: PendingBatchScan::default(),
             processing_scan: None,
+            processing_recovery_complete: false,
         })
     }
 }
@@ -124,7 +123,11 @@ impl WorkerSession {
         batch_id: BatchId,
     ) -> Result<ClaimedPackage, WorkerQueueError> {
         self.ensure_no_active_scan()?;
-        self.queue.claim(request_id, batch_id)
+        let result = self.queue.claim(request_id, batch_id);
+        if result.is_err() {
+            self.require_processing_recovery();
+        }
+        result
     }
 
     /// Returns one still-owned processing request to `pending/`.
@@ -135,7 +138,11 @@ impl WorkerSession {
     /// durably moved.
     pub fn requeue_claimed(&mut self, token: super::ClaimToken) -> Result<(), WorkerQueueError> {
         self.ensure_no_active_scan()?;
-        self.queue.requeue_claimed(token)
+        let result = self.queue.requeue_claimed(token);
+        if result.is_err() {
+            self.require_processing_recovery();
+        }
+        result
     }
 
     /// Incrementally scans a fixed pending snapshot and claims its earliest requests.
@@ -162,6 +169,7 @@ impl WorkerSession {
         if maximum_scan_entries == 0 || maximum_requests == 0 {
             return Err(WorkerQueueError::InvalidBatchLimits);
         }
+        self.ensure_recovery_complete()?;
         if self.processing_scan.is_some() {
             return Err(WorkerQueueError::ProcessingScanInProgress);
         }
@@ -230,23 +238,28 @@ impl WorkerSession {
 
         let candidates = std::mem::take(&mut self.pending_scan.candidates).into_sorted_vec();
         self.pending_scan = PendingBatchScan::default();
-        let queue_lock = self
-            .queue
-            .open_queue_lock()
-            .map_err(WorkerQueueError::Queue)?;
-        queue_lock.lock().map_err(WorkerQueueError::Io)?;
-        let mut claimed = Vec::with_capacity(candidates.len());
+        let mut prepared = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            claimed.push(self.queue.claim_locked(
-                candidate.request_id,
-                batch_id,
-                &mut NoopClaimHook,
-            )?);
+            let claim = self.queue.prepare_claim(candidate.request_id)?;
+            prepared.push((candidate.request_id, claim));
+        }
+
+        let mut claimed = Vec::with_capacity(prepared.len());
+        for (request_id, prepared) in prepared {
+            let claim = self.queue.claim_prepared(request_id, batch_id, prepared);
+            match claim {
+                Ok(claim) => claimed.push(claim),
+                Err(error) => {
+                    self.require_processing_recovery();
+                    return Err(error);
+                }
+            }
         }
         Ok(BatchClaimOutcome::Claimed(claimed))
     }
 
     pub(super) fn ensure_no_active_scan(&self) -> Result<(), WorkerQueueError> {
+        self.ensure_recovery_complete()?;
         match self.pending_scan.batch_id {
             Some(active_batch_id) => Err(WorkerQueueError::BatchScanInProgress { active_batch_id }),
             None if self.processing_scan.is_some() => {
@@ -258,6 +271,21 @@ impl WorkerSession {
 
     pub(super) const fn active_batch_id(&self) -> Option<BatchId> {
         self.pending_scan.batch_id
+    }
+
+    pub(super) const fn ensure_recovery_complete(&self) -> Result<(), WorkerQueueError> {
+        if self.processing_recovery_complete {
+            Ok(())
+        } else if self.processing_scan.is_some() {
+            Err(WorkerQueueError::ProcessingScanInProgress)
+        } else {
+            Err(WorkerQueueError::ProcessingRecoveryRequired)
+        }
+    }
+
+    pub(super) fn require_processing_recovery(&mut self) {
+        self.processing_recovery_complete = false;
+        self.processing_scan = None;
     }
 }
 
