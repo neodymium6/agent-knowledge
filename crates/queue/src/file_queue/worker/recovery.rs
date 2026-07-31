@@ -157,5 +157,6 @@ fn recover_processing_claim(
             attempt: record.attempt,
         },
         package,
+        package_root: path,
     })
 }

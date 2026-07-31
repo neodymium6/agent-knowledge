@@ -85,6 +85,7 @@ impl ClaimToken {
 pub struct ClaimedPackage {
     token: ClaimToken,
     package: ValidatedPackage,
+    package_root: PathBuf,
 }
 
 impl ClaimedPackage {
@@ -98,6 +99,12 @@ impl ClaimedPackage {
     #[must_use]
     pub const fn package(&self) -> &ValidatedPackage {
         &self.package
+    }
+
+    /// Returns the immutable accepted-package directory in `processing/`.
+    #[must_use]
+    pub fn package_root(&self) -> &Path {
+        &self.package_root
     }
 }
 
@@ -232,6 +239,7 @@ impl FileQueue {
                 attempt,
             },
             package: prepared.package,
+            package_root: processing_path,
         })
     }
 

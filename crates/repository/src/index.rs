@@ -5,8 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use agent_knowledge_core::{
-    DocumentId, DocumentLimits, DocumentMetadata, DocumentParseError, DocumentValidationError,
-    Revision, decode_document_metadata,
+    DocumentId, DocumentLimits, DocumentMetadata, DocumentParseError, DocumentType,
+    DocumentValidationError, ProjectId, Revision, decode_document_metadata,
 };
 use sha2::{Digest, Sha256};
 
@@ -38,6 +38,7 @@ impl Default for ContentPolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DocumentRecord {
     relative_path: PathBuf,
+    location: DocumentLocation,
     metadata: DocumentMetadata,
     revision: Revision,
 }
@@ -47,6 +48,12 @@ impl DocumentRecord {
     #[must_use]
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
+    }
+
+    /// Returns the classification derived from the canonical directory.
+    #[must_use]
+    pub const fn location(&self) -> &DocumentLocation {
+        &self.location
     }
 
     /// Returns the decoded document metadata.
@@ -59,6 +66,34 @@ impl DocumentRecord {
     #[must_use]
     pub const fn revision(&self) -> Revision {
         self.revision
+    }
+}
+
+/// Canonical directory-derived classification for one document.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentLocation {
+    document_type: DocumentType,
+    project: Option<ProjectId>,
+    archived: bool,
+}
+
+impl DocumentLocation {
+    /// Returns the document type encoded by its directory.
+    #[must_use]
+    pub const fn document_type(&self) -> DocumentType {
+        self.document_type
+    }
+
+    /// Returns the project encoded by the directory, if any.
+    #[must_use]
+    pub const fn project(&self) -> Option<&ProjectId> {
+        self.project.as_ref()
+    }
+
+    /// Returns whether the document is below an archive directory.
+    #[must_use]
+    pub const fn is_archived(&self) -> bool {
+        self.archived
     }
 }
 
@@ -93,6 +128,7 @@ impl ContentIndex {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(ContentIndexError::Io)?;
             entries.sort_by_key(fs::DirEntry::file_name);
+            let mut child_directories = Vec::new();
             for entry in entries {
                 entry_count =
                     entry_count
@@ -117,7 +153,7 @@ impl ContentIndex {
 
                 let metadata = fs::symlink_metadata(&path).map_err(ContentIndexError::Io)?;
                 if metadata.file_type().is_dir() {
-                    pending.push(path);
+                    child_directories.push(path);
                     continue;
                 }
                 if !metadata.file_type().is_file() {
@@ -140,8 +176,9 @@ impl ContentIndex {
                         path: relative_path.clone(),
                         source,
                     })?;
+                let location = classify_document_path(&relative_path)?;
                 document
-                    .validate_common(policy.document)
+                    .validate(location.document_type, policy.document)
                     .map_err(|source| ContentIndexError::InvalidMetadata {
                         path: relative_path.clone(),
                         source,
@@ -150,6 +187,7 @@ impl ContentIndex {
                 let document_id = document.document_id;
                 let record = DocumentRecord {
                     relative_path: relative_path.clone(),
+                    location,
                     metadata: document,
                     revision,
                 };
@@ -161,6 +199,7 @@ impl ContentIndex {
                     });
                 }
             }
+            pending.extend(child_directories.into_iter().rev());
         }
 
         Ok(Self { documents })
@@ -206,6 +245,72 @@ impl ContentIndex {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
+    }
+}
+
+fn classify_document_path(path: &Path) -> Result<DocumentLocation, ContentIndexError> {
+    let components = path
+        .iter()
+        .map(|component| {
+            component
+                .to_str()
+                .ok_or_else(|| ContentIndexError::InvalidPathEncoding(path.to_path_buf()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let invalid = || ContentIndexError::InvalidDocumentPath(path.to_path_buf());
+
+    match components.as_slice() {
+        ["index.md"] => Ok(DocumentLocation {
+            document_type: DocumentType::Index,
+            project: None,
+            archived: false,
+        }),
+        ["projects", project, "index.md"] => Ok(DocumentLocation {
+            document_type: DocumentType::Index,
+            project: Some(project.parse().map_err(|_| invalid())?),
+            archived: false,
+        }),
+        [
+            "projects",
+            project,
+            "archive",
+            category,
+            rest @ ..,
+            "index.md",
+        ] if !rest.is_empty() => Ok(DocumentLocation {
+            document_type: parse_category(category).ok_or_else(invalid)?,
+            project: Some(project.parse().map_err(|_| invalid())?),
+            archived: true,
+        }),
+        ["projects", project, category, rest @ .., "index.md"] if !rest.is_empty() => {
+            Ok(DocumentLocation {
+                document_type: parse_category(category).ok_or_else(invalid)?,
+                project: Some(project.parse().map_err(|_| invalid())?),
+                archived: false,
+            })
+        }
+        ["inbox", category, rest @ .., "index.md"] if !rest.is_empty() => Ok(DocumentLocation {
+            document_type: parse_category(category).ok_or_else(invalid)?,
+            project: None,
+            archived: false,
+        }),
+        ["archive", category, rest @ .., "index.md"] if !rest.is_empty() => Ok(DocumentLocation {
+            document_type: parse_category(category).ok_or_else(invalid)?,
+            project: None,
+            archived: true,
+        }),
+        _ => Err(invalid()),
+    }
+}
+
+fn parse_category(category: &str) -> Option<DocumentType> {
+    match category {
+        "logs" => Some(DocumentType::Log),
+        "experiments" => Some(DocumentType::Experiment),
+        "decisions" => Some(DocumentType::Decision),
+        "runbooks" => Some(DocumentType::Runbook),
+        "references" => Some(DocumentType::Reference),
+        _ => None,
     }
 }
 
@@ -259,6 +364,8 @@ pub enum ContentIndexError {
     PathEscapedRoot,
     /// A content path was not valid UTF-8.
     InvalidPathEncoding(PathBuf),
+    /// A Markdown path did not follow the canonical classification layout.
+    InvalidDocumentPath(PathBuf),
     /// A symbolic link or other special filesystem entry was present.
     InvalidEntryType(PathBuf),
     /// The hierarchy exceeded the configured entry limit.
@@ -309,6 +416,11 @@ impl fmt::Display for ContentIndexError {
             Self::InvalidPathEncoding(path) => {
                 write!(formatter, "content path `{}` is not UTF-8", path.display())
             }
+            Self::InvalidDocumentPath(path) => write!(
+                formatter,
+                "Markdown path `{}` is outside the canonical document layout",
+                path.display()
+            ),
             Self::InvalidEntryType(path) => write!(
                 formatter,
                 "content entry `{}` is not a regular file or directory",

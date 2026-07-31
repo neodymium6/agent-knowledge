@@ -40,7 +40,10 @@ name = "agent-knowledge-repository"
 version = "0.1.0"
 dependencies = [
  "agent-knowledge-core",
+ "agent-knowledge-queue",
+ "serde_json",
  "sha2",
+ "time",
  "ulid",
 ]
 

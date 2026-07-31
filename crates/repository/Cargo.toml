@@ -10,7 +10,10 @@ workspace = true
 
 [dependencies]
 agent-knowledge-core = { path = "../core" }
+agent-knowledge-queue = { path = "../queue" }
 sha2.workspace = true
+time.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 ulid.workspace = true

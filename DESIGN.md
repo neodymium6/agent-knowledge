@@ -300,8 +300,8 @@ secondary classification.
 content/
 ├── index.md
 ├── inbox/
-│   └── YYYY/
-│       └── MM/
+│   └── <document-type>/
+│       └── <document-bundle>/
 ├── projects/
 │   └── <project>/
 │       ├── index.md
@@ -462,11 +462,45 @@ project = cuda-solver
 document_type = log
 created = 2026-07-31T03:50:00+09:00
 
-projects/cuda-solver/logs/2026/07/31/
+projects/cuda-solver/logs/2026/07/31/035000-<document-id>/index.md
 ```
 
 If classification is incomplete but otherwise valid, the Gateway selects a
-date-based path below `inbox/`. Explicitly invalid classification is rejected.
+type-specific path below `inbox/`. Explicitly invalid classification is
+rejected.
+
+Every non-index document uses a bundle directory with `index.md` as its
+Markdown entry point. Attachments are stored beside that file, so moving or
+archiving the bundle preserves the complete document. Titles are never used as
+trusted path components. Initial canonical destinations are:
+
+```text
+root index:
+  index.md
+
+project index:
+  projects/<project>/index.md
+
+project log:
+  projects/<project>/logs/YYYY/MM/DD/HHMMSS-<document-id>/index.md
+
+other project document:
+  projects/<project>/<document-type>/YYYY-MM-DD-<document-id>/index.md
+
+unclassified document:
+  inbox/<document-type>/<same type-specific bundle>/index.md
+
+archived project document:
+  projects/<project>/archive/<document-type>/<bundle>/index.md
+
+archived unclassified document:
+  archive/<document-type>/<bundle>/index.md
+```
+
+The document-type directory names are `logs`, `experiments`, `decisions`,
+`runbooks`, and `references`. Index documents are mutable but are not moved or
+archived. Log bundles are append-only and cannot be moved or archived by
+normal client operations.
 
 Path validation occurs independently in the Gateway and Worker using the same
 shared Rust library. It:

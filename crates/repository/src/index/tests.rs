@@ -112,7 +112,11 @@ fn indexes_documents_and_exact_byte_revisions() {
 fn optimistic_check_reports_missing_and_conflicting_documents() {
     let root = TestDirectory::new();
     let contents = markdown(DOCUMENT_ID, "Fictional decision");
-    write_document(root.path(), "decisions/example.md", &contents);
+    write_document(
+        root.path(),
+        "projects/fictional/decisions/example/index.md",
+        &contents,
+    );
     let index = match ContentIndex::build(root.path(), ContentPolicy::default()) {
         Ok(index) => index,
         Err(error) => panic!("valid content must index: {error}"),
@@ -141,8 +145,16 @@ fn optimistic_check_reports_missing_and_conflicting_documents() {
 fn duplicate_document_ids_fail_the_complete_index() {
     let root = TestDirectory::new();
     let contents = markdown(DOCUMENT_ID, "Fictional reference");
-    write_document(root.path(), "references/first.md", &contents);
-    write_document(root.path(), "references/second.md", &contents);
+    write_document(
+        root.path(),
+        "projects/fictional/references/first/index.md",
+        &contents,
+    );
+    write_document(
+        root.path(),
+        "projects/fictional/references/second/index.md",
+        &contents,
+    );
 
     assert!(matches!(
         ContentIndex::build(root.path(), ContentPolicy::default()),
@@ -151,8 +163,8 @@ fn duplicate_document_ids_fail_the_complete_index() {
             first_path,
             second_path,
         }) if document_id == parse_document_id(DOCUMENT_ID)
-            && first_path == Path::new("references/first.md")
-            && second_path == Path::new("references/second.md")
+            && first_path == Path::new("projects/fictional/references/first/index.md")
+            && second_path == Path::new("projects/fictional/references/second/index.md")
     ));
 }
 
@@ -161,7 +173,7 @@ fn rejects_unsafe_entries_and_enforces_bounds() {
     let root = TestDirectory::new();
     write_document(
         root.path(),
-        "references/example.md",
+        "projects/fictional/references/example/index.md",
         &markdown(DOCUMENT_ID, "Fictional reference"),
     );
     write_document(root.path(), "attachment.json", "{}\n");
@@ -196,15 +208,21 @@ fn rejects_symbolic_links() {
     let root = TestDirectory::new();
     write_document(
         root.path(),
-        "references/example.md",
+        "projects/fictional/references/example/index.md",
         &markdown(DOCUMENT_ID, "Fictional reference"),
     );
-    if let Err(error) = symlink("example.md", root.path().join("references/link.md")) {
+    let link = root.path().join("projects/fictional/references/link.md");
+    if let Some(parent) = link.parent()
+        && let Err(error) = fs::create_dir_all(parent)
+    {
+        panic!("symbolic-link parent must be created: {error}");
+    }
+    if let Err(error) = symlink("example.md", &link) {
         panic!("symbolic-link fixture must be created: {error}");
     }
     assert!(matches!(
         ContentIndex::build(root.path(), ContentPolicy::default()),
         Err(ContentIndexError::InvalidEntryType(path))
-            if path == Path::new("references/link.md")
+            if path == Path::new("projects/fictional/references/link.md")
     ));
 }
