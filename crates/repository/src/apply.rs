@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use agent_knowledge_core::{
     ChangeRequest, DocumentId, DocumentMetadata, DocumentParseError, DocumentStatus, DocumentType,
-    DocumentValidationError, Operation, ProjectId, Revision, decode_document_metadata,
+    DocumentValidationError, ErrorCode, Operation, ProjectId, Revision, decode_document_metadata,
 };
 use agent_knowledge_queue::{ClaimedPackage, ValidatedPackage};
 use sha2::{Digest, Sha256};
@@ -663,6 +663,24 @@ impl std::error::Error for ApplyError {
             Self::InvalidPayloadMetadata { source, .. } => Some(source),
             Self::Io(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+impl ApplyError {
+    pub(super) const fn request_error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::DocumentNotFound { .. } => Some(ErrorCode::DocumentNotFound),
+            Self::DocumentIdConflict { .. } => Some(ErrorCode::DocumentIdConflict),
+            Self::RevisionConflict { .. } => Some(ErrorCode::RevisionConflict),
+            Self::OperationForbidden { .. } | Self::DestinationExists { .. } => {
+                Some(ErrorCode::OperationForbidden)
+            }
+            Self::ContentIndex(_)
+            | Self::ResultingContent(_)
+            | Self::InvalidPayloadDocument { .. }
+            | Self::InvalidPayloadMetadata { .. }
+            | Self::Io(_) => None,
         }
     }
 }
