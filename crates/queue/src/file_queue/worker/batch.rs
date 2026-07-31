@@ -130,7 +130,14 @@ impl WorkerSession {
                 .join(super::super::QUEUE_IDENTITY_FILE_NAME),
         )
         .map_err(WorkerQueueError::Queue)?;
-        if identity == self.queue.identity {
+        let configured_identity = super::super::read_queue_identity(
+            &self
+                .queue
+                .configured_queue_root
+                .join(super::super::QUEUE_IDENTITY_FILE_NAME),
+        )
+        .map_err(WorkerQueueError::Queue)?;
+        if identity == self.queue.identity && configured_identity == self.queue.identity {
             Ok(identity)
         } else {
             Err(WorkerQueueError::Queue(

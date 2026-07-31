@@ -218,9 +218,13 @@ impl GitRepository {
         let writer_lock = repository_state.join("writer.lock");
         ensure_regular_file(&writer_lock)?;
         let writer = lock_file(&writer_lock)?;
-        ensure_work_root_binding(
-            &repository_state.join("work-root"),
+        let canonical_worktree_binding =
+            fs::canonicalize(canonical_worktree).map_err(GitTransactionError::Io)?;
+        ensure_repository_binding(
+            &repository_state.join("binding-v1"),
             &fs::canonicalize(work_root).map_err(GitTransactionError::Io)?,
+            &canonical_worktree_binding,
+            &official_ref,
         )?;
         drop(writer);
         sync_directory(&repository_state).map_err(GitTransactionError::Io)?;
@@ -902,7 +906,7 @@ impl GitRepository {
         commit: &str,
     ) -> Result<(), GitTransactionError> {
         let output = git_command()
-            .arg(format!("--git-dir={}", self.git_directory.display()))
+            .arg(git_directory_argument(&self.git_directory))
             .args(["update-ref", &self.official_ref, commit, expected])
             .output()
             .map_err(GitTransactionError::Io)?;
@@ -1038,7 +1042,7 @@ impl GitRepository {
     ) -> Result<Option<String>, GitTransactionError> {
         let expression = format!("{revision}^{{commit}}");
         let output = git_command()
-            .arg(format!("--git-dir={}", self.git_directory.display()))
+            .arg(git_directory_argument(&self.git_directory))
             .args(["rev-parse", "--verify", "--quiet", &expression])
             .output()
             .map_err(GitTransactionError::Io)?;
@@ -1370,7 +1374,12 @@ fn ensure_or_create_real_directory(path: &Path) -> Result<(), GitTransactionErro
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
         Ok(_) => Err(GitTransactionError::InvalidDirectory(path.into())),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path).map_err(GitTransactionError::Io)?;
+            if let Err(error) = fs::create_dir(path)
+                && error.kind() != io::ErrorKind::AlreadyExists
+            {
+                return Err(GitTransactionError::Io(error));
+            }
+            ensure_real_directory(path)?;
             let parent = path
                 .parent()
                 .ok_or_else(|| GitTransactionError::InvalidDirectory(path.into()))?;
@@ -1384,12 +1393,15 @@ fn ensure_regular_file(path: &Path) -> Result<(), GitTransactionError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(()),
         Ok(_) => Err(GitTransactionError::InvalidDirectory(path.into())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .and_then(|file| file.sync_all())
-            .map_err(GitTransactionError::Io),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(file) => file.sync_all().map_err(GitTransactionError::Io),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    ensure_regular_file(path)
+                }
+                Err(error) => Err(GitTransactionError::Io(error)),
+            }
+        }
         Err(error) => Err(GitTransactionError::Io(error)),
     }
 }
@@ -1409,27 +1421,39 @@ fn lock_file(path: &Path) -> Result<RepositoryWriter, GitTransactionError> {
     }
 }
 
-fn ensure_work_root_binding(path: &Path, work_root: &Path) -> Result<(), GitTransactionError> {
-    let expected = work_root.as_os_str().as_encoded_bytes();
+fn ensure_repository_binding(
+    path: &Path,
+    work_root: &Path,
+    canonical_worktree: &Path,
+    official_ref: &str,
+) -> Result<(), GitTransactionError> {
+    let mut expected = Vec::new();
+    expected.extend_from_slice(work_root.as_os_str().as_encoded_bytes());
+    expected.push(0);
+    expected.extend_from_slice(canonical_worktree.as_os_str().as_encoded_bytes());
+    expected.push(0);
+    expected.extend_from_slice(official_ref.as_bytes());
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 16 * 1024 => {
             let actual = fs::read(path).map_err(GitTransactionError::Io)?;
             if actual == expected {
                 Ok(())
             } else {
-                Err(GitTransactionError::WorkRootMismatch)
+                Err(GitTransactionError::RepositoryBindingMismatch)
             }
         }
-        Ok(_) => Err(GitTransactionError::WorkRootMismatch),
+        Ok(_) => Err(GitTransactionError::RepositoryBindingMismatch),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(path)
                 .map_err(GitTransactionError::Io)?;
-            file.write_all(expected).map_err(GitTransactionError::Io)?;
+            file.write_all(&expected).map_err(GitTransactionError::Io)?;
             file.sync_all().map_err(GitTransactionError::Io)?;
-            let parent = path.parent().ok_or(GitTransactionError::WorkRootMismatch)?;
+            let parent = path
+                .parent()
+                .ok_or(GitTransactionError::RepositoryBindingMismatch)?;
             sync_directory(parent).map_err(GitTransactionError::Io)
         }
         Err(error) => Err(GitTransactionError::Io(error)),
@@ -1654,7 +1678,7 @@ where
         command.arg("-C").arg(working_directory);
     }
     if let Some(git_directory) = git_directory {
-        command.arg(format!("--git-dir={}", git_directory.display()));
+        command.arg(git_directory_argument(git_directory));
     }
     let arguments = arguments
         .into_iter()
@@ -1686,6 +1710,12 @@ where
             stderr: diagnostic(&output.stderr),
         })
     }
+}
+
+fn git_directory_argument(git_directory: &Path) -> OsString {
+    let mut argument = OsString::from("--git-dir=");
+    argument.push(git_directory.as_os_str());
+    argument
 }
 
 fn git_command() -> Command {
@@ -1752,16 +1782,17 @@ fn validate_local_git_config(git_directory: &Path) -> Result<(), GitTransactionE
 }
 
 fn safe_remote_or_branch_config(key: &str) -> bool {
-    let mut parts = key.split('.');
-    matches!(
-        (parts.next(), parts.next(), parts.next(), parts.next()),
-        (
-            Some("remote"),
-            Some(_),
-            Some("url" | "pushurl" | "fetch" | "mirror"),
-            None
-        ) | (Some("branch"), Some(_), Some("remote" | "merge"), None)
-    )
+    if let Some(value) = key.strip_prefix("remote.")
+        && let Some((name, field)) = value.rsplit_once('.')
+    {
+        return !name.is_empty() && matches!(field, "url" | "pushurl" | "fetch" | "mirror");
+    }
+    if let Some(value) = key.strip_prefix("branch.")
+        && let Some((name, field)) = value.rsplit_once('.')
+    {
+        return !name.is_empty() && matches!(field, "remote" | "merge");
+    }
+    false
 }
 
 fn untracked_files(worktree: &Path) -> Result<Vec<PathBuf>, GitTransactionError> {
@@ -1951,8 +1982,8 @@ pub enum GitTransactionError {
     OverlappingRepositoryPaths,
     /// Another process holds the repository-scoped writer lock.
     RepositoryBusy(PathBuf),
-    /// The repository was already bound to another disposable work root.
-    WorkRootMismatch,
+    /// The repository was already bound to another writer configuration.
+    RepositoryBindingMismatch,
     /// Repository-local Git configuration contained a non-allowlisted key.
     UnsafeGitConfig,
     /// A required directory was a link or non-directory entry.
@@ -2053,8 +2084,8 @@ impl fmt::Display for GitTransactionError {
                 "repository writer lock `{}` is already held",
                 path.display()
             ),
-            Self::WorkRootMismatch => {
-                formatter.write_str("repository is bound to a different work root")
+            Self::RepositoryBindingMismatch => {
+                formatter.write_str("repository is bound to a different writer configuration")
             }
             Self::UnsafeGitConfig => {
                 formatter.write_str("repository-local Git configuration is not allowlisted")

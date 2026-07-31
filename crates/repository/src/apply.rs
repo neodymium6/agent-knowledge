@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agent_knowledge_core::{
     DocumentId, DocumentMetadata, DocumentParseError, DocumentStatus, DocumentType,
@@ -131,17 +132,17 @@ struct VirtualDocument {
     archived: bool,
     status: DocumentStatus,
     revision: Revision,
-    markdown: Option<Vec<u8>>,
+    markdown: Option<Arc<[u8]>>,
 }
 
 enum PlannedMutation {
     WriteNew {
         relative_path: PathBuf,
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
     },
     Replace {
         relative_path: PathBuf,
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
     },
     Move {
         source: PathBuf,
@@ -180,7 +181,8 @@ fn build_plan(
                         document_id: *document_id,
                     });
                 }
-                let bytes = read_payload(package_root, package, content.as_str())?;
+                let bytes =
+                    Arc::<[u8]>::from(read_payload(package_root, package, content.as_str())?);
                 let metadata = decode_payload_metadata(&bytes, policy, content.as_str())?;
                 if metadata.created > operation_time
                     || metadata
@@ -240,7 +242,8 @@ fn build_plan(
                     request.project.as_ref(),
                     request.document_type,
                 )?;
-                let bytes = read_payload(package_root, package, content.as_str())?;
+                let bytes =
+                    Arc::<[u8]>::from(read_payload(package_root, package, content.as_str())?);
                 let metadata = decode_payload_metadata(&bytes, policy, content.as_str())?;
                 if metadata.created != document.created {
                     return Err(ApplyError::OperationForbidden {
@@ -341,12 +344,12 @@ fn build_plan(
                 let source_bundle = bundle_path(&document.relative_path, document.document_type);
                 occupancy.move_path(&source_bundle, &destination_bundle)?;
                 if document.markdown.is_none() {
-                    document.markdown = Some(read_canonical_markdown(
+                    document.markdown = Some(Arc::from(read_canonical_markdown(
                         content_root,
                         &document.canonical_path,
                         policy.maximum_markdown_bytes,
                         document.revision,
-                    )?);
+                    )?));
                 }
                 let archived = archived_markdown(
                     document
@@ -357,6 +360,15 @@ fn build_plan(
                     request.request_id,
                     operation_time,
                 )?;
+                if archived.len() as u64 > policy.maximum_markdown_bytes
+                    || decode_document_metadata(&archived, policy.maximum_front_matter_bytes)
+                        .is_err()
+                {
+                    return Err(ApplyError::PlanningBytesExceeded {
+                        maximum: policy.maximum_markdown_bytes,
+                    });
+                }
+                let archived = Arc::<[u8]>::from(archived);
                 let archived_revision = revision(&archived);
                 reserve_planned_bytes(&mut planned_bytes, archived.len(), maximum_planned_bytes)?;
                 plan.push(PlannedMutation::Replace {
@@ -399,7 +411,8 @@ fn build_plan(
                     .unwrap_or_else(|| Path::new(""))
                     .join(name.as_str());
                 occupancy.reserve(&relative_path)?;
-                let bytes = read_payload(package_root, package, source.as_str())?;
+                let bytes =
+                    Arc::<[u8]>::from(read_payload(package_root, package, source.as_str())?);
                 reserve_planned_bytes(&mut planned_bytes, bytes.len(), maximum_planned_bytes)?;
                 plan.push(PlannedMutation::WriteNew {
                     relative_path,

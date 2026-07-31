@@ -144,7 +144,8 @@ requires:
 - atomic rename within a file system;
 - durable file and directory synchronization;
 - advisory file locking; and
-- normal POSIX file and directory semantics.
+- normal POSIX file and directory semantics; and
+- a mounted `/proc` file system exposing `/proc/self/fd`.
 
 All durable paths are configurable. Processes handle termination signals and
 shut down at transaction boundaries.
@@ -751,6 +752,13 @@ handles for the same queue cannot select different lock files. The Gateway can
 continue accepting requests while the Worker is otherwise idle or applying a
 batch.
 
+On Linux, each live queue handle retains an open descriptor for the initialized
+queue root and performs queue I/O through `/proc/self/fd/<fd>`. It also compares
+the identity reachable at the configured canonical path before every Worker
+transition. Renaming the queue root and creating a replacement at the same path
+therefore invalidates the old Worker without redirecting any of its writes into
+the replacement.
+
 Pending selection takes a fixed acceptance-sequence snapshot and incrementally
 walks the pending directory. Each call has a maximum number of directory
 entries to inspect, and the scanner retains only the earliest configured number
@@ -866,9 +874,10 @@ overrides, disable system/global configuration, hooks, signing, fsmonitor, and
 line-ending conversion, and reject repository-local configuration outside a
 small data-only allowlist. Object and reference mutations run with Git fsync
 enabled. A repository-scoped file lock serializes all repository instances.
-The lock and an immutable binding to the configured work root live below the
-common bare Git directory, so two configurations cannot split the writer or
-journal identity. Recovery never guesses that a Git `.lock` file is stale:
+The lock and an immutable binding to the canonical worktree, official branch,
+and disposable work root live below the common bare Git directory, so two
+configurations cannot split the writer or journal identity. Recovery never
+guesses that a Git `.lock` file is stale:
 an orphaned but still-running Git child may own it, so automated recovery
 fails closed and requires verified operator intervention. Before
 publication or recovery, the Worker verifies that the journaled commit exists,
@@ -908,8 +917,12 @@ The Worker applies and validates requests sequentially in a temporary
 worktree. A request that fails its own validation is rolled back in that
 worktree and moved to `failed/`. Remaining requests continue.
 Canonical Markdown bodies are loaded lazily only for archive operations.
-Payload output, generated archive bytes, and every other planned write share
-one checked per-request materialization bound.
+Payload output buffers are shared between the virtual document view and the
+mutation plan. Payload output, generated archive bytes, and every other planned
+write share one checked per-request materialization bound; one bounded document
+scratch buffer may additionally exist while archive front matter is generated.
+Worker-generated Markdown is validated against document and front-matter limits
+before any filesystem mutation.
 
 Operations within one request share an in-memory document view. For example,
 an update followed by archive archives the updated bytes, and a move followed

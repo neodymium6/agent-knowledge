@@ -3,6 +3,11 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
 use agent_knowledge_core::{BatchId, ErrorCode, PayloadPath, RequestId, Revision};
 use agent_knowledge_queue::{
     ClaimedPackage, FileQueue, PackagePolicy, ProcessingScanOutcome, WorkerSession,
@@ -648,6 +653,21 @@ fn rejects_worktree_config_and_a_second_work_root() {
     let fixture = GitFixture::initialize(root.path());
     let repository = fixture.open();
     drop(repository);
+    git(
+        None,
+        [
+            "--git-dir",
+            fixture
+                .repository
+                .to_str()
+                .unwrap_or("invalid-fictional-repository"),
+            "config",
+            "remote.backup.eu.url",
+            "ssh://fictional.invalid/knowledge.git",
+        ],
+        None,
+    );
+    drop(fixture.open());
     let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
         .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
     let other_work = root.path().join("other-work");
@@ -661,7 +681,42 @@ fn rejects_worktree_config_and_a_second_work_root() {
             "main",
             identity.clone(),
         ),
-        Err(GitTransactionError::WorkRootMismatch)
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+    git(
+        None,
+        [
+            "--git-dir",
+            fixture
+                .repository
+                .to_str()
+                .unwrap_or("invalid-fictional-repository"),
+            "branch",
+            "alternate",
+            "main",
+        ],
+        None,
+    );
+    let alternate = root.path().join("alternate-content");
+    let status = Command::new("git")
+        .arg(super::git_directory_argument(&fixture.repository))
+        .args(["worktree", "add"])
+        .arg(&alternate)
+        .arg("alternate")
+        .status();
+    assert!(
+        matches!(status, Ok(status) if status.success()),
+        "alternate canonical worktree must be created"
+    );
+    assert!(matches!(
+        GitRepository::open(
+            &fixture.repository,
+            &alternate,
+            &fixture.work,
+            "alternate",
+            identity.clone(),
+        ),
+        Err(GitTransactionError::RepositoryBindingMismatch)
     ));
     git(
         None,
@@ -687,6 +742,18 @@ fn rejects_worktree_config_and_a_second_work_root() {
         ),
         Err(GitTransactionError::UnsafeGitConfig)
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn preserves_non_utf8_git_directory_arguments() {
+    let path = PathBuf::from(OsString::from_vec(
+        b"/tmp/fictional-git-directory-\xff".to_vec(),
+    ));
+    let argument = super::git_directory_argument(&path);
+    let mut expected = b"--git-dir=".to_vec();
+    expected.extend_from_slice(path.as_os_str().as_bytes());
+    assert_eq!(argument.as_os_str().as_bytes(), expected);
 }
 
 #[test]

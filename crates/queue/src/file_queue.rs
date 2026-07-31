@@ -105,6 +105,9 @@ pub enum EnqueueOutcome {
 #[derive(Clone, Debug)]
 pub struct FileQueue {
     queue_root: PathBuf,
+    configured_queue_root: PathBuf,
+    #[cfg(target_os = "linux")]
+    _root_handle: Arc<File>,
     identity: Revision,
     lock_file: PathBuf,
     worker_lock_file: PathBuf,
@@ -128,12 +131,26 @@ impl FileQueue {
         queue_root: impl Into<PathBuf>,
         policy: PackagePolicy,
     ) -> Result<Self, QueueError> {
-        let queue_root = queue_root.into();
+        let configured_path = queue_root.into();
+        ensure_directory(&configured_path)?;
+        let configured_queue_root = fs::canonicalize(&configured_path).map_err(QueueError::Io)?;
+        #[cfg(target_os = "linux")]
+        let (queue_root, root_handle) = {
+            use std::os::fd::AsRawFd;
+            let root_handle = Arc::new(File::open(&configured_queue_root).map_err(QueueError::Io)?);
+            (
+                PathBuf::from(format!("/proc/self/fd/{}", root_handle.as_raw_fd())),
+                root_handle,
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        let queue_root = configured_queue_root.clone();
+        fs::metadata(&queue_root).map_err(QueueError::Io)?;
+
         let lock_root = queue_root.join(LOCK_DIRECTORY_NAME);
         let lock_file = lock_root.join(QUEUE_LOCK_FILE_NAME);
         let worker_lock_file = lock_root.join(WORKER_LOCK_FILE_NAME);
 
-        ensure_directory(&queue_root)?;
         ensure_directory(&lock_root)?;
         ensure_directory(&queue_root.join("incoming"))?;
         ensure_directory(&queue_root.join("quarantine"))?;
@@ -156,16 +173,19 @@ impl FileQueue {
 
         sync_directory(&lock_root)?;
         sync_directory(&queue_root)?;
-        if let Some(parent) = queue_root.parent()
+        if let Some(parent) = configured_queue_root.parent()
             && !parent.as_os_str().is_empty()
         {
             sync_directory(parent)?;
         }
         Ok(Self {
-            queue_root,
+            configured_queue_root,
             identity,
             lock_file,
             worker_lock_file,
+            queue_root,
+            #[cfg(target_os = "linux")]
+            _root_handle: root_handle,
             policy,
             maintenance_scanners: Arc::new(Mutex::new(MaintenanceScanners::default())),
         })

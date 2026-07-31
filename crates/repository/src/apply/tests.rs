@@ -473,6 +473,46 @@ fn archives_a_document_created_in_the_same_request() {
 }
 
 #[test]
+fn rejects_an_oversized_generated_archive_before_moving_the_bundle() {
+    let root = TestDirectory::new();
+    let content_root = root.path().join("content");
+    let relative = format!("projects/fictional-project/runbooks/2026-07-31-{DOCUMENT_ID}/index.md");
+    let original = document(DOCUMENT_ID, ORIGINAL_REQUEST_ID, "Bounded runbook", None);
+    write_file(&content_root, &relative, original.as_bytes());
+    let package_root = root.path().join("archive-limit-package");
+    let archive = package(
+        &package_root,
+        request(
+            ARCHIVE_REQUEST_ID,
+            Some("fictional-project"),
+            "runbook",
+            json!([{
+                "type": "archive_document",
+                "document_id": DOCUMENT_ID,
+                "expected_revision": revision(&original).to_string()
+            }]),
+        ),
+        &[],
+    );
+    let maximum = original.len() as u64;
+    let policy = ContentPolicy {
+        maximum_markdown_bytes: maximum,
+        ..ContentPolicy::default()
+    };
+
+    assert!(matches!(
+        apply_request(&content_root, &package_root, &archive, policy),
+        Err(ApplyError::PlanningBytesExceeded {
+            maximum: actual_maximum
+        }) if actual_maximum == maximum
+    ));
+    assert_eq!(
+        read_file(&content_root.join(relative)),
+        original.into_bytes()
+    );
+}
+
+#[test]
 fn archives_the_latest_update_from_the_same_request() {
     let root = TestDirectory::new();
     let content_root = root.path().join("content");
