@@ -98,6 +98,21 @@ agent-knowledge worker ...
 agent-knowledge admin ...
 ```
 
+The implementation bootstrap exposes one local-only administrative intake
+command before the SSH Gateway is added:
+
+```text
+agent-knowledge admin submit \
+  --queue-root /srv/agent-knowledge/queue \
+  --lock-file /srv/agent-knowledge/locks/queue.lock \
+  --package-root ./fictional-request
+```
+
+`package-root` contains extracted `request.json` and `payload/` entries. The
+command validates that directory, restreams every permitted file through the
+same `FileQueue` limits as the future Gateway, and prints one JSON acceptance
+result. It never copies an unchecked directory into an accepted queue state.
+
 The same executable can be used with different entry-point arguments in a
 container. Separate binaries may be produced from the same workspace later,
 without changing protocol or domain logic.

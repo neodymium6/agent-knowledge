@@ -1,0 +1,145 @@
+use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::{CliError, run};
+
+const REQUEST_JSON: &str = r#"{
+    "protocol_version": 1,
+    "request_id": "01K00000000000000000000000",
+    "title": "Record fictional benchmark",
+    "project": "fictional-solver",
+    "document_type": "experiment",
+    "node": "fictional-node-a",
+    "agent": "codex",
+    "session": "01K00000000000000000000001",
+    "created_at": "2026-07-31T03:50:00+09:00",
+    "operations": [
+        {
+            "type": "create_document",
+            "document_id": "01K00000000000000000000002",
+            "content": "benchmark/index.md"
+        }
+    ]
+}"#;
+const MARKDOWN: &str = "---\n\
+schema_version: 1\n\
+document_id: 01K00000000000000000000002\n\
+title: Fictional benchmark\n\
+created: 2026-07-31T03:50:00+09:00\n\
+request_id: 01K00000000000000000000000\n\
+tags:\n\
+  - benchmark\n\
+status: active\n\
+---\n";
+
+static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn create() -> Self {
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "agent-knowledge-cli-test-{}-{sequence}",
+            std::process::id()
+        ));
+        if let Err(error) = fs::create_dir(&path) {
+            panic!("CLI test directory must be created: {error}");
+        }
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.0)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            panic!("CLI test directory must be removed: {error}");
+        }
+    }
+}
+
+fn write_package(root: &Path) -> PathBuf {
+    let package = root.join("package");
+    if let Err(error) = fs::create_dir_all(package.join("payload/benchmark")) {
+        panic!("package fixture directories must be created: {error}");
+    }
+    if let Err(error) = fs::write(package.join("request.json"), REQUEST_JSON) {
+        panic!("request fixture must be written: {error}");
+    }
+    if let Err(error) = fs::write(package.join("payload/benchmark/index.md"), MARKDOWN) {
+        panic!("Markdown fixture must be written: {error}");
+    }
+    package
+}
+
+fn arguments(root: &Path, package: &Path) -> Vec<OsString> {
+    vec![
+        "agent-knowledge".into(),
+        "admin".into(),
+        "submit".into(),
+        "--queue-root".into(),
+        root.join("queue").into_os_string(),
+        "--lock-file".into(),
+        root.join("locks/queue.lock").into_os_string(),
+        "--package-root".into(),
+        package.as_os_str().to_owned(),
+    ]
+}
+
+#[test]
+fn submits_valid_directory_and_reports_idempotent_retry() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let mut first = Vec::new();
+    if let Err(error) = run(arguments(root.path(), &package), &mut first) {
+        panic!("first local submission must succeed: {error}");
+    }
+    let first: serde_json::Value = match serde_json::from_slice(&first) {
+        Ok(response) => response,
+        Err(error) => panic!("first response must be JSON: {error}"),
+    };
+    assert_eq!(first["status"], "accepted");
+    assert_eq!(first["request_id"], "01K00000000000000000000000");
+    assert!(
+        root.path()
+            .join("queue/pending/01K00000000000000000000000")
+            .is_dir()
+    );
+
+    let mut second = Vec::new();
+    if let Err(error) = run(arguments(root.path(), &package), &mut second) {
+        panic!("idempotent local submission must succeed: {error}");
+    }
+    let second: serde_json::Value = match serde_json::from_slice(&second) {
+        Ok(response) => response,
+        Err(error) => panic!("second response must be JSON: {error}"),
+    };
+    assert_eq!(second["status"], "existing");
+    assert_eq!(second["state"], "pending");
+}
+
+#[test]
+fn rejects_unknown_or_incomplete_command_lines() {
+    for arguments in [
+        vec!["agent-knowledge".into()],
+        vec!["agent-knowledge".into(), "admin".into(), "unknown".into()],
+        vec![
+            "agent-knowledge".into(),
+            "admin".into(),
+            "submit".into(),
+            "--queue-root".into(),
+            "fictional-queue".into(),
+        ],
+    ] {
+        assert!(matches!(run(arguments, Vec::new()), Err(CliError::Usage)));
+    }
+}
