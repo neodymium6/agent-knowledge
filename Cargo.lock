@@ -16,6 +16,7 @@ name = "agent-knowledge-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde-saphyr",
  "serde_json",
  "time",
  "ulid",
@@ -31,6 +32,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "time",
+ "ulid",
+]
+
+[[package]]
+name = "agent-knowledge-repository"
+version = "0.1.0"
+dependencies = [
+ "agent-knowledge-core",
+ "sha2",
  "ulid",
 ]
 
