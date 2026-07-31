@@ -100,13 +100,14 @@ pub struct GitRepository {
     configured_canonical_worktree: PathBuf,
     canonical_root_handle: Arc<File>,
     configured_work_root: PathBuf,
+    work_root: PathBuf,
     work_root_handle: Arc<File>,
+    configured_journal_root: PathBuf,
     journal_root: PathBuf,
+    journal_root_handle: Arc<File>,
+    configured_worktree_root: PathBuf,
     worktree_root: PathBuf,
-    writer_lock: Arc<File>,
-    writer_lock_path: PathBuf,
-    work_root_lock: Arc<File>,
-    work_root_lock_path: PathBuf,
+    worktree_root_handle: Arc<File>,
     binding_file: PathBuf,
     work_root_binding_file: PathBuf,
     official_ref: String,
@@ -201,50 +202,34 @@ impl GitRepository {
         let (canonical_root_handle, canonical_worktree) =
             open_stable_directory(&configured_canonical_worktree)?;
         let (work_root_handle, work_root) = open_stable_directory(&configured_work_root)?;
-        let journal_root = work_root.join("transactions");
-        let worktree_root = work_root.join("worktrees");
-        ensure_or_create_real_directory(&journal_root)?;
-        ensure_or_create_real_directory(&worktree_root)?;
+        let configured_journal_root = configured_work_root.join("transactions");
+        let configured_worktree_root = configured_work_root.join("worktrees");
+        ensure_or_create_real_directory(&work_root.join("transactions"))?;
+        ensure_or_create_real_directory(&work_root.join("worktrees"))?;
+        let (journal_root_handle, journal_root) = open_stable_directory(&configured_journal_root)?;
+        let (worktree_root_handle, worktree_root) =
+            open_stable_directory(&configured_worktree_root)?;
         let repository_state = git_directory.join("agent-knowledge");
         ensure_or_create_real_directory(&repository_state)?;
-        let writer_lock_path = repository_state.join("writer.lock");
-        ensure_regular_file(&writer_lock_path)?;
-        let writer_lock = Arc::new(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&writer_lock_path)
-                .map_err(GitTransactionError::Io)?,
-        );
-        let work_root_lock_path = work_root.join(".agent-knowledge-writer.lock");
-        ensure_regular_file(&work_root_lock_path)?;
-        let work_root_lock = Arc::new(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&work_root_lock_path)
-                .map_err(GitTransactionError::Io)?,
-        );
-        let writer = lock_file_handles(
-            &writer_lock,
-            &writer_lock_path,
-            &work_root_lock,
-            &work_root_lock_path,
-        )?;
-        let binding_file = repository_state.join("binding-v1");
-        ensure_binding(
-            &binding_file,
-            &configured_work_root,
-            &configured_canonical_worktree,
-            &official_ref,
-        )?;
-        let work_root_binding_file = work_root.join(".agent-knowledge-repository-binding-v1");
-        ensure_binding(
-            &work_root_binding_file,
+        let writer = lock_root_paths(
+            &git_directory,
             &configured_git_directory,
+            &work_root,
+            &configured_work_root,
+        )?;
+        let expected_binding = repository_binding(
+            &configured_git_directory,
+            &git_root_handle,
             &configured_canonical_worktree,
+            &canonical_root_handle,
+            &configured_work_root,
+            &work_root_handle,
             &official_ref,
         )?;
+        let binding_file = repository_state.join("binding-v2");
+        ensure_binding(&binding_file, &expected_binding)?;
+        let work_root_binding_file = work_root.join(".agent-knowledge-repository-binding-v2");
+        ensure_binding(&work_root_binding_file, &expected_binding)?;
         drop(writer);
         sync_directory(&repository_state).map_err(GitTransactionError::Io)?;
         sync_directory(&work_root).map_err(GitTransactionError::Io)?;
@@ -257,13 +242,14 @@ impl GitRepository {
             configured_canonical_worktree,
             canonical_root_handle,
             configured_work_root,
+            work_root,
             work_root_handle,
+            configured_journal_root,
             journal_root,
+            journal_root_handle,
+            configured_worktree_root,
             worktree_root,
-            writer_lock,
-            writer_lock_path,
-            work_root_lock,
-            work_root_lock_path,
+            worktree_root_handle,
             binding_file,
             work_root_binding_file,
             official_ref,
@@ -416,6 +402,7 @@ impl GitRepository {
                     actual,
                 });
             }
+            self.validate_live_storage()?;
             return Ok(BatchCommitOutcome::NoChanges {
                 failures: prepared.failures,
             });
@@ -685,6 +672,7 @@ impl GitRepository {
                 }
             }
         }
+        self.validate_live_storage()?;
         outcome_from_journal(&journal)
     }
 
@@ -695,10 +683,12 @@ impl GitRepository {
         commit: &str,
         publication_started: bool,
     ) -> Result<(), GitTransactionError> {
+        self.validate_live_storage()?;
         let actual = self.resolve_commit(&self.official_ref)?;
         if actual == base {
             self.ensure_canonical_clean()?;
             self.ensure_transaction_ref(batch_id, commit)?;
+            self.validate_live_storage()?;
             self.compare_and_swap_official(base, commit)?;
         } else if actual != commit {
             return Err(GitTransactionError::OfficialBranchChanged {
@@ -716,26 +706,30 @@ impl GitRepository {
             .map_err(|source| GitTransactionError::PostCommitCleanup {
                 commit: commit.into(),
                 source: Box::new(source),
-            })
+            })?;
+        self.validate_live_storage()
     }
 
     fn lock_writer(&self) -> Result<RepositoryWriter, GitTransactionError> {
-        let writer = lock_file_handles(
-            &self.writer_lock,
-            &self.writer_lock_path,
-            &self.work_root_lock,
-            &self.work_root_lock_path,
+        let writer = lock_root_paths(
+            &self.git_directory,
+            &self.configured_git_directory,
+            &self.work_root,
+            &self.configured_work_root,
         )?;
+        self.validate_live_storage()?;
+        Ok(writer)
+    }
+
+    fn validate_live_storage(&self) -> Result<(), GitTransactionError> {
         validate_pinned_directory(&self.configured_git_directory, &self.git_root_handle)?;
         validate_pinned_directory(
             &self.configured_canonical_worktree,
             &self.canonical_root_handle,
         )?;
         validate_pinned_directory(&self.configured_work_root, &self.work_root_handle)?;
-        validate_pinned_file(&self.writer_lock_path, &self.writer_lock)?;
-        validate_pinned_file(&self.work_root_lock_path, &self.work_root_lock)?;
-        ensure_real_directory(&self.journal_root)?;
-        ensure_real_directory(&self.worktree_root)?;
+        validate_pinned_directory(&self.configured_journal_root, &self.journal_root_handle)?;
+        validate_pinned_directory(&self.configured_worktree_root, &self.worktree_root_handle)?;
         validate_nonoverlapping_paths(
             &self.configured_git_directory,
             &self.configured_canonical_worktree,
@@ -747,19 +741,17 @@ impl GitRepository {
             &self.canonical_worktree,
             &self.official_ref,
         )?;
-        ensure_binding(
-            &self.binding_file,
-            &self.configured_work_root,
-            &self.configured_canonical_worktree,
-            &self.official_ref,
-        )?;
-        ensure_binding(
-            &self.work_root_binding_file,
+        let expected_binding = repository_binding(
             &self.configured_git_directory,
+            &self.git_root_handle,
             &self.configured_canonical_worktree,
+            &self.canonical_root_handle,
+            &self.configured_work_root,
+            &self.work_root_handle,
             &self.official_ref,
         )?;
-        Ok(writer)
+        validate_binding(&self.binding_file, &expected_binding)?;
+        validate_binding(&self.work_root_binding_file, &expected_binding)
     }
 
     fn validate_committed_journal(
@@ -1480,23 +1472,6 @@ fn ensure_or_create_real_directory(path: &Path) -> Result<(), GitTransactionErro
     }
 }
 
-fn ensure_regular_file(path: &Path) -> Result<(), GitTransactionError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
-        Ok(_) => Err(GitTransactionError::InvalidDirectory(path.into())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match OpenOptions::new().write(true).create_new(true).open(path) {
-                Ok(file) => file.sync_all().map_err(GitTransactionError::Io),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    ensure_regular_file(path)
-                }
-                Err(error) => Err(GitTransactionError::Io(error)),
-            }
-        }
-        Err(error) => Err(GitTransactionError::Io(error)),
-    }
-}
-
 fn open_stable_directory(path: &Path) -> Result<(Arc<File>, PathBuf), GitTransactionError> {
     let handle = Arc::new(File::open(path).map_err(GitTransactionError::Io)?);
     #[cfg(target_os = "linux")]
@@ -1516,13 +1491,13 @@ fn open_stable_directory(path: &Path) -> Result<(Arc<File>, PathBuf), GitTransac
     }
 }
 
-fn lock_file_handles(
-    repository: &Arc<File>,
+fn lock_root_paths(
+    stable_repository: &Path,
     repository_path: &Path,
-    work_root: &Arc<File>,
+    stable_work_root: &Path,
     work_root_path: &Path,
 ) -> Result<RepositoryWriter, GitTransactionError> {
-    let repository = repository.try_clone().map_err(GitTransactionError::Io)?;
+    let repository = File::open(stable_repository).map_err(GitTransactionError::Io)?;
     match repository.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
@@ -1532,16 +1507,28 @@ fn lock_file_handles(
         }
         Err(TryLockError::Error(error)) => return Err(GitTransactionError::Io(error)),
     }
-    let work_root = work_root.try_clone().map_err(GitTransactionError::Io)?;
+    let work_root = match File::open(stable_work_root) {
+        Ok(work_root) => work_root,
+        Err(error) => {
+            let _ = repository.unlock();
+            return Err(GitTransactionError::Io(error));
+        }
+    };
     match work_root.try_lock() {
         Ok(()) => Ok(RepositoryWriter {
             _repository: repository,
             _work_root: work_root,
         }),
-        Err(TryLockError::WouldBlock) => Err(GitTransactionError::RepositoryBusy(
-            work_root_path.to_path_buf(),
-        )),
-        Err(TryLockError::Error(error)) => Err(GitTransactionError::Io(error)),
+        Err(TryLockError::WouldBlock) => {
+            let _ = repository.unlock();
+            Err(GitTransactionError::RepositoryBusy(
+                work_root_path.to_path_buf(),
+            ))
+        }
+        Err(TryLockError::Error(error)) => {
+            let _ = repository.unlock();
+            Err(GitTransactionError::Io(error))
+        }
     }
 }
 
@@ -1549,15 +1536,6 @@ fn validate_pinned_directory(configured: &Path, pinned: &File) -> Result<(), Git
     let configured_metadata = fs::metadata(configured).map_err(GitTransactionError::Io)?;
     let pinned_metadata = pinned.metadata().map_err(GitTransactionError::Io)?;
     if !configured_metadata.is_dir() || !same_metadata(&configured_metadata, &pinned_metadata) {
-        return Err(GitTransactionError::RepositoryBindingMismatch);
-    }
-    Ok(())
-}
-
-fn validate_pinned_file(configured: &Path, pinned: &File) -> Result<(), GitTransactionError> {
-    let configured_metadata = fs::metadata(configured).map_err(GitTransactionError::Io)?;
-    let pinned_metadata = pinned.metadata().map_err(GitTransactionError::Io)?;
-    if !configured_metadata.is_file() || !same_metadata(&configured_metadata, &pinned_metadata) {
         return Err(GitTransactionError::RepositoryBindingMismatch);
     }
     Ok(())
@@ -1582,35 +1560,16 @@ fn same_directory(left: &Path, right: &Path) -> Result<bool, GitTransactionError
     Ok(left.is_dir() && right.is_dir() && same_metadata(&left, &right))
 }
 
-fn ensure_binding(
-    path: &Path,
-    work_root: &Path,
-    canonical_worktree: &Path,
-    official_ref: &str,
-) -> Result<(), GitTransactionError> {
-    let mut expected = Vec::new();
-    expected.extend_from_slice(work_root.as_os_str().as_encoded_bytes());
-    expected.push(0);
-    expected.extend_from_slice(canonical_worktree.as_os_str().as_encoded_bytes());
-    expected.push(0);
-    expected.extend_from_slice(official_ref.as_bytes());
+fn ensure_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 16 * 1024 => {
-            let actual = fs::read(path).map_err(GitTransactionError::Io)?;
-            if actual == expected {
-                Ok(())
-            } else {
-                Err(GitTransactionError::RepositoryBindingMismatch)
-            }
-        }
-        Ok(_) => Err(GitTransactionError::RepositoryBindingMismatch),
+        Ok(_) => validate_binding(path, expected),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(path)
                 .map_err(GitTransactionError::Io)?;
-            file.write_all(&expected).map_err(GitTransactionError::Io)?;
+            file.write_all(expected).map_err(GitTransactionError::Io)?;
             file.sync_all().map_err(GitTransactionError::Io)?;
             let parent = path
                 .parent()
@@ -1619,6 +1578,60 @@ fn ensure_binding(
         }
         Err(error) => Err(GitTransactionError::Io(error)),
     }
+}
+
+fn validate_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            GitTransactionError::RepositoryBindingMismatch
+        } else {
+            GitTransactionError::Io(error)
+        }
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() > 16 * 1024 {
+        return Err(GitTransactionError::RepositoryBindingMismatch);
+    }
+    let actual = fs::read(path).map_err(GitTransactionError::Io)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    }
+}
+
+fn repository_binding(
+    git_directory: &Path,
+    git_root: &File,
+    canonical_worktree: &Path,
+    canonical_root: &File,
+    work_root: &Path,
+    work_root_handle: &File,
+    official_ref: &str,
+) -> Result<Vec<u8>, GitTransactionError> {
+    let mut binding = b"agent-knowledge-repository-binding-v2\0".to_vec();
+    append_directory_binding(&mut binding, git_directory, git_root)?;
+    append_directory_binding(&mut binding, canonical_worktree, canonical_root)?;
+    append_directory_binding(&mut binding, work_root, work_root_handle)?;
+    binding.extend_from_slice(official_ref.as_bytes());
+    Ok(binding)
+}
+
+fn append_directory_binding(
+    binding: &mut Vec<u8>,
+    configured_path: &Path,
+    handle: &File,
+) -> Result<(), GitTransactionError> {
+    binding.extend_from_slice(configured_path.as_os_str().as_encoded_bytes());
+    binding.push(0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = handle.metadata().map_err(GitTransactionError::Io)?;
+        binding.extend_from_slice(&metadata.dev().to_le_bytes());
+        binding.extend_from_slice(&metadata.ino().to_le_bytes());
+    }
+    binding.push(0);
+    Ok(())
 }
 
 fn validate_repository_layout(

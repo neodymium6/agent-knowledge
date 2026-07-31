@@ -11,7 +11,8 @@ use agent_knowledge_core::{ErrorCode, PayloadPath};
 
 use super::{
     AcceptanceHook, AcceptancePhase, DirectoryScanner, EnqueueOutcome, FileQueue, IncomingPackage,
-    QueueError, QueueLimit, QueueState, StaleAgeSource, inactive_stale_directories,
+    QueueError, QueueLimit, QueueState, StaleAgeSource, WorkerQueueError,
+    inactive_stale_directories,
 };
 use crate::{PackageLimits, PackagePolicy, validate_accepted_package};
 
@@ -148,6 +149,29 @@ fn incoming_is_empty(root: &Path) -> bool {
     entries.next().is_none()
 }
 
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir(destination)
+        .unwrap_or_else(|error| panic!("copied directory must be created: {error}"));
+    let entries = fs::read_dir(source)
+        .unwrap_or_else(|error| panic!("source directory must be readable: {error}"));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| panic!("source entry must be readable: {error}"));
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = entry
+            .metadata()
+            .unwrap_or_else(|error| panic!("source metadata must be readable: {error}"));
+        if metadata.is_dir() {
+            copy_tree(&source_path, &destination_path);
+        } else if metadata.is_file() {
+            fs::copy(&source_path, &destination_path)
+                .unwrap_or_else(|error| panic!("source file must be copied: {error}"));
+        } else {
+            panic!("queue fixture must contain only directories and regular files");
+        }
+    }
+}
+
 #[test]
 fn initialization_requires_an_existing_parent_directory() {
     let root = TestDirectory::create();
@@ -191,6 +215,49 @@ fn a_replaced_queue_invalidates_gateway_staging_and_acceptance() {
             .unwrap_or(false)
     );
     drop(replacement);
+}
+
+#[test]
+fn rejects_a_copied_queue_as_a_second_live_instance() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    let copied = root.path().join("copied-queue");
+    copy_tree(&root.path().join("queue"), &copied);
+
+    assert!(matches!(
+        FileQueue::initialize(&copied, PackagePolicy::default()),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+}
+
+#[test]
+fn rejects_replaced_fixed_lock_files() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let queue_lock = root.path().join("queue/.locks/queue.lock");
+    fs::rename(&queue_lock, queue_lock.with_extension("detached"))
+        .unwrap_or_else(|error| panic!("queue lock must be moved aside: {error}"));
+    fs::write(&queue_lock, [])
+        .unwrap_or_else(|error| panic!("replacement queue lock must be created: {error}"));
+
+    assert!(matches!(
+        queue.begin(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let worker_lock = root.path().join("queue/.locks/repository-writer.lock");
+    fs::rename(&worker_lock, worker_lock.with_extension("detached"))
+        .unwrap_or_else(|error| panic!("Worker lock must be moved aside: {error}"));
+    fs::write(&worker_lock, [])
+        .unwrap_or_else(|error| panic!("replacement Worker lock must be created: {error}"));
+
+    assert!(matches!(
+        queue.try_worker_session(),
+        Err(WorkerQueueError::Queue(QueueError::InvalidQueueIdentity))
+    ));
 }
 
 #[test]

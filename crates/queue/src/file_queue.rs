@@ -28,6 +28,7 @@ const DIGEST_FILE_NAME: &str = "digest";
 const ACCEPTANCE_FILE_NAME: &str = "acceptance.json";
 const NEXT_SEQUENCE_FILE_NAME: &str = "next-sequence";
 const QUEUE_IDENTITY_FILE_NAME: &str = "queue-id";
+const QUEUE_ROOT_BINDING_FILE_NAME: &str = "queue-root-binding-v1";
 const QUARANTINE_MARKER_FILE_NAME: &str = ".quarantined-at";
 const WORKER_TEMP_DIRECTORY_NAME: &str = "worker-tmp";
 const LOCK_DIRECTORY_NAME: &str = ".locks";
@@ -109,7 +110,11 @@ pub struct FileQueue {
     root_handle: Arc<File>,
     identity: Revision,
     lock_file: PathBuf,
+    stable_lock_file: PathBuf,
+    queue_lock_handle: Arc<File>,
     worker_lock_file: PathBuf,
+    stable_worker_lock_file: PathBuf,
+    worker_lock_handle: Arc<File>,
     policy: PackagePolicy,
     maintenance_scanners: Arc<Mutex<MaintenanceScanners>>,
 }
@@ -166,12 +171,34 @@ impl FileQueue {
 
         ensure_lock_file(&lock_file)?;
         ensure_lock_file(&worker_lock_file)?;
+        let queue_lock_handle = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_file)
+                .map_err(QueueError::Io)?,
+        );
+        let worker_lock_handle = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&worker_lock_file)
+                .map_err(QueueError::Io)?,
+        );
+        let stable_lock_file = stable_file_path(&queue_lock_handle, &lock_file)?;
+        let stable_worker_lock_file = stable_file_path(&worker_lock_handle, &worker_lock_file)?;
         let initialization_lock = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&lock_file)
+            .open(&stable_lock_file)
             .map_err(QueueError::Io)?;
         initialization_lock.lock().map_err(QueueError::Io)?;
+        ensure_queue_root_binding(
+            &queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
+            &configured_queue_root,
+            &root_handle,
+            &queue_root,
+        )?;
         let identity =
             ensure_queue_identity_file(&queue_root.join(QUEUE_IDENTITY_FILE_NAME), &queue_root)?;
         ensure_sequence_file(&queue_root.join(NEXT_SEQUENCE_FILE_NAME), &queue_root)?;
@@ -187,7 +214,11 @@ impl FileQueue {
             configured_queue_root,
             identity,
             lock_file,
+            stable_lock_file,
+            queue_lock_handle,
             worker_lock_file,
+            stable_worker_lock_file,
+            worker_lock_handle,
             queue_root,
             root_handle,
             policy,
@@ -226,6 +257,11 @@ impl FileQueue {
                     if let Err(error) = lease.lock() {
                         let _ = fs::remove_dir_all(&staging_path);
                         return Err(QueueError::Io(error));
+                    }
+                    if let Err(error) = self.current_identity_locked() {
+                        drop(lease);
+                        let _ = fs::remove_dir_all(&staging_path);
+                        return Err(error);
                     }
                     drop(queue_lock);
                     return Ok(IncomingPackage {
@@ -308,6 +344,7 @@ impl FileQueue {
             sync_directory(&quarantine_root)?;
             sync_directory(&incoming_root)?;
         }
+        self.current_identity_locked()?;
         Ok(moved)
     }
 
@@ -351,6 +388,7 @@ impl FileQueue {
         if removed > 0 {
             sync_directory(&quarantine_root)?;
         }
+        self.current_identity_locked()?;
         Ok(removed)
     }
 
@@ -358,7 +396,7 @@ impl FileQueue {
         OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&self.lock_file)
+            .open(&self.stable_lock_file)
             .map_err(QueueError::Io)
     }
 
@@ -376,6 +414,13 @@ impl FileQueue {
                 return Err(QueueError::InvalidQueueIdentity);
             }
         }
+        validate_pinned_lock(&self.lock_file, &self.queue_lock_handle)?;
+        validate_pinned_lock(&self.worker_lock_file, &self.worker_lock_handle)?;
+        validate_queue_root_binding(
+            &self.queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
+            &self.configured_queue_root,
+            &self.root_handle,
+        )?;
         let stable_identity = read_queue_identity(&self.queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
         let configured_identity =
             read_queue_identity(&self.configured_queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
@@ -1029,6 +1074,97 @@ fn ensure_queue_identity_file(path: &Path, queue_root: &Path) -> Result<Revision
             Ok(identity)
         }
         Err(error) => Err(QueueError::Io(error)),
+    }
+}
+
+fn ensure_queue_root_binding(
+    path: &Path,
+    configured_root: &Path,
+    root_handle: &File,
+    queue_root: &Path,
+) -> Result<(), QueueError> {
+    let expected = queue_root_binding(configured_root, root_handle)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => validate_queue_root_binding(path, configured_root, root_handle),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if !accepted_states_are_empty(queue_root)? {
+                return Err(QueueError::InvalidQueueIdentity);
+            }
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(QueueError::Io)?;
+            file.write_all(&expected).map_err(QueueError::Io)?;
+            file.sync_all().map_err(QueueError::Io)?;
+            sync_directory(queue_root)
+        }
+        Err(error) => Err(QueueError::Io(error)),
+    }
+}
+
+fn queue_root_binding(configured_root: &Path, root_handle: &File) -> Result<Vec<u8>, QueueError> {
+    let mut expected = configured_root.as_os_str().as_encoded_bytes().to_vec();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = root_handle.metadata().map_err(QueueError::Io)?;
+        expected.push(0);
+        expected.extend_from_slice(&metadata.dev().to_le_bytes());
+        expected.extend_from_slice(&metadata.ino().to_le_bytes());
+    }
+    Ok(expected)
+}
+
+fn validate_queue_root_binding(
+    path: &Path,
+    configured_root: &Path,
+    root_handle: &File,
+) -> Result<(), QueueError> {
+    let expected = queue_root_binding(configured_root, root_handle)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 16 * 1024 => {
+            if fs::read(path).map_err(QueueError::Io)? == expected {
+                Ok(())
+            } else {
+                Err(QueueError::InvalidQueueIdentity)
+            }
+        }
+        Ok(_) => Err(QueueError::InvalidQueueIdentity),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(QueueError::InvalidQueueIdentity)
+        }
+        Err(error) => Err(QueueError::Io(error)),
+    }
+}
+
+fn validate_pinned_lock(path: &Path, pinned: &File) -> Result<(), QueueError> {
+    let configured = fs::metadata(path).map_err(QueueError::Io)?;
+    let pinned = pinned.metadata().map_err(QueueError::Io)?;
+    if !configured.is_file() {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if configured.dev() != pinned.dev() || configured.ino() != pinned.ino() {
+            return Err(QueueError::InvalidQueueIdentity);
+        }
+    }
+    Ok(())
+}
+
+fn stable_file_path(handle: &File, _fallback: &Path) -> Result<PathBuf, QueueError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let stable = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
+        fs::metadata(&stable).map_err(QueueError::Io)?;
+        Ok(stable)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(_fallback.to_path_buf())
     }
 }
 

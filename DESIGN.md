@@ -153,6 +153,13 @@ by the application, but its parent directory must already exist so the
 application can durably synchronize the new root entry without recursively
 creating unsynchronized ancestors.
 
+A Worker must run under a supervisor that terminates the entire Worker process
+group or control group, including Git descendants, before restarting recovery.
+For example, a systemd service uses control-group termination and a
+single-process container is not restarted until its previous container has
+fully stopped. Starting recovery while a Git child from the previous Worker can
+still run is unsupported and must fail closed operationally.
+
 A future Kubernetes deployment uses one StatefulSet replica and one persistent
 volume mounted by a single Pod. The volume must provide the file-system
 semantics above. Kubernetes compatibility does not imply initial support for
@@ -751,9 +758,12 @@ creation takes the fixed `queue/.locks/repository-writer.lock` without waiting
 and fails if another Worker owns it. This lock is separate from the fixed,
 short-lived `queue/.locks/queue.lock`. Because both identities are derived from
 the queue root rather than supplied by callers, independently initialized
-handles for the same queue cannot select different lock files. The Gateway can
-continue accepting requests while the Worker is otherwise idle or applying a
-batch.
+handles for the same queue cannot select different lock files. Each queue
+handle pins both lock-file inodes and opens an independent lock description
+through `/proc/self/fd` for every acquisition. Replacing either directory entry
+therefore invalidates the handle instead of creating a second lock universe.
+The Gateway can continue accepting requests while the Worker is otherwise idle
+or applying a batch.
 
 On Linux, each live queue handle retains an open descriptor for the initialized
 queue root and performs queue I/O through `/proc/self/fd/<fd>`. It also compares
@@ -764,6 +774,12 @@ snapshotting a queue into the same path therefore invalidates old handles
 without redirecting writes or acknowledging acceptance into the detached queue.
 Every returned claim retains a shared lease on the root descriptor for as long
 as it exposes a `/proc/self/fd/<fd>` package path.
+
+The queue stores an immutable root binding containing its configured canonical
+path and filesystem device/inode identity. A byte-for-byte copy is not accepted
+as a second live queue even when it preserves `queue-id`. Restoring storage onto
+a different filesystem identity is an explicit offline operator migration, not
+a live queue restart.
 
 Pending selection takes a fixed acceptance-sequence snapshot and incrementally
 walks the pending directory. Each call has a maximum number of directory
@@ -879,13 +895,17 @@ Git 2.36 or newer is required. Git subprocesses discard inherited `GIT_*`
 overrides, disable system/global configuration, hooks, signing, fsmonitor, and
 line-ending conversion, and reject repository-local configuration outside a
 small data-only allowlist. Object and reference mutations run with Git fsync
-enabled. Repository- and work-root-scoped file locks serialize every repository
-instance and prevent two repositories from sharing a journal namespace.
-Reciprocal immutable bindings connect the bare repository and disposable work
-root to the same canonical worktree and official branch. Recovery never
+enabled. Advisory locks taken directly on the pinned repository and work-root
+directory inodes serialize every repository instance and prevent replaceable
+lock files from creating a second writer universe. Reciprocal immutable
+bindings connect the bare repository and disposable work root to the same
+canonical worktree and official branch, including the configured paths and
+device/inode identities of all three roots. Recovery never
 guesses that a Git `.lock` file is stale:
 an orphaned but still-running Git child may own it, so automated recovery
-fails closed and requires verified operator intervention. Before
+fails closed and requires verified operator intervention. The process
+supervision requirement in section 6.3 prevents a replacement Worker from
+starting while such a descendant still runs. Before
 publication or recovery, the Worker verifies that the journaled commit exists,
 has the pinned base as its sole direct parent, and contains the exact batch and
 successful-request trailers recorded by the journal. A stale `preparing`
@@ -894,14 +914,18 @@ journal never silently rebases onto a changed official branch.
 The repository, canonical worktree, and disposable work root are canonicalized
 once during startup and pinned with open directory descriptors. Rust filesystem
 operations and Git subprocesses use `/proc/<worker-pid>/fd/<fd>` paths, while
-device and inode checks ensure that each configured path and fixed lock file
-still names the pinned object. The configured canonical worktree must be exactly
-Git's reported worktree root, not one of its subdirectories. After taking both
-writer locks, the Worker revalidates all pinned roots and fixed locks, path
-non-overlap, local Git configuration, bare-repository state, common directory,
-worktree root, checked-out official branch, and reciprocal bindings before
-starting or recovering a transaction. After reset and clean, every materialized
-canonical file and directory is synchronized before publication can complete.
+device and inode checks ensure that each configured path still names the pinned
+object. The transaction-journal and disposable-worktree subdirectories are
+pinned independently as well. The configured canonical worktree must be
+exactly Git's reported worktree root, not one of its subdirectories. After
+taking both root-directory writer locks, the Worker revalidates all pinned
+roots, path non-overlap, local Git configuration, bare-repository state, common
+directory, worktree root, checked-out official branch, and reciprocal bindings
+before starting or recovering a transaction. It repeats this validation
+immediately before the official-ref compare-and-swap and after canonical
+synchronization and cleanup, so it never reports a terminal outcome against a
+detached storage tree. After reset and clean, every materialized canonical file
+and directory is synchronized before publication can complete.
 
 An all-failed batch records the same durable claim tokens and failure outcomes
 in a `no_changes` journal even though it creates no Git commit.

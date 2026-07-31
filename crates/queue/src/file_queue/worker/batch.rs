@@ -6,10 +6,7 @@ use std::path::Path;
 use agent_knowledge_core::{BatchId, RequestId, Revision};
 
 use super::{ClaimedPackage, WorkerQueueError, next_attempt, revalidate_accepted};
-use crate::file_queue::{
-    FileQueue, NEXT_SEQUENCE_FILE_NAME, QueueState, ensure_directory, ensure_lock_file,
-    read_next_sequence, sync_directory,
-};
+use crate::file_queue::{FileQueue, NEXT_SEQUENCE_FILE_NAME, QueueState, read_next_sequence};
 
 /// Progress made while selecting and claiming one bounded Worker batch.
 #[derive(Debug)]
@@ -77,17 +74,10 @@ impl FileQueue {
     /// another process owns the writer lock, or an I/O error when the lock path
     /// cannot be initialized.
     pub fn try_worker_session(&self) -> Result<WorkerSession, WorkerQueueError> {
-        let writer_lock_file = &self.worker_lock_file;
-        if let Some(parent) = writer_lock_file.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            ensure_directory(parent).map_err(WorkerQueueError::Queue)?;
-        }
-        ensure_lock_file(writer_lock_file).map_err(WorkerQueueError::Queue)?;
         let writer_lock = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(writer_lock_file)
+            .open(&self.stable_worker_lock_file)
             .map_err(WorkerQueueError::Io)?;
         match writer_lock.try_lock() {
             Ok(()) => {}
@@ -96,11 +86,8 @@ impl FileQueue {
             }
             Err(TryLockError::Error(error)) => return Err(WorkerQueueError::Io(error)),
         }
-        if let Some(parent) = writer_lock_file.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            sync_directory(parent).map_err(WorkerQueueError::Queue)?;
-        }
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
         Ok(WorkerSession {
             queue: self.clone(),
             _writer_lock: writer_lock,
@@ -231,6 +218,9 @@ impl WorkerSession {
                 .open_queue_lock()
                 .map_err(WorkerQueueError::Queue)?;
             queue_lock.lock().map_err(WorkerQueueError::Io)?;
+            self.queue
+                .current_identity_locked()
+                .map_err(WorkerQueueError::Queue)?;
             let next_sequence =
                 read_next_sequence(&self.queue.queue_root.join(NEXT_SEQUENCE_FILE_NAME))
                     .map_err(WorkerQueueError::Queue)?;

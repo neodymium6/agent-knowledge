@@ -810,18 +810,36 @@ fn rejects_live_work_root_replacement() {
 }
 
 #[test]
-fn rejects_live_repository_lock_replacement() {
+fn repository_root_lock_is_exclusive_across_cloned_handles() {
     let root = TestDirectory::new();
     let fixture = GitFixture::initialize(root.path());
     let repository = fixture.open();
-    let lock_path = fixture
-        .repository
-        .join("agent-knowledge")
-        .join("writer.lock");
-    fs::rename(&lock_path, lock_path.with_extension("detached"))
-        .unwrap_or_else(|error| panic!("writer lock must be moved aside: {error}"));
-    fs::write(&lock_path, [])
-        .unwrap_or_else(|error| panic!("replacement writer lock must be created: {error}"));
+    let independently_cloned = repository.clone();
+    let writer = repository
+        .lock_writer()
+        .unwrap_or_else(|error| panic!("first writer lock must succeed: {error}"));
+
+    assert!(matches!(
+        independently_cloned.lock_writer(),
+        Err(GitTransactionError::RepositoryBusy(path)) if path == fixture.repository
+    ));
+    drop(writer);
+    independently_cloned
+        .lock_writer()
+        .unwrap_or_else(|error| panic!("writer lock must be reusable after release: {error}"));
+}
+
+#[test]
+fn rejects_live_transaction_directory_replacement() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let repository = fixture.open();
+    let transactions = fixture.work.join("transactions");
+    fs::rename(&transactions, fixture.work.join("detached-transactions"))
+        .unwrap_or_else(|error| panic!("transaction directory must be moved aside: {error}"));
+    fs::create_dir(&transactions).unwrap_or_else(|error| {
+        panic!("replacement transaction directory must be created: {error}")
+    });
 
     assert!(matches!(
         repository.lock_writer(),
@@ -1428,6 +1446,43 @@ fn compare_and_swap_refuses_a_concurrent_official_update() {
     );
     let canonical_index_tree = git_output(Some(&git.canonical), ["write-tree".into()]);
     assert_eq!(canonical_index_tree, base_tree);
+}
+
+#[test]
+fn publication_rejects_a_replaced_canonical_root() {
+    let root = TestDirectory::new();
+    let git = GitFixture::initialize(root.path());
+    let base = git.official_commit();
+    let (queue, mut worker) = queue_and_worker(&root.path().join("queue"));
+    let claim = enqueue_and_claim(
+        &queue,
+        &mut worker,
+        FIRST_REQUEST_ID,
+        &create_request(FIRST_REQUEST_ID, "Create a fictional experiment"),
+        &markdown(FIRST_REQUEST_ID, "Fictional experiment"),
+    );
+    let canonical = git.canonical.clone();
+    let detached = root.path().join("detached-content");
+    let result = git.open().apply_batch_with_hook(
+        &mut worker,
+        parse_batch_id(),
+        &[claim],
+        ContentPolicy::default(),
+        &PackagePolicy::default(),
+        TransactionHooks {
+            trial_build: accept_trial_build,
+            before_publish: move |_: &str, _: &str| {
+                fs::rename(&canonical, &detached).map_err(GitTransactionError::Io)?;
+                fs::create_dir(&canonical).map_err(GitTransactionError::Io)
+            },
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+    assert_eq!(git.official_commit(), base);
 }
 
 #[test]

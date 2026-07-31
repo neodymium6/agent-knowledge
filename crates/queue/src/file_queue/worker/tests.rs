@@ -327,6 +327,22 @@ impl ClaimHook for FailAtPhase {
     }
 }
 
+struct ReplaceQueueAtPhase {
+    phase: ClaimPhase,
+    queue_root: PathBuf,
+    detached_root: PathBuf,
+}
+
+impl ClaimHook for ReplaceQueueAtPhase {
+    fn reached(&mut self, phase: ClaimPhase) -> io::Result<()> {
+        if phase == self.phase {
+            fs::rename(&self.queue_root, &self.detached_root)?;
+            fs::create_dir(&self.queue_root)?;
+        }
+        Ok(())
+    }
+}
+
 #[test]
 fn retry_after_phase_write_advances_attempt_before_claiming() {
     let root = TestDirectory::create();
@@ -394,6 +410,36 @@ fn rename_interruption_can_be_recovered_with_the_durable_claim() {
     assert!(
         root.path()
             .join(format!("queue/pending/{request_id}"))
+            .is_dir()
+    );
+}
+
+#[test]
+fn claim_does_not_acknowledge_after_the_queue_root_is_replaced() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    let queue_root = root.path().join("queue");
+    let detached_root = root.path().join("detached-queue");
+    let result = queue.claim_with_hook(
+        parse_request_id(),
+        parse_batch_id(FIRST_BATCH_ID),
+        &mut ReplaceQueueAtPhase {
+            phase: ClaimPhase::QueueDirectoriesSynchronized,
+            queue_root,
+            detached_root: detached_root.clone(),
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(WorkerQueueError::Queue(
+            crate::QueueError::InvalidQueueIdentity
+        ))
+    ));
+    assert!(
+        detached_root
+            .join(format!("processing/{}", parse_request_id()))
             .is_dir()
     );
 }

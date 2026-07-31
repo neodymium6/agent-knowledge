@@ -52,6 +52,8 @@ impl FileQueue {
     ) -> Result<(), WorkerQueueError> {
         let queue_lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
         queue_lock.lock().map_err(WorkerQueueError::Io)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
 
         let Some(state) = find_existing_state_without_package_read(self, request_id)? else {
             return Err(WorkerQueueError::RequestNotFound { request_id });
@@ -76,11 +78,16 @@ impl FileQueue {
         write_result_record(self, &pending_path, &record)?;
 
         let failed_path = self.state_path(QueueState::Failed, request_id);
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
         fs::rename(&pending_path, failed_path).map_err(WorkerQueueError::Io)?;
         sync_directory(&self.queue_root.join(QueueState::Failed.directory_name()))
             .map_err(WorkerQueueError::Queue)?;
         sync_directory(&self.queue_root.join(QueueState::Pending.directory_name()))
-            .map_err(WorkerQueueError::Queue)
+            .map_err(WorkerQueueError::Queue)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
+        Ok(())
     }
 }
 

@@ -169,6 +169,8 @@ impl FileQueue {
     ) -> Result<ClaimedPackage, WorkerQueueError> {
         let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
         lock.lock().map_err(WorkerQueueError::Io)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
         self.ensure_pending_locked(request_id)?;
         drop(lock);
 
@@ -177,6 +179,8 @@ impl FileQueue {
             Err(error) => {
                 let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
                 lock.lock().map_err(WorkerQueueError::Io)?;
+                self.current_identity_locked()
+                    .map_err(WorkerQueueError::Queue)?;
                 match self.ensure_pending_locked(request_id) {
                     Ok(_) => return Err(error),
                     Err(state_error) => return Err(state_error),
@@ -222,6 +226,8 @@ impl FileQueue {
     ) -> Result<ClaimedPackage, WorkerQueueError> {
         let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
         lock.lock().map_err(WorkerQueueError::Io)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
         let stored_digest = self.ensure_pending_locked(request_id)?;
         if stored_digest != prepared.package.digest() {
             return Err(WorkerQueueError::CorruptState {
@@ -246,6 +252,8 @@ impl FileQueue {
             .map_err(WorkerQueueError::Io)?;
 
         let processing_path = self.state_path(QueueState::Processing, request_id);
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
         fs::rename(&pending_path, &processing_path).map_err(WorkerQueueError::Io)?;
         hook.reached(ClaimPhase::Renamed)
             .map_err(WorkerQueueError::Io)?;
@@ -260,6 +268,8 @@ impl FileQueue {
             .map_err(WorkerQueueError::Queue)?;
         hook.reached(ClaimPhase::QueueDirectoriesSynchronized)
             .map_err(WorkerQueueError::Io)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
 
         Ok(ClaimedPackage {
             token: ClaimToken {
@@ -306,6 +316,8 @@ impl FileQueue {
     fn requeue_claimed(&self, token: ClaimToken) -> Result<(), WorkerQueueError> {
         let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
         lock.lock().map_err(WorkerQueueError::Io)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
 
         let request_id = token.request_id;
         let Some((state, _)) = self
@@ -331,6 +343,8 @@ impl FileQueue {
         }
 
         let pending_path = self.state_path(QueueState::Pending, request_id);
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
         fs::rename(&processing_path, pending_path).map_err(WorkerQueueError::Io)?;
         sync_directory(&self.queue_root.join(QueueState::Pending.directory_name()))
             .map_err(WorkerQueueError::Queue)?;
@@ -339,7 +353,10 @@ impl FileQueue {
                 .queue_root
                 .join(QueueState::Processing.directory_name()),
         )
-        .map_err(WorkerQueueError::Queue)
+        .map_err(WorkerQueueError::Queue)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
+        Ok(())
     }
 
     fn validate_claimed(&self, claim: &ClaimedPackage) -> Result<(), WorkerQueueError> {
@@ -347,6 +364,8 @@ impl FileQueue {
         let request_id = token.request_id;
         let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
         lock.lock().map_err(WorkerQueueError::Io)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
         let processing_path = self.state_path(QueueState::Processing, request_id);
         if claim.package_root != processing_path {
             return Err(WorkerQueueError::ClaimChanged { request_id });
