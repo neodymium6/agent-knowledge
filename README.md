@@ -16,8 +16,9 @@ place.
 - OpenSSH forced commands provide the client transport and authentication
   boundary.
 - A durable file queue separates request acceptance from repository changes.
-- A single Repository Worker applies atomic changes, commits them with Git, and
-  publishes static releases with Quartz.
+- A single Repository Worker applies atomic changes and commits them with Git.
+- A bounded Quartz runner and pinned release store publish immutable static
+  releases through an atomically replaced `current` symlink.
 - A conventional Linux host is the initial target. The design remains
   compatible with a future single-replica Kubernetes deployment.
 

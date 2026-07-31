@@ -267,6 +267,13 @@ The Quartz command, configuration path, and integration directory are
 configuration values. A trial build must finish successfully before a release
 can become current.
 
+The Rust builder resolves an absolute executable and integration directory at
+startup, passes arguments without a shell, and appends Quartz's
+`build -d <content> -o <output>` interface. Standard input and process output
+are disconnected from request data and logs, and every invocation has a
+positive execution deadline. The service supervisor remains responsible for
+terminating any descendant process left behind by a failed external command.
+
 ### 7.4 Git remote
 
 The remote is an asynchronous backup target. A remote push failure does not
@@ -1057,6 +1064,8 @@ Each successful build is immutable:
 
 ```text
 releases/
+├── .staging/
+│   └── <batch-id>/
 ├── by-id/
 │   ├── 20260731T040000Z-<commit>/
 │   └── 20260731T040500Z-<commit>/
@@ -1074,6 +1083,19 @@ The Worker:
 
 If a build or activation fails, the previous `current` release remains
 available.
+
+The release store pins the release root, `.staging/`, and `by-id/` directory
+identities and requires them to share one Linux mount. Generated output is
+bounded by entry count, individual-file bytes, and total bytes; symbolic links,
+special files, and hard-linked files are rejected. Before promotion, each
+release receives a synchronized, versioned
+`.agent-knowledge-release.json` manifest binding its release ID, full commit
+ID, and UTC creation time. Promotion from `.staging/<batch-id>/` to `by-id/`
+and replacement of `current` are separately atomic and idempotent, so recovery
+can resume after either rename without replacing the previously active site.
+Failed or interrupted output may be removed only through a batch-scoped
+staging cleanup operation; prepared `by-id/` releases are never removed by the
+publication path.
 
 Release retention is configurable. Removal of old derived releases is an
 administrative maintenance operation and never removes content or accepted

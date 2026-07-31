@@ -36,6 +36,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-knowledge-release"
+version = "0.1.0"
+dependencies = [
+ "agent-knowledge-core",
+ "serde",
+ "serde_json",
+ "time",
+ "ulid",
+]
+
+[[package]]
 name = "agent-knowledge-repository"
 version = "0.1.0"
 dependencies = [
