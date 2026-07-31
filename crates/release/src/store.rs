@@ -362,8 +362,6 @@ impl ReleaseStore {
         if intent.commit != commit {
             return Err(ReleaseError::InvalidBatchIntent);
         }
-        let staging = batch.stable.join(SITE_DIRECTORY);
-        ensure_manifest(&staging.join(MANIFEST_FILE), &intent)?;
         self.prepare_batch(batch_id, batch, commit, intent.created_at)
     }
 
@@ -412,8 +410,15 @@ impl ReleaseStore {
             created_at,
         };
         ensure_real_directory(&staging)?;
-        self.ensure_batch_intent(batch_id, &manifest)?;
-        ensure_manifest(&staging.join(MANIFEST_FILE), &manifest)?;
+        match self.batch_intent(batch_id)? {
+            Some(intent) if intent == manifest => {}
+            Some(_) => return Err(ReleaseError::InvalidBatchIntent),
+            None => {
+                ensure_reserved_manifest_absent(&staging)?;
+                self.ensure_batch_intent(batch_id, &manifest)?;
+            }
+        }
+        publish_trusted_manifest(&batch.stable, &staging.join(MANIFEST_FILE), &manifest)?;
         if validate_release_tree_at(&staging, &batch.handle, self.policy, true)?
             != manifest.content_revision
         {
@@ -1066,6 +1071,7 @@ fn validate_release_id_component(release_id: &str) -> Result<(), ReleaseError> {
     }
 }
 
+#[cfg(test)]
 fn write_manifest(path: &Path, manifest: &ReleaseManifest) -> Result<(), ReleaseError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -1077,6 +1083,7 @@ fn write_manifest(path: &Path, manifest: &ReleaseManifest) -> Result<(), Release
     file.sync_all().map_err(ReleaseError::Io)
 }
 
+#[cfg(test)]
 fn ensure_manifest(path: &Path, manifest: &ReleaseManifest) -> Result<(), ReleaseError> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
@@ -1090,6 +1097,24 @@ fn ensure_manifest(path: &Path, manifest: &ReleaseManifest) -> Result<(), Releas
         Err(error) if error.kind() == io::ErrorKind::NotFound => write_manifest(path, manifest),
         Err(error) => Err(ReleaseError::Io(error)),
     }
+}
+
+fn ensure_reserved_manifest_absent(staging: &Path) -> Result<(), ReleaseError> {
+    match fs::symlink_metadata(staging.join(MANIFEST_FILE)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(ReleaseError::InvalidManifest),
+        Err(error) => Err(ReleaseError::Io(error)),
+    }
+}
+
+fn publish_trusted_manifest(
+    batch: &Path,
+    path: &Path,
+    manifest: &ReleaseManifest,
+) -> Result<(), ReleaseError> {
+    let mut contents = serde_json::to_vec(manifest).map_err(ReleaseError::ManifestEncoding)?;
+    contents.push(b'\n');
+    replace_regular_file(batch, path, &contents, "manifest")
 }
 
 fn read_manifest(release: &Path) -> Result<ReleaseManifest, ReleaseError> {

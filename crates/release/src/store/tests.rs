@@ -271,6 +271,45 @@ fn resumes_from_a_durable_batch_intent_before_promotion() {
 }
 
 #[test]
+fn repairs_a_partial_staging_manifest_from_durable_intent() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = build(&store, batch(FIRST_BATCH), "fictional output\n");
+    let created_at = timestamp("2026-07-31T04:00:00Z");
+    let manifest = ReleaseManifest {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        release_id: release_id(created_at, FIRST_COMMIT),
+        commit: FIRST_COMMIT.into(),
+        content_revision: validate_release_tree_at(
+            output.path(),
+            &output.0.batch_handle,
+            ReleasePolicy::default(),
+            false,
+        )
+        .unwrap_or_else(|error| panic!("staged output must validate: {error}")),
+        created_at,
+    };
+    store
+        .ensure_batch_intent(batch(FIRST_BATCH), &manifest)
+        .unwrap_or_else(|error| panic!("batch intent must be durable: {error}"));
+    fs::write(output.path().join(MANIFEST_FILE), b"{")
+        .unwrap_or_else(|error| panic!("partial manifest must be written: {error}"));
+    drop(output);
+
+    let recovered = store
+        .resume_prepare(batch(FIRST_BATCH), FIRST_COMMIT)
+        .unwrap_or_else(|error| panic!("partial staging manifest must be repaired: {error}"));
+    assert_eq!(recovered.release_id(), manifest.release_id);
+    assert_eq!(
+        read_manifest(&releases.join("by-id").join(recovered.release_id()))
+            .unwrap_or_else(|error| panic!("repaired manifest must be readable: {error}")),
+        manifest
+    );
+}
+
+#[test]
 fn intentless_staging_manifest_cannot_resume_preparation() {
     let root = TestDirectory::new();
     let releases = root.0.join("releases");
@@ -310,6 +349,29 @@ fn intentless_staging_manifest_cannot_resume_preparation() {
     store
         .discard_build(batch(FIRST_BATCH))
         .unwrap_or_else(|error| panic!("intentless staging must remain discardable: {error}"));
+}
+
+#[test]
+fn quartz_created_reserved_manifest_is_rejected_before_intent() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = build(&store, batch(FIRST_BATCH), "fictional output\n");
+    fs::write(
+        output.path().join(MANIFEST_FILE),
+        b"{\"fictional\":\"quartz-owned\"}\n",
+    )
+    .unwrap_or_else(|error| panic!("reserved output must be written: {error}"));
+
+    assert!(matches!(
+        store.prepare(output, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z")),
+        Err(ReleaseError::InvalidManifest)
+    ));
+    assert!(!releases.join("by-batch").join(FIRST_BATCH).exists());
+    store
+        .discard_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("rejected output must remain discardable: {error}"));
 }
 
 #[test]
