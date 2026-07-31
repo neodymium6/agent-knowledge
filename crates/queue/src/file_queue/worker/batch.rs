@@ -28,9 +28,10 @@ pub enum BatchClaimOutcome {
 /// Exclusive Repository Worker access to one file queue.
 #[derive(Debug)]
 pub struct WorkerSession {
-    queue: FileQueue,
+    pub(super) queue: FileQueue,
     _writer_lock: File,
     pending_scan: PendingBatchScan,
+    pub(super) processing_scan: Option<fs::ReadDir>,
 }
 
 #[derive(Debug, Default)]
@@ -106,6 +107,7 @@ impl FileQueue {
             queue: self.clone(),
             _writer_lock: writer_lock,
             pending_scan: PendingBatchScan::default(),
+            processing_scan: None,
         })
     }
 }
@@ -117,10 +119,11 @@ impl WorkerSession {
     ///
     /// Returns an error when the request cannot be durably claimed.
     pub fn claim(
-        &self,
+        &mut self,
         request_id: RequestId,
         batch_id: BatchId,
     ) -> Result<ClaimedPackage, WorkerQueueError> {
+        self.ensure_no_active_scan()?;
         self.queue.claim(request_id, batch_id)
     }
 
@@ -130,7 +133,8 @@ impl WorkerSession {
     ///
     /// Returns an error when the token is stale or the request cannot be
     /// durably moved.
-    pub fn requeue_claimed(&self, token: super::ClaimToken) -> Result<(), WorkerQueueError> {
+    pub fn requeue_claimed(&mut self, token: super::ClaimToken) -> Result<(), WorkerQueueError> {
+        self.ensure_no_active_scan()?;
         self.queue.requeue_claimed(token)
     }
 
@@ -145,7 +149,10 @@ impl WorkerSession {
     /// # Errors
     ///
     /// Returns an error for zero limits, changed scan parameters, malformed
-    /// pending entries, corrupt accepted packages, or failed durable claims.
+    /// queue entries, transient package reads, or failed durable claims. If
+    /// final claiming fails, callers must use
+    /// [`WorkerSession::scan_processing`] to recover any claims whose state
+    /// transition completed before the error.
     pub fn claim_next_batch(
         &mut self,
         batch_id: BatchId,
@@ -155,6 +162,9 @@ impl WorkerSession {
         if maximum_scan_entries == 0 || maximum_requests == 0 {
             return Err(WorkerQueueError::InvalidBatchLimits);
         }
+        if self.processing_scan.is_some() {
+            return Err(WorkerQueueError::ProcessingScanInProgress);
+        }
         if let Some(active_batch_id) = self.pending_scan.batch_id
             && (active_batch_id != batch_id
                 || self.pending_scan.maximum_requests != maximum_requests)
@@ -162,13 +172,12 @@ impl WorkerSession {
             return Err(WorkerQueueError::BatchScanChanged { active_batch_id });
         }
 
-        let queue_lock = self
-            .queue
-            .open_queue_lock()
-            .map_err(WorkerQueueError::Queue)?;
-        queue_lock.lock().map_err(WorkerQueueError::Io)?;
-
         if self.pending_scan.entries.is_none() {
+            let queue_lock = self
+                .queue
+                .open_queue_lock()
+                .map_err(WorkerQueueError::Queue)?;
+            queue_lock.lock().map_err(WorkerQueueError::Io)?;
             let next_sequence =
                 read_next_sequence(&self.queue.queue_root.join(NEXT_SEQUENCE_FILE_NAME))
                     .map_err(WorkerQueueError::Queue)?;
@@ -202,6 +211,7 @@ impl WorkerSession {
                     &self.queue,
                     &mut self.pending_scan,
                     entry,
+                    batch_id,
                     maximum_requests,
                 )
             });
@@ -220,6 +230,11 @@ impl WorkerSession {
 
         let candidates = std::mem::take(&mut self.pending_scan.candidates).into_sorted_vec();
         self.pending_scan = PendingBatchScan::default();
+        let queue_lock = self
+            .queue
+            .open_queue_lock()
+            .map_err(WorkerQueueError::Queue)?;
+        queue_lock.lock().map_err(WorkerQueueError::Io)?;
         let mut claimed = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             claimed.push(self.queue.claim_locked(
@@ -230,12 +245,27 @@ impl WorkerSession {
         }
         Ok(BatchClaimOutcome::Claimed(claimed))
     }
+
+    pub(super) fn ensure_no_active_scan(&self) -> Result<(), WorkerQueueError> {
+        match self.pending_scan.batch_id {
+            Some(active_batch_id) => Err(WorkerQueueError::BatchScanInProgress { active_batch_id }),
+            None if self.processing_scan.is_some() => {
+                Err(WorkerQueueError::ProcessingScanInProgress)
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub(super) const fn active_batch_id(&self) -> Option<BatchId> {
+        self.pending_scan.batch_id
+    }
 }
 
 fn retain_pending_candidate(
     queue: &FileQueue,
     scan: &mut PendingBatchScan,
     entry: fs::DirEntry,
+    batch_id: BatchId,
     maximum_requests: usize,
 ) -> Result<(), WorkerQueueError> {
     let path = entry.path();
@@ -263,7 +293,39 @@ fn retain_pending_candidate(
             detail: "entry name is not a canonical request ID",
         });
     }
-    let package = revalidate_accepted(&path, request_id, QueueState::Pending, &queue.policy)?;
+    let candidate = inspect_pending_candidate(queue, scan, &path, request_id);
+    let candidate = match candidate {
+        Ok(candidate) => candidate,
+        Err(error)
+            if matches!(
+                &error,
+                WorkerQueueError::CorruptPackage { .. }
+                    | WorkerQueueError::CorruptState { .. }
+                    | WorkerQueueError::InvalidPhaseMetadata(_)
+            ) =>
+        {
+            queue.fail_pending(request_id, batch_id, error.error_code())?;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(candidate) = candidate else {
+        return Ok(());
+    };
+    scan.candidates.push(candidate);
+    if scan.candidates.len() > maximum_requests {
+        let _ = scan.candidates.pop();
+    }
+    Ok(())
+}
+
+fn inspect_pending_candidate(
+    queue: &FileQueue,
+    scan: &PendingBatchScan,
+    path: &Path,
+    request_id: RequestId,
+) -> Result<Option<PendingCandidate>, WorkerQueueError> {
+    let package = revalidate_accepted(path, request_id, QueueState::Pending, &queue.policy)?;
     if package.request().request_id != request_id {
         return Err(WorkerQueueError::CorruptState {
             request_id,
@@ -278,15 +340,11 @@ fn retain_pending_candidate(
     })?;
     let sequence = acceptance.sequence.get();
     if sequence > scan.maximum_sequence {
-        return Ok(());
+        return Ok(None);
     }
-    let _ = next_attempt(&path, request_id, QueueState::Pending)?;
-    scan.candidates.push(PendingCandidate {
+    let _ = next_attempt(path, request_id, QueueState::Pending)?;
+    Ok(Some(PendingCandidate {
         sequence,
         request_id,
-    });
-    if scan.candidates.len() > maximum_requests {
-        let _ = scan.candidates.pop();
-    }
-    Ok(())
+    }))
 }

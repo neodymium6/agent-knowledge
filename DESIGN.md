@@ -712,7 +712,15 @@ walks the pending directory. Each call has a maximum number of directory
 entries to inspect, and the scanner retains only the earliest configured number
 of candidates in memory. Selection finishes the complete snapshot before
 claiming, then orders retained requests by acceptance sequence and request ID.
-Requests accepted after the snapshot began remain pending for the next batch.
+The queue lock is held only while taking the snapshot and while performing
+state transitions, not while reading and hashing immutable packages. Requests
+accepted after the snapshot began remain pending for the next batch.
+
+A pending package that has a canonical request ID but fails deterministic
+immutable validation is given an atomic `result.json` and moved to `failed/`.
+The scanner then continues, so one damaged request cannot indefinitely block
+unrelated valid work. Structurally invalid queue entries that cannot be safely
+identified as requests remain operator-visible corruption and stop the scan.
 
 The initial claim record is a bounded, versioned `phase.json` sidecar:
 
@@ -738,6 +746,13 @@ Returning a claimed request to `pending/` requires an exact token containing
 the request ID, batch ID, and attempt. This prevents a stale Worker from
 requeueing a later attempt owned by another batch. The phase record remains in
 the package so the next claim can advance the attempt monotonically.
+
+After acquiring the writer lock, a replacement Worker incrementally scans
+`processing/` with an explicit entry limit. It reconstructs exact claim tokens
+from validated packages and durable phase records. No other Worker transition
+is allowed until that recovery scan completes. This also recovers requests for
+which rename succeeded but the previous process failed before returning a
+token or completing directory synchronization.
 
 ## 17. Revisions and conflicts
 
@@ -957,7 +972,9 @@ A failed request is retained:
 
 ```json
 {
+  "schema_version": 1,
   "request_id": "01K00000000000000000000000",
+  "batch_id": "01K00000000000000000000010",
   "status": "failed",
   "error_code": "REVISION_CONFLICT",
   "failed_at": "2026-07-31T04:00:00+09:00"

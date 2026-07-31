@@ -14,6 +14,10 @@ use crate::{PackageValidationError, ValidatedPackage, validate_accepted_package}
 
 mod batch;
 pub use batch::{BatchClaimOutcome, WorkerSession};
+mod result;
+pub use result::{CURRENT_WORKER_RESULT_SCHEMA_VERSION, WorkerResultRecord, WorkerResultStatus};
+mod recovery;
+pub use recovery::ProcessingScanOutcome;
 
 const PHASE_FILE_NAME: &str = "phase.json";
 const MAXIMUM_PHASE_FILE_BYTES: u64 = 1_024;
@@ -415,6 +419,8 @@ pub enum WorkerQueueError {
     Io(io::Error),
     /// Worker-owned phase JSON could not be encoded.
     PhaseEncoding(serde_json::Error),
+    /// Worker-owned terminal result JSON could not be encoded.
+    ResultEncoding(serde_json::Error),
     /// Stored Worker phase JSON was malformed.
     InvalidPhaseMetadata(serde_json::Error),
     /// Another process currently owns the Repository Worker lock.
@@ -426,8 +432,24 @@ pub enum WorkerQueueError {
         /// Batch identifier that owns the active scan.
         active_batch_id: BatchId,
     },
+    /// Another Worker transition was requested during a pending batch scan.
+    BatchScanInProgress {
+        /// Batch identifier that owns the active scan.
+        active_batch_id: BatchId,
+    },
+    /// A processing recovery scan was active during another transition.
+    ProcessingScanInProgress,
+    /// A processing recovery scan limit was zero.
+    InvalidProcessingScanLimit,
     /// A pending directory entry did not have the required queue shape.
     InvalidPendingEntry {
+        /// Invalid entry path.
+        path: PathBuf,
+        /// Non-sensitive diagnostic.
+        detail: &'static str,
+    },
+    /// A processing directory entry did not have the required queue shape.
+    InvalidProcessingEntry {
         /// Invalid entry path.
         path: PathBuf,
         /// Non-sensitive diagnostic.
@@ -488,12 +510,18 @@ impl WorkerQueueError {
             | Self::InvalidState { .. }
             | Self::ClaimChanged { .. }
             | Self::InvalidBatchLimits
-            | Self::BatchScanChanged { .. } => ErrorCode::InvalidRequest,
+            | Self::BatchScanChanged { .. }
+            | Self::BatchScanInProgress { .. }
+            | Self::ProcessingScanInProgress
+            | Self::InvalidProcessingScanLimit => ErrorCode::InvalidRequest,
             Self::CorruptPackage { .. }
             | Self::CorruptState { .. }
             | Self::InvalidPendingEntry { .. }
+            | Self::InvalidProcessingEntry { .. }
             | Self::InvalidPhaseMetadata(_) => ErrorCode::ContentValidationFailed,
-            Self::PhaseEncoding(_) | Self::AttemptExhausted { .. } => ErrorCode::InternalError,
+            Self::PhaseEncoding(_) | Self::ResultEncoding(_) | Self::AttemptExhausted { .. } => {
+                ErrorCode::InternalError
+            }
         }
     }
 }
@@ -505,6 +533,9 @@ impl fmt::Display for WorkerQueueError {
             Self::Io(error) => write!(formatter, "Worker queue I/O failed: {error}"),
             Self::PhaseEncoding(error) => {
                 write!(formatter, "phase metadata JSON encoding failed: {error}")
+            }
+            Self::ResultEncoding(error) => {
+                write!(formatter, "result metadata JSON encoding failed: {error}")
             }
             Self::InvalidPhaseMetadata(error) => {
                 write!(formatter, "stored phase metadata JSON is invalid: {error}")
@@ -519,9 +550,23 @@ impl fmt::Display for WorkerQueueError {
                 formatter,
                 "batch scan for `{active_batch_id}` must finish before its parameters change"
             ),
+            Self::BatchScanInProgress { active_batch_id } => write!(
+                formatter,
+                "batch scan for `{active_batch_id}` must finish before another Worker transition"
+            ),
+            Self::ProcessingScanInProgress => formatter
+                .write_str("processing recovery scan must finish before another transition"),
+            Self::InvalidProcessingScanLimit => {
+                formatter.write_str("processing recovery scan limit must be greater than zero")
+            }
             Self::InvalidPendingEntry { path, detail } => write!(
                 formatter,
                 "pending queue entry `{}` is invalid: {detail}",
+                path.display()
+            ),
+            Self::InvalidProcessingEntry { path, detail } => write!(
+                formatter,
+                "processing queue entry `{}` is invalid: {detail}",
                 path.display()
             ),
             Self::RequestNotFound { request_id } => {
@@ -572,7 +617,9 @@ impl std::error::Error for WorkerQueueError {
         match self {
             Self::Queue(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::PhaseEncoding(error) | Self::InvalidPhaseMetadata(error) => Some(error),
+            Self::PhaseEncoding(error)
+            | Self::ResultEncoding(error)
+            | Self::InvalidPhaseMetadata(error) => Some(error),
             Self::CorruptPackage { source, .. } => Some(source),
             _ => None,
         }
