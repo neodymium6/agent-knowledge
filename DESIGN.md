@@ -1103,10 +1103,10 @@ tree. The tree revision is checked again before activation, so a changed
 prepared release cannot become current. Promotion from
 `.staging/<batch-id>/site/` to `by-id/` and replacement of `current` are
 separately atomic and idempotent. After a restart, the Worker can recover a
-validated prepared release through the bounded `by-commit/<commit>` lookup and
-resume after either rename without replacing the previously active site. The
-`by-commit/` references are derived indexes and may be rebuilt from validated
-release manifests through the bounded repair operation.
+validated prepared release through its durable `by-batch/<batch-id>` intent
+and resume after either rename without replacing the previously active site.
+The ready-only `by-commit/` references are derived indexes and may be rebuilt
+from validated release manifests through the bounded repair operation.
 
 The batch directory is pinned while a store-wide exclusive lease spans the
 build and live preparation. `prepare` consumes that lease-bearing build handle,

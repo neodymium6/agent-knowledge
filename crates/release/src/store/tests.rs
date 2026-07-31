@@ -10,7 +10,8 @@ use ulid::Ulid;
 
 use super::{
     BuildDirectory, MANIFEST_FILE, MANIFEST_SCHEMA_VERSION, ReleaseError, ReleaseManifest,
-    ReleasePolicy, ReleaseStore, ensure_manifest, release_id, validate_release_tree,
+    ReleasePolicy, ReleaseStore, derived_reference_is_repairable, ensure_manifest, release_id,
+    validate_release_tree,
 };
 
 const FIRST_BATCH: &str = "01K00000000000000000000001";
@@ -257,6 +258,27 @@ fn resumes_from_a_durable_batch_intent_before_promotion() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn rejects_a_malformed_batch_intent_as_recovery_metadata() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    symlink(
+        "../../fictional-release",
+        releases.join("by-batch").join(FIRST_BATCH),
+    )
+    .unwrap_or_else(|error| panic!("malformed batch intent fixture must be created: {error}"));
+
+    assert!(matches!(
+        store.discard_build(batch(FIRST_BATCH)),
+        Err(ReleaseError::InvalidBatchIntent)
+    ));
+}
+
 #[test]
 fn retrying_an_older_release_does_not_regress_commit_lookup() {
     let root = TestDirectory::new();
@@ -286,6 +308,61 @@ fn retrying_an_older_release_does_not_regress_commit_lookup() {
         .unwrap_or_else(|| panic!("newest release must remain indexed"));
     assert_ne!(first, second);
     assert_eq!(recovered, second);
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_intent_recovers_the_exact_release_without_regressing_commit_lookup() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let first = store
+        .prepare(
+            build(&store, batch(FIRST_BATCH), "first fictional output\n"),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("first release must prepare: {error}"));
+    let second = store
+        .prepare(
+            build(&store, batch(SECOND_BATCH), "second fictional output\n"),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:05:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("second release must prepare: {error}"));
+    let recovered_batch = releases.join(".staging").join(FIRST_BATCH);
+    let recovered_site = recovered_batch.join("site");
+    fs::create_dir_all(&recovered_site)
+        .unwrap_or_else(|error| panic!("recovered staging directory must be created: {error}"));
+    for name in ["index.html", MANIFEST_FILE] {
+        fs::copy(
+            releases.join("by-id").join(first.release_id()).join(name),
+            recovered_site.join(name),
+        )
+        .unwrap_or_else(|error| panic!("recovered staged file must be copied: {error}"));
+    }
+    symlink(
+        PathBuf::from("..").join("by-id").join(first.release_id()),
+        releases.join("by-batch").join(FIRST_BATCH),
+    )
+    .unwrap_or_else(|error| panic!("batch intent fixture must be created: {error}"));
+
+    let recovered = store
+        .resume_prepare(batch(FIRST_BATCH), FIRST_COMMIT)
+        .unwrap_or_else(|error| panic!("exact batch release must recover: {error}"));
+    assert_eq!(recovered, first);
+    assert_eq!(
+        store
+            .prepared_for_commit(FIRST_COMMIT)
+            .unwrap_or_else(|error| panic!("commit lookup must succeed: {error}"))
+            .unwrap_or_else(|| panic!("newest release must remain indexed")),
+        second
+    );
+    assert!(!recovered_batch.exists());
+    assert!(!releases.join("by-batch").join(FIRST_BATCH).exists());
 }
 
 #[test]
@@ -319,6 +396,19 @@ fn repairs_a_corrupt_derived_commit_reference() {
             .unwrap_or_else(|| panic!("repaired release must be found")),
         prepared
     );
+}
+
+#[test]
+fn transient_io_errors_do_not_authorize_derived_reference_replacement() {
+    assert!(!derived_reference_is_repairable(&ReleaseError::Io(
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "fictional transient read failure",
+        ),
+    )));
+    assert!(derived_reference_is_repairable(&ReleaseError::Io(
+        io::Error::new(io::ErrorKind::NotFound, "fictional missing release"),
+    )));
 }
 
 #[cfg(target_os = "linux")]

@@ -233,8 +233,7 @@ impl ReleaseStore {
             Ok(metadata) if metadata.file_type().is_dir() => {
                 let batch = lock_batch_directory(&configured, &path)?;
                 validate_pinned_directory(&batch.configured, &batch.handle)?;
-                fs::remove_dir_all(&configured).map_err(ReleaseError::Io)?;
-                sync_directory(&self.staging.stable)?;
+                self.remove_batch_directory(batch_id, &batch)?;
                 self.validate_live_storage()
             }
             Ok(_) => Err(ReleaseError::InvalidDirectory(path)),
@@ -292,10 +291,11 @@ impl ReleaseStore {
                 let manifest = read_manifest(&self.by_id.stable.join(&prepared.release_id))?;
                 if path_exists(&batch_path)? {
                     let batch = lock_batch_directory(&batch_configured, &batch_path)?;
-                    self.cleanup_recovered_staging(&batch, &manifest)?;
+                    self.cleanup_recovered_staging(batch_id, &batch, &manifest)?;
                 } else {
                     sync_directory(&self.staging.stable)?;
                 }
+                self.remove_batch_intent(batch_id)?;
                 return Ok(prepared);
             }
             if !path_exists(&batch_path)? {
@@ -311,10 +311,11 @@ impl ReleaseStore {
                     return Err(ReleaseError::InvalidBatchIntent);
                 }
                 validate_release(&destination, &manifest, self.policy)?;
+                sync_directory(&self.by_id.stable)?;
                 self.ensure_commit_reference(&manifest)?;
                 if path_exists(&batch_path)? {
                     let batch = lock_batch_directory(&batch_configured, &batch_path)?;
-                    self.cleanup_recovered_staging(&batch, &manifest)?;
+                    self.cleanup_recovered_staging(batch_id, &batch, &manifest)?;
                 } else {
                     sync_directory(&self.staging.stable)?;
                 }
@@ -363,7 +364,7 @@ impl ReleaseStore {
             }
             sync_directory(&self.by_id.stable)?;
             self.ensure_commit_reference(&manifest)?;
-            self.cleanup_recovered_staging(&batch, &manifest)?;
+            self.cleanup_recovered_staging(batch_id, &batch, &manifest)?;
             self.remove_batch_intent(batch_id)?;
             return Ok(PreparedRelease {
                 release_id,
@@ -390,11 +391,8 @@ impl ReleaseStore {
         // observe the source removal as durable.
         sync_directory(&self.by_id.stable)?;
         self.ensure_commit_reference(&manifest)?;
+        self.remove_batch_directory(batch_id, &batch)?;
         self.remove_batch_intent(batch_id)?;
-        sync_directory(&batch.stable)?;
-        validate_pinned_directory(&batch.configured, &batch.handle)?;
-        fs::remove_dir(&batch.configured).map_err(ReleaseError::Io)?;
-        sync_directory(&self.staging.stable)?;
         self.validate_live_storage()?;
         validate_release(&destination, &manifest, self.policy)?;
         Ok(PreparedRelease {
@@ -533,6 +531,7 @@ impl ReleaseStore {
 
     fn cleanup_recovered_staging(
         &self,
+        batch_id: BatchId,
         batch: &BatchLease,
         expected: &ReleaseManifest,
     ) -> Result<(), ReleaseError> {
@@ -552,8 +551,23 @@ impl ReleaseStore {
             Some(_) => return Err(ReleaseError::RecoveredBuildConflict),
             None => {}
         }
+        self.remove_batch_directory(batch_id, batch)
+    }
+
+    fn remove_batch_directory(
+        &self,
+        batch_id: BatchId,
+        batch: &BatchLease,
+    ) -> Result<(), ReleaseError> {
         validate_pinned_directory(&batch.configured, &batch.handle)?;
-        fs::remove_dir_all(&batch.configured).map_err(ReleaseError::Io)?;
+        let private = self
+            .staging
+            .stable
+            .join(format!(".cleanup-{batch_id}-{}", Ulid::generate()));
+        fs::rename(&batch.configured, &private).map_err(ReleaseError::Io)?;
+        sync_directory(&self.staging.stable)?;
+        validate_pinned_directory(&private, &batch.handle)?;
+        fs::remove_dir_all(&private).map_err(ReleaseError::Io)?;
         sync_directory(&self.staging.stable)?;
         self.validate_live_storage()
     }
@@ -569,7 +583,9 @@ impl ReleaseStore {
             return Err(ReleaseError::InvalidBatchIntent);
         }
         let target = fs::read_link(reference).map_err(ReleaseError::Io)?;
-        Ok(Some(release_id_from_commit_target(&target)?.into()))
+        let release_id =
+            release_id_from_commit_target(&target).map_err(|_| ReleaseError::InvalidBatchIntent)?;
+        Ok(Some(release_id.into()))
     }
 
     fn ensure_batch_intent(
@@ -622,15 +638,25 @@ impl ReleaseStore {
                     }
                     if let Ok(existing_id) = release_id_from_commit_target(&existing_target) {
                         let existing_path = self.by_id.stable.join(existing_id);
-                        if let Ok(existing) = read_manifest(&existing_path)
-                            && existing.commit == manifest.commit
-                            && existing.release_id == existing_id
-                            && validate_release(&existing_path, &existing, self.policy).is_ok()
-                            && existing.release_id > manifest.release_id
-                        {
-                            sync_directory(&self.by_commit.stable)?;
-                            self.validate_live_storage()?;
-                            return Ok(());
+                        match read_manifest(&existing_path) {
+                            Ok(existing)
+                                if existing.commit == manifest.commit
+                                    && existing.release_id == existing_id =>
+                            {
+                                match validate_release(&existing_path, &existing, self.policy) {
+                                    Ok(()) if existing.release_id > manifest.release_id => {
+                                        sync_directory(&self.by_commit.stable)?;
+                                        self.validate_live_storage()?;
+                                        return Ok(());
+                                    }
+                                    Ok(()) => {}
+                                    Err(error) if derived_reference_is_repairable(&error) => {}
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) if derived_reference_is_repairable(&error) => {}
+                            Err(error) => return Err(error),
                         }
                     }
                 }
@@ -712,6 +738,18 @@ impl ReleaseStore {
                 Err(ReleaseError::Io(error))
             }
         }
+    }
+}
+
+fn derived_reference_is_repairable(error: &ReleaseError) -> bool {
+    match error {
+        ReleaseError::InvalidDirectory(_)
+        | ReleaseError::InvalidManifest
+        | ReleaseError::ManifestDecoding(_)
+        | ReleaseError::EmptyOutput
+        | ReleaseError::UnsafeOutput(_) => true,
+        ReleaseError::Io(error) => error.kind() == io::ErrorKind::NotFound,
+        _ => false,
     }
 }
 
