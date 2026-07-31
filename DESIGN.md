@@ -143,16 +143,37 @@ requires:
 
 - atomic rename within a file system;
 - durable file and directory synchronization;
-- advisory file locking; and
-- normal POSIX file and directory semantics.
+- advisory `flock` locking on regular files and read-only directory
+  descriptors;
+- normal POSIX file and directory semantics; and
+- a mounted `/proc` file system exposing `/proc/self/fd` and allowing same-UID
+  Git descendants to resolve `/proc/<worker-pid>/fd`.
 
 All durable paths are configurable. Processes handle termination signals and
-shut down at transaction boundaries.
+shut down at transaction boundaries. The configured queue root may be created
+by the application, but its parent directory must already exist so the
+application can durably synchronize the new root entry without recursively
+creating unsynchronized ancestors.
+
+The queue root and every fixed queue child directory must be on the same Linux
+mount so all queue transitions have atomic-rename semantics. Initialization
+compares mount identities and rejects nested mounts before accepting work.
+
+A Worker must run under a supervisor that terminates the entire Worker process
+group or control group, including Git descendants, before restarting recovery.
+For example, a systemd service uses control-group termination and a
+single-process container is not restarted until its previous container has
+fully stopped. Starting recovery while a Git child from the previous Worker can
+still run is unsupported and must fail closed operationally.
 
 A future Kubernetes deployment uses one StatefulSet replica and one persistent
 volume mounted by a single Pod. The volume must provide the file-system
-semantics above. Kubernetes compatibility does not imply initial support for
-multiple Gateway or Worker replicas.
+semantics above and preserve inode identity across ordinary Pod restarts.
+Network filesystems that cannot take an exclusive `flock` on a read-only
+directory descriptor, including incompatible NFS configurations, are not
+supported as the transaction store. A local or block-backed filesystem with
+the required semantics is suitable. Kubernetes compatibility does not imply
+initial support for multiple Gateway or Worker replicas.
 
 SSH host keys, client public keys, Git credentials, and other secrets are
 deployment inputs. They are never stored in this repository or in committed
@@ -205,7 +226,7 @@ The Gateway:
 - receives only forced-command SSH sessions;
 - derives a client ID from the authenticated public key configuration;
 - validates the wire format and operation;
-- enforces request, file-count, and byte limits;
+- enforces request, file-count, stored-byte, and materialized-output limits;
 - rejects unsafe archive entries and paths;
 - validates request metadata and front matter;
 - derives create destinations from fixed rules;
@@ -264,12 +285,13 @@ knowledge/
 │   ├── processing/
 │   ├── completed/
 │   ├── failed/
+│   ├── queue-id              # immutable, synchronized queue instance ID
 │   └── .locks/                # fixed queue and Worker lock identities
 ├── repository/              # bare Git repository
 ├── releases/
 │   ├── by-id/
 │   └── current -> by-id/<release-id>/
-└── work/                    # disposable worktrees and builds
+└── work/                    # repository lock, journals, worktrees, and builds
 ```
 
 `repository/` is a bare Git repository. `content/` is its canonical linked
@@ -300,8 +322,8 @@ secondary classification.
 content/
 ├── index.md
 ├── inbox/
-│   └── YYYY/
-│       └── MM/
+│   └── <document-type>/
+│       └── <document-bundle>/
 ├── projects/
 │   └── <project>/
 │       ├── index.md
@@ -424,6 +446,11 @@ status: active
 `document_id` is a permanent ULID. Moving or archiving a document does not
 change it. Paths describe current classification and may change.
 
+Archiving is one atomic Worker operation. It moves the complete bundle and
+rewrites the Markdown front matter with `status: archived`, the archive
+request ID, and the queue acceptance time as `updated`. The Markdown body is
+preserved; generated front matter is normalized YAML.
+
 The exact required fields vary by operation and document type:
 
 - `schema_version`, `document_id`, `title`, `created`, `request_id`, and
@@ -434,7 +461,9 @@ The exact required fields vary by operation and document type:
 
 Timestamps use RFC 3339 with an explicit offset. The Gateway verifies
 client-supplied timestamps and records its own acceptance timestamp in the
-request package.
+request package. Request and document timestamps later than that durable
+acceptance time are rejected, so a client clock cannot prevent later
+Worker-owned lifecycle timestamps from advancing.
 
 Initial status values are:
 
@@ -462,11 +491,45 @@ project = cuda-solver
 document_type = log
 created = 2026-07-31T03:50:00+09:00
 
-projects/cuda-solver/logs/2026/07/31/
+projects/cuda-solver/logs/2026/07/31/035000-<document-id>/index.md
 ```
 
 If classification is incomplete but otherwise valid, the Gateway selects a
-date-based path below `inbox/`. Explicitly invalid classification is rejected.
+type-specific path below `inbox/`. Explicitly invalid classification is
+rejected.
+
+Every non-index document uses a bundle directory with `index.md` as its
+Markdown entry point. Attachments are stored beside that file, so moving or
+archiving the bundle preserves the complete document. Titles are never used as
+trusted path components. Initial canonical destinations are:
+
+```text
+root index:
+  index.md
+
+project index:
+  projects/<project>/index.md
+
+project log:
+  projects/<project>/logs/YYYY/MM/DD/HHMMSS-<document-id>/index.md
+
+other project document:
+  projects/<project>/<document-type>/YYYY-MM-DD-<document-id>/index.md
+
+unclassified document:
+  inbox/<document-type>/<same type-specific bundle>/index.md
+
+archived project document:
+  projects/<project>/archive/<document-type>/<bundle>/index.md
+
+archived unclassified document:
+  archive/<document-type>/<bundle>/index.md
+```
+
+The document-type directory names are `logs`, `experiments`, `decisions`,
+`runbooks`, and `references`. Index documents are mutable but are not moved or
+archived. Log bundles are append-only and cannot be moved or archived by
+normal client operations.
 
 Path validation occurs independently in the Gateway and Worker using the same
 shared Rust library. It:
@@ -705,9 +768,35 @@ creation takes the fixed `queue/.locks/repository-writer.lock` without waiting
 and fails if another Worker owns it. This lock is separate from the fixed,
 short-lived `queue/.locks/queue.lock`. Because both identities are derived from
 the queue root rather than supplied by callers, independently initialized
-handles for the same queue cannot select different lock files. The Gateway can
-continue accepting requests while the Worker is otherwise idle or applying a
-batch.
+handles for the same queue cannot select different lock files. Each queue
+handle pins both lock-file inodes and opens an independent lock description
+through `/proc/self/fd` for every acquisition. Replacing either directory entry
+therefore invalidates the handle instead of creating a second lock universe.
+Both lock identities are also part of the durable root binding, so a new handle
+cannot adopt replacement lock files after a restart. The Gateway can continue
+accepting requests while the Worker is otherwise idle or applying a batch.
+
+On Linux, each live queue handle retains an open descriptor for the initialized
+queue root and each fixed child directory, and performs queue I/O through
+`/proc/self/fd/<fd>`. It also compares every configured directory entry's
+device, inode, mount identity, and type, plus the immutable `queue-id`, with the
+pinned objects before Gateway staging, immediately before and after acceptance
+promotion, and before every Worker transition. It re-canonicalizes the
+configured root to detect replacement of an ancestor with a symlink. Renaming,
+bind-mounting, copying, or snapshotting a queue or one of its fixed directories
+therefore invalidates old handles without redirecting writes or acknowledging
+acceptance into a detached queue. Every returned claim retains a shared lease
+on the pinned `processing/` descriptor for as long as it exposes a
+`/proc/self/fd/<fd>` package path.
+
+The queue stores an immutable root binding containing its configured canonical
+path and the filesystem device/inode identities of the root, fixed lock files,
+and fixed child directories. A byte-for-byte copy is not accepted as a second
+live queue even when it preserves `queue-id`. On first initialization, fixed
+directory entries and both lock entries are synchronized before this binding is
+created. Restoring storage onto a different filesystem identity is not accepted
+by the initial implementation; a future offline migration procedure must
+deliberately rewrite the binding before such restores are supported.
 
 Pending selection takes a fixed acceptance-sequence snapshot and incrementally
 walks the pending directory. Each call has a maximum number of directory
@@ -793,7 +882,7 @@ The Worker performs these phases while holding the writer lock:
 2. Select a bounded batch of pending requests.
 3. Atomically move selected requests to `processing/`.
 4. Pin the current official commit.
-5. Create a temporary worktree and transaction branch.
+5. Create a detached temporary worktree and an internal transaction ref.
 6. Revalidate and apply each request in deterministic order.
 7. Remove permanently invalid requests from the candidate batch.
 8. Validate the resulting file hierarchy and Markdown.
@@ -810,9 +899,80 @@ The Worker performs these phases while holding the writer lock:
 The branch update uses compare-and-swap semantics. An unexpected branch change
 stops publication and requires recovery; it is never overwritten.
 
-The canonical checkout and release can be repaired from the official commit
-after a crash. Normal readers use the pinned official commit, not an
-in-progress checkout update.
+The Worker keeps one durable transaction journal at a time. A `preparing`
+journal is synchronized before disposable Git work begins. After the commit
+object and internal recovery ref exist, a `committed` journal containing the
+exact claim tokens and per-request outcomes is synchronized before the
+official branch can advance. A later batch cannot begin until this journal is
+reconciled and finalized. Each journal is bound to the canonical queue
+instance ID held by the live Worker session. Replacing a queue at the same path
+creates a different ID and invalidates sessions opened against the old queue.
+
+Git 2.36 or newer is required. Git subprocesses discard inherited `GIT_*`
+overrides, disable system/global configuration, hooks, signing, fsmonitor, and
+line-ending conversion, and reject repository-local configuration outside a
+small data-only allowlist. Object and reference mutations run with Git fsync
+enabled. Advisory locks taken directly on the pinned repository and work-root
+directory inodes serialize every repository instance and prevent replaceable
+lock files from creating a second writer universe. Reciprocal immutable
+bindings connect the bare repository and disposable work root to the same
+canonical worktree and official branch, including the configured paths and
+device/inode identities of all three roots and the journal and disposable
+worktree directories. Recovery never
+guesses that a Git `.lock` file is stale:
+an orphaned but still-running Git child may own it, so automated recovery
+fails closed and requires verified operator intervention. The process
+supervision requirement in section 6.3 prevents a replacement Worker from
+starting while such a descendant still runs. Before
+publication or recovery, the Worker verifies that the journaled commit exists,
+has the pinned base as its sole direct parent, and contains the exact batch and
+successful-request trailers recorded by the journal. A stale `preparing`
+journal never silently rebases onto a changed official branch.
+
+The repository, canonical worktree, and disposable work root are canonicalized
+once during startup and pinned with open directory descriptors. Rust filesystem
+operations and Git subprocesses use `/proc/<worker-pid>/fd/<fd>` paths, while
+device and inode checks ensure that each configured path still names the pinned
+object. The transaction-journal and disposable-worktree subdirectories are
+pinned independently as well. The configured canonical worktree must be
+exactly Git's reported worktree root, not one of its subdirectories. After
+taking both root-directory writer locks, the Worker revalidates all pinned
+roots, path non-overlap, local Git configuration, bare-repository state, common
+directory, worktree root, checked-out official branch, and reciprocal bindings
+before starting or recovering a transaction. It repeats this validation
+immediately before the official-ref compare-and-swap and after canonical
+synchronization and cleanup, so it never reports a terminal outcome against a
+detached storage tree. After reset and clean, every materialized canonical file
+and directory is synchronized before publication can complete. Creation and
+removal of disposable Git worktrees also synchronize the pinned `worktrees/`
+directory. If normal removal fails, recovery queries Git's registered worktree
+list and may directly remove only an unregistered direct child whose name is a
+canonical batch ID. A registered worktree removal failure remains an
+infrastructure error. Transaction aborts repeat live-storage validation after
+their journal removal before reporting success.
+
+An all-failed batch records the same durable claim tokens and failure outcomes
+in a `no_changes` journal even though it creates no Git commit.
+
+Committed recovery does not require every request to remain in `processing/`.
+The Worker reconstructs the original claim tokens from the journal, repairs
+publication and the canonical worktree idempotently, and then reconciles each
+queue result. This permits recovery after a crash partway through the
+successful and failed queue transitions. The journal is removed only after all
+of those transitions are durable. Queue reconciliation is idempotent and
+returns an opaque proof bound to the queue, batch, claim tokens, and failure
+codes; journal finalization accepts only that proof. Until release activation
+and this proof are implemented together, the repository crate does not expose
+terminal queue reconciliation or journal finalization.
+
+A synchronized `publication_started` journal marker is written before the
+official ref can advance. It authorizes recovery to replace partially updated
+tracked checkout state after an interrupted reset. Untracked or ignored files
+are accepted only when their paths and bytes exactly match the pinned base
+tree, which identifies old-tree residue from a move interrupted after the new
+index was installed; every other file fails closed. The canonical checkout and
+release can be repaired from the official commit after a crash. Normal readers
+use the pinned official commit, not an in-progress checkout update.
 
 ## 19. Batch isolation
 
@@ -822,6 +982,23 @@ must not make unrelated valid requests fail.
 The Worker applies and validates requests sequentially in a temporary
 worktree. A request that fails its own validation is rolled back in that
 worktree and moved to `failed/`. Remaining requests continue.
+Canonical Markdown bodies are loaded lazily only for archive operations.
+Payload output buffers use one no-copy shared allocation between the virtual
+document view and the mutation plan. Payload output, generated archive bytes,
+and every other planned write share one checked per-request materialization
+bound. Validated payload lengths are reserved before reading, and generated
+archive length is reserved before allocating its output buffer. One bounded
+source document plus a separately bounded metadata-encoding scratch buffer may
+additionally exist while archive front matter is generated.
+Worker-generated Markdown is validated against document and front-matter limits
+before any filesystem mutation.
+
+Operations within one request share an in-memory document view. For example,
+an update followed by archive archives the updated bytes, and a move followed
+by archive uses the moved path. The Worker records ordered bundle-level moves
+and replays them when pairing base-tree deletions with final-tree additions.
+This remains bounded by operation count, supports path reuse, and does not
+depend on Git's content-similarity heuristic.
 
 If the final Quartz build fails:
 
@@ -833,7 +1010,12 @@ If the final Quartz build fails:
 - unaffected requests are rebuilt and committed together.
 
 This fallback is slower than the normal batch path but preserves request-level
-isolation.
+isolation. The repository transaction API can securely abort only a
+`preparing` journal whose queue, claims, and pinned official base still match,
+allowing the Worker to requeue and bisect a deterministic failure. A successful
+trial builder must leave its input worktree and index unchanged; the Worker
+verifies the staged tree, tracked bytes, and untracked/ignored set before
+creating the commit.
 
 ## 20. Commit policy
 
@@ -860,6 +1042,7 @@ Files-Added: 6
 Files-Modified: 1
 Files-Deleted: 0
 
+Batch-ID: 01K00000000000000000000004
 Knowledge-Request: 01K00000000000000000000001
 Knowledge-Request: 01K00000000000000000000002
 Knowledge-Request: 01K00000000000000000000003

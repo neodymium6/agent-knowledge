@@ -8,8 +8,8 @@ use std::path::Path;
 use std::{cell::Cell, thread_local};
 
 use agent_knowledge_core::{
-    ChangeRequest, DocumentId, DocumentLimits, DocumentMetadata, DocumentValidationError,
-    Operation, PayloadPath, RequestId,
+    ChangeRequest, DocumentId, DocumentLimits, DocumentMetadata, DocumentParseError,
+    DocumentValidationError, Operation, PayloadPath, RequestId, decode_document_metadata,
 };
 
 #[cfg(test)]
@@ -67,31 +67,8 @@ fn parse_document(
 
     let bytes =
         fs::read(payload_root.join(payload_path.as_str())).map_err(MarkdownValidationError::Io)?;
-    let markdown = std::str::from_utf8(&bytes)
-        .map_err(|_| MarkdownValidationError::InvalidUtf8(payload_path.clone()))?;
-    let yaml = extract_front_matter(markdown, payload_path, maximum_front_matter_bytes)?;
-    let options = serde_saphyr::options! {
-        budget: serde_saphyr::budget! {
-            max_events: maximum_front_matter_bytes,
-            max_aliases: 0,
-            max_anchors: 0,
-            max_depth: 16,
-            max_documents: 1,
-            max_nodes: maximum_front_matter_bytes,
-            max_total_scalar_bytes: maximum_front_matter_bytes,
-            max_total_comment_bytes: maximum_front_matter_bytes,
-            max_merge_keys: 0,
-        },
-        merge_keys: serde_saphyr::MergeKeyPolicy::Error,
-        strict_booleans: true,
-        with_snippet: false,
-    };
-    let metadata = serde_saphyr::from_str_with_options::<DocumentMetadata>(yaml, options).map_err(
-        |source| MarkdownValidationError::InvalidYaml {
-            path: payload_path.clone(),
-            source: Box::new(source),
-        },
-    )?;
+    let metadata = decode_document_metadata(&bytes, maximum_front_matter_bytes)
+        .map_err(|error| map_parse_error(payload_path, error))?;
     metadata
         .validate(request.document_type, limits)
         .map_err(|source| MarkdownValidationError::InvalidMetadata {
@@ -129,6 +106,29 @@ fn parse_document(
     Ok(metadata)
 }
 
+fn map_parse_error(path: &PayloadPath, error: DocumentParseError) -> MarkdownValidationError {
+    match error {
+        DocumentParseError::InvalidUtf8 => MarkdownValidationError::InvalidUtf8(path.clone()),
+        DocumentParseError::MissingOpeningDelimiter => {
+            MarkdownValidationError::MissingOpeningDelimiter(path.clone())
+        }
+        DocumentParseError::MissingClosingDelimiter => {
+            MarkdownValidationError::MissingClosingDelimiter(path.clone())
+        }
+        DocumentParseError::FrontMatterTooLarge { maximum, actual } => {
+            MarkdownValidationError::FrontMatterTooLarge {
+                path: path.clone(),
+                maximum,
+                actual,
+            }
+        }
+        DocumentParseError::InvalidYaml(source) => MarkdownValidationError::InvalidYaml {
+            path: path.clone(),
+            source,
+        },
+    }
+}
+
 #[cfg(test)]
 pub(super) fn reset_document_parse_count() {
     DOCUMENT_PARSE_COUNT.set(0);
@@ -159,47 +159,6 @@ fn validate_operation_metadata(
     }
 
     Ok(())
-}
-
-fn extract_front_matter<'a>(
-    markdown: &'a str,
-    path: &PayloadPath,
-    maximum_bytes: usize,
-) -> Result<&'a str, MarkdownValidationError> {
-    let remainder = markdown
-        .strip_prefix("---\n")
-        .or_else(|| markdown.strip_prefix("---\r\n"))
-        .ok_or_else(|| MarkdownValidationError::MissingOpeningDelimiter(path.clone()))?;
-
-    let mut offset = 0_usize;
-    for line in remainder.split_inclusive('\n') {
-        let without_newline = line.strip_suffix('\n').unwrap_or(line);
-        let content = without_newline
-            .strip_suffix('\r')
-            .unwrap_or(without_newline);
-        if content == "---" {
-            if offset > maximum_bytes {
-                return Err(MarkdownValidationError::FrontMatterTooLarge {
-                    path: path.clone(),
-                    maximum: maximum_bytes,
-                    actual: offset,
-                });
-            }
-            return Ok(&remainder[..offset]);
-        }
-        offset += line.len();
-        if offset > maximum_bytes {
-            return Err(MarkdownValidationError::FrontMatterTooLarge {
-                path: path.clone(),
-                maximum: maximum_bytes,
-                actual: offset,
-            });
-        }
-    }
-
-    Err(MarkdownValidationError::MissingClosingDelimiter(
-        path.clone(),
-    ))
 }
 
 fn validate_optional_request_metadata(
@@ -366,6 +325,3 @@ impl std::error::Error for MarkdownValidationError {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

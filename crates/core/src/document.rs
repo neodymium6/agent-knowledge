@@ -57,6 +57,29 @@ impl DocumentMetadata {
         document_type: DocumentType,
         limits: DocumentLimits,
     ) -> Result<(), DocumentValidationError> {
+        self.validate_common(limits)?;
+
+        if document_type == DocumentType::Log {
+            if self.node.is_none() {
+                return Err(DocumentValidationError::MissingLogMetadata { field: "node" });
+            }
+            if self.agent.is_none() {
+                return Err(DocumentValidationError::MissingLogMetadata { field: "agent" });
+            }
+            if self.session.is_none() {
+                return Err(DocumentValidationError::MissingLogMetadata { field: "session" });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates front-matter invariants shared by every document type.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first deterministic metadata validation failure.
+    pub fn validate_common(&self, limits: DocumentLimits) -> Result<(), DocumentValidationError> {
         if self.schema_version != CURRENT_DOCUMENT_SCHEMA_VERSION {
             return Err(DocumentValidationError::UnsupportedSchemaVersion {
                 found: self.schema_version,
@@ -95,18 +118,6 @@ impl DocumentMetadata {
             validate_text("tag", tag, limits.maximum_tag_characters)?;
             if !tags.insert(tag.as_str()) {
                 return Err(DocumentValidationError::DuplicateTag(tag.clone()));
-            }
-        }
-
-        if document_type == DocumentType::Log {
-            if self.node.is_none() {
-                return Err(DocumentValidationError::MissingLogMetadata { field: "node" });
-            }
-            if self.agent.is_none() {
-                return Err(DocumentValidationError::MissingLogMetadata { field: "agent" });
-            }
-            if self.session.is_none() {
-                return Err(DocumentValidationError::MissingLogMetadata { field: "session" });
             }
         }
 

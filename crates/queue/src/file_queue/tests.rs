@@ -11,7 +11,8 @@ use agent_knowledge_core::{ErrorCode, PayloadPath};
 
 use super::{
     AcceptanceHook, AcceptancePhase, DirectoryScanner, EnqueueOutcome, FileQueue, IncomingPackage,
-    QueueError, QueueLimit, QueueState, StaleAgeSource, inactive_stale_directories,
+    QueueError, QueueLimit, QueueState, StaleAgeSource, WorkerQueueError,
+    inactive_stale_directories,
 };
 use crate::{PackageLimits, PackagePolicy, validate_accepted_package};
 
@@ -146,6 +147,229 @@ fn incoming_is_empty(root: &Path) -> bool {
         Err(error) => panic!("incoming directory must be readable: {error}"),
     };
     entries.next().is_none()
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir(destination)
+        .unwrap_or_else(|error| panic!("copied directory must be created: {error}"));
+    let entries = fs::read_dir(source)
+        .unwrap_or_else(|error| panic!("source directory must be readable: {error}"));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| panic!("source entry must be readable: {error}"));
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = entry
+            .metadata()
+            .unwrap_or_else(|error| panic!("source metadata must be readable: {error}"));
+        if metadata.is_dir() {
+            copy_tree(&source_path, &destination_path);
+        } else if metadata.is_file() {
+            fs::copy(&source_path, &destination_path)
+                .unwrap_or_else(|error| panic!("source file must be copied: {error}"));
+        } else {
+            panic!("queue fixture must contain only directories and regular files");
+        }
+    }
+}
+
+#[test]
+fn initialization_requires_an_existing_parent_directory() {
+    let root = TestDirectory::create();
+    let queue_root = root.path().join("missing-parent").join("queue");
+    assert!(matches!(
+        FileQueue::initialize(&queue_root, PackagePolicy::default()),
+        Err(QueueError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+    ));
+    assert!(!queue_root.exists());
+}
+
+#[test]
+fn a_replaced_queue_invalidates_gateway_staging_and_acceptance() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let staged = stage_package(&queue, RESULTS);
+    let queue_path = root.path().join("queue");
+    let detached_path = root.path().join("detached-queue");
+    if let Err(error) = fs::rename(&queue_path, &detached_path) {
+        panic!("original queue must be moved aside: {error}");
+    }
+    let replacement = match FileQueue::initialize(&queue_path, PackagePolicy::default()) {
+        Ok(queue) => queue,
+        Err(error) => panic!("replacement queue must initialize: {error}"),
+    };
+    fs::copy(detached_path.join("queue-id"), queue_path.join("queue-id"))
+        .unwrap_or_else(|error| panic!("replacement must preserve the copied queue ID: {error}"));
+
+    assert!(matches!(
+        queue.begin(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+    assert!(matches!(
+        staged.accept(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+    assert!(incoming_is_empty(root.path()));
+    assert!(
+        fs::read_dir(detached_path.join("pending"))
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+    );
+    drop(replacement);
+}
+
+#[test]
+fn rejects_a_copied_queue_as_a_second_live_instance() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    let copied = root.path().join("copied-queue");
+    copy_tree(&root.path().join("queue"), &copied);
+
+    assert!(matches!(
+        FileQueue::initialize(&copied, PackagePolicy::default()),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+}
+
+#[test]
+fn rejects_replaced_fixed_lock_files() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let queue_lock = root.path().join("queue/.locks/queue.lock");
+    fs::rename(&queue_lock, queue_lock.with_extension("detached"))
+        .unwrap_or_else(|error| panic!("queue lock must be moved aside: {error}"));
+    fs::write(&queue_lock, [])
+        .unwrap_or_else(|error| panic!("replacement queue lock must be created: {error}"));
+
+    assert!(matches!(
+        queue.begin(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+    assert!(matches!(
+        FileQueue::initialize(root.path().join("queue"), PackagePolicy::default()),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let worker = queue
+        .try_worker_session()
+        .unwrap_or_else(|error| panic!("original Worker lock must be held: {error}"));
+    let worker_lock = root.path().join("queue/.locks/repository-writer.lock");
+    fs::rename(&worker_lock, worker_lock.with_extension("detached"))
+        .unwrap_or_else(|error| panic!("Worker lock must be moved aside: {error}"));
+    fs::write(&worker_lock, [])
+        .unwrap_or_else(|error| panic!("replacement Worker lock must be created: {error}"));
+
+    assert!(matches!(
+        worker.queue_identity(),
+        Err(WorkerQueueError::Queue(QueueError::InvalidQueueIdentity))
+    ));
+    assert!(matches!(
+        FileQueue::initialize(root.path().join("queue"), PackagePolicy::default()),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+    drop(worker);
+}
+
+#[test]
+fn rejects_replaced_fixed_queue_directories() {
+    for directory in [
+        ".locks",
+        "incoming",
+        "quarantine",
+        "worker-tmp",
+        "pending",
+        "processing",
+        "completed",
+        "failed",
+    ] {
+        let root = TestDirectory::create();
+        let queue = initialize_queue(root.path(), PackagePolicy::default());
+        let entry = root.path().join("queue").join(directory);
+        let detached = root.path().join(format!("detached-{directory}"));
+        fs::rename(&entry, &detached)
+            .unwrap_or_else(|error| panic!("{directory} must be moved aside: {error}"));
+        fs::create_dir(&entry)
+            .unwrap_or_else(|error| panic!("replacement {directory} must be created: {error}"));
+
+        assert!(matches!(
+            queue.begin(),
+            Err(QueueError::InvalidQueueIdentity)
+        ));
+        assert!(matches!(
+            FileQueue::initialize(root.path().join("queue"), PackagePolicy::default()),
+            Err(QueueError::InvalidQueueIdentity)
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_symlinks_that_restore_replaced_queue_entries() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let queue_entry = root.path().join("queue");
+    let detached_queue = root.path().join("detached-queue");
+    fs::rename(&queue_entry, &detached_queue)
+        .unwrap_or_else(|error| panic!("queue root must be moved aside: {error}"));
+    symlink(&detached_queue, &queue_entry)
+        .unwrap_or_else(|error| panic!("queue root symlink must be created: {error}"));
+    assert!(matches!(
+        queue.begin(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let pending = root.path().join("queue/pending");
+    let detached_pending = root.path().join("detached-pending");
+    fs::rename(&pending, &detached_pending)
+        .unwrap_or_else(|error| panic!("pending directory must be moved aside: {error}"));
+    symlink(&detached_pending, &pending)
+        .unwrap_or_else(|error| panic!("pending symlink must be created: {error}"));
+    assert!(matches!(
+        queue.begin(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let queue_lock = root.path().join("queue/.locks/queue.lock");
+    let detached_lock = root.path().join("detached-queue-lock");
+    fs::rename(&queue_lock, &detached_lock)
+        .unwrap_or_else(|error| panic!("queue lock must be moved aside: {error}"));
+    symlink(&detached_lock, &queue_lock)
+        .unwrap_or_else(|error| panic!("queue lock symlink must be created: {error}"));
+    assert!(matches!(
+        queue.begin(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_an_ancestor_symlink_that_restores_the_queue_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::create();
+    let ancestor = root.path().join("configured");
+    fs::create_dir(&ancestor)
+        .unwrap_or_else(|error| panic!("configured ancestor must be created: {error}"));
+    let queue = FileQueue::initialize(ancestor.join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("fixture queue must initialize: {error}"));
+    let detached_ancestor = root.path().join("detached-configured");
+    fs::rename(&ancestor, &detached_ancestor)
+        .unwrap_or_else(|error| panic!("configured ancestor must be moved aside: {error}"));
+    symlink(&detached_ancestor, &ancestor)
+        .unwrap_or_else(|error| panic!("ancestor symlink must be created: {error}"));
+
+    assert!(matches!(
+        queue.begin(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
 }
 
 #[test]
@@ -549,7 +773,10 @@ fn enforces_directory_and_path_component_limits_before_writing() {
         Ok(policy) => policy,
         Err(error) => panic!("fixture policy must be valid: {error}"),
     };
-    let entry_queue = initialize_queue(&root.path().join("entry-limit"), entry_policy);
+    let entry_root = root.path().join("entry-limit");
+    fs::create_dir(&entry_root)
+        .unwrap_or_else(|error| panic!("entry-limit queue parent must be created: {error}"));
+    let entry_queue = initialize_queue(&entry_root, entry_policy);
     let mut entry_package = match entry_queue.begin() {
         Ok(package) => package,
         Err(error) => panic!("entry-limit package must begin: {error}"),
@@ -592,6 +819,42 @@ impl AcceptanceHook for FailAfterExistingDirectoriesSynchronized {
             Ok(())
         }
     }
+}
+
+struct ReplaceQueueAfterSynchronization {
+    configured: PathBuf,
+    detached: PathBuf,
+}
+
+impl AcceptanceHook for ReplaceQueueAfterSynchronization {
+    fn reached(&mut self, phase: AcceptancePhase) -> io::Result<()> {
+        if phase == AcceptancePhase::QueueDirectoriesSynchronized {
+            fs::rename(&self.configured, &self.detached)?;
+            FileQueue::initialize(&self.configured, PackagePolicy::default())
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn queue_replacement_before_acceptance_response_prevents_acknowledgement() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let mut hook = ReplaceQueueAfterSynchronization {
+        configured: root.path().join("queue"),
+        detached: root.path().join("detached-queue"),
+    };
+
+    assert!(matches!(
+        stage_package(&queue, RESULTS).accept_with_hook(&mut hook),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+    assert!(
+        fs::read_dir(root.path().join("queue/pending"))
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+    );
 }
 
 #[test]

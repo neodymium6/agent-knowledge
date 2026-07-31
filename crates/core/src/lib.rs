@@ -3,6 +3,7 @@
 mod document;
 mod error_code;
 mod id;
+mod markdown;
 mod path;
 mod request;
 mod revision;
@@ -12,6 +13,7 @@ pub use document::{
 };
 pub use error_code::{DocumentStatus, ErrorCode};
 pub use id::{BatchId, DocumentId, RequestId, SessionId};
+pub use markdown::{DocumentParseError, decode_document_metadata};
 pub use path::{AttachmentName, PathValidationError, PayloadPath, ProjectId};
 pub use request::{
     CURRENT_PROTOCOL_VERSION, ChangeRequest, DocumentType, Operation, RequestDecodeError,

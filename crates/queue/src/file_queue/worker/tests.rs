@@ -209,6 +209,23 @@ fn claims_pending_package_with_durable_phase_record() {
 }
 
 #[test]
+fn a_claim_retains_its_pinned_processing_directory_lease() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    let mut worker = open_worker(&queue);
+    let claim = worker
+        .claim(parse_request_id(), parse_batch_id(FIRST_BATCH_ID))
+        .unwrap_or_else(|error| panic!("pending request must be claimed: {error}"));
+
+    drop(worker);
+    drop(queue);
+
+    assert!(claim.package_root().is_dir());
+    assert!(claim.package_root().join("request.json").is_file());
+}
+
+#[test]
 fn requeue_requires_current_token_and_increments_the_next_attempt() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path());
@@ -246,6 +263,32 @@ fn requeue_requires_current_token_and_increments_the_next_attempt() {
 }
 
 #[test]
+fn live_worker_validation_rejects_a_requeued_claim() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    let request_id = parse_request_id();
+    let mut worker = open_worker(&queue);
+    let claim = match worker.claim(request_id, parse_batch_id(FIRST_BATCH_ID)) {
+        Ok(claim) => claim,
+        Err(error) => panic!("fixture claim must succeed: {error}"),
+    };
+    if let Err(error) = worker.validate_claimed(&claim) {
+        panic!("current claim must validate: {error}");
+    }
+    if let Err(error) = worker.requeue_claimed(claim.token()) {
+        panic!("current claim must requeue: {error}");
+    }
+    assert!(matches!(
+        worker.validate_claimed(&claim),
+        Err(WorkerQueueError::InvalidState {
+            request_id: changed,
+            ..
+        }) if changed == request_id
+    ));
+}
+
+#[test]
 fn claim_rejects_corrupt_stored_phase_metadata() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path());
@@ -279,6 +322,22 @@ impl ClaimHook for FailAtPhase {
     fn reached(&mut self, phase: ClaimPhase) -> io::Result<()> {
         if phase == self.phase {
             return Err(io::Error::other("injected claim interruption"));
+        }
+        Ok(())
+    }
+}
+
+struct ReplaceQueueAtPhase {
+    phase: ClaimPhase,
+    queue_root: PathBuf,
+    detached_root: PathBuf,
+}
+
+impl ClaimHook for ReplaceQueueAtPhase {
+    fn reached(&mut self, phase: ClaimPhase) -> io::Result<()> {
+        if phase == self.phase {
+            fs::rename(&self.queue_root, &self.detached_root)?;
+            fs::create_dir(&self.queue_root)?;
         }
         Ok(())
     }
@@ -351,6 +410,36 @@ fn rename_interruption_can_be_recovered_with_the_durable_claim() {
     assert!(
         root.path()
             .join(format!("queue/pending/{request_id}"))
+            .is_dir()
+    );
+}
+
+#[test]
+fn claim_does_not_acknowledge_after_the_queue_root_is_replaced() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    let queue_root = root.path().join("queue");
+    let detached_root = root.path().join("detached-queue");
+    let result = queue.claim_with_hook(
+        parse_request_id(),
+        parse_batch_id(FIRST_BATCH_ID),
+        &mut ReplaceQueueAtPhase {
+            phase: ClaimPhase::QueueDirectoriesSynchronized,
+            queue_root,
+            detached_root: detached_root.clone(),
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(WorkerQueueError::Queue(
+            crate::QueueError::InvalidQueueIdentity
+        ))
+    ));
+    assert!(
+        detached_root
+            .join(format!("processing/{}", parse_request_id()))
             .is_dir()
     );
 }
@@ -712,5 +801,33 @@ fn processing_recovery_error_keeps_worker_transitions_gated() {
     assert!(matches!(
         error,
         WorkerQueueError::ProcessingRecoveryRequired
+    ));
+}
+
+#[test]
+fn queue_identity_rejects_replacement_at_the_same_path() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    let worker = open_worker(&queue);
+    let queue_path = root.path().join("queue");
+    let replaced_path = root.path().join("replaced-queue");
+    if let Err(error) = fs::rename(&queue_path, &replaced_path) {
+        panic!("original queue must be moved aside: {error}");
+    }
+    let replacement = FileQueue::initialize(&queue_path, PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("replacement queue must initialize: {error}"));
+    accept_fixture(&replacement);
+    assert!(matches!(
+        worker.queue_identity(),
+        Err(WorkerQueueError::Queue(
+            crate::QueueError::InvalidQueueIdentity
+        ))
+    ));
+    let mut worker = worker;
+    assert!(matches!(
+        worker.claim(parse_request_id(), parse_batch_id(FIRST_BATCH_ID)),
+        Err(WorkerQueueError::Queue(
+            crate::QueueError::InvalidQueueIdentity
+        ))
     ));
 }

@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use agent_knowledge_core::{ErrorCode, PayloadPath, RequestId};
+use agent_knowledge_core::{ErrorCode, PayloadPath, RequestId, Revision};
+use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::{
@@ -26,6 +27,8 @@ const REQUEST_FILE_NAME: &str = "request.json";
 const DIGEST_FILE_NAME: &str = "digest";
 const ACCEPTANCE_FILE_NAME: &str = "acceptance.json";
 const NEXT_SEQUENCE_FILE_NAME: &str = "next-sequence";
+const QUEUE_IDENTITY_FILE_NAME: &str = "queue-id";
+const QUEUE_ROOT_BINDING_FILE_NAME: &str = "queue-root-binding-v1";
 const QUARANTINE_MARKER_FILE_NAME: &str = ".quarantined-at";
 const WORKER_TEMP_DIRECTORY_NAME: &str = "worker-tmp";
 const LOCK_DIRECTORY_NAME: &str = ".locks";
@@ -35,6 +38,7 @@ const PAYLOAD_DIRECTORY_NAME: &str = "payload";
 const COPY_BUFFER_LENGTH: usize = 64 * 1024;
 const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
 const MAXIMUM_SEQUENCE_FILE_BYTES: u64 = 32;
+const MAXIMUM_QUEUE_IDENTITY_BYTES: u64 = 72;
 const MAXIMUM_QUARANTINE_MARKER_BYTES: u64 = 64;
 const MAXIMUM_STAGING_NAME_ATTEMPTS: usize = 16;
 
@@ -67,6 +71,15 @@ impl QueueState {
             Self::Processing => "processing",
             Self::Completed => "completed",
             Self::Failed => "failed",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Pending => 0,
+            Self::Processing => 1,
+            Self::Completed => 2,
+            Self::Failed => 3,
         }
     }
 }
@@ -102,10 +115,51 @@ pub enum EnqueueOutcome {
 #[derive(Clone, Debug)]
 pub struct FileQueue {
     queue_root: PathBuf,
+    configured_queue_root: PathBuf,
+    root_handle: Arc<File>,
+    directories: Arc<QueueDirectories>,
+    identity: Revision,
     lock_file: PathBuf,
+    stable_lock_file: PathBuf,
+    queue_lock_handle: Arc<File>,
     worker_lock_file: PathBuf,
+    stable_worker_lock_file: PathBuf,
+    worker_lock_handle: Arc<File>,
     policy: PackagePolicy,
     maintenance_scanners: Arc<Mutex<MaintenanceScanners>>,
+}
+
+#[derive(Debug)]
+struct QueueDirectories {
+    lock: PinnedDirectory,
+    incoming: PinnedDirectory,
+    quarantine: PinnedDirectory,
+    worker_temporary: PinnedDirectory,
+    states: [PinnedDirectory; 4],
+}
+
+impl QueueDirectories {
+    fn state(&self, state: QueueState) -> &PinnedDirectory {
+        &self.states[state.index()]
+    }
+
+    fn all(&self) -> impl Iterator<Item = &PinnedDirectory> {
+        [
+            &self.lock,
+            &self.incoming,
+            &self.quarantine,
+            &self.worker_temporary,
+        ]
+        .into_iter()
+        .chain(self.states.iter())
+    }
+}
+
+#[derive(Debug)]
+struct PinnedDirectory {
+    entry: PathBuf,
+    stable: PathBuf,
+    handle: Arc<File>,
 }
 
 impl FileQueue {
@@ -124,44 +178,115 @@ impl FileQueue {
         queue_root: impl Into<PathBuf>,
         policy: PackagePolicy,
     ) -> Result<Self, QueueError> {
-        let queue_root = queue_root.into();
-        let lock_root = queue_root.join(LOCK_DIRECTORY_NAME);
-        let lock_file = lock_root.join(QUEUE_LOCK_FILE_NAME);
-        let worker_lock_file = lock_root.join(WORKER_LOCK_FILE_NAME);
+        let configured_path = queue_root.into();
+        let configured_parent = configured_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent_metadata = fs::metadata(configured_parent).map_err(QueueError::Io)?;
+        if !parent_metadata.is_dir() {
+            return Err(QueueError::InvalidStoragePath(configured_parent.into()));
+        }
+        ensure_directory(&configured_path)?;
+        sync_directory(configured_parent)?;
+        let configured_queue_root = fs::canonicalize(&configured_path).map_err(QueueError::Io)?;
+        let root_handle = Arc::new(File::open(&configured_queue_root).map_err(QueueError::Io)?);
+        #[cfg(target_os = "linux")]
+        let queue_root = {
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}", root_handle.as_raw_fd()))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let queue_root = configured_queue_root.clone();
+        fs::metadata(&queue_root).map_err(QueueError::Io)?;
 
-        ensure_directory(&queue_root)?;
-        ensure_directory(&lock_root)?;
+        ensure_directory(&queue_root.join(LOCK_DIRECTORY_NAME))?;
         ensure_directory(&queue_root.join("incoming"))?;
         ensure_directory(&queue_root.join("quarantine"))?;
         ensure_directory(&queue_root.join(WORKER_TEMP_DIRECTORY_NAME))?;
         for state in QueueState::ALL {
             ensure_directory(&queue_root.join(state.directory_name()))?;
         }
+        sync_directory(&queue_root)?;
+        let directories = Arc::new(QueueDirectories {
+            lock: pin_directory(&queue_root.join(LOCK_DIRECTORY_NAME))?,
+            incoming: pin_directory(&queue_root.join("incoming"))?,
+            quarantine: pin_directory(&queue_root.join("quarantine"))?,
+            worker_temporary: pin_directory(&queue_root.join(WORKER_TEMP_DIRECTORY_NAME))?,
+            states: [
+                pin_directory(&queue_root.join(QueueState::Pending.directory_name()))?,
+                pin_directory(&queue_root.join(QueueState::Processing.directory_name()))?,
+                pin_directory(&queue_root.join(QueueState::Completed.directory_name()))?,
+                pin_directory(&queue_root.join(QueueState::Failed.directory_name()))?,
+            ],
+        });
+        validate_common_queue_mount(&root_handle, &directories)?;
+        let lock_file = directories.lock.stable.join(QUEUE_LOCK_FILE_NAME);
+        let worker_lock_file = directories.lock.stable.join(WORKER_LOCK_FILE_NAME);
 
         ensure_lock_file(&lock_file)?;
         ensure_lock_file(&worker_lock_file)?;
+        let queue_lock_handle = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_file)
+                .map_err(QueueError::Io)?,
+        );
+        let worker_lock_handle = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&worker_lock_file)
+                .map_err(QueueError::Io)?,
+        );
+        let stable_lock_file = stable_file_path(&queue_lock_handle, &lock_file)?;
+        let stable_worker_lock_file = stable_file_path(&worker_lock_handle, &worker_lock_file)?;
+        queue_lock_handle.sync_all().map_err(QueueError::Io)?;
+        worker_lock_handle.sync_all().map_err(QueueError::Io)?;
+        sync_directory(&directories.lock.stable)?;
         let initialization_lock = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&lock_file)
+            .open(&stable_lock_file)
             .map_err(QueueError::Io)?;
         initialization_lock.lock().map_err(QueueError::Io)?;
+        ensure_queue_root_binding(
+            &queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
+            &configured_queue_root,
+            &root_handle,
+            &directories,
+            &queue_lock_handle,
+            &worker_lock_handle,
+            &queue_root,
+        )?;
+        let identity =
+            ensure_queue_identity_file(&queue_root.join(QUEUE_IDENTITY_FILE_NAME), &queue_root)?;
         ensure_sequence_file(&queue_root.join(NEXT_SEQUENCE_FILE_NAME), &queue_root)?;
 
-        sync_directory(&lock_root)?;
         sync_directory(&queue_root)?;
-        if let Some(parent) = queue_root.parent()
+        if let Some(parent) = configured_queue_root.parent()
             && !parent.as_os_str().is_empty()
         {
             sync_directory(parent)?;
         }
-        Ok(Self {
-            queue_root,
+        let queue = Self {
+            configured_queue_root,
+            directories,
+            identity,
             lock_file,
+            stable_lock_file,
+            queue_lock_handle,
             worker_lock_file,
+            stable_worker_lock_file,
+            worker_lock_handle,
+            queue_root,
+            root_handle,
             policy,
             maintenance_scanners: Arc::new(Mutex::new(MaintenanceScanners::default())),
-        })
+        };
+        queue.current_identity_locked()?;
+        Ok(queue)
     }
 
     /// Creates an exclusive random package directory below `incoming/`.
@@ -172,7 +297,8 @@ impl FileQueue {
     pub fn begin(&self) -> Result<IncomingPackage, QueueError> {
         let queue_lock = self.open_queue_lock()?;
         queue_lock.lock().map_err(QueueError::Io)?;
-        let incoming_root = self.queue_root.join("incoming");
+        self.current_identity_locked()?;
+        let incoming_root = &self.directories.incoming.stable;
         for _ in 0..MAXIMUM_STAGING_NAME_ATTEMPTS {
             let staging_name = format!(".incoming-{}", Ulid::generate());
             let staging_path = incoming_root.join(staging_name);
@@ -192,6 +318,11 @@ impl FileQueue {
                     if let Err(error) = lease.lock() {
                         let _ = fs::remove_dir_all(&staging_path);
                         return Err(QueueError::Io(error));
+                    }
+                    if let Err(error) = self.current_identity_locked() {
+                        drop(lease);
+                        let _ = fs::remove_dir_all(&staging_path);
+                        return Err(error);
                     }
                     drop(queue_lock);
                     return Ok(IncomingPackage {
@@ -215,9 +346,15 @@ impl FileQueue {
     }
 
     fn state_path(&self, state: QueueState, request_id: RequestId) -> PathBuf {
-        self.queue_root
-            .join(state.directory_name())
-            .join(request_id.to_string())
+        self.state_root(state).join(request_id.to_string())
+    }
+
+    fn state_root(&self, state: QueueState) -> &Path {
+        &self.directories.state(state).stable
+    }
+
+    fn worker_temporary_root(&self) -> &Path {
+        &self.directories.worker_temporary.stable
     }
 
     /// Moves inactive stale staging directories into `quarantine/`.
@@ -237,16 +374,17 @@ impl FileQueue {
     ) -> Result<usize, QueueError> {
         let lock = self.open_queue_lock()?;
         lock.lock().map_err(QueueError::Io)?;
+        self.current_identity_locked()?;
 
-        let incoming_root = self.queue_root.join("incoming");
-        let quarantine_root = self.queue_root.join("quarantine");
+        let incoming_root = &self.directories.incoming.stable;
+        let quarantine_root = &self.directories.quarantine.stable;
         let candidates = {
             let mut scanners = self
                 .maintenance_scanners
                 .lock()
                 .map_err(|_| QueueError::MaintenanceScannerPoisoned)?;
             inactive_stale_directories(
-                &incoming_root,
+                incoming_root,
                 minimum_age,
                 maximum_scan_entries,
                 maximum_actions,
@@ -263,16 +401,17 @@ impl FileQueue {
             let destination = quarantine_root.join(name);
             fs::rename(&candidate, &destination).map_err(QueueError::Io)?;
             if let Err(error) = replace_quarantine_marker(&destination) {
-                sync_directory(&quarantine_root)?;
-                sync_directory(&incoming_root)?;
+                sync_directory(quarantine_root)?;
+                sync_directory(incoming_root)?;
                 return Err(error);
             }
             moved += 1;
         }
         if moved > 0 {
-            sync_directory(&quarantine_root)?;
-            sync_directory(&incoming_root)?;
+            sync_directory(quarantine_root)?;
+            sync_directory(incoming_root)?;
         }
+        self.current_identity_locked()?;
         Ok(moved)
     }
 
@@ -292,15 +431,16 @@ impl FileQueue {
     ) -> Result<usize, QueueError> {
         let lock = self.open_queue_lock()?;
         lock.lock().map_err(QueueError::Io)?;
+        self.current_identity_locked()?;
 
-        let quarantine_root = self.queue_root.join("quarantine");
+        let quarantine_root = &self.directories.quarantine.stable;
         let candidates = {
             let mut scanners = self
                 .maintenance_scanners
                 .lock()
                 .map_err(|_| QueueError::MaintenanceScannerPoisoned)?;
             inactive_stale_directories(
-                &quarantine_root,
+                quarantine_root,
                 minimum_age,
                 maximum_scan_entries,
                 maximum_actions,
@@ -313,8 +453,9 @@ impl FileQueue {
             fs::remove_dir_all(candidate).map_err(QueueError::Io)?;
         }
         if removed > 0 {
-            sync_directory(&quarantine_root)?;
+            sync_directory(quarantine_root)?;
         }
+        self.current_identity_locked()?;
         Ok(removed)
     }
 
@@ -322,8 +463,41 @@ impl FileQueue {
         OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&self.lock_file)
+            .open(&self.stable_lock_file)
             .map_err(QueueError::Io)
+    }
+
+    fn current_identity_locked(&self) -> Result<Revision, QueueError> {
+        let current_canonical_root =
+            fs::canonicalize(&self.configured_queue_root).map_err(QueueError::Io)?;
+        if current_canonical_root != self.configured_queue_root {
+            return Err(QueueError::InvalidQueueIdentity);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            validate_pinned_root(&self.configured_queue_root, &self.root_handle)?;
+        }
+        for directory in self.directories.all() {
+            validate_pinned_directory(directory)?;
+        }
+        validate_pinned_lock(&self.lock_file, &self.queue_lock_handle)?;
+        validate_pinned_lock(&self.worker_lock_file, &self.worker_lock_handle)?;
+        validate_queue_root_binding(
+            &self.queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
+            &self.configured_queue_root,
+            &self.root_handle,
+            &self.directories,
+            &self.queue_lock_handle,
+            &self.worker_lock_handle,
+        )?;
+        let stable_identity = read_queue_identity(&self.queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
+        let configured_identity =
+            read_queue_identity(&self.configured_queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
+        if stable_identity == self.identity && configured_identity == self.identity {
+            Ok(stable_identity)
+        } else {
+            Err(QueueError::InvalidQueueIdentity)
+        }
     }
 
     fn find_existing(
@@ -624,6 +798,7 @@ impl IncomingPackage {
 
         let lock = self.queue.open_queue_lock()?;
         lock.lock().map_err(QueueError::Io)?;
+        self.queue.current_identity_locked()?;
 
         let request_id = validated.request().request_id;
         let digest = validated.digest();
@@ -648,12 +823,13 @@ impl IncomingPackage {
                 });
             }
             if existing.digest() == digest {
-                sync_directory(&self.queue.queue_root.join("incoming"))?;
+                sync_directory(&self.queue.directories.incoming.stable)?;
                 for accepted_state in QueueState::ALL {
-                    sync_directory(&self.queue.queue_root.join(accepted_state.directory_name()))?;
+                    sync_directory(self.queue.state_root(accepted_state))?;
                 }
                 hook.reached(AcceptancePhase::ExistingQueueDirectoriesSynchronized)
                     .map_err(QueueError::Io)?;
+                self.queue.current_identity_locked()?;
                 return Ok(EnqueueOutcome::Existing {
                     request_id,
                     digest,
@@ -675,15 +851,17 @@ impl IncomingPackage {
             .map_err(QueueError::Io)?;
 
         let pending_path = self.queue.state_path(QueueState::Pending, request_id);
+        self.queue.current_identity_locked()?;
         fs::rename(&self.staging_path, &pending_path).map_err(QueueError::Io)?;
         self.promoted = true;
         hook.reached(AcceptancePhase::Renamed)
             .map_err(QueueError::Io)?;
 
-        sync_directory(&self.queue.queue_root.join("pending"))?;
-        sync_directory(&self.queue.queue_root.join("incoming"))?;
+        sync_directory(self.queue.state_root(QueueState::Pending))?;
+        sync_directory(&self.queue.directories.incoming.stable)?;
         hook.reached(AcceptancePhase::QueueDirectoriesSynchronized)
             .map_err(QueueError::Io)?;
+        self.queue.current_identity_locked()?;
 
         Ok(EnqueueOutcome::Accepted { request_id, digest })
     }
@@ -884,9 +1062,17 @@ fn ensure_directory(path: &Path) -> Result<(), QueueError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
         Ok(_) => Err(QueueError::InvalidStoragePath(path.into())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(path).map_err(QueueError::Io)
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                match fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+                    Ok(_) => Err(QueueError::InvalidStoragePath(path.into())),
+                    Err(error) => Err(QueueError::Io(error)),
+                }
+            }
+            Err(error) => Err(QueueError::Io(error)),
+        },
         Err(error) => Err(QueueError::Io(error)),
     }
 }
@@ -932,6 +1118,333 @@ fn ensure_sequence_file(path: &Path, queue_root: &Path) -> Result<(), QueueError
         }
         Err(error) => Err(QueueError::Io(error)),
     }
+}
+
+fn ensure_queue_identity_file(path: &Path, queue_root: &Path) -> Result<Revision, QueueError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => read_queue_identity(path),
+        Ok(_) => Err(QueueError::InvalidStoragePath(path.into())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if !accepted_states_are_empty(queue_root)? {
+                return Err(QueueError::InvalidQueueIdentity);
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(b"agent-knowledge-queue-instance-v1\0");
+            hasher.update(Ulid::generate().to_bytes());
+            let identity = Revision::from_bytes(hasher.finalize().into());
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(QueueError::Io)?;
+            writeln!(file, "{identity}").map_err(QueueError::Io)?;
+            file.sync_all().map_err(QueueError::Io)?;
+            sync_directory(queue_root)?;
+            Ok(identity)
+        }
+        Err(error) => Err(QueueError::Io(error)),
+    }
+}
+
+fn ensure_queue_root_binding(
+    path: &Path,
+    configured_root: &Path,
+    root_handle: &File,
+    directories: &QueueDirectories,
+    queue_lock_handle: &File,
+    worker_lock_handle: &File,
+    queue_root: &Path,
+) -> Result<(), QueueError> {
+    let expected = queue_root_binding(
+        configured_root,
+        root_handle,
+        directories,
+        queue_lock_handle,
+        worker_lock_handle,
+    )?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => validate_queue_root_binding(
+            path,
+            configured_root,
+            root_handle,
+            directories,
+            queue_lock_handle,
+            worker_lock_handle,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if !accepted_states_are_empty(queue_root)? {
+                return Err(QueueError::InvalidQueueIdentity);
+            }
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(QueueError::Io)?;
+            file.write_all(&expected).map_err(QueueError::Io)?;
+            file.sync_all().map_err(QueueError::Io)?;
+            sync_directory(queue_root)
+        }
+        Err(error) => Err(QueueError::Io(error)),
+    }
+}
+
+fn queue_root_binding(
+    configured_root: &Path,
+    root_handle: &File,
+    directories: &QueueDirectories,
+    queue_lock_handle: &File,
+    worker_lock_handle: &File,
+) -> Result<Vec<u8>, QueueError> {
+    let mut expected = configured_root.as_os_str().as_encoded_bytes().to_vec();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let handles = std::iter::once(root_handle)
+            .chain(directories.all().map(|directory| directory.handle.as_ref()))
+            .chain([queue_lock_handle, worker_lock_handle]);
+        for handle in handles {
+            let metadata = handle.metadata().map_err(QueueError::Io)?;
+            expected.push(0);
+            expected.extend_from_slice(&metadata.dev().to_le_bytes());
+            expected.extend_from_slice(&metadata.ino().to_le_bytes());
+        }
+    }
+    Ok(expected)
+}
+
+fn validate_queue_root_binding(
+    path: &Path,
+    configured_root: &Path,
+    root_handle: &File,
+    directories: &QueueDirectories,
+    queue_lock_handle: &File,
+    worker_lock_handle: &File,
+) -> Result<(), QueueError> {
+    let expected = queue_root_binding(
+        configured_root,
+        root_handle,
+        directories,
+        queue_lock_handle,
+        worker_lock_handle,
+    )?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 16 * 1024 => {
+            if fs::read(path).map_err(QueueError::Io)? == expected {
+                Ok(())
+            } else {
+                Err(QueueError::InvalidQueueIdentity)
+            }
+        }
+        Ok(_) => Err(QueueError::InvalidQueueIdentity),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(QueueError::InvalidQueueIdentity)
+        }
+        Err(error) => Err(QueueError::Io(error)),
+    }
+}
+
+fn validate_pinned_lock(path: &Path, pinned: &File) -> Result<(), QueueError> {
+    let configured = fs::symlink_metadata(path).map_err(QueueError::Io)?;
+    let pinned_metadata = pinned.metadata().map_err(QueueError::Io)?;
+    if !configured.file_type().is_file() {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if configured.dev() != pinned_metadata.dev() || configured.ino() != pinned_metadata.ino() {
+            return Err(QueueError::InvalidQueueIdentity);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    validate_live_mount(path, &configured, pinned)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_pinned_root(path: &Path, pinned: &File) -> Result<(), QueueError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let configured = fs::symlink_metadata(path).map_err(QueueError::Io)?;
+    let pinned_metadata = pinned.metadata().map_err(QueueError::Io)?;
+    if !configured.file_type().is_dir()
+        || configured.dev() != pinned_metadata.dev()
+        || configured.ino() != pinned_metadata.ino()
+    {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    validate_live_mount(path, &configured, pinned)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_live_mount(
+    path: &Path,
+    configured_metadata: &fs::Metadata,
+    pinned: &File,
+) -> Result<(), QueueError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let configured = File::open(path).map_err(QueueError::Io)?;
+    let opened_metadata = configured.metadata().map_err(QueueError::Io)?;
+    let pinned_metadata = pinned.metadata().map_err(QueueError::Io)?;
+    if opened_metadata.dev() != configured_metadata.dev()
+        || opened_metadata.ino() != configured_metadata.ino()
+        || opened_metadata.file_type() != configured_metadata.file_type()
+        || opened_metadata.dev() != pinned_metadata.dev()
+        || opened_metadata.ino() != pinned_metadata.ino()
+    {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    if linux_mount_id(&configured)? != linux_mount_id(pinned)? {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    Ok(())
+}
+
+fn pin_directory(path: &Path) -> Result<PinnedDirectory, QueueError> {
+    let metadata = fs::symlink_metadata(path).map_err(QueueError::Io)?;
+    if !metadata.file_type().is_dir() {
+        return Err(QueueError::InvalidStoragePath(path.into()));
+    }
+    let handle = Arc::new(File::open(path).map_err(QueueError::Io)?);
+    let stable = stable_file_path(&handle, path)?;
+    Ok(PinnedDirectory {
+        entry: path.into(),
+        stable,
+        handle,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_common_queue_mount(
+    root: &File,
+    directories: &QueueDirectories,
+) -> Result<(), QueueError> {
+    let root_mount = linux_mount_id(root)?;
+    for directory in directories.all() {
+        if linux_mount_id(&directory.handle)? != root_mount {
+            return Err(QueueError::InvalidStoragePath(directory.entry.clone()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_id(file: &File) -> Result<u64, QueueError> {
+    use std::os::fd::AsRawFd;
+
+    const MAXIMUM_FDINFO_BYTES: u64 = 16 * 1024;
+
+    let path = PathBuf::from(format!("/proc/self/fdinfo/{}", file.as_raw_fd()));
+    let mut bytes = Vec::with_capacity(MAXIMUM_FDINFO_BYTES as usize);
+    File::open(path)
+        .and_then(|file| file.take(MAXIMUM_FDINFO_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(QueueError::Io)?;
+    if bytes.len() as u64 > MAXIMUM_FDINFO_BYTES {
+        return Err(QueueError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file descriptor metadata exceeds the supported size",
+        )));
+    }
+    let contents = std::str::from_utf8(&bytes).map_err(|_| {
+        QueueError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file descriptor metadata is not UTF-8",
+        ))
+    })?;
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))
+        .ok_or_else(|| {
+            QueueError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file descriptor metadata has no mount identifier",
+            ))
+        })?
+        .parse()
+        .map_err(|_| {
+            QueueError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file descriptor mount identifier is invalid",
+            ))
+        })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn validate_common_queue_mount(
+    root: &File,
+    directories: &QueueDirectories,
+) -> Result<(), QueueError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root_device = root.metadata().map_err(QueueError::Io)?.dev();
+    for directory in directories.all() {
+        if directory.handle.metadata().map_err(QueueError::Io)?.dev() != root_device {
+            return Err(QueueError::InvalidStoragePath(directory.entry.clone()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_common_queue_mount(
+    _root: &File,
+    _directories: &QueueDirectories,
+) -> Result<(), QueueError> {
+    Ok(())
+}
+
+fn validate_pinned_directory(directory: &PinnedDirectory) -> Result<(), QueueError> {
+    let entry = fs::symlink_metadata(&directory.entry).map_err(QueueError::Io)?;
+    let pinned = directory.handle.metadata().map_err(QueueError::Io)?;
+    if !entry.file_type().is_dir() {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if entry.dev() != pinned.dev() || entry.ino() != pinned.ino() {
+            return Err(QueueError::InvalidQueueIdentity);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    validate_live_mount(&directory.entry, &entry, &directory.handle)?;
+    Ok(())
+}
+
+fn stable_file_path(handle: &File, _fallback: &Path) -> Result<PathBuf, QueueError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let stable = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
+        fs::metadata(&stable).map_err(QueueError::Io)?;
+        Ok(stable)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(_fallback.to_path_buf())
+    }
+}
+
+fn read_queue_identity(path: &Path) -> Result<Revision, QueueError> {
+    let metadata = fs::symlink_metadata(path).map_err(QueueError::Io)?;
+    if !metadata.file_type().is_file() || metadata.len() > MAXIMUM_QUEUE_IDENTITY_BYTES {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .and_then(|file| {
+            file.take(MAXIMUM_QUEUE_IDENTITY_BYTES + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(QueueError::Io)?;
+    if bytes.len() as u64 > MAXIMUM_QUEUE_IDENTITY_BYTES {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    let value = std::str::from_utf8(&bytes)
+        .map_err(|_| QueueError::InvalidQueueIdentity)?
+        .trim();
+    value.parse().map_err(|_| QueueError::InvalidQueueIdentity)
 }
 
 fn accepted_states_are_empty(queue_root: &Path) -> Result<bool, QueueError> {
@@ -1217,6 +1730,8 @@ pub enum QueueError {
     SequenceExhausted,
     /// The durable queue acceptance sequence file was malformed.
     InvalidSequenceState,
+    /// The immutable queue instance identity was missing, malformed, or changed.
+    InvalidQueueIdentity,
     /// An in-process maintenance scanner mutex was poisoned.
     MaintenanceScannerPoisoned,
     /// The same request ID appeared in more than one accepted state.
@@ -1254,6 +1769,7 @@ impl QueueError {
             | Self::QuarantineTimestamp(_)
             | Self::SequenceExhausted
             | Self::InvalidSequenceState
+            | Self::InvalidQueueIdentity
             | Self::MaintenanceScannerPoisoned => ErrorCode::InternalError,
         }
     }
@@ -1315,6 +1831,9 @@ impl fmt::Display for QueueError {
             }
             Self::InvalidSequenceState => {
                 formatter.write_str("durable acceptance sequence state is invalid")
+            }
+            Self::InvalidQueueIdentity => {
+                formatter.write_str("durable queue instance identity is invalid")
             }
             Self::MaintenanceScannerPoisoned => {
                 formatter.write_str("maintenance scanner state is unavailable")

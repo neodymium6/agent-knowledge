@@ -7,9 +7,7 @@ use time::OffsetDateTime;
 use ulid::Ulid;
 
 use super::WorkerQueueError;
-use crate::file_queue::{
-    FileQueue, QueueError, QueueState, WORKER_TEMP_DIRECTORY_NAME, sync_directory,
-};
+use crate::file_queue::{FileQueue, QueueError, QueueState, sync_directory};
 
 const RESULT_FILE_NAME: &str = "result.json";
 
@@ -52,6 +50,8 @@ impl FileQueue {
     ) -> Result<(), WorkerQueueError> {
         let queue_lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
         queue_lock.lock().map_err(WorkerQueueError::Io)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
 
         let Some(state) = find_existing_state_without_package_read(self, request_id)? else {
             return Err(WorkerQueueError::RequestNotFound { request_id });
@@ -76,11 +76,14 @@ impl FileQueue {
         write_result_record(self, &pending_path, &record)?;
 
         let failed_path = self.state_path(QueueState::Failed, request_id);
-        fs::rename(&pending_path, failed_path).map_err(WorkerQueueError::Io)?;
-        sync_directory(&self.queue_root.join(QueueState::Failed.directory_name()))
+        self.current_identity_locked()
             .map_err(WorkerQueueError::Queue)?;
-        sync_directory(&self.queue_root.join(QueueState::Pending.directory_name()))
-            .map_err(WorkerQueueError::Queue)
+        fs::rename(&pending_path, failed_path).map_err(WorkerQueueError::Io)?;
+        sync_directory(self.state_root(QueueState::Failed)).map_err(WorkerQueueError::Queue)?;
+        sync_directory(self.state_root(QueueState::Pending)).map_err(WorkerQueueError::Queue)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
+        Ok(())
     }
 }
 
@@ -119,7 +122,7 @@ fn write_result_record(
     package_root: &std::path::Path,
     record: &WorkerResultRecord,
 ) -> Result<(), WorkerQueueError> {
-    let temporary_root = queue.queue_root.join(WORKER_TEMP_DIRECTORY_NAME);
+    let temporary_root = queue.worker_temporary_root();
     let temporary_path = temporary_root.join(format!(".result-{}", Ulid::generate()));
     let destination = package_root.join(RESULT_FILE_NAME);
     match fs::symlink_metadata(&destination) {
@@ -147,7 +150,7 @@ fn write_result_record(
         drop(temporary);
         fs::rename(&temporary_path, destination).map_err(WorkerQueueError::Io)?;
         sync_directory(package_root).map_err(WorkerQueueError::Queue)?;
-        sync_directory(&temporary_root).map_err(WorkerQueueError::Queue)
+        sync_directory(temporary_root).map_err(WorkerQueueError::Queue)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);

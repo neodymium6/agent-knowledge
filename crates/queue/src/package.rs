@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -126,7 +126,9 @@ impl PackagePolicy {
         self.limits
     }
 
-    fn allows_attachment(&self, name: &str) -> bool {
+    /// Returns whether a file name uses one configured attachment extension.
+    #[must_use]
+    pub fn allows_attachment_name(&self, name: &str) -> bool {
         Path::new(name)
             .extension()
             .and_then(|extension| extension.to_str())
@@ -197,6 +199,7 @@ impl FromStr for PackageDigest {
 pub struct PayloadMetadata {
     path: PayloadPath,
     byte_length: u64,
+    revision: Revision,
 }
 
 impl PayloadMetadata {
@@ -210,6 +213,12 @@ impl PayloadMetadata {
     #[must_use]
     pub const fn byte_length(&self) -> u64 {
         self.byte_length
+    }
+
+    /// Returns the SHA-256 revision of the exact validated file bytes.
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
     }
 }
 
@@ -331,7 +340,7 @@ fn validate_package_contents(
 
     let canonical_request =
         serde_json::to_vec(&request).map_err(PackageValidationError::CanonicalRequestJson)?;
-    let digest = calculate_digest(&canonical_request, &payload_root, &payload_files)?;
+    let digest = calculate_digest(&canonical_request, &payload_root, &mut payload_files)?;
 
     Ok(ValidatedPackage {
         request,
@@ -548,6 +557,7 @@ fn scan_payload_directory(
             files.push(PayloadMetadata {
                 path,
                 byte_length: metadata.len(),
+                revision: Revision::from_bytes([0; 32]),
             });
         }
     }
@@ -613,12 +623,13 @@ fn validate_payload_references(
 ) -> Result<(), PackageValidationError> {
     let available = payload
         .iter()
-        .map(|file| file.path.as_str())
-        .collect::<HashSet<_>>();
+        .map(|file| (file.path.as_str(), file.byte_length))
+        .collect::<HashMap<_, _>>();
     let mut referenced = HashSet::new();
+    let mut materialized_bytes = 0_u64;
 
     for operation in &request.operations {
-        match operation {
+        let source = match operation {
             Operation::CreateDocument { content, .. }
             | Operation::UpdateDocument { content, .. } => {
                 if Path::new(content.as_str())
@@ -632,17 +643,35 @@ fn validate_payload_references(
                 }
                 require_payload(content, &available)?;
                 referenced.insert(content.as_str());
+                Some(content)
             }
             Operation::AddAttachment { source, name, .. } => {
-                if !policy.allows_attachment(name.as_str()) {
+                if !policy.allows_attachment_name(name.as_str()) {
                     return Err(PackageValidationError::UnsupportedAttachment(
                         name.to_string(),
                     ));
                 }
                 require_payload(source, &available)?;
                 referenced.insert(source.as_str());
+                Some(source)
             }
-            Operation::MoveDocument { .. } | Operation::ArchiveDocument { .. } => {}
+            Operation::MoveDocument { .. } | Operation::ArchiveDocument { .. } => None,
+        };
+        if let Some(source) = source {
+            materialized_bytes = materialized_bytes
+                .checked_add(available[source.as_str()])
+                .ok_or(PackageValidationError::LimitExceeded {
+                    limit: PackageLimit::MaterializedBytes,
+                    maximum: policy.limits.maximum_total_bytes,
+                    actual: u64::MAX,
+                })?;
+            if materialized_bytes > policy.limits.maximum_total_bytes {
+                return Err(PackageValidationError::LimitExceeded {
+                    limit: PackageLimit::MaterializedBytes,
+                    maximum: policy.limits.maximum_total_bytes,
+                    actual: materialized_bytes,
+                });
+            }
         }
     }
 
@@ -660,9 +689,9 @@ fn validate_payload_references(
 
 fn require_payload(
     path: &PayloadPath,
-    available: &HashSet<&str>,
+    available: &HashMap<&str, u64>,
 ) -> Result<(), PackageValidationError> {
-    if available.contains(path.as_str()) {
+    if available.contains_key(path.as_str()) {
         Ok(())
     } else {
         Err(PackageValidationError::MissingPayload(path.clone()))
@@ -745,7 +774,7 @@ fn enforce_entry_count(
 fn calculate_digest(
     canonical_request: &[u8],
     payload_root: &Path,
-    payload: &[PayloadMetadata],
+    payload: &mut [PayloadMetadata],
 ) -> Result<PackageDigest, PackageValidationError> {
     let mut hasher = Sha256::new();
     hasher.update(DIGEST_DOMAIN);
@@ -754,6 +783,7 @@ fn calculate_digest(
 
     let mut buffer = [0_u8; HASH_BUFFER_LENGTH];
     for file in payload {
+        let mut file_hasher = Sha256::new();
         hash_length_prefixed(&mut hasher, file.path.as_str().as_bytes());
         hasher.update(file.byte_length.to_be_bytes());
 
@@ -776,12 +806,14 @@ fn calculate_digest(
                 ));
             }
             hasher.update(&buffer[..read]);
+            file_hasher.update(&buffer[..read]);
         }
         if observed_length != file.byte_length {
             return Err(PackageValidationError::FileChangedDuringValidation(
                 file.path.clone(),
             ));
         }
+        file.revision = Revision::from_bytes(file_hasher.finalize().into());
     }
 
     let bytes: [u8; 32] = hasher.finalize().into();
@@ -803,6 +835,8 @@ fn hash_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
 pub enum PackageLimit {
     /// Combined request and payload bytes.
     TotalBytes,
+    /// Payload bytes materialized by all operations, including repeated sources.
+    MaterializedBytes,
     /// Bytes in one file.
     IndividualFileBytes,
     /// Number of request and payload files.

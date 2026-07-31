@@ -3,13 +3,10 @@ use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::Path;
 
-use agent_knowledge_core::{BatchId, RequestId};
+use agent_knowledge_core::{BatchId, RequestId, Revision};
 
 use super::{ClaimedPackage, WorkerQueueError, next_attempt, revalidate_accepted};
-use crate::file_queue::{
-    FileQueue, NEXT_SEQUENCE_FILE_NAME, QueueState, ensure_directory, ensure_lock_file,
-    read_next_sequence, sync_directory,
-};
+use crate::file_queue::{FileQueue, NEXT_SEQUENCE_FILE_NAME, QueueState, read_next_sequence};
 
 /// Progress made while selecting and claiming one bounded Worker batch.
 #[derive(Debug)]
@@ -77,17 +74,10 @@ impl FileQueue {
     /// another process owns the writer lock, or an I/O error when the lock path
     /// cannot be initialized.
     pub fn try_worker_session(&self) -> Result<WorkerSession, WorkerQueueError> {
-        let writer_lock_file = &self.worker_lock_file;
-        if let Some(parent) = writer_lock_file.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            ensure_directory(parent).map_err(WorkerQueueError::Queue)?;
-        }
-        ensure_lock_file(writer_lock_file).map_err(WorkerQueueError::Queue)?;
         let writer_lock = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(writer_lock_file)
+            .open(&self.stable_worker_lock_file)
             .map_err(WorkerQueueError::Io)?;
         match writer_lock.try_lock() {
             Ok(()) => {}
@@ -96,11 +86,8 @@ impl FileQueue {
             }
             Err(TryLockError::Error(error)) => return Err(WorkerQueueError::Io(error)),
         }
-        if let Some(parent) = writer_lock_file.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            sync_directory(parent).map_err(WorkerQueueError::Queue)?;
-        }
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
         Ok(WorkerSession {
             queue: self.clone(),
             _writer_lock: writer_lock,
@@ -112,6 +99,48 @@ impl FileQueue {
 }
 
 impl WorkerSession {
+    /// Returns a stable digest identifying this queue's canonical root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the queue root can no longer be canonicalized.
+    pub fn queue_identity(&self) -> Result<Revision, WorkerQueueError> {
+        let queue_lock = self
+            .queue
+            .open_queue_lock()
+            .map_err(WorkerQueueError::Queue)?;
+        queue_lock.lock().map_err(WorkerQueueError::Io)?;
+        self.queue
+            .current_identity_locked()
+            .map_err(WorkerQueueError::Queue)
+    }
+
+    /// Verifies that this live Worker can perform one repository transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error until processing recovery is complete or while a
+    /// pending or processing scan is active.
+    pub fn ensure_transaction_ready(&self) -> Result<(), WorkerQueueError> {
+        self.queue_identity()?;
+        self.ensure_no_active_scan()
+    }
+
+    /// Revalidates that one claim is still owned by this live Worker session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when recovery is incomplete, another scan is active,
+    /// or the processing package no longer matches its exact claim token.
+    pub fn validate_claimed(
+        &mut self,
+        claim: &super::ClaimedPackage,
+    ) -> Result<(), WorkerQueueError> {
+        self.queue_identity()?;
+        self.ensure_no_active_scan()?;
+        self.queue.validate_claimed(claim)
+    }
+
     /// Claims one known pending request while holding Worker ownership.
     ///
     /// # Errors
@@ -122,6 +151,7 @@ impl WorkerSession {
         request_id: RequestId,
         batch_id: BatchId,
     ) -> Result<ClaimedPackage, WorkerQueueError> {
+        self.queue_identity()?;
         self.ensure_no_active_scan()?;
         let result = self.queue.claim(request_id, batch_id);
         if result.is_err() {
@@ -137,6 +167,7 @@ impl WorkerSession {
     /// Returns an error when the token is stale or the request cannot be
     /// durably moved.
     pub fn requeue_claimed(&mut self, token: super::ClaimToken) -> Result<(), WorkerQueueError> {
+        self.queue_identity()?;
         self.ensure_no_active_scan()?;
         let result = self.queue.requeue_claimed(token);
         if result.is_err() {
@@ -166,6 +197,7 @@ impl WorkerSession {
         maximum_scan_entries: usize,
         maximum_requests: usize,
     ) -> Result<BatchClaimOutcome, WorkerQueueError> {
+        self.queue_identity()?;
         if maximum_scan_entries == 0 || maximum_requests == 0 {
             return Err(WorkerQueueError::InvalidBatchLimits);
         }
@@ -186,16 +218,15 @@ impl WorkerSession {
                 .open_queue_lock()
                 .map_err(WorkerQueueError::Queue)?;
             queue_lock.lock().map_err(WorkerQueueError::Io)?;
+            self.queue
+                .current_identity_locked()
+                .map_err(WorkerQueueError::Queue)?;
             let next_sequence =
                 read_next_sequence(&self.queue.queue_root.join(NEXT_SEQUENCE_FILE_NAME))
                     .map_err(WorkerQueueError::Queue)?;
             self.pending_scan.entries = Some(
-                fs::read_dir(
-                    self.queue
-                        .queue_root
-                        .join(QueueState::Pending.directory_name()),
-                )
-                .map_err(WorkerQueueError::Io)?,
+                fs::read_dir(self.queue.state_root(QueueState::Pending))
+                    .map_err(WorkerQueueError::Io)?,
             );
             self.pending_scan.batch_id = Some(batch_id);
             self.pending_scan.maximum_requests = maximum_requests;

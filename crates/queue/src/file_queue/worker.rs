@@ -3,13 +3,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agent_knowledge_core::{BatchId, ErrorCode, RequestId};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use super::{FileQueue, QueueError, QueueState, WORKER_TEMP_DIRECTORY_NAME, sync_directory};
+use super::{FileQueue, QueueError, QueueState, sync_directory};
 use crate::{PackageValidationError, ValidatedPackage, validate_accepted_package};
 
 mod batch;
@@ -61,6 +62,23 @@ pub struct ClaimToken {
 }
 
 impl ClaimToken {
+    /// Reconstructs a token from a durable Worker transaction record.
+    ///
+    /// Queue transitions still validate every field against durable processing
+    /// metadata, so constructing a token does not itself grant ownership.
+    #[must_use]
+    pub const fn from_durable_record(
+        request_id: RequestId,
+        batch_id: BatchId,
+        attempt: NonZeroU32,
+    ) -> Self {
+        Self {
+            request_id,
+            batch_id,
+            attempt,
+        }
+    }
+
     /// Returns the claimed request identifier.
     #[must_use]
     pub const fn request_id(self) -> RequestId {
@@ -81,11 +99,23 @@ impl ClaimToken {
 }
 
 /// A validated package atomically moved from `pending/` to `processing/`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ClaimedPackage {
     token: ClaimToken,
     package: ValidatedPackage,
+    package_root: PathBuf,
+    _directory_lease: Arc<File>,
 }
+
+impl PartialEq for ClaimedPackage {
+    fn eq(&self, other: &Self) -> bool {
+        self.token == other.token
+            && self.package == other.package
+            && self.package_root == other.package_root
+    }
+}
+
+impl Eq for ClaimedPackage {}
 
 impl ClaimedPackage {
     /// Returns the ownership token for later phase transitions.
@@ -98,6 +128,12 @@ impl ClaimedPackage {
     #[must_use]
     pub const fn package(&self) -> &ValidatedPackage {
         &self.package
+    }
+
+    /// Returns the immutable accepted-package directory in `processing/`.
+    #[must_use]
+    pub fn package_root(&self) -> &Path {
+        &self.package_root
     }
 }
 
@@ -133,6 +169,8 @@ impl FileQueue {
     ) -> Result<ClaimedPackage, WorkerQueueError> {
         let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
         lock.lock().map_err(WorkerQueueError::Io)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
         self.ensure_pending_locked(request_id)?;
         drop(lock);
 
@@ -141,6 +179,8 @@ impl FileQueue {
             Err(error) => {
                 let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
                 lock.lock().map_err(WorkerQueueError::Io)?;
+                self.current_identity_locked()
+                    .map_err(WorkerQueueError::Queue)?;
                 match self.ensure_pending_locked(request_id) {
                     Ok(_) => return Err(error),
                     Err(state_error) => return Err(state_error),
@@ -186,6 +226,8 @@ impl FileQueue {
     ) -> Result<ClaimedPackage, WorkerQueueError> {
         let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
         lock.lock().map_err(WorkerQueueError::Io)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
         let stored_digest = self.ensure_pending_locked(request_id)?;
         if stored_digest != prepared.package.digest() {
             return Err(WorkerQueueError::CorruptState {
@@ -210,20 +252,18 @@ impl FileQueue {
             .map_err(WorkerQueueError::Io)?;
 
         let processing_path = self.state_path(QueueState::Processing, request_id);
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
         fs::rename(&pending_path, &processing_path).map_err(WorkerQueueError::Io)?;
         hook.reached(ClaimPhase::Renamed)
             .map_err(WorkerQueueError::Io)?;
 
-        sync_directory(
-            &self
-                .queue_root
-                .join(QueueState::Processing.directory_name()),
-        )
-        .map_err(WorkerQueueError::Queue)?;
-        sync_directory(&self.queue_root.join(QueueState::Pending.directory_name()))
-            .map_err(WorkerQueueError::Queue)?;
+        sync_directory(self.state_root(QueueState::Processing)).map_err(WorkerQueueError::Queue)?;
+        sync_directory(self.state_root(QueueState::Pending)).map_err(WorkerQueueError::Queue)?;
         hook.reached(ClaimPhase::QueueDirectoriesSynchronized)
             .map_err(WorkerQueueError::Io)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
 
         Ok(ClaimedPackage {
             token: ClaimToken {
@@ -232,6 +272,8 @@ impl FileQueue {
                 attempt,
             },
             package: prepared.package,
+            package_root: processing_path,
+            _directory_lease: Arc::clone(&self.directories.state(QueueState::Processing).handle),
         })
     }
 
@@ -268,6 +310,8 @@ impl FileQueue {
     fn requeue_claimed(&self, token: ClaimToken) -> Result<(), WorkerQueueError> {
         let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
         lock.lock().map_err(WorkerQueueError::Io)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
 
         let request_id = token.request_id;
         let Some((state, _)) = self
@@ -293,15 +337,49 @@ impl FileQueue {
         }
 
         let pending_path = self.state_path(QueueState::Pending, request_id);
-        fs::rename(&processing_path, pending_path).map_err(WorkerQueueError::Io)?;
-        sync_directory(&self.queue_root.join(QueueState::Pending.directory_name()))
+        self.current_identity_locked()
             .map_err(WorkerQueueError::Queue)?;
-        sync_directory(
-            &self
-                .queue_root
-                .join(QueueState::Processing.directory_name()),
-        )
-        .map_err(WorkerQueueError::Queue)
+        fs::rename(&processing_path, pending_path).map_err(WorkerQueueError::Io)?;
+        sync_directory(self.state_root(QueueState::Pending)).map_err(WorkerQueueError::Queue)?;
+        sync_directory(self.state_root(QueueState::Processing)).map_err(WorkerQueueError::Queue)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
+        Ok(())
+    }
+
+    fn validate_claimed(&self, claim: &ClaimedPackage) -> Result<(), WorkerQueueError> {
+        let token = claim.token;
+        let request_id = token.request_id;
+        let lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
+        lock.lock().map_err(WorkerQueueError::Io)?;
+        self.current_identity_locked()
+            .map_err(WorkerQueueError::Queue)?;
+        let processing_path = self.state_path(QueueState::Processing, request_id);
+        if claim.package_root != processing_path {
+            return Err(WorkerQueueError::ClaimChanged { request_id });
+        }
+        let Some((state, digest)) = self
+            .find_existing(request_id)
+            .map_err(WorkerQueueError::Queue)?
+        else {
+            return Err(WorkerQueueError::RequestNotFound { request_id });
+        };
+        if state != QueueState::Processing {
+            return Err(WorkerQueueError::InvalidState {
+                request_id,
+                expected: QueueState::Processing,
+                actual: state,
+            });
+        }
+        let record = read_required_phase_record(&processing_path, request_id, state)?;
+        if record.batch_id != token.batch_id
+            || record.attempt != token.attempt
+            || record.phase != WorkerPhase::Claimed
+            || digest != claim.package.digest()
+        {
+            return Err(WorkerQueueError::ClaimChanged { request_id });
+        }
+        Ok(())
     }
 }
 
@@ -410,7 +488,7 @@ fn write_phase_record(
     package_root: &Path,
     record: &WorkerPhaseRecord,
 ) -> Result<(), WorkerQueueError> {
-    let temporary_root = queue.queue_root.join(WORKER_TEMP_DIRECTORY_NAME);
+    let temporary_root = queue.worker_temporary_root();
     let temporary_path = temporary_root.join(format!(".phase-{}", Ulid::generate()));
     let destination = package_root.join(PHASE_FILE_NAME);
     match fs::symlink_metadata(&destination) {
@@ -438,7 +516,7 @@ fn write_phase_record(
         drop(temporary);
         fs::rename(&temporary_path, destination).map_err(WorkerQueueError::Io)?;
         sync_directory(package_root).map_err(WorkerQueueError::Queue)?;
-        sync_directory(&temporary_root).map_err(WorkerQueueError::Queue)
+        sync_directory(temporary_root).map_err(WorkerQueueError::Queue)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);

@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::Arc;
 
 use agent_knowledge_core::RequestId;
 
@@ -44,6 +45,7 @@ impl WorkerSession {
         &mut self,
         maximum_scan_entries: usize,
     ) -> Result<ProcessingScanOutcome, WorkerQueueError> {
+        self.queue_identity()?;
         if maximum_scan_entries == 0 {
             return Err(WorkerQueueError::InvalidProcessingScanLimit);
         }
@@ -53,12 +55,8 @@ impl WorkerSession {
         if self.processing_scan.is_none() {
             self.processing_recovery_complete = false;
             self.processing_scan = Some(
-                fs::read_dir(
-                    self.queue
-                        .queue_root
-                        .join(QueueState::Processing.directory_name()),
-                )
-                .map_err(WorkerQueueError::Io)?,
+                fs::read_dir(self.queue.state_root(QueueState::Processing))
+                    .map_err(WorkerQueueError::Io)?,
             );
         }
 
@@ -157,5 +155,7 @@ fn recover_processing_claim(
             attempt: record.attempt,
         },
         package,
+        package_root: path,
+        _directory_lease: Arc::clone(&queue.directories.state(QueueState::Processing).handle),
     })
 }

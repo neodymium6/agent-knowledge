@@ -192,6 +192,38 @@ fn rejects_missing_and_unreferenced_payload() {
 }
 
 #[test]
+fn bounds_payload_bytes_materialized_by_repeated_references() {
+    let root = TestDirectory::create();
+    let mut request: serde_json::Value = serde_json::from_str(REQUEST_JSON)
+        .unwrap_or_else(|error| panic!("fixture request must decode: {error}"));
+    let operations = request["operations"]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("fixture operations must be an array"));
+    for index in 0..64 {
+        operations.push(serde_json::json!({
+            "type": "add_attachment",
+            "document_id": "01K00000000000000000000002",
+            "source": "benchmark/results.csv",
+            "name": format!("copy-{index}.csv")
+        }));
+    }
+    write_fixture(root.path(), &request.to_string(), false);
+    if let Err(error) = fs::write(
+        root.path().join("payload/benchmark/results.csv"),
+        vec![b'x'; 1024 * 1024],
+    ) {
+        panic!("large repeated payload fixture must be written: {error}");
+    }
+    assert!(matches!(
+        validate_package(root.path(), &PackagePolicy::default()),
+        Err(PackageValidationError::LimitExceeded {
+            limit: PackageLimit::MaterializedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn enforces_file_count_and_byte_limits() {
     let root = TestDirectory::create();
     write_fixture(root.path(), REQUEST_JSON, false);
