@@ -1075,7 +1075,7 @@ releases/
 ├── by-commit/
 │   └── <commit> -> ../by-id/<release-id>/
 ├── by-batch/
-│   └── <batch-id> -> ../by-id/<release-id>/
+│   └── <batch-id>  # durable release manifest intent
 ├── cleanup-intent/
 │   └── <batch-id>
 └── current -> by-id/20260731T040500Z-<commit>/
@@ -1152,9 +1152,12 @@ directory identity cannot be dropped and reopened between building and
 preparation. Quartz receives its replaceable `site/` child as the output path,
 allowing the CLI to remove and recreate the output root without invalidating
 the batch container. Restart recovery uses the batch ID and the durable
-`by-batch/<batch-id>` intent. That intent may be temporarily dangling until the
-atomic `site/` promotion; the ready-only `by-commit/` index is updated after
-promotion and never points at an in-progress release.
+`by-batch/<batch-id>` manifest intent. The store publishes this intent outside
+Quartz-controlled staging before writing the matching staging manifest, so
+recovery never trusts staging metadata by itself. The intent may describe a
+not-yet-promoted release until the atomic `site/` promotion; the ready-only
+`by-commit/` index is updated after promotion and never points at an
+in-progress release.
 
 Failed or interrupted output may be removed only through a batch-scoped
 staging cleanup operation. Cleanup first records the pinned batch inode in

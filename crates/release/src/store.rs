@@ -331,11 +331,11 @@ impl ReleaseStore {
                 return Err(ReleaseError::MissingRecoveryState);
             }
         }
-        if let Some(release_id) = intent.as_deref() {
-            let destination = self.by_id.stable.join(release_id);
+        if let Some(intent) = intent.as_ref() {
+            let destination = self.by_id.stable.join(&intent.release_id);
             if path_exists(&destination)? {
                 let manifest = read_manifest(&destination)?;
-                if manifest.release_id != release_id || manifest.commit != commit {
+                if manifest != *intent || manifest.commit != commit {
                     return Err(ReleaseError::InvalidBatchIntent);
                 }
                 validate_release(&destination, &self.by_id.handle, &manifest, self.policy)?;
@@ -358,15 +358,13 @@ impl ReleaseStore {
         if batch.cleanup_started {
             return Err(ReleaseError::InvalidBatchIntent);
         }
-        let manifest = read_manifest(&batch.stable.join(SITE_DIRECTORY))?;
-        if manifest.commit != commit
-            || intent
-                .as_deref()
-                .is_some_and(|release_id| release_id != manifest.release_id)
-        {
+        let intent = intent.ok_or(ReleaseError::MissingRecoveryState)?;
+        if intent.commit != commit {
             return Err(ReleaseError::InvalidBatchIntent);
         }
-        self.prepare_batch(batch_id, batch, commit, manifest.created_at)
+        let staging = batch.stable.join(SITE_DIRECTORY);
+        ensure_manifest(&staging.join(MANIFEST_FILE), &intent)?;
+        self.prepare_batch(batch_id, batch, commit, intent.created_at)
     }
 
     fn prepare_batch(
@@ -414,13 +412,13 @@ impl ReleaseStore {
             created_at,
         };
         ensure_real_directory(&staging)?;
+        self.ensure_batch_intent(batch_id, &manifest)?;
         ensure_manifest(&staging.join(MANIFEST_FILE), &manifest)?;
         if validate_release_tree_at(&staging, &batch.handle, self.policy, true)?
             != manifest.content_revision
         {
             return Err(ReleaseError::OutputChanged);
         }
-        self.ensure_batch_intent(batch_id, &manifest)?;
         fs::rename(&staging, &destination).map_err(ReleaseError::Io)?;
         // A recovered process must observe the destination before it may
         // observe the source removal as durable.
@@ -722,20 +720,23 @@ impl ReleaseStore {
         self.validate_live_storage()
     }
 
-    fn batch_intent(&self, batch_id: BatchId) -> Result<Option<String>, ReleaseError> {
+    fn batch_intent(&self, batch_id: BatchId) -> Result<Option<ReleaseManifest>, ReleaseError> {
         let reference = self.by_batch.stable.join(batch_id.to_string());
-        let metadata = match fs::symlink_metadata(&reference) {
-            Ok(metadata) => metadata,
+        match fs::symlink_metadata(&reference) {
+            Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(ReleaseError::Io(error)),
-        };
-        if !metadata.file_type().is_symlink() {
+        }
+        let manifest = read_manifest_file(&reference).map_err(|error| match error {
+            ReleaseError::Io(error) => ReleaseError::Io(error),
+            _ => ReleaseError::InvalidBatchIntent,
+        })?;
+        if release_id(manifest.created_at, &manifest.commit) != manifest.release_id
+            || validate_commit(&manifest.commit).is_err()
+        {
             return Err(ReleaseError::InvalidBatchIntent);
         }
-        let target = fs::read_link(reference).map_err(ReleaseError::Io)?;
-        let release_id =
-            release_id_from_commit_target(&target).map_err(|_| ReleaseError::InvalidBatchIntent)?;
-        Ok(Some(release_id.into()))
+        Ok(Some(manifest))
     }
 
     fn ensure_batch_intent(
@@ -743,25 +744,24 @@ impl ReleaseStore {
         batch_id: BatchId,
         manifest: &ReleaseManifest,
     ) -> Result<(), ReleaseError> {
-        let target = PathBuf::from("..")
-            .join(BY_ID_DIRECTORY)
-            .join(&manifest.release_id);
         let reference = self.by_batch.stable.join(batch_id.to_string());
-        if let Ok(metadata) = fs::symlink_metadata(&reference)
-            && metadata.file_type().is_symlink()
-            && fs::read_link(&reference).map_err(ReleaseError::Io)? == target
-        {
-            sync_directory(&self.by_batch.stable)?;
-            return self.validate_live_storage();
+        if path_exists(&reference)? {
+            if self.batch_intent(batch_id)?.as_ref() == Some(manifest) {
+                sync_directory(&self.by_batch.stable)?;
+                return self.validate_live_storage();
+            }
+            return Err(ReleaseError::InvalidBatchIntent);
         }
-        replace_symlink(&self.by_batch.stable, &reference, &target, "batch")?;
+        let mut contents = serde_json::to_vec(manifest).map_err(ReleaseError::ManifestEncoding)?;
+        contents.push(b'\n');
+        replace_regular_file(&self.by_batch.stable, &reference, &contents, "batch")?;
         self.validate_live_storage()
     }
 
     fn remove_batch_intent(&self, batch_id: BatchId) -> Result<(), ReleaseError> {
         let reference = self.by_batch.stable.join(batch_id.to_string());
         match fs::symlink_metadata(&reference) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata.file_type().is_file() => {
                 fs::remove_file(reference).map_err(ReleaseError::Io)?;
             }
             Ok(_) => return Err(ReleaseError::InvalidBatchIntent),
@@ -1095,12 +1095,16 @@ fn ensure_manifest(path: &Path, manifest: &ReleaseManifest) -> Result<(), Releas
 fn read_manifest(release: &Path) -> Result<ReleaseManifest, ReleaseError> {
     ensure_real_directory(release)?;
     let path = release.join(MANIFEST_FILE);
-    let metadata = fs::symlink_metadata(&path).map_err(ReleaseError::Io)?;
+    read_manifest_file(&path)
+}
+
+fn read_manifest_file(path: &Path) -> Result<ReleaseManifest, ReleaseError> {
+    let metadata = fs::symlink_metadata(path).map_err(ReleaseError::Io)?;
     if !metadata.file_type().is_file() || metadata.len() > MAXIMUM_MANIFEST_BYTES {
         return Err(ReleaseError::InvalidManifest);
     }
-    validate_regular_file(&path, &metadata)?;
-    let file = open_regular_file(&path)?;
+    validate_regular_file(path, &metadata)?;
+    let file = open_regular_file(path)?;
     let opened = file.metadata().map_err(ReleaseError::Io)?;
     if !same_metadata(&metadata, &opened)
         || !opened.file_type().is_file()
@@ -1108,7 +1112,7 @@ fn read_manifest(release: &Path) -> Result<ReleaseManifest, ReleaseError> {
     {
         return Err(ReleaseError::InvalidManifest);
     }
-    validate_regular_file(&path, &opened)?;
+    validate_regular_file(path, &opened)?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take(MAXIMUM_MANIFEST_BYTES + 1)
         .read_to_end(&mut bytes)

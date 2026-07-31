@@ -244,8 +244,6 @@ fn resumes_from_a_durable_batch_intent_before_promotion() {
         content_revision,
         created_at,
     };
-    ensure_manifest(&output.path().join(MANIFEST_FILE), &manifest)
-        .unwrap_or_else(|error| panic!("staged manifest must be durable: {error}"));
     store
         .ensure_batch_intent(batch(FIRST_BATCH), &manifest)
         .unwrap_or_else(|error| panic!("batch intent must be durable: {error}"));
@@ -270,6 +268,48 @@ fn resumes_from_a_durable_batch_intent_before_promotion() {
             .unwrap_or_else(|| panic!("resumed release must be indexed")),
         recovered
     );
+}
+
+#[test]
+fn intentless_staging_manifest_cannot_resume_preparation() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = store
+        .begin_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("release build must begin: {error}"));
+    fs::write(
+        output.path().join("index.html"),
+        "partial fictional output\n",
+    )
+    .unwrap_or_else(|error| panic!("partial output must be written: {error}"));
+    let created_at = timestamp("2026-07-31T04:00:00Z");
+    let manifest = ReleaseManifest {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        release_id: release_id(created_at, FIRST_COMMIT),
+        commit: FIRST_COMMIT.into(),
+        content_revision: validate_release_tree_at(
+            output.path(),
+            &output.batch_handle,
+            ReleasePolicy::default(),
+            false,
+        )
+        .unwrap_or_else(|error| panic!("partial output must validate: {error}")),
+        created_at,
+    };
+    ensure_manifest(&output.path().join(MANIFEST_FILE), &manifest)
+        .unwrap_or_else(|error| panic!("untrusted staging manifest must be written: {error}"));
+    drop(output);
+
+    assert!(matches!(
+        store.resume_prepare(batch(FIRST_BATCH), FIRST_COMMIT),
+        Err(ReleaseError::MissingRecoveryState)
+    ));
+    assert!(!releases.join("by-id").join(&manifest.release_id).exists());
+    store
+        .discard_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("intentless staging must remain discardable: {error}"));
 }
 
 #[test]
@@ -603,11 +643,8 @@ fn retrying_an_older_release_does_not_regress_commit_lookup() {
     assert_eq!(recovered, second);
 }
 
-#[cfg(unix)]
 #[test]
 fn batch_intent_recovers_the_exact_release_without_regressing_commit_lookup() {
-    use std::os::unix::fs::symlink;
-
     let root = TestDirectory::new();
     let releases = root.0.join("releases");
     let store = ReleaseStore::open(&releases, ReleasePolicy::default())
@@ -637,11 +674,11 @@ fn batch_intent_recovers_the_exact_release_without_regressing_commit_lookup() {
         )
         .unwrap_or_else(|error| panic!("recovered staged file must be copied: {error}"));
     }
-    symlink(
-        PathBuf::from("..").join("by-id").join(first.release_id()),
-        releases.join("by-batch").join(FIRST_BATCH),
-    )
-    .unwrap_or_else(|error| panic!("batch intent fixture must be created: {error}"));
+    let manifest = read_manifest(&releases.join("by-id").join(first.release_id()))
+        .unwrap_or_else(|error| panic!("prepared manifest must be readable: {error}"));
+    store
+        .ensure_batch_intent(batch(FIRST_BATCH), &manifest)
+        .unwrap_or_else(|error| panic!("batch intent fixture must be created: {error}"));
 
     let recovered = store
         .resume_prepare(batch(FIRST_BATCH), FIRST_COMMIT)
