@@ -173,7 +173,9 @@ fn accepts_new_package_and_returns_existing_for_an_identical_retry() {
         Err(error) => panic!("accepted package must revalidate: {error}"),
     };
     assert_eq!(
-        validated.acceptance().map(|metadata| metadata.sequence),
+        validated
+            .acceptance()
+            .map(|metadata| metadata.sequence.get()),
         Some(1)
     );
     assert!(incoming_is_empty(root.path()));
@@ -212,7 +214,7 @@ fn acceptance_sequence_is_monotonic_across_restart() {
             Err(error) => panic!("accepted package must validate: {error}"),
         };
         assert_eq!(
-            package.acceptance().map(|metadata| metadata.sequence),
+            package.acceptance().map(|metadata| metadata.sequence.get()),
             Some(index as u64 + 1)
         );
     }
@@ -239,9 +241,32 @@ fn acceptance_sequence_is_monotonic_across_restart() {
         Err(error) => panic!("accepted package must validate: {error}"),
     };
     assert_eq!(
-        package.acceptance().map(|metadata| metadata.sequence),
+        package.acceptance().map(|metadata| metadata.sequence.get()),
         Some(3)
     );
+}
+
+#[test]
+fn missing_sequence_state_fails_closed_when_requests_exist() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let _ = accept(stage_package(&queue, RESULTS));
+    drop(queue);
+    if let Err(error) = fs::remove_file(root.path().join("queue/next-sequence")) {
+        panic!("fixture sequence state must be removed: {error}");
+    }
+
+    let error = match FileQueue::initialize(
+        root.path().join("queue"),
+        root.path().join("locks/queue.lock"),
+        PackagePolicy::default(),
+    ) {
+        Ok(_) => panic!("missing sequence state with accepted requests must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, QueueError::InvalidSequenceState));
+    assert_eq!(error.error_code(), ErrorCode::InternalError);
+    assert!(!root.path().join("queue/next-sequence").exists());
 }
 
 #[test]
@@ -647,7 +672,7 @@ fn stale_incoming_requires_quarantine_before_reaping() {
         panic!("abandoned incoming fixture must be created: {error}");
     }
 
-    let moved = match queue.quarantine_stale_incoming(std::time::Duration::ZERO) {
+    let moved = match queue.quarantine_stale_incoming(std::time::Duration::ZERO, 100, 100) {
         Ok(moved) => moved,
         Err(error) => panic!("stale incoming quarantine must succeed: {error}"),
     };
@@ -660,10 +685,70 @@ fn stale_incoming_requires_quarantine_before_reaping() {
             .is_dir()
     );
 
-    let removed = match queue.reap_quarantined_incoming(std::time::Duration::ZERO) {
+    let removed = match queue.reap_quarantined_incoming(std::time::Duration::ZERO, 100, 100) {
         Ok(removed) => removed,
         Err(error) => panic!("quarantined incoming reap must succeed: {error}"),
     };
     assert_eq!(removed, 1);
     assert!(active.staging_path.is_dir());
+}
+
+#[test]
+fn quarantine_retention_starts_when_the_directory_is_quarantined() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let abandoned = root
+        .path()
+        .join("queue/incoming/.incoming-01K00000000000000000000998");
+    if let Err(error) = fs::create_dir(&abandoned) {
+        panic!("abandoned incoming fixture must be created: {error}");
+    }
+
+    let moved = match queue.quarantine_stale_incoming(std::time::Duration::ZERO, 100, 100) {
+        Ok(moved) => moved,
+        Err(error) => panic!("stale incoming quarantine must succeed: {error}"),
+    };
+    assert_eq!(moved, 1);
+    let quarantined = root
+        .path()
+        .join("queue/quarantine/.incoming-01K00000000000000000000998");
+    assert!(quarantined.join(".quarantined-at").is_file());
+
+    let removed =
+        match queue.reap_quarantined_incoming(std::time::Duration::from_secs(60), 100, 100) {
+            Ok(removed) => removed,
+            Err(error) => panic!("retention check must succeed: {error}"),
+        };
+    assert_eq!(removed, 0);
+    assert!(quarantined.is_dir());
+}
+
+#[test]
+fn stale_maintenance_respects_scan_and_action_budgets() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    for suffix in ["00995", "00996", "00997"] {
+        let path = root.path().join(format!(
+            "queue/incoming/.incoming-01K000000000000000000{suffix}"
+        ));
+        if let Err(error) = fs::create_dir(path) {
+            panic!("abandoned incoming fixture must be created: {error}");
+        }
+    }
+
+    let first = match queue.quarantine_stale_incoming(std::time::Duration::ZERO, 1, 100) {
+        Ok(moved) => moved,
+        Err(error) => panic!("scan-budgeted quarantine must succeed: {error}"),
+    };
+    assert_eq!(first, 1);
+    let second = match queue.quarantine_stale_incoming(std::time::Duration::ZERO, 100, 1) {
+        Ok(moved) => moved,
+        Err(error) => panic!("action-budgeted quarantine must succeed: {error}"),
+    };
+    assert_eq!(second, 1);
+    let remaining = match fs::read_dir(root.path().join("queue/incoming")) {
+        Ok(entries) => entries.count(),
+        Err(error) => panic!("incoming directory must be readable: {error}"),
+    };
+    assert_eq!(remaining, 1);
 }

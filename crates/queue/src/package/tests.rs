@@ -34,6 +34,25 @@ const REQUEST_JSON: &str = r#"{
     ]
 }"#;
 
+const ARCHIVE_REQUEST_JSON: &str = r#"{
+    "protocol_version": 1,
+    "request_id": "01K00000000000000000000003",
+    "title": "Archive fictional benchmark",
+    "project": "fictional-solver",
+    "document_type": "experiment",
+    "node": "fictional-node-a",
+    "agent": "codex",
+    "session": "01K00000000000000000000004",
+    "created_at": "2026-07-31T04:00:00+09:00",
+    "operations": [
+        {
+            "type": "archive_document",
+            "document_id": "01K00000000000000000000002",
+            "expected_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        }
+    ]
+}"#;
+
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory(PathBuf);
@@ -276,6 +295,40 @@ fn bounds_payload_directory_count_and_path_depth() {
             limit: PackageLimit::PathComponents,
             maximum: 1,
             actual: 2
+        }
+    ));
+}
+
+#[test]
+fn counts_request_json_against_the_entry_limit_without_payload_files() {
+    let root = TestDirectory::create();
+    if let Err(error) = fs::create_dir(root.path().join("payload")) {
+        panic!("empty payload directory must be created: {error}");
+    }
+    if let Err(error) = fs::write(root.path().join("request.json"), ARCHIVE_REQUEST_JSON) {
+        panic!("archive request fixture must be written: {error}");
+    }
+    let policy = match PackagePolicy::new(
+        PackageLimits {
+            maximum_entry_count: 0,
+            ..PackageLimits::default()
+        },
+        ["csv"],
+    ) {
+        Ok(policy) => policy,
+        Err(error) => panic!("test policy must be valid: {error}"),
+    };
+
+    let error = match validate_package(root.path(), &policy) {
+        Ok(_) => panic!("request.json must count toward the entry limit"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        PackageValidationError::LimitExceeded {
+            limit: PackageLimit::EntryCount,
+            maximum: 0,
+            actual: 1
         }
     ));
 }
@@ -589,6 +642,27 @@ fn revalidates_accepted_digest_and_detects_changed_contents() {
     assert!(matches!(
         error,
         PackageValidationError::StoredDigestMismatch { .. }
+    ));
+    assert_eq!(error.error_code(), ErrorCode::ContentValidationFailed);
+}
+
+#[test]
+fn rejects_zero_accepted_sequence() {
+    let root = TestDirectory::create();
+    write_fixture(root.path(), REQUEST_JSON, false);
+    let package = match validate_package(root.path(), &PackagePolicy::default()) {
+        Ok(package) => package,
+        Err(error) => panic!("incoming fixture package must validate: {error}"),
+    };
+    write_accepted_metadata(root.path(), package.digest(), 0);
+
+    let error = match validate_accepted_package(root.path(), &PackagePolicy::default()) {
+        Ok(_) => panic!("accepted sequence zero must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        PackageValidationError::InvalidAcceptanceMetadata(_)
     ));
     assert_eq!(error.error_code(), ErrorCode::ContentValidationFailed);
 }

@@ -615,6 +615,11 @@ package revalidation excludes Gateway and Worker metadata bytes from the
 immutable client-package digest but still rejects links, executable files,
 and any unknown top-level entry.
 
+The next sequence is stored durably in `queue/next-sequence`. If that file is
+missing while any accepted-state directory is nonempty, queue initialization
+fails instead of restarting at one. Operators must recover the sequence state
+from durable queue metadata before accepting another request.
+
 ### 16.2 Durable acceptance
 
 The Gateway accepts a request as follows:
@@ -655,7 +660,15 @@ are protected by an advisory lease while active. An explicit administrative
 maintenance operation may atomically move only inactive entries older than a
 configured threshold into `quarantine/`. A separate operation may remove
 stale quarantined entries. Neither operation scans or removes accepted
-packages.
+packages. Each maintenance invocation has explicit maximum scan and action
+counts so a large abandoned directory set cannot cause unbounded work or
+memory use.
+
+Immediately before the atomic quarantine rename, maintenance writes and
+synchronizes a `.quarantined-at` marker. Reaping measures its retention age
+from that marker rather than from the incoming directory's older modification
+time. A quarantined directory without a completed regular-file marker is
+retained for manual recovery.
 
 `processing/` entries contain an atomic phase record. On startup, the Worker
 examines interrupted entries, commit trailers, the official branch, and

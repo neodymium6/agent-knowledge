@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -32,7 +33,7 @@ const MAXIMUM_ACCEPTANCE_FILE_BYTES: u64 = 256;
 #[serde(deny_unknown_fields)]
 pub struct AcceptanceMetadata {
     /// Queue-local durable acceptance order, starting at one.
-    pub sequence: u64,
+    pub sequence: NonZeroU64,
     /// Central-server timestamp recorded while holding the acceptance lock.
     #[serde(with = "time::serde::rfc3339")]
     pub accepted_at: OffsetDateTime,
@@ -299,6 +300,7 @@ fn validate_package_contents(
     let mut total_bytes = request_bytes.len() as u64;
     let mut file_count = 1_usize;
     enforce_totals(total_bytes, file_count, policy.limits)?;
+    enforce_entry_count(file_count, policy.limits)?;
 
     let request = ChangeRequest::decode_json(&request_bytes)
         .map_err(PackageValidationError::InvalidRequest)?;
@@ -721,6 +723,20 @@ fn enforce_totals(
             limit: PackageLimit::FileCount,
             maximum: limits.maximum_file_count as u64,
             actual: file_count as u64,
+        });
+    }
+    Ok(())
+}
+
+fn enforce_entry_count(
+    entry_count: usize,
+    limits: PackageLimits,
+) -> Result<(), PackageValidationError> {
+    if entry_count > limits.maximum_entry_count {
+        return Err(PackageValidationError::LimitExceeded {
+            limit: PackageLimit::EntryCount,
+            maximum: limits.maximum_entry_count as u64,
+            actual: entry_count as u64,
         });
     }
     Ok(())

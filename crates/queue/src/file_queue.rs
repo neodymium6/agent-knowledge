@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -17,6 +18,7 @@ const REQUEST_FILE_NAME: &str = "request.json";
 const DIGEST_FILE_NAME: &str = "digest";
 const ACCEPTANCE_FILE_NAME: &str = "acceptance.json";
 const NEXT_SEQUENCE_FILE_NAME: &str = "next-sequence";
+const QUARANTINE_MARKER_FILE_NAME: &str = ".quarantined-at";
 const PAYLOAD_DIRECTORY_NAME: &str = "payload";
 const COPY_BUFFER_LENGTH: usize = 64 * 1024;
 const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
@@ -129,7 +131,7 @@ impl FileQueue {
             .open(&lock_file)
             .map_err(QueueError::Io)?;
         initialization_lock.lock().map_err(QueueError::Io)?;
-        ensure_sequence_file(&queue_root.join(NEXT_SEQUENCE_FILE_NAME))?;
+        ensure_sequence_file(&queue_root.join(NEXT_SEQUENCE_FILE_NAME), &queue_root)?;
 
         sync_directory(&queue_root)?;
         if let Some(parent) = queue_root.parent()
@@ -212,18 +214,30 @@ impl FileQueue {
     ///
     /// Returns an error when queue locking, age inspection, lease acquisition,
     /// rename, or directory synchronization fails.
-    pub fn quarantine_stale_incoming(&self, minimum_age: Duration) -> Result<usize, QueueError> {
+    pub fn quarantine_stale_incoming(
+        &self,
+        minimum_age: Duration,
+        maximum_scan_entries: usize,
+        maximum_actions: usize,
+    ) -> Result<usize, QueueError> {
         let lock = self.open_queue_lock()?;
         lock.lock().map_err(QueueError::Io)?;
 
         let incoming_root = self.queue_root.join("incoming");
         let quarantine_root = self.queue_root.join("quarantine");
-        let candidates = inactive_stale_directories(&incoming_root, minimum_age)?;
+        let candidates = inactive_stale_directories(
+            &incoming_root,
+            minimum_age,
+            maximum_scan_entries,
+            maximum_actions,
+            StaleAgeSource::Directory,
+        )?;
         let mut moved = 0_usize;
         for candidate in candidates {
             let name = candidate
                 .file_name()
                 .ok_or_else(|| QueueError::InvalidStoragePath(candidate.clone()))?;
+            write_quarantine_marker(&candidate)?;
             fs::rename(&candidate, quarantine_root.join(name)).map_err(QueueError::Io)?;
             moved += 1;
         }
@@ -242,12 +256,23 @@ impl FileQueue {
     ///
     /// Returns an error when queue locking, age inspection, lease acquisition,
     /// removal, or directory synchronization fails.
-    pub fn reap_quarantined_incoming(&self, minimum_age: Duration) -> Result<usize, QueueError> {
+    pub fn reap_quarantined_incoming(
+        &self,
+        minimum_age: Duration,
+        maximum_scan_entries: usize,
+        maximum_actions: usize,
+    ) -> Result<usize, QueueError> {
         let lock = self.open_queue_lock()?;
         lock.lock().map_err(QueueError::Io)?;
 
         let quarantine_root = self.queue_root.join("quarantine");
-        let candidates = inactive_stale_directories(&quarantine_root, minimum_age)?;
+        let candidates = inactive_stale_directories(
+            &quarantine_root,
+            minimum_age,
+            maximum_scan_entries,
+            maximum_actions,
+            StaleAgeSource::QuarantineMarker,
+        )?;
         let removed = candidates.len();
         for candidate in candidates {
             fs::remove_dir_all(candidate).map_err(QueueError::Io)?;
@@ -586,7 +611,7 @@ impl IncomingPackage {
 
         let sequence = allocate_sequence(&self.queue.queue_root)?;
         let acceptance = AcceptanceMetadata {
-            sequence,
+            sequence: NonZeroU64::new(sequence).ok_or(QueueError::InvalidSequenceState)?,
             accepted_at: time::OffsetDateTime::now_utc(),
         };
         write_acceptance_file(&self.staging_path, acceptance)?;
@@ -613,16 +638,20 @@ impl IncomingPackage {
 fn inactive_stale_directories(
     root: &Path,
     minimum_age: Duration,
+    maximum_scan_entries: usize,
+    maximum_actions: usize,
+    age_source: StaleAgeSource,
 ) -> Result<Vec<PathBuf>, QueueError> {
+    if maximum_scan_entries == 0 || maximum_actions == 0 {
+        return Ok(Vec::new());
+    }
     let now = SystemTime::now();
-    let mut entries = fs::read_dir(root)
+    let mut stale = Vec::with_capacity(maximum_actions.min(maximum_scan_entries));
+    for entry in fs::read_dir(root)
         .map_err(QueueError::Io)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(QueueError::Io)?;
-    entries.sort_by_key(fs::DirEntry::file_name);
-
-    let mut stale = Vec::new();
-    for entry in entries {
+        .take(maximum_scan_entries)
+    {
+        let entry = entry.map_err(QueueError::Io)?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -635,7 +664,18 @@ fn inactive_stale_directories(
         if !metadata.file_type().is_dir() {
             continue;
         }
-        let modified = metadata.modified().map_err(QueueError::Io)?;
+        let modified = match age_source {
+            StaleAgeSource::Directory => metadata.modified().map_err(QueueError::Io)?,
+            StaleAgeSource::QuarantineMarker => {
+                let marker = match fs::symlink_metadata(path.join(QUARANTINE_MARKER_FILE_NAME)) {
+                    Ok(marker) if marker.file_type().is_file() => marker,
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(QueueError::Io(error)),
+                };
+                marker.modified().map_err(QueueError::Io)?
+            }
+        };
         let Ok(age) = now.duration_since(modified) else {
             continue;
         };
@@ -645,12 +685,50 @@ fn inactive_stale_directories(
 
         let lease = File::open(&path).map_err(QueueError::Io)?;
         match lease.try_lock() {
-            Ok(()) => stale.push(path),
+            Ok(()) => {
+                stale.push(path);
+                if stale.len() == maximum_actions {
+                    break;
+                }
+            }
             Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Error(error)) => return Err(QueueError::Io(error)),
         }
     }
     Ok(stale)
+}
+
+#[derive(Clone, Copy)]
+enum StaleAgeSource {
+    Directory,
+    QuarantineMarker,
+}
+
+fn write_quarantine_marker(package_root: &Path) -> Result<(), QueueError> {
+    let marker_path = package_root.join(QUARANTINE_MARKER_FILE_NAME);
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+    {
+        Ok(mut marker) => {
+            let timestamp = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(QueueError::QuarantineTimestamp)?;
+            writeln!(marker, "{timestamp}").map_err(QueueError::Io)?;
+            marker.sync_all().map_err(QueueError::Io)?;
+            sync_directory(package_root)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&marker_path).map_err(QueueError::Io)?;
+            if metadata.file_type().is_file() {
+                Ok(())
+            } else {
+                Err(QueueError::InvalidStoragePath(marker_path))
+            }
+        }
+        Err(error) => Err(QueueError::Io(error)),
+    }
 }
 
 fn is_staging_directory_name(name: &str) -> bool {
@@ -698,7 +776,7 @@ fn ensure_lock_file(path: &Path) -> Result<(), QueueError> {
     }
 }
 
-fn ensure_sequence_file(path: &Path) -> Result<(), QueueError> {
+fn ensure_sequence_file(path: &Path, queue_root: &Path) -> Result<(), QueueError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {
             let _ = read_next_sequence(path)?;
@@ -706,19 +784,38 @@ fn ensure_sequence_file(path: &Path) -> Result<(), QueueError> {
         }
         Ok(_) => Err(QueueError::InvalidStoragePath(path.into())),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if !accepted_states_are_empty(queue_root)? {
+                return Err(QueueError::InvalidSequenceState);
+            }
             match OpenOptions::new().write(true).create_new(true).open(path) {
                 Ok(mut file) => {
                     file.write_all(b"1\n").map_err(QueueError::Io)?;
                     file.sync_all().map_err(QueueError::Io)
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    ensure_sequence_file(path)
+                    ensure_sequence_file(path, queue_root)
                 }
                 Err(error) => Err(QueueError::Io(error)),
             }
         }
         Err(error) => Err(QueueError::Io(error)),
     }
+}
+
+fn accepted_states_are_empty(queue_root: &Path) -> Result<bool, QueueError> {
+    for state in QueueState::ALL {
+        let mut entries =
+            fs::read_dir(queue_root.join(state.directory_name())).map_err(QueueError::Io)?;
+        if entries
+            .next()
+            .transpose()
+            .map_err(QueueError::Io)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn write_digest_file(package_root: &Path, digest: PackageDigest) -> Result<(), QueueError> {
@@ -982,6 +1079,8 @@ pub enum QueueError {
     },
     /// Serializing Gateway-owned acceptance metadata failed.
     AcceptanceMetadata(serde_json::Error),
+    /// Formatting the Gateway-owned quarantine timestamp failed.
+    QuarantineTimestamp(time::error::Format),
     /// The durable queue acceptance sequence was exhausted.
     SequenceExhausted,
     /// The durable queue acceptance sequence file was malformed.
@@ -1018,6 +1117,7 @@ impl QueueError {
             Self::InvalidStoragePath(_)
             | Self::RequestInMultipleStates { .. }
             | Self::AcceptanceMetadata(_)
+            | Self::QuarantineTimestamp(_)
             | Self::SequenceExhausted
             | Self::InvalidSequenceState => ErrorCode::InternalError,
         }
@@ -1072,6 +1172,9 @@ impl fmt::Display for QueueError {
                     "acceptance metadata serialization failed: {error}"
                 )
             }
+            Self::QuarantineTimestamp(error) => {
+                write!(formatter, "quarantine timestamp formatting failed: {error}")
+            }
             Self::SequenceExhausted => {
                 formatter.write_str("durable acceptance sequence is exhausted")
             }
@@ -1102,6 +1205,7 @@ impl std::error::Error for QueueError {
             Self::Io(error) => Some(error),
             Self::Package(error) => Some(error),
             Self::AcceptanceMetadata(error) => Some(error),
+            Self::QuarantineTimestamp(error) => Some(error),
             _ => None,
         }
     }
