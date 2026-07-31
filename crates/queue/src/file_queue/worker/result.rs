@@ -1,17 +1,18 @@
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 
 use agent_knowledge_core::{BatchId, ErrorCode, RequestId};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use super::WorkerQueueError;
+use super::{ClaimToken, WorkerQueueError, read_required_phase_record};
 use crate::file_queue::{
     FileQueue, QueueError, QueueState, WORKER_TEMP_DIRECTORY_NAME, sync_directory,
 };
 
 const RESULT_FILE_NAME: &str = "result.json";
+const MAXIMUM_RESULT_FILE_BYTES: u64 = 1_024;
 
 /// Current schema version for Repository Worker result sidecars.
 pub const CURRENT_WORKER_RESULT_SCHEMA_VERSION: u16 = 1;
@@ -73,7 +74,7 @@ impl FileQueue {
             error_code,
             failed_at: OffsetDateTime::now_utc(),
         };
-        write_result_record(self, &pending_path, &record)?;
+        write_result_record(self, &pending_path, QueueState::Pending, &record)?;
 
         let failed_path = self.state_path(QueueState::Failed, request_id);
         fs::rename(&pending_path, failed_path).map_err(WorkerQueueError::Io)?;
@@ -82,6 +83,124 @@ impl FileQueue {
         sync_directory(&self.queue_root.join(QueueState::Pending.directory_name()))
             .map_err(WorkerQueueError::Queue)
     }
+
+    pub(super) fn complete_claimed(&self, token: ClaimToken) -> Result<(), WorkerQueueError> {
+        let queue_lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
+        queue_lock.lock().map_err(WorkerQueueError::Io)?;
+        let request_id = token.request_id();
+        let Some(state) = find_existing_state_without_package_read(self, request_id)? else {
+            return Err(WorkerQueueError::RequestNotFound { request_id });
+        };
+        match state {
+            QueueState::Processing => {
+                validate_claim_token(self, token, state)?;
+                transition(
+                    self,
+                    request_id,
+                    QueueState::Processing,
+                    QueueState::Completed,
+                )
+            }
+            QueueState::Completed => {
+                validate_claim_token(self, token, state)?;
+                sync_transition_directories(self, QueueState::Processing, state)
+            }
+            actual => Err(WorkerQueueError::InvalidState {
+                request_id,
+                expected: QueueState::Processing,
+                actual,
+            }),
+        }
+    }
+
+    pub(super) fn fail_claimed(
+        &self,
+        token: ClaimToken,
+        error_code: ErrorCode,
+    ) -> Result<(), WorkerQueueError> {
+        let queue_lock = self.open_queue_lock().map_err(WorkerQueueError::Queue)?;
+        queue_lock.lock().map_err(WorkerQueueError::Io)?;
+        let request_id = token.request_id();
+        let Some(state) = find_existing_state_without_package_read(self, request_id)? else {
+            return Err(WorkerQueueError::RequestNotFound { request_id });
+        };
+        match state {
+            QueueState::Processing => {
+                validate_claim_token(self, token, state)?;
+                let processing_path = self.state_path(state, request_id);
+                let record = WorkerResultRecord {
+                    schema_version: CURRENT_WORKER_RESULT_SCHEMA_VERSION,
+                    request_id,
+                    batch_id: token.batch_id(),
+                    status: WorkerResultStatus::Failed,
+                    error_code,
+                    failed_at: OffsetDateTime::now_utc(),
+                };
+                write_result_record(self, &processing_path, state, &record)?;
+                transition(self, request_id, state, QueueState::Failed)
+            }
+            QueueState::Failed => {
+                validate_claim_token(self, token, state)?;
+                let record = read_result_record(
+                    &self.state_path(state, request_id).join(RESULT_FILE_NAME),
+                    request_id,
+                    state,
+                )?;
+                if record.batch_id == token.batch_id()
+                    && record.status == WorkerResultStatus::Failed
+                    && record.error_code == error_code
+                {
+                    sync_transition_directories(self, QueueState::Processing, state)
+                } else {
+                    Err(WorkerQueueError::ClaimChanged { request_id })
+                }
+            }
+            actual => Err(WorkerQueueError::InvalidState {
+                request_id,
+                expected: QueueState::Processing,
+                actual,
+            }),
+        }
+    }
+}
+
+fn validate_claim_token(
+    queue: &FileQueue,
+    token: ClaimToken,
+    state: QueueState,
+) -> Result<(), WorkerQueueError> {
+    let request_id = token.request_id();
+    let record =
+        read_required_phase_record(&queue.state_path(state, request_id), request_id, state)?;
+    if record.batch_id == token.batch_id() && record.attempt == token.attempt() {
+        Ok(())
+    } else {
+        Err(WorkerQueueError::ClaimChanged { request_id })
+    }
+}
+
+fn transition(
+    queue: &FileQueue,
+    request_id: RequestId,
+    source: QueueState,
+    destination: QueueState,
+) -> Result<(), WorkerQueueError> {
+    fs::rename(
+        queue.state_path(source, request_id),
+        queue.state_path(destination, request_id),
+    )
+    .map_err(WorkerQueueError::Io)?;
+    sync_transition_directories(queue, source, destination)
+}
+
+fn sync_transition_directories(
+    queue: &FileQueue,
+    source: QueueState,
+    destination: QueueState,
+) -> Result<(), WorkerQueueError> {
+    sync_directory(&queue.queue_root.join(destination.directory_name()))
+        .map_err(WorkerQueueError::Queue)?;
+    sync_directory(&queue.queue_root.join(source.directory_name())).map_err(WorkerQueueError::Queue)
 }
 
 fn find_existing_state_without_package_read(
@@ -117,6 +236,7 @@ fn find_existing_state_without_package_read(
 fn write_result_record(
     queue: &FileQueue,
     package_root: &std::path::Path,
+    state: QueueState,
     record: &WorkerResultRecord,
 ) -> Result<(), WorkerQueueError> {
     let temporary_root = queue.queue_root.join(WORKER_TEMP_DIRECTORY_NAME);
@@ -127,7 +247,7 @@ fn write_result_record(
         Ok(_) => {
             return Err(WorkerQueueError::CorruptState {
                 request_id: record.request_id,
-                state: QueueState::Pending,
+                state,
                 detail: "result metadata is not a regular file",
             });
         }
@@ -153,4 +273,36 @@ fn write_result_record(
         let _ = fs::remove_file(&temporary_path);
     }
     result
+}
+
+fn read_result_record(
+    path: &std::path::Path,
+    request_id: RequestId,
+    state: QueueState,
+) -> Result<WorkerResultRecord, WorkerQueueError> {
+    let mut bytes = Vec::with_capacity(MAXIMUM_RESULT_FILE_BYTES as usize);
+    File::open(path)
+        .map_err(WorkerQueueError::Io)?
+        .take(MAXIMUM_RESULT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(WorkerQueueError::Io)?;
+    if bytes.len() as u64 > MAXIMUM_RESULT_FILE_BYTES {
+        return Err(WorkerQueueError::CorruptState {
+            request_id,
+            state,
+            detail: "result metadata exceeds its byte limit",
+        });
+    }
+    let record: WorkerResultRecord =
+        serde_json::from_slice(&bytes).map_err(WorkerQueueError::InvalidResultMetadata)?;
+    if record.schema_version != CURRENT_WORKER_RESULT_SCHEMA_VERSION
+        || record.request_id != request_id
+    {
+        return Err(WorkerQueueError::CorruptState {
+            request_id,
+            state,
+            detail: "result metadata identity or schema is invalid",
+        });
+    }
+    Ok(record)
 }

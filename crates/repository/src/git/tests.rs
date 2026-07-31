@@ -9,8 +9,11 @@ use agent_knowledge_queue::{
 };
 use ulid::Ulid;
 
-use super::{BatchCommitOutcome, GitIdentity, GitRepository, GitTransactionError, parse_text};
+use super::{
+    BatchCommitOutcome, GitIdentity, GitRepository, GitTransactionError, parse_text, staged_stats,
+};
 use crate::ContentPolicy;
+use crate::apply::AppliedFileMove;
 
 const FIRST_REQUEST_ID: &str = "01K00000000000000000000001";
 const SECOND_REQUEST_ID: &str = "01K00000000000000000000002";
@@ -418,10 +421,32 @@ fn commits_successes_and_isolates_a_conflicting_request() {
     assert!(!message.contains(&format!("Knowledge-Request: {SECOND_REQUEST_ID}")));
     assert_eq!(git.worktree_count(), 0);
     assert_eq!(git.transaction_count(), 1);
-    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), Some(&commit)) {
-        panic!("durably reconciled batch must finalize: {error}");
-    }
+    assert!(matches!(
+        repository.reconcile_batch(&mut worker, parse_batch_id()),
+        Ok(BatchCommitOutcome::Committed {
+            commit: reconciled,
+            ..
+        }) if reconciled == commit
+    ));
     assert_eq!(git.transaction_count(), 0);
+    let repeated = worker.reconcile_batch(
+        parse_batch_id(),
+        &successful,
+        &[(failures[0].token(), failures[0].error_code())],
+    );
+    if let Err(error) = repeated {
+        panic!("terminal queue reconciliation must be idempotent: {error}");
+    }
+    assert!(
+        root.path()
+            .join(format!("queue/completed/{FIRST_REQUEST_ID}"))
+            .is_dir()
+    );
+    assert!(
+        root.path()
+            .join(format!("queue/failed/{SECOND_REQUEST_ID}/result.json"))
+            .is_file()
+    );
 }
 
 #[test]
@@ -451,9 +476,6 @@ fn all_request_failures_leave_the_official_commit_unchanged() {
     assert_eq!(git.official_commit(), base);
     assert_eq!(git.worktree_count(), 0);
     assert_eq!(git.transaction_count(), 1);
-    if let Err(error) = worker.requeue_claimed(claim.token()) {
-        panic!("fixture must simulate a failed queue transition before recovery: {error}");
-    }
     let repository = git.open();
     assert!(matches!(
         repository.recover_batch(&worker, parse_batch_id()),
@@ -461,10 +483,44 @@ fn all_request_failures_leave_the_official_commit_unchanged() {
             if failures.len() == 1
                 && failures[0].error_code() == ErrorCode::DocumentNotFound
     ));
-    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), None) {
-        panic!("durably failed batch must finalize: {error}");
-    }
+    assert!(matches!(
+        repository.reconcile_batch(&mut worker, parse_batch_id()),
+        Ok(BatchCommitOutcome::NoChanges { failures })
+            if failures.len() == 1
+                && failures[0].error_code() == ErrorCode::DocumentNotFound
+    ));
     assert_eq!(git.transaction_count(), 0);
+}
+
+#[test]
+fn rejects_a_request_timestamp_after_durable_acceptance() {
+    let root = TestDirectory::new();
+    let git = GitFixture::initialize(root.path());
+    let (queue, mut worker) = queue_and_worker(&root.path().join("queue"));
+    let future_request = create_request(FIRST_REQUEST_ID, "Create a future fictional experiment")
+        .replace(
+            "\"created_at\": \"2026-07-31T04:00:00Z\"",
+            "\"created_at\": \"9999-07-31T04:00:00Z\"",
+        );
+    let claim = enqueue_and_claim(
+        &queue,
+        &mut worker,
+        FIRST_REQUEST_ID,
+        &future_request,
+        &markdown(FIRST_REQUEST_ID, "Future fictional experiment"),
+    );
+    assert!(matches!(
+        git.open().apply_batch(
+            &mut worker,
+            parse_batch_id(),
+            &[claim],
+            ContentPolicy::default(),
+            &PackagePolicy::default(),
+        ),
+        Ok(BatchCommitOutcome::NoChanges { failures })
+            if failures.len() == 1
+                && failures[0].error_code() == ErrorCode::InvalidRequest
+    ));
 }
 
 #[test]
@@ -499,9 +555,37 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
     assert_eq!(git.official_commit(), base);
     assert_eq!(git.transaction_count(), 1);
     assert_eq!(git.worktree_count(), 1);
-    if let Err(error) = worker.requeue_claimed(claim.token()) {
-        panic!("fixture must simulate a queue transition before recovery: {error}");
+    let journal_path = git.work.join(format!("transactions/{BATCH_ID}.json"));
+    let original_journal = match fs::read(&journal_path) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("transaction journal must be readable: {error}"),
+    };
+    let mut changed_journal: serde_json::Value = match serde_json::from_slice(&original_journal) {
+        Ok(value) => value,
+        Err(error) => panic!("transaction journal must decode: {error}"),
+    };
+    changed_journal["state"]["commit"] = serde_json::Value::String(base.clone());
+    let changed_journal = match serde_json::to_vec(&changed_journal) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("changed journal fixture must encode: {error}"),
+    };
+    if let Err(error) = fs::write(&journal_path, changed_journal) {
+        panic!("changed journal fixture must be written: {error}");
     }
+    assert!(matches!(
+        repository.recover_batch(&worker, parse_batch_id()),
+        Err(GitTransactionError::JournalMismatch)
+    ));
+    if let Err(error) = fs::write(&journal_path, original_journal) {
+        panic!("original journal fixture must be restored: {error}");
+    }
+
+    let (_other_queue, other_worker) =
+        queue_and_worker(&root.path().join("unrelated-fictional-queue"));
+    assert!(matches!(
+        repository.recover_batch(&other_worker, parse_batch_id()),
+        Err(GitTransactionError::JournalMismatch)
+    ));
 
     let outcome = match repository.recover_batch(&worker, parse_batch_id()) {
         Ok(outcome) => outcome,
@@ -514,10 +598,94 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
     assert_eq!(git.official_commit(), commit);
     assert_eq!(git.worktree_count(), 0);
     assert_eq!(git.transaction_count(), 1);
-    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), Some(&commit)) {
-        panic!("resumed batch must finalize: {error}");
-    }
+    assert!(matches!(
+        repository.reconcile_batch(&mut worker, parse_batch_id()),
+        Ok(BatchCommitOutcome::Committed {
+            commit: reconciled,
+            ..
+        }) if reconciled == commit
+    ));
     assert_eq!(git.transaction_count(), 0);
+}
+
+#[test]
+fn counts_an_explicitly_moved_and_rewritten_file_without_git_rename_detection() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let source = PathBuf::from("projects/fictional-a/runbooks/source/index.md");
+    let destination = PathBuf::from("projects/fictional-a/archive/runbooks/source/index.md");
+    write_tracked_fixture(
+        &fixture.canonical,
+        &source,
+        b"A compact fictional source document.\n",
+    );
+    let base = commit_canonical_fixture(&fixture.canonical, "Add fictional source document");
+
+    let destination_path = fixture.canonical.join(&destination);
+    if let Some(parent) = destination_path.parent()
+        && let Err(error) = fs::create_dir_all(parent)
+    {
+        panic!("archive fixture parent must be created: {error}");
+    }
+    if let Err(error) = fs::rename(fixture.canonical.join(&source), &destination_path) {
+        panic!("archive fixture must move: {error}");
+    }
+    if let Err(error) = fs::write(
+        &destination_path,
+        b"A completely rewritten fictional archived document with unrelated bytes.\n",
+    ) {
+        panic!("archive fixture must be rewritten: {error}");
+    }
+    git(Some(&fixture.canonical), ["add", "--all"], None);
+
+    let stats = match staged_stats(
+        &fixture.canonical,
+        &base,
+        &[AppliedFileMove {
+            source,
+            destination,
+        }],
+    ) {
+        Ok(stats) => stats,
+        Err(error) => panic!("explicit move must authorize the paired deletion: {error}"),
+    };
+    assert_eq!(stats.added, 0);
+    assert_eq!(stats.modified, 1);
+    assert_eq!(stats.deleted, 0);
+}
+
+fn write_tracked_fixture(worktree: &Path, relative_path: &Path, bytes: &[u8]) {
+    let path = worktree.join(relative_path);
+    if let Some(parent) = path.parent()
+        && let Err(error) = fs::create_dir_all(parent)
+    {
+        panic!("tracked fixture parent must be created: {error}");
+    }
+    if let Err(error) = fs::write(path, bytes) {
+        panic!("tracked fixture must be written: {error}");
+    }
+}
+
+fn commit_canonical_fixture(worktree: &Path, message: &str) -> String {
+    git(Some(worktree), ["add", "--all"], None);
+    let status = Command::new("git")
+        .current_dir(worktree)
+        .args([
+            "-c",
+            "user.name=Agent Knowledge Test",
+            "-c",
+            "user.email=agent-knowledge@example.invalid",
+            "commit",
+            "-m",
+            message,
+        ])
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!("canonical fixture commit failed with {status}"),
+        Err(error) => panic!("canonical fixture commit command failed: {error}"),
+    }
+    git_output(Some(worktree), ["rev-parse".into(), "HEAD".into()])
 }
 
 #[test]
@@ -614,9 +782,10 @@ fn blocks_a_new_batch_until_the_published_journal_is_finalized() {
         ),
         Err(GitTransactionError::UnfinishedTransaction)
     ));
-    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), Some(&first_commit)) {
-        panic!("first batch must finalize before the next publication: {error}");
-    }
+    assert!(matches!(
+        repository.reconcile_batch(&mut worker, parse_batch_id()),
+        Ok(BatchCommitOutcome::Committed { commit, .. }) if commit == first_commit
+    ));
 }
 
 #[test]

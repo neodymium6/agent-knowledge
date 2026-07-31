@@ -19,17 +19,28 @@ use time::OffsetDateTime;
 use crate::{ContentIndex, ContentIndexError, ContentPolicy};
 
 /// Result of applying one complete request to an isolated content tree.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplyOutcome {
     operations_applied: usize,
+    file_moves: Vec<AppliedFileMove>,
 }
 
 impl ApplyOutcome {
     /// Returns the number of request operations applied.
     #[must_use]
-    pub const fn operations_applied(self) -> usize {
+    pub const fn operations_applied(&self) -> usize {
         self.operations_applied
     }
+
+    pub(super) fn file_moves(&self) -> &[AppliedFileMove] {
+        &self.file_moves
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AppliedFileMove {
+    pub(super) source: PathBuf,
+    pub(super) destination: PathBuf,
 }
 
 /// Applies one Worker-owned request package to an isolated content tree.
@@ -89,10 +100,13 @@ fn apply_request_with_policy(
         .map_err(ApplyError::ContentIndex)?;
     let plan = build_plan(content_root, package_root, package, &index, policy)?;
     let operations_applied = package.request().operations.len();
-    execute_plan(content_root, plan)?;
+    let file_moves = execute_plan(content_root, plan, policy.maximum_entry_count)?;
     ContentIndex::build(content_root, policy, package_policy)
         .map_err(ApplyError::ResultingContent)?;
-    Ok(ApplyOutcome { operations_applied })
+    Ok(ApplyOutcome {
+        operations_applied,
+        file_moves,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +119,7 @@ struct VirtualDocument {
     archived: bool,
     status: DocumentStatus,
     revision: Revision,
+    markdown: Vec<u8>,
 }
 
 enum PlannedMutation {
@@ -133,6 +148,9 @@ fn build_plan(
     let operation_time = package
         .acceptance()
         .map_or(request.created_at, |acceptance| acceptance.accepted_at);
+    if request.created_at > operation_time {
+        return Err(ApplyError::RequestCreatedAfterAcceptance);
+    }
     let mut plan = Vec::with_capacity(request.operations.len());
     let mut documents = HashMap::<DocumentId, VirtualDocument>::new();
     let mut destinations = HashSet::<PathBuf>::new();
@@ -150,6 +168,16 @@ fn build_plan(
                 }
                 let bytes = read_payload(package_root, package, content.as_str())?;
                 let metadata = decode_payload_metadata(&bytes, policy, content.as_str())?;
+                if metadata.created > operation_time
+                    || metadata
+                        .updated
+                        .is_some_and(|updated| updated > operation_time)
+                {
+                    return Err(ApplyError::OperationForbidden {
+                        document_id: *document_id,
+                        detail: "document timestamps cannot follow request acceptance",
+                    });
+                }
                 if metadata.status == DocumentStatus::Archived {
                     return Err(ApplyError::OperationForbidden {
                         document_id: *document_id,
@@ -182,6 +210,7 @@ fn build_plan(
                         archived: false,
                         status: metadata.status,
                         revision: revision(&bytes),
+                        markdown: bytes,
                     },
                 );
             }
@@ -190,7 +219,8 @@ fn build_plan(
                 expected_revision,
                 content,
             } => {
-                let document = resolve_document(&mut documents, index, *document_id)?;
+                let document =
+                    resolve_document(&mut documents, index, content_root, policy, *document_id)?;
                 require_revision(document, *document_id, *expected_revision)?;
                 require_mutable(
                     document,
@@ -219,6 +249,12 @@ fn build_plan(
                         detail: "updated documents require an update time",
                     });
                 };
+                if updated > operation_time {
+                    return Err(ApplyError::OperationForbidden {
+                        document_id: *document_id,
+                        detail: "document update time cannot follow request acceptance",
+                    });
+                }
                 if updated <= previous_update {
                     return Err(ApplyError::OperationForbidden {
                         document_id: *document_id,
@@ -232,6 +268,7 @@ fn build_plan(
                 document.status = metadata.status;
                 document.updated = metadata.updated;
                 document.revision = revision(&bytes);
+                document.markdown = bytes;
             }
             Operation::MoveDocument {
                 document_id,
@@ -251,7 +288,8 @@ fn build_plan(
                         detail: "documents cannot be moved into log or index classification",
                     });
                 }
-                let document = resolve_document(&mut documents, index, *document_id)?;
+                let document =
+                    resolve_document(&mut documents, index, content_root, policy, *document_id)?;
                 require_revision(document, *document_id, *expected_revision)?;
                 require_movable(document, *document_id)?;
                 let destination = create_document_path(
@@ -275,7 +313,8 @@ fn build_plan(
                 document_id,
                 expected_revision,
             } => {
-                let document = resolve_document(&mut documents, index, *document_id)?;
+                let document =
+                    resolve_document(&mut documents, index, content_root, policy, *document_id)?;
                 require_revision(document, *document_id, *expected_revision)?;
                 require_classification(
                     document,
@@ -288,17 +327,15 @@ fn build_plan(
                 let destination_bundle = bundle_path(&destination, document.document_type);
                 reserve_new_destination(content_root, &destination_bundle, &mut destinations)?;
                 let archived = archived_markdown(
-                    content_root,
-                    &document.relative_path,
+                    &document.markdown,
                     policy,
-                    document.revision,
                     request.request_id,
                     operation_time,
                 )?;
                 let archived_revision = revision(&archived);
                 plan.push(PlannedMutation::Replace {
                     relative_path: document.relative_path.clone(),
-                    bytes: archived,
+                    bytes: archived.clone(),
                 });
                 plan.push(PlannedMutation::Move {
                     source: bundle_path(&document.relative_path, document.document_type),
@@ -309,13 +346,15 @@ fn build_plan(
                 document.status = DocumentStatus::Archived;
                 document.updated = Some(operation_time);
                 document.revision = archived_revision;
+                document.markdown = archived;
             }
             Operation::AddAttachment {
                 document_id,
                 source,
                 name,
             } => {
-                let document = resolve_document(&mut documents, index, *document_id)?;
+                let document =
+                    resolve_document(&mut documents, index, content_root, policy, *document_id)?;
                 require_accessible(
                     document,
                     *document_id,
@@ -348,6 +387,8 @@ fn build_plan(
 fn resolve_document<'a>(
     documents: &'a mut HashMap<DocumentId, VirtualDocument>,
     index: &ContentIndex,
+    content_root: &Path,
+    policy: ContentPolicy,
     document_id: DocumentId,
 ) -> Result<&'a mut VirtualDocument, ApplyError> {
     match documents.entry(document_id) {
@@ -356,6 +397,12 @@ fn resolve_document<'a>(
             let record = index
                 .get(document_id)
                 .ok_or(ApplyError::DocumentNotFound { document_id })?;
+            let markdown = read_canonical_markdown(
+                content_root,
+                record.relative_path(),
+                policy.maximum_markdown_bytes,
+                record.revision(),
+            )?;
             Ok(entry.insert(VirtualDocument {
                 relative_path: record.relative_path().to_path_buf(),
                 document_type: record.location().document_type(),
@@ -365,9 +412,30 @@ fn resolve_document<'a>(
                 archived: record.location().is_archived(),
                 status: record.metadata().status,
                 revision: record.revision(),
+                markdown,
             }))
         }
     }
+}
+
+fn read_canonical_markdown(
+    content_root: &Path,
+    relative_path: &Path,
+    maximum_bytes: u64,
+    expected_revision: Revision,
+) -> Result<Vec<u8>, ApplyError> {
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(maximum_bytes.min(64 * 1024)).unwrap_or(64 * 1024));
+    File::open(content_root.join(relative_path))
+        .and_then(|file| {
+            file.take(maximum_bytes.saturating_add(1))
+                .read_to_end(&mut bytes)
+        })
+        .map_err(ApplyError::Io)?;
+    if bytes.len() as u64 > maximum_bytes || revision(&bytes) != expected_revision {
+        return Err(ApplyError::ContentChangedDuringApply);
+    }
+    Ok(bytes)
 }
 
 fn require_revision(
@@ -484,26 +552,15 @@ fn decode_payload_metadata(
 }
 
 fn archived_markdown(
-    content_root: &Path,
-    relative_path: &Path,
+    bytes: &[u8],
     policy: ContentPolicy,
-    expected_revision: Revision,
     request_id: agent_knowledge_core::RequestId,
     archived_at: OffsetDateTime,
 ) -> Result<Vec<u8>, ApplyError> {
-    let mut bytes = Vec::with_capacity(
-        usize::try_from(policy.maximum_markdown_bytes.min(64 * 1024)).unwrap_or(64 * 1024),
-    );
-    File::open(content_root.join(relative_path))
-        .and_then(|file| {
-            file.take(policy.maximum_markdown_bytes.saturating_add(1))
-                .read_to_end(&mut bytes)
-        })
-        .map_err(ApplyError::Io)?;
-    if bytes.len() as u64 > policy.maximum_markdown_bytes || revision(&bytes) != expected_revision {
+    if bytes.len() as u64 > policy.maximum_markdown_bytes {
         return Err(ApplyError::ContentChangedDuringApply);
     }
-    let mut metadata = decode_document_metadata(&bytes, policy.maximum_front_matter_bytes)
+    let mut metadata = decode_document_metadata(bytes, policy.maximum_front_matter_bytes)
         .map_err(|_| ApplyError::ContentChangedDuringApply)?;
     let previous_update = metadata.updated.unwrap_or(metadata.created);
     if archived_at <= previous_update {
@@ -515,7 +572,7 @@ fn archived_markdown(
     metadata.updated = Some(archived_at);
     metadata.request_id = request_id;
     metadata.status = DocumentStatus::Archived;
-    let body = markdown_body(&bytes).ok_or(ApplyError::ContentChangedDuringApply)?;
+    let body = markdown_body(bytes).ok_or(ApplyError::ContentChangedDuringApply)?;
     let yaml = serde_saphyr::to_string(&metadata).map_err(ApplyError::MetadataEncoding)?;
     let mut archived = Vec::with_capacity(yaml.len() + body.len() + 9);
     archived.extend_from_slice(b"---\n");
@@ -692,7 +749,12 @@ fn revision(bytes: &[u8]) -> Revision {
     Revision::from_bytes(Sha256::digest(bytes).into())
 }
 
-fn execute_plan(content_root: &Path, plan: Vec<PlannedMutation>) -> Result<(), ApplyError> {
+fn execute_plan(
+    content_root: &Path,
+    plan: Vec<PlannedMutation>,
+    maximum_entry_count: usize,
+) -> Result<Vec<AppliedFileMove>, ApplyError> {
+    let mut file_moves = Vec::new();
     for mutation in plan {
         match mutation {
             PlannedMutation::WriteNew {
@@ -718,13 +780,65 @@ fn execute_plan(content_root: &Path, plan: Vec<PlannedMutation>) -> Result<(), A
                 source,
                 destination,
             } => {
-                let destination = content_root.join(destination);
-                create_parent(&destination)?;
-                fs::rename(content_root.join(source), destination).map_err(ApplyError::Io)?;
+                file_moves.extend(collect_file_moves(
+                    content_root,
+                    &source,
+                    &destination,
+                    maximum_entry_count,
+                )?);
+                let destination_path = content_root.join(&destination);
+                create_parent(&destination_path)?;
+                fs::rename(content_root.join(source), destination_path).map_err(ApplyError::Io)?;
             }
         }
     }
-    Ok(())
+    Ok(file_moves)
+}
+
+fn collect_file_moves(
+    content_root: &Path,
+    source: &Path,
+    destination: &Path,
+    maximum_entry_count: usize,
+) -> Result<Vec<AppliedFileMove>, ApplyError> {
+    let source_path = content_root.join(source);
+    let metadata = fs::symlink_metadata(&source_path).map_err(ApplyError::Io)?;
+    if metadata.file_type().is_file() {
+        return Ok(vec![AppliedFileMove {
+            source: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+        }]);
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(ApplyError::ContentChangedDuringApply);
+    }
+    let mut directories = vec![source.to_path_buf()];
+    let mut moves = Vec::new();
+    while let Some(relative_directory) = directories.pop() {
+        for entry in fs::read_dir(content_root.join(&relative_directory)).map_err(ApplyError::Io)? {
+            let entry = entry.map_err(ApplyError::Io)?;
+            let relative_path = relative_directory.join(entry.file_name());
+            if directories.len().saturating_add(moves.len()) >= maximum_entry_count {
+                return Err(ApplyError::ContentChangedDuringApply);
+            }
+            let file_type = entry.file_type().map_err(ApplyError::Io)?;
+            if file_type.is_dir() {
+                directories.push(relative_path);
+            } else if file_type.is_file() {
+                let suffix = relative_path
+                    .strip_prefix(source)
+                    .map_err(|_| ApplyError::ContentChangedDuringApply)?
+                    .to_path_buf();
+                moves.push(AppliedFileMove {
+                    source: relative_path,
+                    destination: destination.join(&suffix),
+                });
+            } else {
+                return Err(ApplyError::ContentChangedDuringApply);
+            }
+        }
+    }
+    Ok(moves)
 }
 
 fn create_parent(path: &Path) -> Result<(), ApplyError> {
@@ -737,6 +851,8 @@ fn create_parent(path: &Path) -> Result<(), ApplyError> {
 /// A deterministic request-application or transient filesystem failure.
 #[derive(Debug)]
 pub enum ApplyError {
+    /// The client request time was later than its durable queue acceptance.
+    RequestCreatedAfterAcceptance,
     /// The base content tree was invalid.
     ContentIndex(ContentIndexError),
     /// The resulting content tree was invalid.
@@ -801,6 +917,9 @@ pub enum ApplyError {
 impl fmt::Display for ApplyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RequestCreatedAfterAcceptance => {
+                formatter.write_str("request creation time cannot follow queue acceptance")
+            }
             Self::ContentIndex(error) => write!(formatter, "base content is invalid: {error}"),
             Self::ResultingContent(error) => {
                 write!(formatter, "resulting content is invalid: {error}")
@@ -878,6 +997,7 @@ impl std::error::Error for ApplyError {
 impl ApplyError {
     pub(super) const fn request_error_code(&self) -> Option<ErrorCode> {
         match self {
+            Self::RequestCreatedAfterAcceptance => Some(ErrorCode::InvalidRequest),
             Self::DocumentNotFound { .. } => Some(ErrorCode::DocumentNotFound),
             Self::DocumentIdConflict { .. } => Some(ErrorCode::DocumentIdConflict),
             Self::RevisionConflict { .. } => Some(ErrorCode::RevisionConflict),

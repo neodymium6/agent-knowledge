@@ -420,6 +420,209 @@ fn moves_and_archives_complete_document_bundles() {
 }
 
 #[test]
+fn archives_a_document_created_in_the_same_request() {
+    let root = TestDirectory::new();
+    let content_root = root.path().join("content");
+    if let Err(error) = fs::create_dir(&content_root) {
+        panic!("content root must be created: {error}");
+    }
+    let markdown = document(
+        DOCUMENT_ID,
+        ARCHIVE_REQUEST_ID,
+        "Ephemeral experiment",
+        None,
+    );
+    let package_root = root.path().join("package");
+    let package = package(
+        &package_root,
+        request(
+            ARCHIVE_REQUEST_ID,
+            Some("fictional-project"),
+            "experiment",
+            json!([
+                {
+                    "type": "create_document",
+                    "document_id": DOCUMENT_ID,
+                    "content": "index.md"
+                },
+                {
+                    "type": "archive_document",
+                    "document_id": DOCUMENT_ID,
+                    "expected_revision": revision(&markdown).to_string()
+                }
+            ]),
+        ),
+        &[("index.md", markdown.as_bytes())],
+    );
+
+    let outcome = match apply_request(
+        &content_root,
+        &package_root,
+        &package,
+        ContentPolicy::default(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => panic!("create followed by archive must apply atomically: {error}"),
+    };
+    assert_eq!(outcome.operations_applied(), 2);
+    let archived = content_root.join(format!(
+        "projects/fictional-project/archive/experiments/2026-07-31-{DOCUMENT_ID}/index.md"
+    ));
+    assert!(archived.is_file());
+    assert_eq!(outcome.file_moves().len(), 1);
+}
+
+#[test]
+fn archives_the_latest_update_from_the_same_request() {
+    let root = TestDirectory::new();
+    let content_root = root.path().join("content");
+    let relative = format!("projects/fictional-project/runbooks/2026-07-31-{DOCUMENT_ID}/index.md");
+    let original = document(DOCUMENT_ID, ORIGINAL_REQUEST_ID, "Original runbook", None);
+    write_file(&content_root, &relative, original.as_bytes());
+    let replacement = document(
+        DOCUMENT_ID,
+        ARCHIVE_REQUEST_ID,
+        "Updated before archive",
+        Some("2026-07-31T03:55:00Z"),
+    );
+    let package_root = root.path().join("package");
+    let package = package(
+        &package_root,
+        request(
+            ARCHIVE_REQUEST_ID,
+            Some("fictional-project"),
+            "runbook",
+            json!([
+                {
+                    "type": "update_document",
+                    "document_id": DOCUMENT_ID,
+                    "expected_revision": revision(&original).to_string(),
+                    "content": "index.md"
+                },
+                {
+                    "type": "archive_document",
+                    "document_id": DOCUMENT_ID,
+                    "expected_revision": revision(&replacement).to_string()
+                }
+            ]),
+        ),
+        &[("index.md", replacement.as_bytes())],
+    );
+
+    if let Err(error) = apply_request(
+        &content_root,
+        &package_root,
+        &package,
+        ContentPolicy::default(),
+    ) {
+        panic!("update followed by archive must use the replacement bytes: {error}");
+    }
+    let archived = content_root.join(format!(
+        "projects/fictional-project/archive/runbooks/2026-07-31-{DOCUMENT_ID}/index.md"
+    ));
+    let archived = String::from_utf8(read_file(&archived))
+        .unwrap_or_else(|error| panic!("archived Markdown must be UTF-8: {error}"));
+    assert!(archived.contains("Updated before archive"));
+}
+
+#[test]
+fn archives_a_document_moved_in_the_same_request() {
+    let root = TestDirectory::new();
+    let content_root = root.path().join("content");
+    let source = format!("projects/fictional-a/decisions/2026-07-31-{DOCUMENT_ID}");
+    let markdown = document(DOCUMENT_ID, ORIGINAL_REQUEST_ID, "Movable decision", None);
+    write_file(
+        &content_root,
+        &format!("{source}/index.md"),
+        markdown.as_bytes(),
+    );
+    write_file(
+        &content_root,
+        &format!("{source}/evidence.pdf"),
+        b"fictional evidence\n",
+    );
+    let package_root = root.path().join("package");
+    let package = package(
+        &package_root,
+        request(
+            ARCHIVE_REQUEST_ID,
+            Some("fictional-b"),
+            "runbook",
+            json!([
+                {
+                    "type": "move_document",
+                    "document_id": DOCUMENT_ID,
+                    "expected_revision": revision(&markdown).to_string(),
+                    "project": "fictional-b",
+                    "document_type": "runbook"
+                },
+                {
+                    "type": "archive_document",
+                    "document_id": DOCUMENT_ID,
+                    "expected_revision": revision(&markdown).to_string()
+                }
+            ]),
+        ),
+        &[],
+    );
+
+    let outcome = match apply_request(
+        &content_root,
+        &package_root,
+        &package,
+        ContentPolicy::default(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => panic!("move followed by archive must use the virtual path: {error}"),
+    };
+    let archived = content_root.join(format!(
+        "projects/fictional-b/archive/runbooks/2026-07-31-{DOCUMENT_ID}"
+    ));
+    assert_eq!(
+        read_file(&archived.join("evidence.pdf")),
+        b"fictional evidence\n"
+    );
+    assert_eq!(outcome.file_moves().len(), 4);
+}
+
+#[test]
+fn rejects_document_timestamps_after_request_acceptance() {
+    let root = TestDirectory::new();
+    let content_root = root.path().join("content");
+    if let Err(error) = fs::create_dir(&content_root) {
+        panic!("content root must be created: {error}");
+    }
+    let future = document(DOCUMENT_ID, CREATE_REQUEST_ID, "Future experiment", None).replace(
+        "created: 2026-07-31T03:50:00Z",
+        "created: 2026-07-31T04:00:01Z",
+    );
+    let package_root = root.path().join("package");
+    let package = package(
+        &package_root,
+        request(
+            CREATE_REQUEST_ID,
+            Some("fictional-project"),
+            "experiment",
+            json!([{
+                "type": "create_document",
+                "document_id": DOCUMENT_ID,
+                "content": "index.md"
+            }]),
+        ),
+        &[("index.md", future.as_bytes())],
+    );
+    assert!(matches!(
+        apply_request(
+            &content_root,
+            &package_root,
+            &package,
+            ContentPolicy::default()
+        ),
+        Err(ApplyError::OperationForbidden { .. })
+    ));
+}
+
+#[test]
 fn append_only_logs_reject_updates() {
     let root = TestDirectory::new();
     let content_root = root.path().join("content");

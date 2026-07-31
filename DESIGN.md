@@ -439,7 +439,9 @@ The exact required fields vary by operation and document type:
 
 Timestamps use RFC 3339 with an explicit offset. The Gateway verifies
 client-supplied timestamps and records its own acceptance timestamp in the
-request package.
+request package. Request and document timestamps later than that durable
+acceptance time are rejected, so a client clock cannot prevent later
+Worker-owned lifecycle timestamps from advancing.
 
 Initial status values are:
 
@@ -854,7 +856,14 @@ journal is synchronized before disposable Git work begins. After the commit
 object and internal recovery ref exist, a `committed` journal containing the
 exact claim tokens and per-request outcomes is synchronized before the
 official branch can advance. A later batch cannot begin until this journal is
-reconciled and finalized.
+reconciled and finalized. Each journal is bound to the canonical queue
+identity held by the live Worker session.
+
+Git object and reference mutations run with Git fsync enabled. Before
+publication or recovery, the Worker verifies that the journaled commit exists,
+has the pinned base as its sole direct parent, and contains the exact batch and
+successful-request trailers recorded by the journal. A stale `preparing`
+journal never silently rebases onto a changed official branch.
 
 An all-failed batch records the same durable claim tokens and failure outcomes
 in a `no_changes` journal even though it creates no Git commit.
@@ -864,7 +873,9 @@ The Worker reconstructs the original claim tokens from the journal, repairs
 publication and the canonical worktree idempotently, and then reconciles each
 queue result. This permits recovery after a crash partway through the
 successful and failed queue transitions. The journal is removed only after all
-of those transitions are durable.
+of those transitions are durable. Queue reconciliation is idempotent and
+returns an opaque proof bound to the queue, batch, claim tokens, and failure
+codes; journal finalization accepts only that proof.
 
 The canonical checkout and release can be repaired from the official commit
 after a crash. Normal readers use the pinned official commit, not an
@@ -878,6 +889,12 @@ must not make unrelated valid requests fail.
 The Worker applies and validates requests sequentially in a temporary
 worktree. A request that fails its own validation is rolled back in that
 worktree and moved to `failed/`. Remaining requests continue.
+
+Operations within one request share an in-memory document view. For example,
+an update followed by archive archives the updated bytes, and a move followed
+by archive uses the moved path. The Worker also records every file move it
+executes and uses those exact source-to-destination pairs when rejecting
+physical deletions; it does not depend on Git's content-similarity heuristic.
 
 If the final Quartz build fails:
 
@@ -916,6 +933,7 @@ Files-Added: 6
 Files-Modified: 1
 Files-Deleted: 0
 
+Batch-ID: 01K00000000000000000000004
 Knowledge-Request: 01K00000000000000000000001
 Knowledge-Request: 01K00000000000000000000002
 Knowledge-Request: 01K00000000000000000000003

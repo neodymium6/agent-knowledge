@@ -1,9 +1,10 @@
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::Path;
 
-use agent_knowledge_core::{BatchId, RequestId};
+use agent_knowledge_core::{BatchId, ErrorCode, RequestId, Revision};
+use sha2::{Digest, Sha256};
 
 use super::{ClaimedPackage, WorkerQueueError, next_attempt, revalidate_accepted};
 use crate::file_queue::{
@@ -23,6 +24,41 @@ pub enum BatchClaimOutcome {
     },
     /// The complete snapshot was scanned and its earliest requests were claimed.
     Claimed(Vec<ClaimedPackage>),
+}
+
+/// Durable proof that every queue result for one repository batch is terminal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciledBatch {
+    queue_identity: Revision,
+    batch_id: BatchId,
+    successful: Vec<super::ClaimToken>,
+    failures: Vec<(super::ClaimToken, ErrorCode)>,
+}
+
+impl ReconciledBatch {
+    /// Returns the queue identity that produced this proof.
+    #[must_use]
+    pub const fn queue_identity(&self) -> Revision {
+        self.queue_identity
+    }
+
+    /// Returns the reconciled batch identifier.
+    #[must_use]
+    pub const fn batch_id(&self) -> BatchId {
+        self.batch_id
+    }
+
+    /// Returns the claims durably moved to `completed/`.
+    #[must_use]
+    pub fn successful(&self) -> &[super::ClaimToken] {
+        &self.successful
+    }
+
+    /// Returns the claims and error codes durably moved to `failed/`.
+    #[must_use]
+    pub fn failures(&self) -> &[(super::ClaimToken, ErrorCode)] {
+        &self.failures
+    }
 }
 
 /// Exclusive Repository Worker access to one file queue.
@@ -112,6 +148,19 @@ impl FileQueue {
 }
 
 impl WorkerSession {
+    /// Returns a stable digest identifying this queue's canonical root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the queue root can no longer be canonicalized.
+    pub fn queue_identity(&self) -> Result<Revision, WorkerQueueError> {
+        let root = fs::canonicalize(&self.queue.queue_root).map_err(WorkerQueueError::Io)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"agent-knowledge-queue-identity-v1\0");
+        hasher.update(root.as_os_str().as_encoded_bytes());
+        Ok(Revision::from_bytes(hasher.finalize().into()))
+    }
+
     /// Verifies that this live Worker can perform one repository transaction.
     ///
     /// # Errors
@@ -163,6 +212,48 @@ impl WorkerSession {
     pub fn requeue_claimed(&mut self, token: super::ClaimToken) -> Result<(), WorkerQueueError> {
         self.ensure_no_active_scan()?;
         let result = self.queue.requeue_claimed(token);
+        if result.is_err() {
+            self.require_processing_recovery();
+        }
+        result
+    }
+
+    /// Idempotently records every terminal queue result for one repository batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tokens are duplicated, belong to another batch,
+    /// no longer match durable ownership, or a terminal transition fails.
+    pub fn reconcile_batch(
+        &mut self,
+        batch_id: BatchId,
+        successful: &[super::ClaimToken],
+        failures: &[(super::ClaimToken, ErrorCode)],
+    ) -> Result<ReconciledBatch, WorkerQueueError> {
+        self.ensure_no_active_scan()?;
+        let mut request_ids = HashSet::with_capacity(successful.len() + failures.len());
+        if successful
+            .iter()
+            .copied()
+            .chain(failures.iter().map(|(token, _)| *token))
+            .any(|token| token.batch_id() != batch_id || !request_ids.insert(token.request_id()))
+        {
+            return Err(WorkerQueueError::InvalidReconciliation);
+        }
+        let result = (|| {
+            for token in successful {
+                self.queue.complete_claimed(*token)?;
+            }
+            for (token, error_code) in failures {
+                self.queue.fail_claimed(*token, *error_code)?;
+            }
+            Ok(ReconciledBatch {
+                queue_identity: self.queue_identity()?,
+                batch_id,
+                successful: successful.to_vec(),
+                failures: failures.to_vec(),
+            })
+        })();
         if result.is_err() {
             self.require_processing_recovery();
         }
