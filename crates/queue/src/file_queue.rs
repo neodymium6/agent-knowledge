@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use agent_knowledge_core::{ErrorCode, PayloadPath, RequestId};
@@ -11,7 +12,7 @@ use ulid::Ulid;
 
 use crate::{
     AcceptanceMetadata, PackageDigest, PackagePolicy, PackageValidationError, ValidatedPackage,
-    validate_package,
+    validate_accepted_package, validate_package,
 };
 
 const REQUEST_FILE_NAME: &str = "request.json";
@@ -23,6 +24,7 @@ const PAYLOAD_DIRECTORY_NAME: &str = "payload";
 const COPY_BUFFER_LENGTH: usize = 64 * 1024;
 const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
 const MAXIMUM_SEQUENCE_FILE_BYTES: u64 = 32;
+const MAXIMUM_QUARANTINE_MARKER_BYTES: u64 = 64;
 const MAXIMUM_STAGING_NAME_ATTEMPTS: usize = 16;
 
 /// An accepted queue state represented by one directory below `queue/`.
@@ -91,6 +93,7 @@ pub struct FileQueue {
     queue_root: PathBuf,
     lock_file: PathBuf,
     policy: PackagePolicy,
+    maintenance_scanners: Arc<Mutex<MaintenanceScanners>>,
 }
 
 impl FileQueue {
@@ -149,6 +152,7 @@ impl FileQueue {
             queue_root,
             lock_file,
             policy,
+            maintenance_scanners: Arc::new(Mutex::new(MaintenanceScanners::default())),
         })
     }
 
@@ -158,6 +162,8 @@ impl FileQueue {
     ///
     /// Returns an error when a staging directory cannot be created.
     pub fn begin(&self) -> Result<IncomingPackage, QueueError> {
+        let queue_lock = self.open_queue_lock()?;
+        queue_lock.lock().map_err(QueueError::Io)?;
         let incoming_root = self.queue_root.join("incoming");
         for _ in 0..MAXIMUM_STAGING_NAME_ATTEMPTS {
             let staging_name = format!(".incoming-{}", Ulid::generate());
@@ -179,6 +185,7 @@ impl FileQueue {
                         let _ = fs::remove_dir_all(&staging_path);
                         return Err(QueueError::Io(error));
                     }
+                    drop(queue_lock);
                     return Ok(IncomingPackage {
                         queue: self.clone(),
                         staging_path,
@@ -225,20 +232,33 @@ impl FileQueue {
 
         let incoming_root = self.queue_root.join("incoming");
         let quarantine_root = self.queue_root.join("quarantine");
-        let candidates = inactive_stale_directories(
-            &incoming_root,
-            minimum_age,
-            maximum_scan_entries,
-            maximum_actions,
-            StaleAgeSource::Directory,
-        )?;
+        let candidates = {
+            let mut scanners = self
+                .maintenance_scanners
+                .lock()
+                .map_err(|_| QueueError::MaintenanceScannerPoisoned)?;
+            inactive_stale_directories(
+                &incoming_root,
+                minimum_age,
+                maximum_scan_entries,
+                maximum_actions,
+                StaleAgeSource::Directory,
+                &mut scanners.incoming,
+            )?
+        };
         let mut moved = 0_usize;
         for candidate in candidates {
             let name = candidate
                 .file_name()
                 .ok_or_else(|| QueueError::InvalidStoragePath(candidate.clone()))?;
-            write_quarantine_marker(&candidate)?;
-            fs::rename(&candidate, quarantine_root.join(name)).map_err(QueueError::Io)?;
+            remove_incoming_quarantine_marker(&candidate)?;
+            let destination = quarantine_root.join(name);
+            fs::rename(&candidate, &destination).map_err(QueueError::Io)?;
+            if let Err(error) = replace_quarantine_marker(&destination) {
+                sync_directory(&quarantine_root)?;
+                sync_directory(&incoming_root)?;
+                return Err(error);
+            }
             moved += 1;
         }
         if moved > 0 {
@@ -266,13 +286,20 @@ impl FileQueue {
         lock.lock().map_err(QueueError::Io)?;
 
         let quarantine_root = self.queue_root.join("quarantine");
-        let candidates = inactive_stale_directories(
-            &quarantine_root,
-            minimum_age,
-            maximum_scan_entries,
-            maximum_actions,
-            StaleAgeSource::QuarantineMarker,
-        )?;
+        let candidates = {
+            let mut scanners = self
+                .maintenance_scanners
+                .lock()
+                .map_err(|_| QueueError::MaintenanceScannerPoisoned)?;
+            inactive_stale_directories(
+                &quarantine_root,
+                minimum_age,
+                maximum_scan_entries,
+                maximum_actions,
+                StaleAgeSource::QuarantineMarker,
+                &mut scanners.quarantine,
+            )?
+        };
         let removed = candidates.len();
         for candidate in candidates {
             fs::remove_dir_all(candidate).map_err(QueueError::Io)?;
@@ -594,6 +621,23 @@ impl IncomingPackage {
         let digest = validated.digest();
         if let Some((state, existing_digest)) = self.queue.find_existing(request_id)? {
             if existing_digest == digest {
+                let existing_path = self.queue.state_path(state, request_id);
+                let existing = validate_accepted_package(&existing_path, &self.queue.policy)
+                    .map_err(|error| match error {
+                        PackageValidationError::Io(error) => QueueError::Io(error),
+                        _ => QueueError::CorruptState {
+                            request_id,
+                            state,
+                            detail: "accepted package failed immutable revalidation",
+                        },
+                    })?;
+                if existing.request().request_id != request_id || existing.digest() != digest {
+                    return Err(QueueError::CorruptState {
+                        request_id,
+                        state,
+                        detail: "accepted package identity does not match its queue entry",
+                    });
+                }
                 sync_directory(&self.queue.queue_root.join("incoming"))?;
                 for accepted_state in QueueState::ALL {
                     sync_directory(&self.queue.queue_root.join(accepted_state.directory_name()))?;
@@ -635,22 +679,43 @@ impl IncomingPackage {
     }
 }
 
+#[derive(Debug, Default)]
+struct MaintenanceScanners {
+    incoming: DirectoryScanner,
+    quarantine: DirectoryScanner,
+}
+
+#[derive(Debug, Default)]
+struct DirectoryScanner {
+    entries: Option<fs::ReadDir>,
+}
+
 fn inactive_stale_directories(
     root: &Path,
     minimum_age: Duration,
     maximum_scan_entries: usize,
     maximum_actions: usize,
     age_source: StaleAgeSource,
+    scanner: &mut DirectoryScanner,
 ) -> Result<Vec<PathBuf>, QueueError> {
     if maximum_scan_entries == 0 || maximum_actions == 0 {
         return Ok(Vec::new());
     }
+    if scanner.entries.is_none() {
+        scanner.entries = Some(fs::read_dir(root).map_err(QueueError::Io)?);
+    }
     let now = SystemTime::now();
     let mut stale = Vec::with_capacity(maximum_actions.min(maximum_scan_entries));
-    for entry in fs::read_dir(root)
-        .map_err(QueueError::Io)?
-        .take(maximum_scan_entries)
-    {
+    let mut scanned = 0_usize;
+    while scanned < maximum_scan_entries {
+        let Some(entries) = scanner.entries.as_mut() else {
+            break;
+        };
+        let Some(entry) = entries.next() else {
+            scanner.entries = None;
+            break;
+        };
+        scanned += 1;
         let entry = entry.map_err(QueueError::Io)?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -666,15 +731,14 @@ fn inactive_stale_directories(
         }
         let modified = match age_source {
             StaleAgeSource::Directory => metadata.modified().map_err(QueueError::Io)?,
-            StaleAgeSource::QuarantineMarker => {
-                let marker = match fs::symlink_metadata(path.join(QUARANTINE_MARKER_FILE_NAME)) {
-                    Ok(marker) if marker.file_type().is_file() => marker,
-                    Ok(_) => continue,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(QueueError::Io(error)),
-                };
-                marker.modified().map_err(QueueError::Io)?
-            }
+            StaleAgeSource::QuarantineMarker => match inspect_quarantine_marker(&path)? {
+                QuarantineMarker::Complete(modified) => modified,
+                QuarantineMarker::MissingOrIncomplete => {
+                    replace_quarantine_marker(&path)?;
+                    continue;
+                }
+                QuarantineMarker::UnsafeType => continue,
+            },
         };
         let Ok(age) = now.duration_since(modified) else {
             continue;
@@ -704,31 +768,89 @@ enum StaleAgeSource {
     QuarantineMarker,
 }
 
-fn write_quarantine_marker(package_root: &Path) -> Result<(), QueueError> {
+enum QuarantineMarker {
+    Complete(SystemTime),
+    MissingOrIncomplete,
+    UnsafeType,
+}
+
+fn inspect_quarantine_marker(package_root: &Path) -> Result<QuarantineMarker, QueueError> {
     let marker_path = package_root.join(QUARANTINE_MARKER_FILE_NAME);
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker_path)
+    let metadata = match fs::symlink_metadata(&marker_path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => return Ok(QuarantineMarker::UnsafeType),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(QuarantineMarker::MissingOrIncomplete);
+        }
+        Err(error) => return Err(QueueError::Io(error)),
+    };
+    let mut bytes = Vec::with_capacity(MAXIMUM_QUARANTINE_MARKER_BYTES as usize);
+    File::open(&marker_path)
+        .map_err(QueueError::Io)?
+        .take(MAXIMUM_QUARANTINE_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(QueueError::Io)?;
+    if bytes.len() as u64 > MAXIMUM_QUARANTINE_MARKER_BYTES {
+        return Ok(QuarantineMarker::MissingOrIncomplete);
+    }
+    let Ok(contents) = std::str::from_utf8(&bytes) else {
+        return Ok(QuarantineMarker::MissingOrIncomplete);
+    };
+    let Some(timestamp) = contents.strip_suffix('\n') else {
+        return Ok(QuarantineMarker::MissingOrIncomplete);
+    };
+    if timestamp.contains('\n')
+        || time::OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339)
+            .is_err()
     {
-        Ok(mut marker) => {
-            let timestamp = time::OffsetDateTime::now_utc()
-                .format(&time::format_description::well_known::Rfc3339)
-                .map_err(QueueError::QuarantineTimestamp)?;
-            writeln!(marker, "{timestamp}").map_err(QueueError::Io)?;
-            marker.sync_all().map_err(QueueError::Io)?;
+        return Ok(QuarantineMarker::MissingOrIncomplete);
+    }
+    Ok(QuarantineMarker::Complete(
+        metadata.modified().map_err(QueueError::Io)?,
+    ))
+}
+
+fn remove_incoming_quarantine_marker(package_root: &Path) -> Result<(), QueueError> {
+    let marker_path = package_root.join(QUARANTINE_MARKER_FILE_NAME);
+    match fs::symlink_metadata(&marker_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::remove_file(marker_path).map_err(QueueError::Io)?;
             sync_directory(package_root)
         }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(&marker_path).map_err(QueueError::Io)?;
-            if metadata.file_type().is_file() {
-                Ok(())
-            } else {
-                Err(QueueError::InvalidStoragePath(marker_path))
-            }
-        }
+        Ok(_) => Err(QueueError::InvalidStoragePath(marker_path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(QueueError::Io(error)),
     }
+}
+
+fn replace_quarantine_marker(package_root: &Path) -> Result<(), QueueError> {
+    let marker_path = package_root.join(QUARANTINE_MARKER_FILE_NAME);
+    match fs::symlink_metadata(&marker_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(QueueError::InvalidStoragePath(marker_path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(QueueError::Io(error)),
+    }
+    let temporary_path = package_root.join(format!(".quarantine-marker-{}", Ulid::generate()));
+    let result = (|| {
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(QueueError::Io)?;
+        let timestamp = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(QueueError::QuarantineTimestamp)?;
+        writeln!(marker, "{timestamp}").map_err(QueueError::Io)?;
+        marker.sync_all().map_err(QueueError::Io)?;
+        drop(marker);
+        fs::rename(&temporary_path, marker_path).map_err(QueueError::Io)?;
+        sync_directory(package_root)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
 }
 
 fn is_staging_directory_name(name: &str) -> bool {
@@ -1085,6 +1207,8 @@ pub enum QueueError {
     SequenceExhausted,
     /// The durable queue acceptance sequence file was malformed.
     InvalidSequenceState,
+    /// An in-process maintenance scanner mutex was poisoned.
+    MaintenanceScannerPoisoned,
     /// The same request ID appeared in more than one accepted state.
     RequestInMultipleStates {
         /// The duplicated request identifier.
@@ -1119,7 +1243,8 @@ impl QueueError {
             | Self::AcceptanceMetadata(_)
             | Self::QuarantineTimestamp(_)
             | Self::SequenceExhausted
-            | Self::InvalidSequenceState => ErrorCode::InternalError,
+            | Self::InvalidSequenceState
+            | Self::MaintenanceScannerPoisoned => ErrorCode::InternalError,
         }
     }
 }
@@ -1180,6 +1305,9 @@ impl fmt::Display for QueueError {
             }
             Self::InvalidSequenceState => {
                 formatter.write_str("durable acceptance sequence state is invalid")
+            }
+            Self::MaintenanceScannerPoisoned => {
+                formatter.write_str("maintenance scanner state is unavailable")
             }
             Self::RequestInMultipleStates { request_id } => {
                 write!(

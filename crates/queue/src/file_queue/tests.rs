@@ -2,14 +2,16 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Duration;
 
 use agent_knowledge_core::{ErrorCode, PayloadPath};
 
 use super::{
-    AcceptanceHook, AcceptancePhase, EnqueueOutcome, FileQueue, IncomingPackage, QueueError,
-    QueueLimit, QueueState,
+    AcceptanceHook, AcceptancePhase, DirectoryScanner, EnqueueOutcome, FileQueue, IncomingPackage,
+    QueueError, QueueLimit, QueueState, StaleAgeSource, inactive_stale_directories,
 };
 use crate::{PackageLimits, PackagePolicy, validate_accepted_package};
 
@@ -189,6 +191,52 @@ fn accepts_new_package_and_returns_existing_for_an_identical_retry() {
         }
     );
     assert!(incoming_is_empty(root.path()));
+}
+
+#[test]
+fn identical_retry_revalidates_the_existing_accepted_package() {
+    let missing_metadata_root = TestDirectory::create();
+    let queue = initialize_queue(missing_metadata_root.path(), PackagePolicy::default());
+    let accepted = accept(stage_package(&queue, RESULTS));
+    let request_id = match accepted {
+        EnqueueOutcome::Accepted { request_id, .. } => request_id,
+        EnqueueOutcome::Existing { .. } => panic!("first request must be newly accepted"),
+    };
+    let accepted_root = missing_metadata_root
+        .path()
+        .join("queue/pending")
+        .join(request_id.to_string());
+    if let Err(error) = fs::remove_file(accepted_root.join("acceptance.json")) {
+        panic!("fixture acceptance metadata must be removed: {error}");
+    }
+    let error = match stage_package(&queue, RESULTS).accept() {
+        Ok(_) => panic!("retry must not trust a package with missing acceptance metadata"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, QueueError::CorruptState { .. }));
+    assert_eq!(error.error_code(), ErrorCode::ContentValidationFailed);
+
+    let changed_payload_root = TestDirectory::create();
+    let queue = initialize_queue(changed_payload_root.path(), PackagePolicy::default());
+    let accepted = accept(stage_package(&queue, RESULTS));
+    let request_id = match accepted {
+        EnqueueOutcome::Accepted { request_id, .. } => request_id,
+        EnqueueOutcome::Existing { .. } => panic!("first request must be newly accepted"),
+    };
+    let payload = changed_payload_root
+        .path()
+        .join("queue/pending")
+        .join(request_id.to_string())
+        .join("payload/benchmark/results.csv");
+    if let Err(error) = fs::write(payload, b"step,value\n1,99\n") {
+        panic!("fixture accepted payload must be changed: {error}");
+    }
+    let error = match stage_package(&queue, RESULTS).accept() {
+        Ok(_) => panic!("retry must not trust changed immutable payload"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, QueueError::CorruptState { .. }));
+    assert_eq!(error.error_code(), ErrorCode::ContentValidationFailed);
 }
 
 #[test]
@@ -658,6 +706,49 @@ fn an_abandoned_incoming_directory_is_never_reported_as_accepted() {
 }
 
 #[test]
+fn staging_directory_is_not_visible_before_its_lease_is_held() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let queue_lock = match queue.open_queue_lock() {
+        Ok(lock) => lock,
+        Err(error) => panic!("queue lock must open: {error}"),
+    };
+    if let Err(error) = queue_lock.lock() {
+        panic!("queue lock fixture must be held: {error}");
+    }
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (result_sender, result_receiver) = mpsc::channel();
+    let concurrent_queue = queue.clone();
+    let thread = thread::spawn(move || {
+        if started_sender.send(()).is_err() {
+            return;
+        }
+        let _ = result_sender.send(concurrent_queue.begin());
+    });
+    if let Err(error) = started_receiver.recv() {
+        panic!("begin thread must start: {error}");
+    }
+    match result_receiver.recv_timeout(Duration::from_millis(100)) {
+        Err(RecvTimeoutError::Timeout) => {}
+        Err(error) => panic!("begin result channel must remain connected: {error}"),
+        Ok(_) => panic!("begin must wait for the queue lock before creating a directory"),
+    }
+    assert!(incoming_is_empty(root.path()));
+
+    drop(queue_lock);
+    let package = match result_receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(package)) => package,
+        Ok(Err(error)) => panic!("begin must succeed after queue lock release: {error}"),
+        Err(error) => panic!("begin must finish after queue lock release: {error}"),
+    };
+    assert!(package.staging_path.is_dir());
+    match thread.join() {
+        Ok(()) => {}
+        Err(_) => panic!("begin thread must not panic"),
+    }
+}
+
+#[test]
 fn stale_incoming_requires_quarantine_before_reaping() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path(), PackagePolicy::default());
@@ -703,6 +794,9 @@ fn quarantine_retention_starts_when_the_directory_is_quarantined() {
     if let Err(error) = fs::create_dir(&abandoned) {
         panic!("abandoned incoming fixture must be created: {error}");
     }
+    if let Err(error) = fs::write(abandoned.join(".quarantined-at"), b"") {
+        panic!("incomplete quarantine marker fixture must be written: {error}");
+    }
 
     let moved = match queue.quarantine_stale_incoming(std::time::Duration::ZERO, 100, 100) {
         Ok(moved) => moved,
@@ -712,7 +806,11 @@ fn quarantine_retention_starts_when_the_directory_is_quarantined() {
     let quarantined = root
         .path()
         .join("queue/quarantine/.incoming-01K00000000000000000000998");
-    assert!(quarantined.join(".quarantined-at").is_file());
+    let marker = match fs::read_to_string(quarantined.join(".quarantined-at")) {
+        Ok(marker) => marker,
+        Err(error) => panic!("completed quarantine marker must be readable: {error}"),
+    };
+    assert!(!marker.is_empty());
 
     let removed =
         match queue.reap_quarantined_incoming(std::time::Duration::from_secs(60), 100, 100) {
@@ -721,6 +819,39 @@ fn quarantine_retention_starts_when_the_directory_is_quarantined() {
         };
     assert_eq!(removed, 0);
     assert!(quarantined.is_dir());
+}
+
+#[test]
+fn reaping_repairs_an_incomplete_quarantine_marker_before_aging() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let quarantined = root
+        .path()
+        .join("queue/quarantine/.incoming-01K00000000000000000000994");
+    if let Err(error) = fs::create_dir(&quarantined) {
+        panic!("quarantined fixture must be created: {error}");
+    }
+    if let Err(error) = fs::write(quarantined.join(".quarantined-at"), b"") {
+        panic!("incomplete quarantine marker fixture must be written: {error}");
+    }
+
+    let removed = match queue.reap_quarantined_incoming(std::time::Duration::ZERO, 100, 100) {
+        Ok(removed) => removed,
+        Err(error) => panic!("incomplete marker repair must succeed: {error}"),
+    };
+    assert_eq!(removed, 0);
+    let marker = match fs::read_to_string(quarantined.join(".quarantined-at")) {
+        Ok(marker) => marker,
+        Err(error) => panic!("repaired quarantine marker must be readable: {error}"),
+    };
+    assert!(!marker.is_empty());
+
+    let removed = match queue.reap_quarantined_incoming(std::time::Duration::ZERO, 100, 100) {
+        Ok(removed) => removed,
+        Err(error) => panic!("completed marker reap must succeed: {error}"),
+    };
+    assert_eq!(removed, 1);
+    assert!(!quarantined.exists());
 }
 
 #[test]
@@ -736,19 +867,57 @@ fn stale_maintenance_respects_scan_and_action_budgets() {
         }
     }
 
-    let first = match queue.quarantine_stale_incoming(std::time::Duration::ZERO, 1, 100) {
-        Ok(moved) => moved,
-        Err(error) => panic!("scan-budgeted quarantine must succeed: {error}"),
-    };
-    assert_eq!(first, 1);
-    let second = match queue.quarantine_stale_incoming(std::time::Duration::ZERO, 100, 1) {
-        Ok(moved) => moved,
-        Err(error) => panic!("action-budgeted quarantine must succeed: {error}"),
-    };
-    assert_eq!(second, 1);
+    for _ in 0..3 {
+        let moved = match queue.quarantine_stale_incoming(std::time::Duration::ZERO, 1, 1) {
+            Ok(moved) => moved,
+            Err(error) => panic!("budgeted quarantine must succeed: {error}"),
+        };
+        assert_eq!(moved, 1);
+    }
     let remaining = match fs::read_dir(root.path().join("queue/incoming")) {
         Ok(entries) => entries.count(),
         Err(error) => panic!("incoming directory must be readable: {error}"),
     };
-    assert_eq!(remaining, 1);
+    assert_eq!(remaining, 0);
+}
+
+#[test]
+fn bounded_directory_scanner_resumes_after_the_previous_entry() {
+    let root = TestDirectory::create();
+    let scan_root = root.path().join("scan");
+    if let Err(error) = fs::create_dir(&scan_root) {
+        panic!("scan fixture root must be created: {error}");
+    }
+    for suffix in ["00992", "00993"] {
+        let path = scan_root.join(format!(".incoming-01K000000000000000000{suffix}"));
+        if let Err(error) = fs::create_dir(path) {
+            panic!("scan fixture directory must be created: {error}");
+        }
+    }
+    let mut scanner = DirectoryScanner::default();
+    let first = match inactive_stale_directories(
+        &scan_root,
+        Duration::ZERO,
+        1,
+        1,
+        StaleAgeSource::Directory,
+        &mut scanner,
+    ) {
+        Ok(candidates) => candidates,
+        Err(error) => panic!("first bounded scan must succeed: {error}"),
+    };
+    let second = match inactive_stale_directories(
+        &scan_root,
+        Duration::ZERO,
+        1,
+        1,
+        StaleAgeSource::Directory,
+        &mut scanner,
+    ) {
+        Ok(candidates) => candidates,
+        Err(error) => panic!("second bounded scan must succeed: {error}"),
+    };
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_ne!(first, second);
 }

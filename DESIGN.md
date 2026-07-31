@@ -576,7 +576,8 @@ The Gateway calculates a digest of the normalized request metadata and payload.
 It searches all queue states for the request ID.
 
 - A new request ID is accepted normally.
-- An existing ID with the same digest returns the existing status.
+- An existing ID with the same digest is revalidated as an immutable accepted
+  package before the Gateway returns its existing status.
 - An existing ID with a different digest fails with
   `REQUEST_ID_REUSED`.
 
@@ -624,8 +625,9 @@ from durable queue metadata before accepting another request.
 
 The Gateway accepts a request as follows:
 
-1. Create a randomly named directory below `queue/incoming/` with exclusive
-   creation.
+1. While holding the queue lock, create a randomly named directory below
+   `queue/incoming/`, acquire its advisory lease, and then release the queue
+   lock.
 2. Stream files while enforcing count and byte limits.
 3. Validate the complete package and calculate its digest.
 4. Synchronize every file.
@@ -662,13 +664,17 @@ configured threshold into `quarantine/`. A separate operation may remove
 stale quarantined entries. Neither operation scans or removes accepted
 packages. Each maintenance invocation has explicit maximum scan and action
 counts so a large abandoned directory set cannot cause unbounded work or
-memory use.
+memory use. A long-running queue handle retains each directory iterator
+between invocations, so bounded scans resume after the previous entry instead
+of repeatedly inspecting the same prefix.
 
-Immediately before the atomic quarantine rename, maintenance writes and
-synchronizes a `.quarantined-at` marker. Reaping measures its retention age
-from that marker rather than from the incoming directory's older modification
-time. A quarantined directory without a completed regular-file marker is
-retained for manual recovery.
+After the atomic quarantine rename, maintenance atomically writes and
+synchronizes a completed `.quarantined-at` marker. Reaping validates the
+marker and measures retention age from its modification time rather than from
+the incoming directory's older modification time. If a crash leaves the
+quarantined directory without a complete marker, the next reap invocation
+atomically creates a fresh marker and retains the directory for the full
+configured period.
 
 `processing/` entries contain an atomic phase record. On startup, the Worker
 examines interrupted entries, commit trailers, the official branch, and
