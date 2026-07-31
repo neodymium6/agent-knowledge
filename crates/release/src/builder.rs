@@ -239,14 +239,26 @@ impl ChildGuard {
         timeout: Duration,
     ) -> Result<(), QuartzBuildError> {
         self.terminate_group()?;
-        self.disarm();
         #[cfg(not(unix))]
         {
             let _ = (deadline, timeout);
+            self.disarm();
             Ok(())
         }
         #[cfg(unix)]
-        wait_for_process_group(self.process_group, deadline, timeout)
+        self.wait_for_group_then_disarm(deadline, timeout, wait_for_process_group)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_group_then_disarm(
+        &mut self,
+        deadline: Instant,
+        timeout: Duration,
+        wait: impl FnOnce(Pid, Instant, Duration) -> Result<(), QuartzBuildError>,
+    ) -> Result<(), QuartzBuildError> {
+        wait(self.process_group, deadline, timeout)?;
+        self.disarm();
+        Ok(())
     }
 
     fn terminate(&mut self) {

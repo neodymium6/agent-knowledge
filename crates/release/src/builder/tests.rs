@@ -13,8 +13,8 @@ use time::OffsetDateTime;
 use ulid::Ulid;
 
 use super::{
-    BUILD_PROCESS_LEASE, BuildProcessLease, QuartzBuildError, QuartzBuilder, enforce_output_limits,
-    spawn_quartz,
+    BUILD_PROCESS_LEASE, BuildProcessLease, ChildGuard, QuartzBuildError, QuartzBuilder,
+    enforce_output_limits, spawn_quartz,
 };
 use crate::ReleasePolicy;
 #[cfg(unix)]
@@ -136,6 +136,42 @@ fn does_not_spawn_quartz_after_the_deadline() {
         spawn_quartz(&mut command, deadline, timeout),
         Err(QuartzBuildError::TimedOut { .. })
     ));
+    assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn keeps_group_cleanup_armed_when_waiting_fails() {
+    use std::os::unix::process::CommandExt;
+
+    let root = TestDirectory::new();
+    let marker = root.0.join("escaped");
+    let program = root.0.join("fake-quartz");
+    executable(
+        &program,
+        &format!(
+            "#!/bin/sh\nsleep 0.1\nprintf escaped > '{}'\n",
+            marker.display()
+        ),
+    );
+    let mut command = Command::new(&program);
+    command.process_group(0);
+    let child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("fake Quartz process must start: {error}"));
+    let mut guard = ChildGuard::new(child)
+        .unwrap_or_else(|error| panic!("child guard must initialize: {error}"));
+    let timeout = Duration::from_millis(1);
+
+    assert!(matches!(
+        guard.wait_for_group_then_disarm(Instant::now(), timeout, |_, _, _| {
+            Err(QuartzBuildError::TimedOut { timeout })
+        }),
+        Err(QuartzBuildError::TimedOut { .. })
+    ));
+    assert!(guard.group_armed);
+    drop(guard);
+    std::thread::sleep(Duration::from_millis(150));
     assert!(!marker.exists());
 }
 
