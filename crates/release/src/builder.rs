@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::store::{BuildDirectory, BuiltDirectory, MAXIMUM_RELEASE_TREE_DEPTH, ReleasePolicy};
+use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use nix::errno::Errno;
@@ -28,12 +29,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_GRACE: Duration = Duration::from_secs(1);
 static BUILD_PROCESS_LEASE: Mutex<()> = Mutex::new(());
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProgramRevision {
+    length: u64,
+    digest: [u8; 32],
+}
+
 /// A bounded invocation of the configured Quartz CLI.
 #[derive(Clone, Debug)]
 pub struct QuartzBuilder {
     configured_program: PathBuf,
     program: PathBuf,
     program_handle: Arc<File>,
+    program_revision: ProgramRevision,
     configured_integration_directory: PathBuf,
     integration_directory: PathBuf,
     integration_handle: Arc<File>,
@@ -84,6 +92,7 @@ impl QuartzBuilder {
         let program_handle =
             Arc::new(File::open(&configured_program).map_err(QuartzBuildError::Io)?);
         let program = stable_file_path(&program_handle, &configured_program)?;
+        let program_revision = file_revision(&program)?;
         let configured_integration_directory = canonical_directory(integration_directory.as_ref())?;
         let integration_handle =
             Arc::new(File::open(&configured_integration_directory).map_err(QuartzBuildError::Io)?);
@@ -93,6 +102,7 @@ impl QuartzBuilder {
             configured_program,
             program,
             program_handle,
+            program_revision,
             configured_integration_directory,
             integration_directory,
             integration_handle,
@@ -146,7 +156,9 @@ impl QuartzBuilder {
             .stderr(Stdio::null());
         #[cfg(unix)]
         command.process_group(0);
-        let child = spawn_quartz(&mut command, deadline, self.timeout)?;
+        let child = spawn_quartz(&mut command, deadline, self.timeout, || {
+            self.validate_live_command()
+        })?;
         let mut child = ChildGuard::new(child)?;
         let status = loop {
             if let Some(status) = child.try_wait()? {
@@ -172,6 +184,7 @@ impl QuartzBuilder {
 
     fn validate_live_command(&self) -> Result<(), QuartzBuildError> {
         validate_pinned_file(&self.configured_program, &self.program_handle)?;
+        validate_file_revision(&self.program, self.program_revision)?;
         validate_pinned_directory(
             &self.configured_integration_directory,
             &self.integration_handle,
@@ -183,8 +196,10 @@ fn spawn_quartz(
     command: &mut Command,
     deadline: Instant,
     timeout: Duration,
+    mut validate: impl FnMut() -> Result<(), QuartzBuildError>,
 ) -> Result<Child, QuartzBuildError> {
     loop {
+        validate()?;
         match command.spawn() {
             Ok(child) => return Ok(child),
             Err(error) if text_file_busy(&error) => {
@@ -196,6 +211,47 @@ fn spawn_quartz(
             Err(error) => return Err(QuartzBuildError::Io(error)),
         }
     }
+}
+
+fn file_revision(path: &Path) -> Result<ProgramRevision, QuartzBuildError> {
+    let file = File::open(path).map_err(QuartzBuildError::Io)?;
+    let length = file.metadata().map_err(QuartzBuildError::Io)?.len();
+    Ok(ProgramRevision {
+        length,
+        digest: digest_file(file, length)?,
+    })
+}
+
+fn validate_file_revision(path: &Path, expected: ProgramRevision) -> Result<(), QuartzBuildError> {
+    let file = File::open(path).map_err(QuartzBuildError::Io)?;
+    if file.metadata().map_err(QuartzBuildError::Io)?.len() != expected.length
+        || digest_file(file, expected.length)? != expected.digest
+    {
+        return Err(QuartzBuildError::CommandIdentityChanged);
+    }
+    Ok(())
+}
+
+fn digest_file(mut file: File, length: u64) -> Result<[u8; 32], QuartzBuildError> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut remaining = length;
+    while remaining > 0 {
+        let maximum = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| QuartzBuildError::CommandIdentityChanged)?;
+        let read = file
+            .read(&mut buffer[..maximum])
+            .map_err(QuartzBuildError::Io)?;
+        if read == 0 {
+            return Err(QuartzBuildError::CommandIdentityChanged);
+        }
+        digest.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    if file.read(&mut buffer[..1]).map_err(QuartzBuildError::Io)? != 0 {
+        return Err(QuartzBuildError::CommandIdentityChanged);
+    }
+    Ok(digest.finalize().into())
 }
 
 #[cfg(unix)]

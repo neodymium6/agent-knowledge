@@ -143,6 +143,59 @@ fn retries_a_temporarily_busy_quartz_executable() {
 
 #[cfg(unix)]
 #[test]
+fn rejects_a_quartz_executable_modified_while_busy() {
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    let output = root.0.join("output");
+    for directory in [&integration, &content, &output] {
+        fs::create_dir(directory)
+            .unwrap_or_else(|error| panic!("fixture directory must be created: {error}"));
+    }
+    let program = root.0.join("fake-busy-quartz");
+    executable(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' safe > \"$5/index.html\"\n",
+    );
+    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+    let mut writer = OpenOptions::new()
+        .write(true)
+        .open(&program)
+        .unwrap_or_else(|error| panic!("Quartz executable must be held busy: {error}"));
+    let modify_writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(25));
+        let replacement = b"#!/bin/sh\nprintf '%s\\n' changed > \"$5/index.html\"\n";
+        writer
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| writer.write_all(replacement))
+            .and_then(|_| writer.set_len(replacement.len() as u64))
+            .and_then(|_| writer.sync_all())
+            .unwrap_or_else(|error| panic!("busy executable must be modified: {error}"));
+        std::thread::sleep(Duration::from_millis(50));
+        drop(writer);
+    });
+
+    assert!(matches!(
+        builder.build_path(&content, &output),
+        Err(QuartzBuildError::CommandIdentityChanged)
+    ));
+    modify_writer
+        .join()
+        .unwrap_or_else(|_| panic!("busy executable writer must finish"));
+    assert!(
+        fs::read_dir(&output)
+            .unwrap_or_else(|error| panic!("output directory must be readable: {error}"))
+            .next()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn successful_build_returns_the_only_preparation_capability() {
     let root = TestDirectory::new();
     let integration = root.0.join("integration");

@@ -271,10 +271,12 @@ The Rust builder resolves an absolute executable and integration directory at
 startup, passes arguments without a shell, and appends Quartz's
 `build -d <content> -o <output>` interface. Standard input and process output
 are disconnected from request data and logs, and every invocation has a
-positive execution deadline. Each invocation runs in an isolated process
-group; the builder kills that group on timeout and after the command wrapper
-exits. The service supervisor remains responsible for terminating any process
-that escapes the group before restarting recovery.
+positive execution deadline. The builder pins the executable identity and
+content revision, revalidating both before every execution attempt and after
+the build. Each invocation runs in an isolated process group; the builder kills
+that group on timeout and after the command wrapper exits. The service
+supervisor remains responsible for terminating any process that escapes the
+group before restarting recovery.
 
 ### 7.4 Git remote
 
