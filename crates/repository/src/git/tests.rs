@@ -447,7 +447,11 @@ fn commits_successes_and_isolates_a_conflicting_request() {
             .unwrap_or_else(|error| panic!("repaired document must be readable: {error}")),
         markdown(FIRST_REQUEST_ID, "Fictional experiment")
     );
-    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), Some(&commit)) {
+    if let Err(error) = repository.finalize_batch_without_publication_proofs(
+        &worker,
+        parse_batch_id(),
+        Some(&commit),
+    ) {
         panic!("durably reconciled batch must finalize: {error}");
     }
     assert_eq!(git.transaction_count(), 0);
@@ -488,7 +492,9 @@ fn all_request_failures_leave_the_official_commit_unchanged() {
             if failures.len() == 1
                 && failures[0].error_code() == ErrorCode::DocumentNotFound
     ));
-    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), None) {
+    if let Err(error) =
+        repository.finalize_batch_without_publication_proofs(&worker, parse_batch_id(), None)
+    {
         panic!("durably failed batch must finalize: {error}");
     }
     assert_eq!(git.transaction_count(), 0);
@@ -1163,7 +1169,11 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
     assert_eq!(git.official_commit(), commit);
     assert_eq!(git.worktree_count(), 0);
     assert_eq!(git.transaction_count(), 1);
-    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), Some(&commit)) {
+    if let Err(error) = repository.finalize_batch_without_publication_proofs(
+        &worker,
+        parse_batch_id(),
+        Some(&commit),
+    ) {
         panic!("resumed batch must finalize: {error}");
     }
     assert_eq!(git.transaction_count(), 0);
@@ -1456,7 +1466,11 @@ fn blocks_a_new_batch_until_the_published_journal_is_finalized() {
         ),
         Err(GitTransactionError::UnfinishedTransaction)
     ));
-    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), Some(&first_commit)) {
+    if let Err(error) = repository.finalize_batch_without_publication_proofs(
+        &worker,
+        parse_batch_id(),
+        Some(&first_commit),
+    ) {
         panic!("first batch must finalize before the next publication: {error}");
     }
 }

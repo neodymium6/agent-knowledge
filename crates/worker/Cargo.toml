@@ -1,5 +1,5 @@
 [package]
-name = "agent-knowledge-repository"
+name = "agent-knowledge-worker"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,9 +12,5 @@ workspace = true
 agent-knowledge-core = { path = "../core" }
 agent-knowledge-queue = { path = "../queue" }
 agent-knowledge-release = { path = "../release" }
-serde.workspace = true
-serde_json.workspace = true
-serde-saphyr.workspace = true
-sha2.workspace = true
+agent-knowledge-repository = { path = "../repository" }
 time.workspace = true
-ulid.workspace = true

@@ -5,6 +5,7 @@ members = [
   "crates/queue",
   "crates/release",
   "crates/repository",
+  "crates/worker",
 ]
 resolver = "3"
 
