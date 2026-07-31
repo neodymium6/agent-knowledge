@@ -468,19 +468,14 @@ impl FileQueue {
     }
 
     fn current_identity_locked(&self) -> Result<Revision, QueueError> {
+        let current_canonical_root =
+            fs::canonicalize(&self.configured_queue_root).map_err(QueueError::Io)?;
+        if current_canonical_root != self.configured_queue_root {
+            return Err(QueueError::InvalidQueueIdentity);
+        }
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::fs::MetadataExt;
-
-            let pinned = self.root_handle.metadata().map_err(QueueError::Io)?;
-            let configured =
-                fs::symlink_metadata(&self.configured_queue_root).map_err(QueueError::Io)?;
-            if !configured.file_type().is_dir()
-                || pinned.dev() != configured.dev()
-                || pinned.ino() != configured.ino()
-            {
-                return Err(QueueError::InvalidQueueIdentity);
-            }
+            validate_pinned_root(&self.configured_queue_root, &self.root_handle)?;
         }
         for directory in self.directories.all() {
             validate_pinned_directory(directory)?;
@@ -1250,16 +1245,58 @@ fn validate_queue_root_binding(
 
 fn validate_pinned_lock(path: &Path, pinned: &File) -> Result<(), QueueError> {
     let configured = fs::symlink_metadata(path).map_err(QueueError::Io)?;
-    let pinned = pinned.metadata().map_err(QueueError::Io)?;
+    let pinned_metadata = pinned.metadata().map_err(QueueError::Io)?;
     if !configured.file_type().is_file() {
         return Err(QueueError::InvalidQueueIdentity);
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if configured.dev() != pinned.dev() || configured.ino() != pinned.ino() {
+        if configured.dev() != pinned_metadata.dev() || configured.ino() != pinned_metadata.ino() {
             return Err(QueueError::InvalidQueueIdentity);
         }
+    }
+    #[cfg(target_os = "linux")]
+    validate_live_mount(path, &configured, pinned)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_pinned_root(path: &Path, pinned: &File) -> Result<(), QueueError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let configured = fs::symlink_metadata(path).map_err(QueueError::Io)?;
+    let pinned_metadata = pinned.metadata().map_err(QueueError::Io)?;
+    if !configured.file_type().is_dir()
+        || configured.dev() != pinned_metadata.dev()
+        || configured.ino() != pinned_metadata.ino()
+    {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    validate_live_mount(path, &configured, pinned)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_live_mount(
+    path: &Path,
+    configured_metadata: &fs::Metadata,
+    pinned: &File,
+) -> Result<(), QueueError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let configured = File::open(path).map_err(QueueError::Io)?;
+    let opened_metadata = configured.metadata().map_err(QueueError::Io)?;
+    let pinned_metadata = pinned.metadata().map_err(QueueError::Io)?;
+    if opened_metadata.dev() != configured_metadata.dev()
+        || opened_metadata.ino() != configured_metadata.ino()
+        || opened_metadata.file_type() != configured_metadata.file_type()
+        || opened_metadata.dev() != pinned_metadata.dev()
+        || opened_metadata.ino() != pinned_metadata.ino()
+    {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    if linux_mount_id(&configured)? != linux_mount_id(pinned)? {
+        return Err(QueueError::InvalidQueueIdentity);
     }
     Ok(())
 }
@@ -1370,6 +1407,8 @@ fn validate_pinned_directory(directory: &PinnedDirectory) -> Result<(), QueueErr
             return Err(QueueError::InvalidQueueIdentity);
         }
     }
+    #[cfg(target_os = "linux")]
+    validate_live_mount(&directory.entry, &entry, &directory.handle)?;
     Ok(())
 }
 

@@ -779,13 +779,15 @@ accepting requests while the Worker is otherwise idle or applying a batch.
 On Linux, each live queue handle retains an open descriptor for the initialized
 queue root and each fixed child directory, and performs queue I/O through
 `/proc/self/fd/<fd>`. It also compares every configured directory entry's
-device, inode, and type, plus the immutable `queue-id`, with the pinned objects
-before Gateway staging, immediately before and after acceptance promotion, and
-before every Worker transition. Renaming, copying, or snapshotting a queue or
-one of its fixed directories therefore invalidates old handles without
-redirecting writes or acknowledging acceptance into a detached queue. Every
-returned claim retains a shared lease on the pinned `processing/` descriptor
-for as long as it exposes a `/proc/self/fd/<fd>` package path.
+device, inode, mount identity, and type, plus the immutable `queue-id`, with the
+pinned objects before Gateway staging, immediately before and after acceptance
+promotion, and before every Worker transition. It re-canonicalizes the
+configured root to detect replacement of an ancestor with a symlink. Renaming,
+bind-mounting, copying, or snapshotting a queue or one of its fixed directories
+therefore invalidates old handles without redirecting writes or acknowledging
+acceptance into a detached queue. Every returned claim retains a shared lease
+on the pinned `processing/` descriptor for as long as it exposes a
+`/proc/self/fd/<fd>` package path.
 
 The queue stores an immutable root binding containing its configured canonical
 path and the filesystem device/inode identities of the root, fixed lock files,
@@ -943,8 +945,11 @@ synchronization and cleanup, so it never reports a terminal outcome against a
 detached storage tree. After reset and clean, every materialized canonical file
 and directory is synchronized before publication can complete. Creation and
 removal of disposable Git worktrees also synchronize the pinned `worktrees/`
-directory; recovery may remove only a direct child whose name is a canonical
-batch ID when Git registration is already absent.
+directory. If normal removal fails, recovery queries Git's registered worktree
+list and may directly remove only an unregistered direct child whose name is a
+canonical batch ID. A registered worktree removal failure remains an
+infrastructure error. Transaction aborts repeat live-storage validation after
+their journal removal before reporting success.
 
 An all-failed batch records the same durable claim tokens and failure outcomes
 in a `no_changes` journal even though it creates no Git commit.

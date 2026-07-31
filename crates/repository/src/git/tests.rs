@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -585,6 +586,45 @@ fn trial_build_failure_keeps_the_official_commit_unchanged() {
 }
 
 #[test]
+fn abort_rejects_a_storage_replacement_before_acknowledgement() {
+    let root = TestDirectory::new();
+    let git = GitFixture::initialize(root.path());
+    let (queue, mut worker) = queue_and_worker(&root.path().join("queue"));
+    let claim = enqueue_and_claim(
+        &queue,
+        &mut worker,
+        FIRST_REQUEST_ID,
+        &create_request(FIRST_REQUEST_ID, "Create an aborted fictional experiment"),
+        &markdown(FIRST_REQUEST_ID, "Aborted fictional experiment"),
+    );
+    let repository = git.open();
+    assert!(matches!(
+        repository.apply_batch(
+            &mut worker,
+            parse_batch_id(),
+            std::slice::from_ref(&claim),
+            ContentPolicy::default(),
+            &PackagePolicy::default(),
+            |_| Err(GitTransactionError::TrialBuildFailed),
+        ),
+        Err(GitTransactionError::TrialBuildFailed)
+    ));
+    let configured_work = git.work.clone();
+    let detached_work = root.path().join("detached-work");
+
+    let result =
+        repository.abort_preparing_batch_with_hook(&mut worker, parse_batch_id(), &[claim], || {
+            fs::rename(&configured_work, &detached_work).map_err(GitTransactionError::Io)?;
+            fs::create_dir(&configured_work).map_err(GitTransactionError::Io)
+        });
+
+    assert!(matches!(
+        result,
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+}
+
+#[test]
 fn trial_build_cannot_change_the_tree_that_will_be_committed() {
     let root = TestDirectory::new();
     let git = GitFixture::initialize(root.path());
@@ -908,6 +948,48 @@ fn cleanup_removes_an_unregistered_disposable_batch_worktree() {
         .remove_worktree(&worktree)
         .unwrap_or_else(|error| panic!("unregistered worktree cleanup must succeed: {error}"));
     assert!(!worktree.exists());
+}
+
+#[test]
+fn cleanup_preserves_a_registered_worktree_after_a_removal_error() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let repository = fixture.open();
+    let worktree = repository.worktree_path(parse_batch_id());
+    let base = repository
+        .resolve_commit("refs/heads/main")
+        .unwrap_or_else(|error| panic!("official commit must resolve: {error}"));
+    super::run_git(
+        None,
+        Some(&repository.git_directory),
+        [
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("--detach"),
+            worktree.as_os_str(),
+            OsStr::new(&base),
+        ],
+    )
+    .unwrap_or_else(|error| panic!("registered worktree must be created: {error}"));
+    let simulated_error = GitTransactionError::GitCommand {
+        arguments: vec!["worktree".into(), "remove".into()],
+        stderr: "fictional removal failure".into(),
+    };
+
+    assert!(matches!(
+        repository.handle_failed_worktree_removal(&worktree, simulated_error),
+        Err(GitTransactionError::GitCommand { .. })
+    ));
+    assert!(worktree.exists());
+    assert!(
+        repository
+            .is_registered_worktree(&worktree)
+            .unwrap_or_else(|error| panic!("registration must be readable: {error}"))
+    );
+
+    repository
+        .remove_worktree(&worktree)
+        .unwrap_or_else(|error| panic!("registered worktree cleanup must succeed: {error}"));
 }
 
 #[test]

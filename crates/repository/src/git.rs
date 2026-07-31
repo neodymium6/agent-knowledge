@@ -541,6 +541,19 @@ impl GitRepository {
         batch_id: BatchId,
         claims: &[ClaimedPackage],
     ) -> Result<(), GitTransactionError> {
+        self.abort_preparing_batch_with_hook(worker, batch_id, claims, || Ok(()))
+    }
+
+    fn abort_preparing_batch_with_hook<F>(
+        &self,
+        worker: &mut WorkerSession,
+        batch_id: BatchId,
+        claims: &[ClaimedPackage],
+        before_final_validation: F,
+    ) -> Result<(), GitTransactionError>
+    where
+        F: FnOnce() -> Result<(), GitTransactionError>,
+    {
         let _writer = self.lock_writer()?;
         self.ensure_no_other_journal(batch_id)?;
         let journal_path = self.journal_path(batch_id);
@@ -561,7 +574,9 @@ impl GitRepository {
         }
         self.remove_worktree(&self.worktree_path(batch_id))?;
         self.remove_preparing_ref(batch_id, &journal.base_commit)?;
-        remove_journal(&journal_path)
+        remove_journal(&journal_path)?;
+        before_final_validation()?;
+        self.validate_live_storage()
     }
 
     /// Removes a terminal transaction journal after the caller has durably
@@ -1042,8 +1057,8 @@ impl GitRepository {
                     worktree.as_os_str(),
                 ],
             );
-            if removal.is_err() {
-                self.remove_unregistered_worktree(worktree)?;
+            if let Err(error) = removal {
+                self.handle_failed_worktree_removal(worktree, error)?;
             }
         }
         run_git(
@@ -1056,6 +1071,39 @@ impl GitRepository {
             ],
         )?;
         sync_directory(&self.worktree_root).map_err(GitTransactionError::Io)
+    }
+
+    fn handle_failed_worktree_removal(
+        &self,
+        worktree: &Path,
+        error: GitTransactionError,
+    ) -> Result<(), GitTransactionError> {
+        if self.is_registered_worktree(worktree)? {
+            Err(error)
+        } else {
+            self.remove_unregistered_worktree(worktree)
+        }
+    }
+
+    fn is_registered_worktree(&self, worktree: &Path) -> Result<bool, GitTransactionError> {
+        let output = run_git(
+            None,
+            Some(&self.git_directory),
+            [
+                OsStr::new("worktree"),
+                OsStr::new("list"),
+                OsStr::new("--porcelain"),
+                OsStr::new("-z"),
+            ],
+        )?;
+        let expected = worktree.as_os_str().as_encoded_bytes();
+        let canonical = fs::canonicalize(worktree).map_err(GitTransactionError::Io)?;
+        let canonical = canonical.as_os_str().as_encoded_bytes();
+        Ok(output.stdout.split(|byte| *byte == 0).any(|field| {
+            field
+                .strip_prefix(b"worktree ")
+                .is_some_and(|registered| registered == expected || registered == canonical)
+        }))
     }
 
     fn remove_unregistered_worktree(&self, worktree: &Path) -> Result<(), GitTransactionError> {

@@ -349,6 +349,29 @@ fn rejects_symlinks_that_restore_replaced_queue_entries() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn rejects_an_ancestor_symlink_that_restores_the_queue_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::create();
+    let ancestor = root.path().join("configured");
+    fs::create_dir(&ancestor)
+        .unwrap_or_else(|error| panic!("configured ancestor must be created: {error}"));
+    let queue = FileQueue::initialize(ancestor.join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("fixture queue must initialize: {error}"));
+    let detached_ancestor = root.path().join("detached-configured");
+    fs::rename(&ancestor, &detached_ancestor)
+        .unwrap_or_else(|error| panic!("configured ancestor must be moved aside: {error}"));
+    symlink(&detached_ancestor, &ancestor)
+        .unwrap_or_else(|error| panic!("ancestor symlink must be created: {error}"));
+
+    assert!(matches!(
+        queue.begin(),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+}
+
 #[test]
 fn accepts_new_package_and_returns_existing_for_an_identical_retry() {
     let root = TestDirectory::create();
