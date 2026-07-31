@@ -13,6 +13,7 @@ agent-knowledge-core = { path = "../core" }
 agent-knowledge-queue = { path = "../queue" }
 serde.workspace = true
 serde_json.workspace = true
+serde-saphyr.workspace = true
 sha2.workspace = true
 time.workspace = true
 ulid.workspace = true

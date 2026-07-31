@@ -1,12 +1,12 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use agent_knowledge_core::{
-    ChangeRequest, DocumentId, DocumentMetadata, DocumentParseError, DocumentStatus, DocumentType,
+    DocumentId, DocumentMetadata, DocumentParseError, DocumentStatus, DocumentType,
     DocumentValidationError, ErrorCode, Operation, ProjectId, Revision, decode_document_metadata,
 };
 use agent_knowledge_queue::{
@@ -87,13 +87,7 @@ fn apply_request_with_policy(
 ) -> Result<ApplyOutcome, ApplyError> {
     let index = ContentIndex::build(content_root, policy, package_policy)
         .map_err(ApplyError::ContentIndex)?;
-    let plan = build_plan(
-        content_root,
-        package_root,
-        package.request(),
-        &index,
-        policy,
-    )?;
+    let plan = build_plan(content_root, package_root, package, &index, policy)?;
     let operations_applied = package.request().operations.len();
     execute_plan(content_root, plan)?;
     ContentIndex::build(content_root, policy, package_policy)
@@ -107,6 +101,7 @@ struct VirtualDocument {
     document_type: DocumentType,
     project: Option<ProjectId>,
     created: OffsetDateTime,
+    updated: Option<OffsetDateTime>,
     archived: bool,
     status: DocumentStatus,
     revision: Revision,
@@ -130,10 +125,14 @@ enum PlannedMutation {
 fn build_plan(
     content_root: &Path,
     package_root: &Path,
-    request: &ChangeRequest,
+    package: &ValidatedPackage,
     index: &ContentIndex,
     policy: ContentPolicy,
 ) -> Result<Vec<PlannedMutation>, ApplyError> {
+    let request = package.request();
+    let operation_time = package
+        .acceptance()
+        .map_or(request.created_at, |acceptance| acceptance.accepted_at);
     let mut plan = Vec::with_capacity(request.operations.len());
     let mut documents = HashMap::<DocumentId, VirtualDocument>::new();
     let mut destinations = HashSet::<PathBuf>::new();
@@ -149,8 +148,14 @@ fn build_plan(
                         document_id: *document_id,
                     });
                 }
-                let bytes = read_payload(package_root, content.as_str())?;
+                let bytes = read_payload(package_root, package, content.as_str())?;
                 let metadata = decode_payload_metadata(&bytes, policy, content.as_str())?;
+                if metadata.status == DocumentStatus::Archived {
+                    return Err(ApplyError::OperationForbidden {
+                        document_id: *document_id,
+                        detail: "documents cannot be created with archived status",
+                    });
+                }
                 let relative_path = create_document_path(
                     request.project.as_ref(),
                     request.document_type,
@@ -173,6 +178,7 @@ fn build_plan(
                         document_type: request.document_type,
                         project: request.project.clone(),
                         created: metadata.created,
+                        updated: metadata.updated,
                         archived: false,
                         status: metadata.status,
                         revision: revision(&bytes),
@@ -192,7 +198,7 @@ fn build_plan(
                     request.project.as_ref(),
                     request.document_type,
                 )?;
-                let bytes = read_payload(package_root, content.as_str())?;
+                let bytes = read_payload(package_root, package, content.as_str())?;
                 let metadata = decode_payload_metadata(&bytes, policy, content.as_str())?;
                 if metadata.created != document.created {
                     return Err(ApplyError::OperationForbidden {
@@ -206,11 +212,25 @@ fn build_plan(
                         detail: "archive status requires an archive operation",
                     });
                 }
+                let previous_update = document.updated.unwrap_or(document.created);
+                let Some(updated) = metadata.updated else {
+                    return Err(ApplyError::OperationForbidden {
+                        document_id: *document_id,
+                        detail: "updated documents require an update time",
+                    });
+                };
+                if updated <= previous_update {
+                    return Err(ApplyError::OperationForbidden {
+                        document_id: *document_id,
+                        detail: "document update time must increase",
+                    });
+                }
                 plan.push(PlannedMutation::Replace {
                     relative_path: document.relative_path.clone(),
                     bytes: bytes.clone(),
                 });
                 document.status = metadata.status;
+                document.updated = metadata.updated;
                 document.revision = revision(&bytes);
             }
             Operation::MoveDocument {
@@ -267,12 +287,28 @@ fn build_plan(
                 let destination = archive_document_path(document, *document_id);
                 let destination_bundle = bundle_path(&destination, document.document_type);
                 reserve_new_destination(content_root, &destination_bundle, &mut destinations)?;
+                let archived = archived_markdown(
+                    content_root,
+                    &document.relative_path,
+                    policy,
+                    document.revision,
+                    request.request_id,
+                    operation_time,
+                )?;
+                let archived_revision = revision(&archived);
+                plan.push(PlannedMutation::Replace {
+                    relative_path: document.relative_path.clone(),
+                    bytes: archived,
+                });
                 plan.push(PlannedMutation::Move {
                     source: bundle_path(&document.relative_path, document.document_type),
                     destination: destination_bundle,
                 });
                 document.relative_path = destination;
                 document.archived = true;
+                document.status = DocumentStatus::Archived;
+                document.updated = Some(operation_time);
+                document.revision = archived_revision;
             }
             Operation::AddAttachment {
                 document_id,
@@ -300,7 +336,7 @@ fn build_plan(
                 reserve_new_destination(content_root, &relative_path, &mut destinations)?;
                 plan.push(PlannedMutation::WriteNew {
                     relative_path,
-                    bytes: read_payload(package_root, source.as_str())?,
+                    bytes: read_payload(package_root, package, source.as_str())?,
                 });
             }
         }
@@ -325,6 +361,7 @@ fn resolve_document<'a>(
                 document_type: record.location().document_type(),
                 project: record.location().project().cloned(),
                 created: record.metadata().created,
+                updated: record.metadata().updated,
                 archived: record.location().is_archived(),
                 status: record.metadata().status,
                 revision: record.revision(),
@@ -446,6 +483,73 @@ fn decode_payload_metadata(
     Ok(metadata)
 }
 
+fn archived_markdown(
+    content_root: &Path,
+    relative_path: &Path,
+    policy: ContentPolicy,
+    expected_revision: Revision,
+    request_id: agent_knowledge_core::RequestId,
+    archived_at: OffsetDateTime,
+) -> Result<Vec<u8>, ApplyError> {
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(policy.maximum_markdown_bytes.min(64 * 1024)).unwrap_or(64 * 1024),
+    );
+    File::open(content_root.join(relative_path))
+        .and_then(|file| {
+            file.take(policy.maximum_markdown_bytes.saturating_add(1))
+                .read_to_end(&mut bytes)
+        })
+        .map_err(ApplyError::Io)?;
+    if bytes.len() as u64 > policy.maximum_markdown_bytes || revision(&bytes) != expected_revision {
+        return Err(ApplyError::ContentChangedDuringApply);
+    }
+    let mut metadata = decode_document_metadata(&bytes, policy.maximum_front_matter_bytes)
+        .map_err(|_| ApplyError::ContentChangedDuringApply)?;
+    let previous_update = metadata.updated.unwrap_or(metadata.created);
+    if archived_at <= previous_update {
+        return Err(ApplyError::OperationForbidden {
+            document_id: metadata.document_id,
+            detail: "archive time must follow the previous document update",
+        });
+    }
+    metadata.updated = Some(archived_at);
+    metadata.request_id = request_id;
+    metadata.status = DocumentStatus::Archived;
+    let body = markdown_body(&bytes).ok_or(ApplyError::ContentChangedDuringApply)?;
+    let yaml = serde_saphyr::to_string(&metadata).map_err(ApplyError::MetadataEncoding)?;
+    let mut archived = Vec::with_capacity(yaml.len() + body.len() + 9);
+    archived.extend_from_slice(b"---\n");
+    archived.extend_from_slice(yaml.as_bytes());
+    if !yaml.ends_with('\n') {
+        archived.push(b'\n');
+    }
+    archived.extend_from_slice(b"---\n");
+    archived.extend_from_slice(body);
+    Ok(archived)
+}
+
+fn markdown_body(markdown: &[u8]) -> Option<&[u8]> {
+    let text = std::str::from_utf8(markdown).ok()?;
+    let opening_length = if text.starts_with("---\r\n") {
+        5
+    } else if text.starts_with("---\n") {
+        4
+    } else {
+        return None;
+    };
+    let remainder = &text[opening_length..];
+    let mut offset = 0_usize;
+    for line in remainder.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let content = content.strip_suffix('\r').unwrap_or(content);
+        offset += line.len();
+        if content == "---" {
+            return Some(&remainder.as_bytes()[offset..]);
+        }
+    }
+    None
+}
+
 fn create_document_path(
     project: Option<&ProjectId>,
     document_type: DocumentType,
@@ -559,8 +663,29 @@ fn reserve_new_destination(
     }
 }
 
-fn read_payload(package_root: &Path, relative_path: &str) -> Result<Vec<u8>, ApplyError> {
-    fs::read(package_root.join("payload").join(relative_path)).map_err(ApplyError::Io)
+fn read_payload(
+    package_root: &Path,
+    package: &ValidatedPackage,
+    relative_path: &str,
+) -> Result<Vec<u8>, ApplyError> {
+    let metadata = package
+        .payload()
+        .iter()
+        .find(|metadata| metadata.path().as_str() == relative_path)
+        .ok_or(ApplyError::ClaimPackageChanged)?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.byte_length().min(64 * 1024)).unwrap_or(64 * 1024),
+    );
+    File::open(package_root.join("payload").join(relative_path))
+        .and_then(|file| {
+            file.take(metadata.byte_length().saturating_add(1))
+                .read_to_end(&mut bytes)
+        })
+        .map_err(ApplyError::Io)?;
+    if bytes.len() as u64 != metadata.byte_length() || revision(&bytes) != metadata.revision() {
+        return Err(ApplyError::ClaimPackageChanged);
+    }
+    Ok(bytes)
 }
 
 fn revision(bytes: &[u8]) -> Revision {
@@ -663,6 +788,10 @@ pub enum ApplyError {
     },
     /// The accepted package no longer matched its claim-time validation.
     ClaimPackageChanged,
+    /// Canonical content changed after the base index was built.
+    ContentChangedDuringApply,
+    /// Worker-generated front matter could not be encoded.
+    MetadataEncoding(serde_saphyr::ser::Error),
     /// Live accepted-package revalidation failed.
     PackageValidation(PackageValidationError),
     /// A filesystem operation failed.
@@ -715,6 +844,15 @@ impl fmt::Display for ApplyError {
             Self::ClaimPackageChanged => {
                 formatter.write_str("claimed package changed after claim-time validation")
             }
+            Self::ContentChangedDuringApply => {
+                formatter.write_str("canonical content changed while applying a request")
+            }
+            Self::MetadataEncoding(error) => {
+                write!(
+                    formatter,
+                    "generated document metadata could not be encoded: {error}"
+                )
+            }
             Self::PackageValidation(error) => {
                 write!(formatter, "claimed package revalidation failed: {error}")
             }
@@ -730,6 +868,7 @@ impl std::error::Error for ApplyError {
             Self::InvalidPayloadDocument { source, .. } => Some(source),
             Self::InvalidPayloadMetadata { source, .. } => Some(source),
             Self::PackageValidation(error) => Some(error),
+            Self::MetadataEncoding(error) => Some(error),
             Self::Io(error) => Some(error),
             _ => None,
         }
@@ -745,12 +884,15 @@ impl ApplyError {
             Self::OperationForbidden { .. } | Self::DestinationExists { .. } => {
                 Some(ErrorCode::OperationForbidden)
             }
+            Self::ResultingContent(ContentIndexError::Io(_)) => None,
             Self::ResultingContent(_) => Some(ErrorCode::ContentValidationFailed),
             Self::InvalidPayloadDocument { .. } | Self::InvalidPayloadMetadata { .. } => {
                 Some(ErrorCode::InvalidFrontMatter)
             }
             Self::ContentIndex(_)
             | Self::ClaimPackageChanged
+            | Self::ContentChangedDuringApply
+            | Self::MetadataEncoding(_)
             | Self::PackageValidation(_)
             | Self::Io(_) => None,
         }

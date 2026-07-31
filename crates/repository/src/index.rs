@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use agent_knowledge_core::{
-    DocumentId, DocumentLimits, DocumentMetadata, DocumentParseError, DocumentType,
-    DocumentValidationError, ProjectId, Revision, decode_document_metadata,
+    AttachmentName, DocumentId, DocumentLimits, DocumentMetadata, DocumentParseError,
+    DocumentStatus, DocumentType, DocumentValidationError, PayloadPath, ProjectId, Revision,
+    decode_document_metadata,
 };
 use agent_knowledge_queue::PackagePolicy;
 use sha2::{Digest, Sha256};
@@ -131,11 +132,17 @@ impl ContentIndex {
         let mut entry_count = 0_usize;
         while let Some(directory) = pending.pop() {
             let remaining = policy.maximum_entry_count.saturating_sub(entry_count);
-            let mut entries = fs::read_dir(&directory)
-                .map_err(ContentIndexError::Io)?
-                .take(remaining.saturating_add(1))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(ContentIndexError::Io)?;
+            let mut entries = Vec::with_capacity(remaining.min(1_024));
+            for entry in fs::read_dir(&directory).map_err(ContentIndexError::Io)? {
+                let entry = entry.map_err(ContentIndexError::Io)?;
+                if directory == content_root && entry.file_name() == ".git" {
+                    continue;
+                }
+                entries.push(entry);
+                if entries.len() > remaining {
+                    break;
+                }
+            }
             if entries.len() > remaining {
                 return Err(ContentIndexError::EntryLimitExceeded {
                     maximum: policy.maximum_entry_count,
@@ -164,10 +171,6 @@ impl ContentIndex {
                 if relative_path.to_str().is_none() {
                     return Err(ContentIndexError::InvalidPathEncoding(relative_path));
                 }
-                if relative_path == Path::new(".git") {
-                    continue;
-                }
-
                 let metadata = fs::symlink_metadata(&path).map_err(ContentIndexError::Io)?;
                 if metadata.file_type().is_dir() {
                     child_directories.push(path);
@@ -178,6 +181,14 @@ impl ContentIndex {
                 }
                 validate_regular_file_metadata(&relative_path, &metadata)?;
                 if path.extension().and_then(|value| value.to_str()) != Some("md") {
+                    let maximum = package_policy.limits().maximum_file_bytes;
+                    if metadata.len() > maximum {
+                        return Err(ContentIndexError::AttachmentTooLarge {
+                            path: relative_path,
+                            maximum,
+                            actual: metadata.len(),
+                        });
+                    }
                     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                         return Err(ContentIndexError::InvalidPathEncoding(relative_path));
                     };
@@ -195,7 +206,14 @@ impl ContentIndex {
                     });
                 }
 
-                let bytes = fs::read(&path).map_err(ContentIndexError::Io)?;
+                let bytes = read_bounded_file(&path, policy.maximum_markdown_bytes)?;
+                if bytes.len() as u64 > policy.maximum_markdown_bytes {
+                    return Err(ContentIndexError::MarkdownTooLarge {
+                        path: relative_path,
+                        maximum: policy.maximum_markdown_bytes,
+                        actual: bytes.len() as u64,
+                    });
+                }
                 let document = decode_document_metadata(&bytes, policy.maximum_front_matter_bytes)
                     .map_err(|source| ContentIndexError::InvalidDocument {
                         path: relative_path.clone(),
@@ -203,6 +221,9 @@ impl ContentIndex {
                     })?;
                 let location = classify_document_path(&relative_path)?;
                 validate_canonical_document_path(&relative_path, &location, &document)?;
+                if location.archived != (document.status == DocumentStatus::Archived) {
+                    return Err(ContentIndexError::ArchiveStatusMismatch(relative_path));
+                }
                 document
                     .validate(location.document_type, policy.document)
                     .map_err(|source| ContentIndexError::InvalidMetadata {
@@ -228,7 +249,7 @@ impl ContentIndex {
             pending.extend(child_directories.into_iter().rev());
         }
 
-        validate_attachment_locations(&attachments, &documents)?;
+        validate_attachment_locations(&attachments, &documents, package_policy)?;
 
         Ok(Self { documents })
     }
@@ -276,9 +297,19 @@ impl ContentIndex {
     }
 }
 
+fn read_bounded_file(path: &Path, maximum: u64) -> Result<Vec<u8>, ContentIndexError> {
+    let capacity = usize::try_from(maximum.min(64 * 1024)).unwrap_or(64 * 1024);
+    let mut bytes = Vec::with_capacity(capacity);
+    File::open(path)
+        .and_then(|file| file.take(maximum.saturating_add(1)).read_to_end(&mut bytes))
+        .map_err(ContentIndexError::Io)?;
+    Ok(bytes)
+}
+
 fn validate_attachment_locations(
     attachments: &[PathBuf],
     documents: &HashMap<DocumentId, DocumentRecord>,
+    package_policy: &PackagePolicy,
 ) -> Result<(), ContentIndexError> {
     let document_directories = documents
         .values()
@@ -288,23 +319,35 @@ fn validate_attachment_locations(
         let beside_document = attachment
             .parent()
             .is_some_and(|parent| document_directories.contains(parent));
-        if !beside_document && !is_project_asset(attachment) {
+        let valid_name = attachment
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.parse::<AttachmentName>().is_ok());
+        if !valid_name {
+            return Err(ContentIndexError::InvalidAttachmentPath(attachment.clone()));
+        }
+        if !beside_document && !is_project_asset(attachment, package_policy) {
             return Err(ContentIndexError::OrphanAttachment(attachment.clone()));
         }
     }
     Ok(())
 }
 
-fn is_project_asset(path: &Path) -> bool {
+fn is_project_asset(path: &Path, package_policy: &PackagePolicy) -> bool {
     let components = path
         .iter()
         .filter_map(|component| component.to_str())
         .collect::<Vec<_>>();
-    matches!(
-        components.as_slice(),
-        ["projects", project, "assets", rest @ ..]
-            if !rest.is_empty() && project.parse::<ProjectId>().is_ok()
-    )
+    let ["projects", project, "assets", rest @ ..] = components.as_slice() else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.len() <= package_policy.limits().maximum_path_components
+        && project.parse::<ProjectId>().is_ok()
+        && rest
+            .iter()
+            .all(|component| component.parse::<AttachmentName>().is_ok())
+        && rest.join("/").parse::<PayloadPath>().is_ok()
 }
 
 #[cfg(unix)]
@@ -546,8 +589,21 @@ pub enum ContentIndexError {
     HardLinkedFile(PathBuf),
     /// A non-Markdown file used a disallowed extension.
     UnsupportedAttachment(PathBuf),
+    /// An attachment path did not use safe visible components.
+    InvalidAttachmentPath(PathBuf),
+    /// One attachment exceeded the configured per-file byte limit.
+    AttachmentTooLarge {
+        /// Attachment path relative to the content root.
+        path: PathBuf,
+        /// Configured maximum bytes.
+        maximum: u64,
+        /// Observed bytes.
+        actual: u64,
+    },
     /// An attachment was neither beside a document nor in project assets.
     OrphanAttachment(PathBuf),
+    /// Front-matter archive status disagreed with the canonical directory.
+    ArchiveStatusMismatch(PathBuf),
     /// The hierarchy exceeded the configured entry limit.
     EntryLimitExceeded {
         /// Configured maximum entries.
@@ -619,9 +675,28 @@ impl fmt::Display for ContentIndexError {
                 "content attachment `{}` has a disallowed extension",
                 path.display()
             ),
+            Self::InvalidAttachmentPath(path) => write!(
+                formatter,
+                "content attachment `{}` has an unsafe path",
+                path.display()
+            ),
+            Self::AttachmentTooLarge {
+                path,
+                maximum,
+                actual,
+            } => write!(
+                formatter,
+                "content attachment `{}` is {actual} bytes; maximum is {maximum}",
+                path.display()
+            ),
             Self::OrphanAttachment(path) => write!(
                 formatter,
                 "content attachment `{}` is outside a document bundle or project assets",
+                path.display()
+            ),
+            Self::ArchiveStatusMismatch(path) => write!(
+                formatter,
+                "document `{}` archive status disagrees with its path",
                 path.display()
             ),
             Self::EntryLimitExceeded { maximum } => {

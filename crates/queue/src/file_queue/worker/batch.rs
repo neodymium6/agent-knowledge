@@ -112,6 +112,16 @@ impl FileQueue {
 }
 
 impl WorkerSession {
+    /// Verifies that this live Worker can perform one repository transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error until processing recovery is complete or while a
+    /// pending or processing scan is active.
+    pub fn ensure_transaction_ready(&self) -> Result<(), WorkerQueueError> {
+        self.ensure_no_active_scan()
+    }
+
     /// Revalidates that one claim is still owned by this live Worker session.
     ///
     /// # Errors

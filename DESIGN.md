@@ -424,6 +424,11 @@ status: active
 `document_id` is a permanent ULID. Moving or archiving a document does not
 change it. Paths describe current classification and may change.
 
+Archiving is one atomic Worker operation. It moves the complete bundle and
+rewrites the Markdown front matter with `status: archived`, the archive
+request ID, and the queue acceptance time as `updated`. The Markdown body is
+preserved; generated front matter is normalized YAML.
+
 The exact required fields vary by operation and document type:
 
 - `schema_version`, `document_id`, `title`, `created`, `request_id`, and
@@ -827,7 +832,7 @@ The Worker performs these phases while holding the writer lock:
 2. Select a bounded batch of pending requests.
 3. Atomically move selected requests to `processing/`.
 4. Pin the current official commit.
-5. Create a temporary worktree and transaction branch.
+5. Create a detached temporary worktree and an internal transaction ref.
 6. Revalidate and apply each request in deterministic order.
 7. Remove permanently invalid requests from the candidate batch.
 8. Validate the resulting file hierarchy and Markdown.
@@ -843,6 +848,23 @@ The Worker performs these phases while holding the writer lock:
 
 The branch update uses compare-and-swap semantics. An unexpected branch change
 stops publication and requires recovery; it is never overwritten.
+
+The Worker keeps one durable transaction journal at a time. A `preparing`
+journal is synchronized before disposable Git work begins. After the commit
+object and internal recovery ref exist, a `committed` journal containing the
+exact claim tokens and per-request outcomes is synchronized before the
+official branch can advance. A later batch cannot begin until this journal is
+reconciled and finalized.
+
+An all-failed batch records the same durable claim tokens and failure outcomes
+in a `no_changes` journal even though it creates no Git commit.
+
+Committed recovery does not require every request to remain in `processing/`.
+The Worker reconstructs the original claim tokens from the journal, repairs
+publication and the canonical worktree idempotently, and then reconciles each
+queue result. This permits recovery after a crash partway through the
+successful and failed queue transitions. The journal is removed only after all
+of those transitions are durable.
 
 The canonical checkout and release can be repaired from the official commit
 after a crash. Normal readers use the pinned official commit, not an

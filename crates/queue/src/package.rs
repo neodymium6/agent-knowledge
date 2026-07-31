@@ -199,6 +199,7 @@ impl FromStr for PackageDigest {
 pub struct PayloadMetadata {
     path: PayloadPath,
     byte_length: u64,
+    revision: Revision,
 }
 
 impl PayloadMetadata {
@@ -212,6 +213,12 @@ impl PayloadMetadata {
     #[must_use]
     pub const fn byte_length(&self) -> u64 {
         self.byte_length
+    }
+
+    /// Returns the SHA-256 revision of the exact validated file bytes.
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
     }
 }
 
@@ -333,7 +340,7 @@ fn validate_package_contents(
 
     let canonical_request =
         serde_json::to_vec(&request).map_err(PackageValidationError::CanonicalRequestJson)?;
-    let digest = calculate_digest(&canonical_request, &payload_root, &payload_files)?;
+    let digest = calculate_digest(&canonical_request, &payload_root, &mut payload_files)?;
 
     Ok(ValidatedPackage {
         request,
@@ -550,6 +557,7 @@ fn scan_payload_directory(
             files.push(PayloadMetadata {
                 path,
                 byte_length: metadata.len(),
+                revision: Revision::from_bytes([0; 32]),
             });
         }
     }
@@ -747,7 +755,7 @@ fn enforce_entry_count(
 fn calculate_digest(
     canonical_request: &[u8],
     payload_root: &Path,
-    payload: &[PayloadMetadata],
+    payload: &mut [PayloadMetadata],
 ) -> Result<PackageDigest, PackageValidationError> {
     let mut hasher = Sha256::new();
     hasher.update(DIGEST_DOMAIN);
@@ -756,6 +764,7 @@ fn calculate_digest(
 
     let mut buffer = [0_u8; HASH_BUFFER_LENGTH];
     for file in payload {
+        let mut file_hasher = Sha256::new();
         hash_length_prefixed(&mut hasher, file.path.as_str().as_bytes());
         hasher.update(file.byte_length.to_be_bytes());
 
@@ -778,12 +787,14 @@ fn calculate_digest(
                 ));
             }
             hasher.update(&buffer[..read]);
+            file_hasher.update(&buffer[..read]);
         }
         if observed_length != file.byte_length {
             return Err(PackageValidationError::FileChangedDuringValidation(
                 file.path.clone(),
             ));
         }
+        file.revision = Revision::from_bytes(file_hasher.finalize().into());
     }
 
     let bytes: [u8; 32] = hasher.finalize().into();

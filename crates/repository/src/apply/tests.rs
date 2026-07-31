@@ -1,4 +1,5 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use agent_knowledge_core::Revision;
@@ -402,6 +403,20 @@ fn moves_and_archives_complete_document_bundles() {
         read_file(&content_root.join(format!("{archived}/report.pdf"))),
         b"fictional\n"
     );
+    let archived_markdown = read_file(&content_root.join(format!("{archived}/index.md")));
+    let metadata = match agent_knowledge_core::decode_document_metadata(
+        &archived_markdown,
+        ContentPolicy::default().maximum_front_matter_bytes,
+    ) {
+        Ok(metadata) => metadata,
+        Err(error) => panic!("archived front matter must decode: {error}"),
+    };
+    assert_eq!(
+        metadata.status,
+        agent_knowledge_core::DocumentStatus::Archived
+    );
+    assert_eq!(metadata.request_id.to_string(), ARCHIVE_REQUEST_ID);
+    assert!(metadata.updated.is_some());
 }
 
 #[test]
@@ -514,4 +529,139 @@ fn deterministic_failure_is_detected_before_any_mutation() {
         read_file(&content_root.join(format!("{bundle}/report.pdf"))),
         b"existing\n"
     );
+}
+
+#[test]
+fn rejects_payload_bytes_changed_after_package_validation() {
+    let root = TestDirectory::new();
+    let content_root = root.path().join("content");
+    if let Err(error) = fs::create_dir(&content_root) {
+        panic!("content root must be created: {error}");
+    }
+    let markdown = document(DOCUMENT_ID, CREATE_REQUEST_ID, "Fictional experiment", None);
+    let package_root = root.path().join("package");
+    let package = package(
+        &package_root,
+        request(
+            CREATE_REQUEST_ID,
+            Some("fictional-project"),
+            "experiment",
+            json!([{
+                "type": "create_document",
+                "document_id": DOCUMENT_ID,
+                "content": "index.md"
+            }]),
+        ),
+        &[("index.md", markdown.as_bytes())],
+    );
+    let changed = markdown.replace("Fictional experiment", "Malicious experiment");
+    assert_eq!(changed.len(), markdown.len());
+    write_file(
+        &package_root.join("payload"),
+        "index.md",
+        changed.as_bytes(),
+    );
+    assert!(matches!(
+        apply_request(
+            &content_root,
+            &package_root,
+            &package,
+            ContentPolicy::default()
+        ),
+        Err(ApplyError::ClaimPackageChanged)
+    ));
+    assert!(
+        !content_root
+            .join(format!(
+                "projects/fictional-project/experiments/2026-07-31-{DOCUMENT_ID}"
+            ))
+            .exists()
+    );
+}
+
+#[test]
+fn rejects_archived_creation_and_regressing_update_time() {
+    let root = TestDirectory::new();
+    let content_root = root.path().join("content");
+    if let Err(error) = fs::create_dir(&content_root) {
+        panic!("content root must be created: {error}");
+    }
+    let archived = document(DOCUMENT_ID, CREATE_REQUEST_ID, "Archived creation", None)
+        .replace("status: active", "status: archived");
+    let package_root = root.path().join("archived-package");
+    let archived_package = package(
+        &package_root,
+        request(
+            CREATE_REQUEST_ID,
+            Some("fictional-project"),
+            "experiment",
+            json!([{
+                "type": "create_document",
+                "document_id": DOCUMENT_ID,
+                "content": "index.md"
+            }]),
+        ),
+        &[("index.md", archived.as_bytes())],
+    );
+    assert!(matches!(
+        apply_request(
+            &content_root,
+            &package_root,
+            &archived_package,
+            ContentPolicy::default()
+        ),
+        Err(ApplyError::OperationForbidden { .. })
+    ));
+
+    let original = document(
+        DOCUMENT_ID,
+        ORIGINAL_REQUEST_ID,
+        "Fictional runbook",
+        Some("2026-07-31T05:00:00Z"),
+    );
+    let relative = format!("projects/fictional-project/runbooks/2026-07-31-{DOCUMENT_ID}/index.md");
+    write_file(&content_root, &relative, original.as_bytes());
+    let replacement = document(
+        DOCUMENT_ID,
+        UPDATE_REQUEST_ID,
+        "Regressed fictional runbook",
+        Some("2026-07-31T04:00:00Z"),
+    );
+    let package_root = root.path().join("regressed-package");
+    let regressed = package(
+        &package_root,
+        request(
+            UPDATE_REQUEST_ID,
+            Some("fictional-project"),
+            "runbook",
+            json!([{
+                "type": "update_document",
+                "document_id": DOCUMENT_ID,
+                "expected_revision": revision(&original).to_string(),
+                "content": "index.md"
+            }]),
+        ),
+        &[("index.md", replacement.as_bytes())],
+    );
+    assert!(matches!(
+        apply_request(
+            &content_root,
+            &package_root,
+            &regressed,
+            ContentPolicy::default()
+        ),
+        Err(ApplyError::OperationForbidden { .. })
+    ));
+    assert_eq!(
+        read_file(&content_root.join(relative)),
+        original.into_bytes()
+    );
+}
+
+#[test]
+fn resulting_content_io_failure_remains_retryable() {
+    let error = ApplyError::ResultingContent(crate::ContentIndexError::Io(io::Error::other(
+        "fictional transient failure",
+    )));
+    assert_eq!(error.request_error_code(), None);
 }

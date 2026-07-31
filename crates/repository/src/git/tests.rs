@@ -16,6 +16,7 @@ const FIRST_REQUEST_ID: &str = "01K00000000000000000000001";
 const SECOND_REQUEST_ID: &str = "01K00000000000000000000002";
 const DOCUMENT_ID: &str = "01K00000000000000000000003";
 const BATCH_ID: &str = "01K00000000000000000000004";
+const SECOND_BATCH_ID: &str = "01K00000000000000000000005";
 
 struct TestDirectory {
     path: PathBuf,
@@ -203,7 +204,11 @@ fn parse_request_id(value: &str) -> RequestId {
 }
 
 fn parse_batch_id() -> BatchId {
-    match BATCH_ID.parse() {
+    parse_batch_id_value(BATCH_ID)
+}
+
+fn parse_batch_id_value(value: &str) -> BatchId {
+    match value.parse() {
         Ok(value) => value,
         Err(error) => panic!("fixture batch ID must parse: {error}"),
     }
@@ -281,6 +286,24 @@ fn enqueue_and_claim(
     request: &str,
     markdown: &str,
 ) -> ClaimedPackage {
+    enqueue_and_claim_for_batch(
+        queue,
+        worker,
+        request_id,
+        request,
+        markdown,
+        parse_batch_id(),
+    )
+}
+
+fn enqueue_and_claim_for_batch(
+    queue: &FileQueue,
+    worker: &mut WorkerSession,
+    request_id: &str,
+    request: &str,
+    markdown: &str,
+    batch_id: BatchId,
+) -> ClaimedPackage {
     let mut incoming = match queue.begin() {
         Ok(incoming) => incoming,
         Err(error) => panic!("incoming package must begin: {error}"),
@@ -298,7 +321,7 @@ fn enqueue_and_claim(
     if let Err(error) = incoming.accept() {
         panic!("package must be accepted: {error}");
     }
-    match worker.claim(parse_request_id(request_id), parse_batch_id()) {
+    match worker.claim(parse_request_id(request_id), batch_id) {
         Ok(claim) => claim,
         Err(error) => panic!("package must be claimed: {error}"),
     }
@@ -395,7 +418,7 @@ fn commits_successes_and_isolates_a_conflicting_request() {
     assert!(!message.contains(&format!("Knowledge-Request: {SECOND_REQUEST_ID}")));
     assert_eq!(git.worktree_count(), 0);
     assert_eq!(git.transaction_count(), 1);
-    if let Err(error) = repository.finalize_batch(parse_batch_id(), &commit) {
+    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), Some(&commit)) {
         panic!("durably reconciled batch must finalize: {error}");
     }
     assert_eq!(git.transaction_count(), 0);
@@ -412,7 +435,7 @@ fn all_request_failures_leave_the_official_commit_unchanged() {
     let outcome = match git.open().apply_batch(
         &mut worker,
         parse_batch_id(),
-        &[claim],
+        std::slice::from_ref(&claim),
         ContentPolicy::default(),
         &PackagePolicy::default(),
     ) {
@@ -427,6 +450,20 @@ fn all_request_failures_leave_the_official_commit_unchanged() {
     ));
     assert_eq!(git.official_commit(), base);
     assert_eq!(git.worktree_count(), 0);
+    assert_eq!(git.transaction_count(), 1);
+    if let Err(error) = worker.requeue_claimed(claim.token()) {
+        panic!("fixture must simulate a failed queue transition before recovery: {error}");
+    }
+    let repository = git.open();
+    assert!(matches!(
+        repository.recover_batch(&worker, parse_batch_id()),
+        Ok(BatchCommitOutcome::NoChanges { failures })
+            if failures.len() == 1
+                && failures[0].error_code() == ErrorCode::DocumentNotFound
+    ));
+    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), None) {
+        panic!("durably failed batch must finalize: {error}");
+    }
     assert_eq!(git.transaction_count(), 0);
 }
 
@@ -462,14 +499,11 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
     assert_eq!(git.official_commit(), base);
     assert_eq!(git.transaction_count(), 1);
     assert_eq!(git.worktree_count(), 1);
+    if let Err(error) = worker.requeue_claimed(claim.token()) {
+        panic!("fixture must simulate a queue transition before recovery: {error}");
+    }
 
-    let outcome = match repository.apply_batch(
-        &mut worker,
-        parse_batch_id(),
-        &[claim],
-        ContentPolicy::default(),
-        &PackagePolicy::default(),
-    ) {
+    let outcome = match repository.recover_batch(&worker, parse_batch_id()) {
         Ok(outcome) => outcome,
         Err(error) => panic!("committed journal must resume publication: {error}"),
     };
@@ -480,7 +514,7 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
     assert_eq!(git.official_commit(), commit);
     assert_eq!(git.worktree_count(), 0);
     assert_eq!(git.transaction_count(), 1);
-    if let Err(error) = repository.finalize_batch(parse_batch_id(), &commit) {
+    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), Some(&commit)) {
         panic!("resumed batch must finalize: {error}");
     }
     assert_eq!(git.transaction_count(), 0);
@@ -531,6 +565,61 @@ fn rejects_unordered_and_duplicate_batch_claims_before_writing() {
 }
 
 #[test]
+fn blocks_a_new_batch_until_the_published_journal_is_finalized() {
+    let root = TestDirectory::new();
+    let git = GitFixture::initialize(root.path());
+    let (queue, mut worker) = queue_and_worker(&root.path().join("queue"));
+    let first = enqueue_and_claim(
+        &queue,
+        &mut worker,
+        FIRST_REQUEST_ID,
+        &create_request(FIRST_REQUEST_ID, "Create the first fictional experiment"),
+        &markdown(FIRST_REQUEST_ID, "First fictional experiment"),
+    );
+    let repository = git.open();
+    let first_outcome = match repository.apply_batch(
+        &mut worker,
+        parse_batch_id(),
+        &[first],
+        ContentPolicy::default(),
+        &PackagePolicy::default(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => panic!("first batch must publish: {error}"),
+    };
+    let BatchCommitOutcome::Committed {
+        commit: first_commit,
+        ..
+    } = first_outcome
+    else {
+        panic!("first batch must create a commit");
+    };
+
+    let second_batch = parse_batch_id_value(SECOND_BATCH_ID);
+    let second = enqueue_and_claim_for_batch(
+        &queue,
+        &mut worker,
+        SECOND_REQUEST_ID,
+        &create_request(SECOND_REQUEST_ID, "Create the second fictional experiment"),
+        &markdown(SECOND_REQUEST_ID, "Second fictional experiment"),
+        second_batch,
+    );
+    assert!(matches!(
+        repository.apply_batch(
+            &mut worker,
+            second_batch,
+            &[second],
+            ContentPolicy::default(),
+            &PackagePolicy::default(),
+        ),
+        Err(GitTransactionError::UnfinishedTransaction)
+    ));
+    if let Err(error) = repository.finalize_batch(&worker, parse_batch_id(), Some(&first_commit)) {
+        panic!("first batch must finalize before the next publication: {error}");
+    }
+}
+
+#[test]
 fn refuses_to_start_with_a_dirty_canonical_worktree() {
     let root = TestDirectory::new();
     let git = GitFixture::initialize(root.path());
@@ -549,7 +638,7 @@ fn refuses_to_start_with_a_dirty_canonical_worktree() {
         git.open().apply_batch(
             &mut worker,
             parse_batch_id(),
-            &[claim],
+            std::slice::from_ref(&claim),
             ContentPolicy::default(),
             &PackagePolicy::default(),
         ),
@@ -557,6 +646,26 @@ fn refuses_to_start_with_a_dirty_canonical_worktree() {
     ));
     assert_eq!(git.transaction_count(), 0);
     assert_eq!(git.worktree_count(), 0);
+
+    if let Err(error) = fs::remove_file(git.canonical.join("untracked.json")) {
+        panic!("untracked fixture must be removed: {error}");
+    }
+    if let Err(error) = fs::write(git.repository.join("info/exclude"), "ignored.json\n") {
+        panic!("fictional ignore rule must be written: {error}");
+    }
+    if let Err(error) = fs::write(git.canonical.join("ignored.json"), b"{}\n") {
+        panic!("ignored canonical fixture must be written: {error}");
+    }
+    assert!(matches!(
+        git.open().apply_batch(
+            &mut worker,
+            parse_batch_id(),
+            &[claim],
+            ContentPolicy::default(),
+            &PackagePolicy::default(),
+        ),
+        Err(GitTransactionError::CanonicalWorktreeDirty)
+    ));
 }
 
 #[test]

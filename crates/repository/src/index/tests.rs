@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_knowledge_core::{DocumentId, Revision};
-use agent_knowledge_queue::PackagePolicy;
+use agent_knowledge_queue::{PackageLimits, PackagePolicy};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
@@ -220,6 +220,26 @@ fn rejects_unsafe_entries_and_enforces_bounds() {
     ));
 }
 
+#[test]
+fn excludes_the_worktree_git_entry_from_the_content_bound() {
+    let root = TestDirectory::new();
+    write_document(root.path(), ".git", "gitdir: /fictional/path\n");
+    write_document(
+        root.path(),
+        &format!("projects/fictional/references/{BUNDLE}/index.md"),
+        &markdown(DOCUMENT_ID, "Fictional reference"),
+    );
+    let index = ContentIndex::build(
+        root.path(),
+        ContentPolicy {
+            maximum_entry_count: 5,
+            ..ContentPolicy::default()
+        },
+        &PackagePolicy::default(),
+    );
+    assert!(matches!(index, Ok(index) if index.len() == 1));
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_symbolic_links() {
@@ -295,6 +315,61 @@ fn rejects_noncanonical_document_and_attachment_paths() {
         ),
         Err(ContentIndexError::UnsupportedAttachment(path))
             if path == Path::new("projects/fictional/assets/program.exe")
+    ));
+
+    let root = TestDirectory::new();
+    write_document(root.path(), "projects/fictional/assets/report.json", "{}\n");
+    let package_policy = match PackagePolicy::new(
+        PackageLimits {
+            maximum_file_bytes: 2,
+            ..PackageLimits::default()
+        },
+        ["json"],
+    ) {
+        Ok(policy) => policy,
+        Err(error) => panic!("attachment policy fixture must be valid: {error}"),
+    };
+    assert!(matches!(
+        ContentIndex::build(root.path(), ContentPolicy::default(), &package_policy),
+        Err(ContentIndexError::AttachmentTooLarge {
+            path,
+            maximum: 2,
+            actual: 3,
+        }) if path == Path::new("projects/fictional/assets/report.json")
+    ));
+
+    let root = TestDirectory::new();
+    write_document(
+        root.path(),
+        "projects/fictional/assets/.hidden.json",
+        "{}\n",
+    );
+    assert!(matches!(
+        ContentIndex::build(
+            root.path(),
+            ContentPolicy::default(),
+            &PackagePolicy::default()
+        ),
+        Err(ContentIndexError::InvalidAttachmentPath(path))
+            if path == Path::new("projects/fictional/assets/.hidden.json")
+    ));
+
+    let root = TestDirectory::new();
+    write_document(
+        root.path(),
+        &format!("projects/fictional/archive/runbooks/{BUNDLE}/index.md"),
+        &markdown(DOCUMENT_ID, "Incorrectly archived runbook"),
+    );
+    assert!(matches!(
+        ContentIndex::build(
+            root.path(),
+            ContentPolicy::default(),
+            &PackagePolicy::default()
+        ),
+        Err(ContentIndexError::ArchiveStatusMismatch(path))
+            if path == Path::new(&format!(
+                "projects/fictional/archive/runbooks/{BUNDLE}/index.md"
+            ))
     ));
 }
 

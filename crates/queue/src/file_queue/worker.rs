@@ -61,6 +61,23 @@ pub struct ClaimToken {
 }
 
 impl ClaimToken {
+    /// Reconstructs a token from a durable Worker transaction record.
+    ///
+    /// Queue transitions still validate every field against durable processing
+    /// metadata, so constructing a token does not itself grant ownership.
+    #[must_use]
+    pub const fn from_durable_record(
+        request_id: RequestId,
+        batch_id: BatchId,
+        attempt: NonZeroU32,
+    ) -> Self {
+        Self {
+            request_id,
+            batch_id,
+            attempt,
+        }
+    }
+
     /// Returns the claimed request identifier.
     #[must_use]
     pub const fn request_id(self) -> RequestId {
