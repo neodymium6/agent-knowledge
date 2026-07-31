@@ -134,8 +134,7 @@ impl QuartzBuilder {
         let mut child = ChildGuard::new(child)?;
         let status = loop {
             if let Some(status) = child.try_wait()? {
-                child.terminate_group()?;
-                child.disarm();
+                child.terminate_group_and_wait(deadline, self.timeout)?;
                 enforce_output_limits(output, self.output_policy, deadline, self.timeout)?;
                 break status;
             }
@@ -205,6 +204,32 @@ impl ChildGuard {
             ))),
         }
         #[cfg(not(unix))]
+        Ok(())
+    }
+
+    fn terminate_group_and_wait(
+        &mut self,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> Result<(), QuartzBuildError> {
+        self.terminate_group()?;
+        #[cfg(not(unix))]
+        let _ = (deadline, timeout);
+        #[cfg(unix)]
+        loop {
+            match killpg(self.process_group, None) {
+                Err(Errno::ESRCH) => break,
+                Ok(()) => {}
+                Err(error) => {
+                    return Err(QuartzBuildError::Io(io::Error::from_raw_os_error(
+                        error as i32,
+                    )));
+                }
+            }
+            check_build_deadline(deadline, timeout)?;
+            thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+        }
+        self.disarm();
         Ok(())
     }
 

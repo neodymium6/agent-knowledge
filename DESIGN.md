@@ -1126,11 +1126,12 @@ the entire build process group on excess. The scan is depth-first, bounds open
 descriptors by the directory-depth limit, and checks the build deadline
 throughout traversal. This bounds normal runaway builds before final
 validation. When the Quartz leader exits, the Worker terminates the remaining
-process group before performing the final output scan, so descendants cannot
-continue changing the observed tree. Deployments should additionally place
-build staging on a quota-limited filesystem or apply an equivalent
-ephemeral-storage limit when a hard kernel-enforced capacity boundary is
-required.
+process group and waits, within the build deadline, until the group has no
+signalable members before performing the final output scan. This prevents a
+descendant with an in-flight filesystem operation from changing the observed
+tree after validation. Deployments should additionally place build staging on
+a quota-limited filesystem or apply an equivalent ephemeral-storage limit when
+a hard kernel-enforced capacity boundary is required.
 
 The batch directory is pinned while a store-wide exclusive lease spans the
 build and live preparation. `prepare` consumes that lease-bearing build handle,
