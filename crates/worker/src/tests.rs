@@ -64,6 +64,12 @@ struct Fixture {
 
 impl Fixture {
     fn create() -> Self {
+        Self::create_with_quartz_script(
+            b"content=\noutput=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-d\" ]; then content=$2; shift 2; elif [ \"$1\" = \"-o\" ]; then output=$2; shift 2; else shift; fi\ndone\nprintf '%s\\n' '<p>fictional site</p>' > \"$output/index.html\"\n",
+        )
+    }
+
+    fn create_with_quartz_script(script_contents: &[u8]) -> Self {
         let root = TestDirectory::create();
         let repository_path = root.path().join("repository");
         let seed_path = root.path().join("seed");
@@ -116,11 +122,8 @@ impl Fixture {
         fs::create_dir(&integration)
             .unwrap_or_else(|error| panic!("Quartz integration must be created: {error}"));
         let script = integration.join("quartz.sh");
-        fs::write(
-            &script,
-            b"output=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then output=$2; shift 2; else shift; fi\ndone\nprintf '%s\\n' '<p>fictional site</p>' > \"$output/index.html\"\n",
-        )
-        .unwrap_or_else(|error| panic!("Quartz fixture must be written: {error}"));
+        fs::write(&script, script_contents)
+            .unwrap_or_else(|error| panic!("Quartz fixture must be written: {error}"));
         let quartz = QuartzBuilder::new(
             "/bin/sh",
             &integration,
@@ -459,6 +462,41 @@ fn trial_failure_cleans_transaction_artifacts_for_an_exact_retry() {
         .process(&mut worker, batch_id(), &[claim], created_at())
         .unwrap_or_else(|error| panic!("exact batch retry must publish: {error}"));
     assert!(matches!(outcome, BatchCommitOutcome::Committed { .. }));
+}
+
+#[test]
+fn repository_failure_after_trial_discards_unconsumed_build() {
+    let fixture = Fixture::create_with_quartz_script(
+        b"content=\noutput=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-d\" ]; then content=$2; shift 2; elif [ \"$1\" = \"-o\" ]; then output=$2; shift 2; else shift; fi\ndone\nprintf '%s\\n' '<p>fictional site</p>' > \"$output/index.html\"\nprintf '%s\\n' 'unexpected mutation' > \"$content/untracked.txt\"\n",
+    );
+    let repository = fixture.repository();
+    let (queue, mut worker) = fixture.queue_and_worker();
+    let claim = enqueue_and_claim(&queue, &mut worker);
+    let processor = fixture.processor(repository);
+
+    assert!(
+        processor
+            .process(
+                &mut worker,
+                batch_id(),
+                std::slice::from_ref(&claim),
+                created_at(),
+            )
+            .is_err()
+    );
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join(format!("releases/.staging/{BATCH_ID}"))
+            .exists()
+    );
+    assert_eq!(
+        fs::read_dir(fixture.work_path.join("transactions"))
+            .unwrap_or_else(|error| panic!("transactions must be readable: {error}"))
+            .count(),
+        0
+    );
 }
 
 #[test]

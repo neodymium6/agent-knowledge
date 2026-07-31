@@ -764,17 +764,8 @@ impl GitRepository {
         remove_journal(&journal_path)
     }
 
-    /// Recovers a terminal transaction without requiring its requests to
-    /// remain in `processing/`.
-    ///
-    /// The returned durable tokens let the caller idempotently reconcile queue
-    /// entries after a crash partway through terminal transitions.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the journal is absent or malformed, publication
-    /// cannot be resumed, or disposable cleanup fails.
-    pub fn recover_batch(
+    #[cfg(test)]
+    fn recover_batch(
         &self,
         worker: &WorkerSession,
         batch_id: BatchId,
@@ -790,7 +781,8 @@ impl GitRepository {
     ///
     /// # Errors
     ///
-    /// Returns the same failures as [`Self::recover_batch`] or a callback error.
+    /// Returns an error when the journal is absent or malformed, publication
+    /// cannot be resumed, disposable cleanup fails, or the callback fails.
     pub fn recover_batch_with_publication<F>(
         &self,
         worker: &WorkerSession,

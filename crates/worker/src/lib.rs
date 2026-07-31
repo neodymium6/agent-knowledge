@@ -109,7 +109,8 @@ impl BatchProcessor {
                 let error = callback_error
                     .take()
                     .unwrap_or_else(|| BatchProcessorError::repository(error));
-                if trial_failed.get() {
+                let has_unconsumed_build = built.take().is_some();
+                if trial_failed.get() || has_unconsumed_build {
                     self.repository
                         .abort_preparing_batch(worker, batch_id, claims)
                         .map_err(BatchProcessorError::repository)?;
@@ -209,13 +210,6 @@ impl BatchProcessor {
         commit: &str,
         created_at: OffsetDateTime,
     ) -> Result<PreparedRelease, BatchProcessorError> {
-        if let Some(prepared) = self
-            .releases
-            .prepared_for_commit(commit)
-            .map_err(BatchProcessorError::release)?
-        {
-            return Ok(prepared);
-        }
         match self.releases.resume_prepare(batch_id, commit) {
             Ok(prepared) => Ok(prepared),
             Err(ReleaseError::MissingRecoveryState) => {
@@ -247,17 +241,10 @@ impl BatchProcessor {
         }
         let prepared = match prepared {
             Some(prepared) => prepared,
-            None => match self
+            None => self
                 .releases
-                .prepared_for_commit(commit)
-                .map_err(BatchProcessorError::release)?
-            {
-                Some(prepared) => prepared,
-                None => self
-                    .releases
-                    .resume_prepare(batch_id, commit)
-                    .map_err(BatchProcessorError::release)?,
-            },
+                .resume_prepare(batch_id, commit)
+                .map_err(BatchProcessorError::release)?,
         };
         self.releases
             .activate(&prepared)
