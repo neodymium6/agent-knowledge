@@ -792,6 +792,70 @@ fn revalidates_core_repository_configuration_under_the_writer_lock() {
     ));
 }
 
+#[test]
+fn rejects_live_work_root_replacement() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let repository = fixture.open();
+    let detached = root.path().join("detached-work");
+    fs::rename(&fixture.work, &detached)
+        .unwrap_or_else(|error| panic!("work root must be moved aside: {error}"));
+    fs::create_dir(&fixture.work)
+        .unwrap_or_else(|error| panic!("replacement work root must be created: {error}"));
+
+    assert!(matches!(
+        repository.lock_writer(),
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+}
+
+#[test]
+fn rejects_live_repository_lock_replacement() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let repository = fixture.open();
+    let lock_path = fixture
+        .repository
+        .join("agent-knowledge")
+        .join("writer.lock");
+    fs::rename(&lock_path, lock_path.with_extension("detached"))
+        .unwrap_or_else(|error| panic!("writer lock must be moved aside: {error}"));
+    fs::write(&lock_path, [])
+        .unwrap_or_else(|error| panic!("replacement writer lock must be created: {error}"));
+
+    assert!(matches!(
+        repository.lock_writer(),
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+}
+
+#[test]
+fn rejects_a_work_root_bound_to_another_repository() {
+    let root = TestDirectory::new();
+    let first_root = root.path().join("first");
+    let second_root = root.path().join("second");
+    fs::create_dir(&first_root)
+        .unwrap_or_else(|error| panic!("first fixture root must be created: {error}"));
+    fs::create_dir(&second_root)
+        .unwrap_or_else(|error| panic!("second fixture root must be created: {error}"));
+    let first = GitFixture::initialize(&first_root);
+    let second = GitFixture::initialize(&second_root);
+    drop(first.open());
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+
+    assert!(matches!(
+        GitRepository::open(
+            &second.repository,
+            &second.canonical,
+            &first.work,
+            "main",
+            identity,
+        ),
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn preserves_non_utf8_git_directory_arguments() {
@@ -840,17 +904,17 @@ fn stores_only_canonical_repository_paths() {
     .unwrap_or_else(|error| panic!("repository must open through a path alias: {error}"));
 
     assert_eq!(
-        repository.git_directory,
+        repository.configured_git_directory,
         fs::canonicalize(&fixture.repository)
             .unwrap_or_else(|error| panic!("repository path must canonicalize: {error}"))
     );
     assert_eq!(
-        repository.canonical_worktree,
+        repository.configured_canonical_worktree,
         fs::canonicalize(&fixture.canonical)
             .unwrap_or_else(|error| panic!("worktree path must canonicalize: {error}"))
     );
     assert_eq!(
-        repository.work_root,
+        repository.configured_work_root,
         fs::canonicalize(&fixture.work)
             .unwrap_or_else(|error| panic!("work root must canonicalize: {error}"))
     );
@@ -923,6 +987,8 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
         Err(GitTransactionError::JournalMismatch)
     ));
 
+    drop(repository);
+    let repository = git.open();
     let outcome = match repository.recover_batch(&worker, parse_batch_id()) {
         Ok(outcome) => outcome,
         Err(error) => panic!("committed journal must resume publication: {error}"),

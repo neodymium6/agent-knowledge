@@ -106,8 +106,7 @@ pub enum EnqueueOutcome {
 pub struct FileQueue {
     queue_root: PathBuf,
     configured_queue_root: PathBuf,
-    #[cfg(target_os = "linux")]
-    _root_handle: Arc<File>,
+    root_handle: Arc<File>,
     identity: Revision,
     lock_file: PathBuf,
     worker_lock_file: PathBuf,
@@ -143,14 +142,11 @@ impl FileQueue {
         ensure_directory(&configured_path)?;
         sync_directory(configured_parent)?;
         let configured_queue_root = fs::canonicalize(&configured_path).map_err(QueueError::Io)?;
+        let root_handle = Arc::new(File::open(&configured_queue_root).map_err(QueueError::Io)?);
         #[cfg(target_os = "linux")]
-        let (queue_root, root_handle) = {
+        let queue_root = {
             use std::os::fd::AsRawFd;
-            let root_handle = Arc::new(File::open(&configured_queue_root).map_err(QueueError::Io)?);
-            (
-                PathBuf::from(format!("/proc/self/fd/{}", root_handle.as_raw_fd())),
-                root_handle,
-            )
+            PathBuf::from(format!("/proc/self/fd/{}", root_handle.as_raw_fd()))
         };
         #[cfg(not(target_os = "linux"))]
         let queue_root = configured_queue_root.clone();
@@ -193,8 +189,7 @@ impl FileQueue {
             lock_file,
             worker_lock_file,
             queue_root,
-            #[cfg(target_os = "linux")]
-            _root_handle: root_handle,
+            root_handle,
             policy,
             maintenance_scanners: Arc::new(Mutex::new(MaintenanceScanners::default())),
         };
@@ -368,6 +363,19 @@ impl FileQueue {
     }
 
     fn current_identity_locked(&self) -> Result<Revision, QueueError> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let pinned = self.root_handle.metadata().map_err(QueueError::Io)?;
+            let configured = fs::metadata(&self.configured_queue_root).map_err(QueueError::Io)?;
+            if !configured.is_dir()
+                || pinned.dev() != configured.dev()
+                || pinned.ino() != configured.ino()
+            {
+                return Err(QueueError::InvalidQueueIdentity);
+            }
+        }
         let stable_identity = read_queue_identity(&self.queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
         let configured_identity =
             read_queue_identity(&self.configured_queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;

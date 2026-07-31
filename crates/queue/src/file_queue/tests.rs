@@ -173,6 +173,8 @@ fn a_replaced_queue_invalidates_gateway_staging_and_acceptance() {
         Ok(queue) => queue,
         Err(error) => panic!("replacement queue must initialize: {error}"),
     };
+    fs::copy(detached_path.join("queue-id"), queue_path.join("queue-id"))
+        .unwrap_or_else(|error| panic!("replacement must preserve the copied queue ID: {error}"));
 
     assert!(matches!(
         queue.begin(),

@@ -3,6 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agent_knowledge_core::{BatchId, ErrorCode, RequestId};
 use serde::{Deserialize, Serialize};
@@ -98,12 +99,23 @@ impl ClaimToken {
 }
 
 /// A validated package atomically moved from `pending/` to `processing/`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ClaimedPackage {
     token: ClaimToken,
     package: ValidatedPackage,
     package_root: PathBuf,
+    _root_lease: Arc<File>,
 }
+
+impl PartialEq for ClaimedPackage {
+    fn eq(&self, other: &Self) -> bool {
+        self.token == other.token
+            && self.package == other.package
+            && self.package_root == other.package_root
+    }
+}
+
+impl Eq for ClaimedPackage {}
 
 impl ClaimedPackage {
     /// Returns the ownership token for later phase transitions.
@@ -257,6 +269,7 @@ impl FileQueue {
             },
             package: prepared.package,
             package_root: processing_path,
+            _root_lease: Arc::clone(&self.root_handle),
         })
     }
 

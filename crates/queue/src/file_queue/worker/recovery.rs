@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::Arc;
 
 use agent_knowledge_core::RequestId;
 
@@ -159,5 +160,6 @@ fn recover_processing_claim(
         },
         package,
         package_root: path,
+        _root_lease: Arc::clone(&queue.root_handle),
     })
 }

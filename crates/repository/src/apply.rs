@@ -181,6 +181,11 @@ fn build_plan(
                         document_id: *document_id,
                     });
                 }
+                reserve_planned_bytes(
+                    &mut planned_bytes,
+                    payload_byte_length(package, content.as_str())?,
+                    maximum_planned_bytes,
+                )?;
                 let bytes = Arc::new(read_payload(package_root, package, content.as_str())?);
                 let metadata = decode_payload_metadata(&bytes, policy, content.as_str())?;
                 if metadata.created > operation_time
@@ -206,7 +211,6 @@ fn build_plan(
                     *document_id,
                 );
                 occupancy.reserve(&bundle_path(&relative_path, request.document_type))?;
-                reserve_planned_bytes(&mut planned_bytes, bytes.len(), maximum_planned_bytes)?;
                 plan.push(PlannedMutation::WriteNew {
                     relative_path: relative_path.clone(),
                     bytes: bytes.clone(),
@@ -241,6 +245,11 @@ fn build_plan(
                     request.project.as_ref(),
                     request.document_type,
                 )?;
+                reserve_planned_bytes(
+                    &mut planned_bytes,
+                    payload_byte_length(package, content.as_str())?,
+                    maximum_planned_bytes,
+                )?;
                 let bytes = Arc::new(read_payload(package_root, package, content.as_str())?);
                 let metadata = decode_payload_metadata(&bytes, policy, content.as_str())?;
                 if metadata.created != document.created {
@@ -274,7 +283,6 @@ fn build_plan(
                         detail: "document update time must increase",
                     });
                 }
-                reserve_planned_bytes(&mut planned_bytes, bytes.len(), maximum_planned_bytes)?;
                 plan.push(PlannedMutation::Replace {
                     relative_path: document.relative_path.clone(),
                     bytes: bytes.clone(),
@@ -357,17 +365,13 @@ fn build_plan(
                     policy,
                     request.request_id,
                     operation_time,
+                    &mut planned_bytes,
+                    maximum_planned_bytes,
                 )?;
-                if archived.len() as u64 > policy.maximum_markdown_bytes {
-                    return Err(ApplyError::PlanningBytesExceeded {
-                        maximum: policy.maximum_markdown_bytes,
-                    });
-                }
                 decode_document_metadata(&archived, policy.maximum_front_matter_bytes)
                     .map_err(ApplyError::GeneratedDocument)?;
                 let archived = Arc::new(archived);
                 let archived_revision = revision(&archived);
-                reserve_planned_bytes(&mut planned_bytes, archived.len(), maximum_planned_bytes)?;
                 plan.push(PlannedMutation::Replace {
                     relative_path: document.relative_path.clone(),
                     bytes: archived,
@@ -408,8 +412,12 @@ fn build_plan(
                     .unwrap_or_else(|| Path::new(""))
                     .join(name.as_str());
                 occupancy.reserve(&relative_path)?;
+                reserve_planned_bytes(
+                    &mut planned_bytes,
+                    payload_byte_length(package, source.as_str())?,
+                    maximum_planned_bytes,
+                )?;
                 let bytes = Arc::new(read_payload(package_root, package, source.as_str())?);
-                reserve_planned_bytes(&mut planned_bytes, bytes.len(), maximum_planned_bytes)?;
                 plan.push(PlannedMutation::WriteNew {
                     relative_path,
                     bytes,
@@ -450,19 +458,14 @@ fn resolve_document<'a>(
     }
 }
 
-fn reserve_planned_bytes(
-    total: &mut u64,
-    additional: usize,
-    maximum: u64,
-) -> Result<(), ApplyError> {
-    let additional =
-        u64::try_from(additional).map_err(|_| ApplyError::PlanningBytesExceeded { maximum })?;
-    *total = total
+fn reserve_planned_bytes(total: &mut u64, additional: u64, maximum: u64) -> Result<(), ApplyError> {
+    let next = total
         .checked_add(additional)
         .ok_or(ApplyError::PlanningBytesExceeded { maximum })?;
-    if *total > maximum {
+    if next > maximum {
         return Err(ApplyError::PlanningBytesExceeded { maximum });
     }
+    *total = next;
     Ok(())
 }
 
@@ -604,6 +607,8 @@ fn archived_markdown(
     policy: ContentPolicy,
     request_id: agent_knowledge_core::RequestId,
     archived_at: OffsetDateTime,
+    planned_bytes: &mut u64,
+    maximum_planned_bytes: u64,
 ) -> Result<Vec<u8>, ApplyError> {
     if bytes.len() as u64 > policy.maximum_markdown_bytes {
         return Err(ApplyError::ContentChangedDuringApply);
@@ -622,7 +627,41 @@ fn archived_markdown(
     metadata.status = DocumentStatus::Archived;
     let body = markdown_body(bytes).ok_or(ApplyError::ContentChangedDuringApply)?;
     let yaml = serde_saphyr::to_string(&metadata).map_err(ApplyError::MetadataEncoding)?;
-    let mut archived = Vec::with_capacity(yaml.len() + body.len() + 9);
+    let front_matter_bytes = yaml
+        .len()
+        .checked_add(usize::from(!yaml.ends_with('\n')))
+        .ok_or(ApplyError::PlanningBytesExceeded {
+            maximum: policy.maximum_markdown_bytes,
+        })?;
+    if front_matter_bytes > policy.maximum_front_matter_bytes {
+        return Err(ApplyError::GeneratedDocument(
+            DocumentParseError::FrontMatterTooLarge {
+                maximum: policy.maximum_front_matter_bytes,
+                actual: front_matter_bytes,
+            },
+        ));
+    }
+    let archived_bytes = front_matter_bytes
+        .checked_add(body.len())
+        .and_then(|length| length.checked_add(8))
+        .ok_or(ApplyError::PlanningBytesExceeded {
+            maximum: policy.maximum_markdown_bytes,
+        })?;
+    let archived_bytes =
+        u64::try_from(archived_bytes).map_err(|_| ApplyError::PlanningBytesExceeded {
+            maximum: policy.maximum_markdown_bytes,
+        })?;
+    if archived_bytes > policy.maximum_markdown_bytes {
+        return Err(ApplyError::PlanningBytesExceeded {
+            maximum: policy.maximum_markdown_bytes,
+        });
+    }
+    reserve_planned_bytes(planned_bytes, archived_bytes, maximum_planned_bytes)?;
+    let mut archived = Vec::with_capacity(usize::try_from(archived_bytes).map_err(|_| {
+        ApplyError::PlanningBytesExceeded {
+            maximum: policy.maximum_markdown_bytes,
+        }
+    })?);
     archived.extend_from_slice(b"---\n");
     archived.extend_from_slice(yaml.as_bytes());
     if !yaml.ends_with('\n') {
@@ -824,6 +863,15 @@ fn read_payload(
         return Err(ApplyError::ClaimPackageChanged);
     }
     Ok(bytes)
+}
+
+fn payload_byte_length(package: &ValidatedPackage, relative_path: &str) -> Result<u64, ApplyError> {
+    package
+        .payload()
+        .iter()
+        .find(|metadata| metadata.path().as_str() == relative_path)
+        .map(|metadata| metadata.byte_length())
+        .ok_or(ApplyError::ClaimPackageChanged)
 }
 
 fn revision(bytes: &[u8]) -> Revision {

@@ -757,11 +757,13 @@ batch.
 
 On Linux, each live queue handle retains an open descriptor for the initialized
 queue root and performs queue I/O through `/proc/self/fd/<fd>`. It also compares
-the identity reachable at the configured canonical path before Gateway staging,
-immediately before and after acceptance promotion, and before every Worker
-transition. Renaming the queue root and creating a replacement at the same path
-therefore invalidates old handles without redirecting writes or acknowledging
-acceptance into the detached queue.
+the configured path's device, inode, directory type, and immutable `queue-id`
+with the pinned root before Gateway staging, immediately before and after
+acceptance promotion, and before every Worker transition. Renaming, copying, or
+snapshotting a queue into the same path therefore invalidates old handles
+without redirecting writes or acknowledging acceptance into the detached queue.
+Every returned claim retains a shared lease on the root descriptor for as long
+as it exposes a `/proc/self/fd/<fd>` package path.
 
 Pending selection takes a fixed acceptance-sequence snapshot and incrementally
 walks the pending directory. Each call has a maximum number of directory
@@ -877,10 +879,10 @@ Git 2.36 or newer is required. Git subprocesses discard inherited `GIT_*`
 overrides, disable system/global configuration, hooks, signing, fsmonitor, and
 line-ending conversion, and reject repository-local configuration outside a
 small data-only allowlist. Object and reference mutations run with Git fsync
-enabled. A repository-scoped file lock serializes all repository instances.
-The lock and an immutable binding to the canonical worktree, official branch,
-and disposable work root live below the common bare Git directory, so two
-configurations cannot split the writer or journal identity. Recovery never
+enabled. Repository- and work-root-scoped file locks serialize every repository
+instance and prevent two repositories from sharing a journal namespace.
+Reciprocal immutable bindings connect the bare repository and disposable work
+root to the same canonical worktree and official branch. Recovery never
 guesses that a Git `.lock` file is stale:
 an orphaned but still-running Git child may own it, so automated recovery
 fails closed and requires verified operator intervention. Before
@@ -890,12 +892,16 @@ successful-request trailers recorded by the journal. A stale `preparing`
 journal never silently rebases onto a changed official branch.
 
 The repository, canonical worktree, and disposable work root are canonicalized
-once during startup, and only those canonical paths are retained. The configured
-canonical worktree must be exactly Git's reported worktree root, not one of its
-subdirectories. After taking the repository writer lock, the Worker revalidates
-the local Git configuration, bare-repository state, common directory, worktree
-root, checked-out official branch, and immutable repository binding before
-starting or recovering a transaction.
+once during startup and pinned with open directory descriptors. Rust filesystem
+operations and Git subprocesses use `/proc/<worker-pid>/fd/<fd>` paths, while
+device and inode checks ensure that each configured path and fixed lock file
+still names the pinned object. The configured canonical worktree must be exactly
+Git's reported worktree root, not one of its subdirectories. After taking both
+writer locks, the Worker revalidates all pinned roots and fixed locks, path
+non-overlap, local Git configuration, bare-repository state, common directory,
+worktree root, checked-out official branch, and reciprocal bindings before
+starting or recovering a transaction. After reset and clean, every materialized
+canonical file and directory is synchronized before publication can complete.
 
 An all-failed batch records the same durable claim tokens and failure outcomes
 in a `no_changes` journal even though it creates no Git commit.
@@ -932,8 +938,10 @@ Canonical Markdown bodies are loaded lazily only for archive operations.
 Payload output buffers use one no-copy shared allocation between the virtual
 document view and the mutation plan. Payload output, generated archive bytes,
 and every other planned write share one checked per-request materialization
-bound; one bounded document scratch buffer may additionally exist while archive
-front matter is generated.
+bound. Validated payload lengths are reserved before reading, and generated
+archive length is reserved before allocating its output buffer. One bounded
+source document plus a separately bounded metadata-encoding scratch buffer may
+additionally exist while archive front matter is generated.
 Worker-generated Markdown is validated against document and front-matter limits
 before any filesystem mutation.
 

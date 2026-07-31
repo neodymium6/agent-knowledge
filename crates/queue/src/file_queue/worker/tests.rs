@@ -209,6 +209,23 @@ fn claims_pending_package_with_durable_phase_record() {
 }
 
 #[test]
+fn a_claim_retains_its_pinned_queue_root_lease() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    let mut worker = open_worker(&queue);
+    let claim = worker
+        .claim(parse_request_id(), parse_batch_id(FIRST_BATCH_ID))
+        .unwrap_or_else(|error| panic!("pending request must be claimed: {error}"));
+
+    drop(worker);
+    drop(queue);
+
+    assert!(claim.package_root().is_dir());
+    assert!(claim.package_root().join("request.json").is_file());
+}
+
+#[test]
 fn requeue_requires_current_token_and_increments_the_next_attempt() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path());
