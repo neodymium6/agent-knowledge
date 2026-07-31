@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::store::{MAXIMUM_RELEASE_TREE_DEPTH, ReleasePolicy};
+use crate::store::{BuildDirectory, BuiltDirectory, MAXIMUM_RELEASE_TREE_DEPTH, ReleasePolicy};
 
 #[cfg(unix)]
 use nix::errno::Errno;
@@ -102,8 +102,18 @@ impl QuartzBuilder {
         })
     }
 
-    /// Builds one content tree into an existing empty output directory.
-    pub fn build(&self, content: &Path, output: &Path) -> Result<(), QuartzBuildError> {
+    /// Consumes a staging directory and returns it only after a successful,
+    /// fully validated Quartz build.
+    pub fn build(
+        &self,
+        content: &Path,
+        build: BuildDirectory,
+    ) -> Result<BuiltDirectory, QuartzBuildError> {
+        self.build_path(content, build.path())?;
+        Ok(BuiltDirectory::new(build))
+    }
+
+    fn build_path(&self, content: &Path, output: &Path) -> Result<(), QuartzBuildError> {
         if !content.is_absolute() || !output.is_absolute() {
             return Err(QuartzBuildError::BuildPathsMustBeAbsolute);
         }
@@ -276,7 +286,7 @@ impl BuildProcessLease {
     fn acquire() -> Result<Self, QuartzBuildError> {
         let lock = BUILD_PROCESS_LEASE
             .lock()
-            .map_err(|_| QuartzBuildError::InvalidProcessState)?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(target_os = "linux")]
         {
             let previous_subreaper = nix::sys::prctl::get_child_subreaper()

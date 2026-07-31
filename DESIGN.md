@@ -1143,11 +1143,15 @@ equivalent ephemeral-storage limit when a hard kernel-enforced capacity
 boundary is required.
 
 The batch directory is pinned while a store-wide exclusive lease spans the
-build and live preparation. `prepare` consumes that lease-bearing build handle,
-so the directory identity cannot be dropped and reopened between those phases.
-Quartz receives its replaceable `site/` child as the output path, allowing the
-CLI to remove and recreate the output root without invalidating the batch
-container. Restart recovery uses the batch ID and the durable
+build and live preparation. `QuartzBuilder::build` consumes the original
+`BuildDirectory` and returns an unforgeable `BuiltDirectory` capability only
+after command success and final validation. `prepare` accepts and consumes only
+that capability, so failed, timed-out, or partially validated output cannot be
+promoted through the public API. The capability retains the batch lease, so the
+directory identity cannot be dropped and reopened between building and
+preparation. Quartz receives its replaceable `site/` child as the output path,
+allowing the CLI to remove and recreate the output root without invalidating
+the batch container. Restart recovery uses the batch ID and the durable
 `by-batch/<batch-id>` intent. That intent may be temporarily dangling until the
 atomic `site/` promotion; the ready-only `by-commit/` index is updated after
 promotion and never points at an in-progress release.

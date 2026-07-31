@@ -116,6 +116,21 @@ impl BuildDirectory {
     }
 }
 
+/// A build directory that completed Quartz execution and final validation.
+#[derive(Debug)]
+pub struct BuiltDirectory(BuildDirectory);
+
+impl BuiltDirectory {
+    pub(crate) fn new(build: BuildDirectory) -> Self {
+        Self(build)
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
 /// Pinned release roots with atomic staging and activation.
 #[derive(Clone, Debug)]
 pub struct ReleaseStore {
@@ -262,10 +277,11 @@ impl ReleaseStore {
     /// Validates and durably promotes generated output into `by-id/`.
     pub fn prepare(
         &self,
-        build: BuildDirectory,
+        build: BuiltDirectory,
         commit: &str,
         created_at: OffsetDateTime,
     ) -> Result<PreparedRelease, ReleaseError> {
+        let BuiltDirectory(build) = build;
         let BuildDirectory {
             batch_id,
             configured,

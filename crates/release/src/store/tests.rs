@@ -11,11 +11,12 @@ use ulid::Ulid;
 #[cfg(unix)]
 use super::unix_mode_is_directory;
 use super::{
-    BINDING_FILE, BuildDirectory, CLEANUP_MARKER_FILE, LEGACY_BINDING_FILE, MANIFEST_FILE,
-    MANIFEST_SCHEMA_VERSION, MAXIMUM_CLEANUP_ACTIONS, MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH,
-    MAXIMUM_RELEASE_TREE_DEPTH, ReleaseError, ReleaseManifest, ReleasePolicy, ReleaseStore,
-    cleanup_name, derived_reference_is_repairable, ensure_cleanup_marker, ensure_manifest,
-    read_manifest, release_id, validate_release_tree, validate_release_tree_at,
+    BINDING_FILE, BuildDirectory, BuiltDirectory, CLEANUP_MARKER_FILE, LEGACY_BINDING_FILE,
+    MANIFEST_FILE, MANIFEST_SCHEMA_VERSION, MAXIMUM_CLEANUP_ACTIONS,
+    MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH, MAXIMUM_RELEASE_TREE_DEPTH, ReleaseError, ReleaseManifest,
+    ReleasePolicy, ReleaseStore, cleanup_name, derived_reference_is_repairable,
+    ensure_cleanup_marker, ensure_manifest, read_manifest, release_id, validate_release_tree,
+    validate_release_tree_at,
 };
 
 const FIRST_BATCH: &str = "01K00000000000000000000001";
@@ -58,13 +59,17 @@ fn timestamp(value: &str) -> OffsetDateTime {
         .unwrap_or_else(|error| panic!("fixture timestamp must parse: {error}"))
 }
 
-fn build(store: &ReleaseStore, batch_id: BatchId, body: &str) -> BuildDirectory {
+fn build(store: &ReleaseStore, batch_id: BatchId, body: &str) -> BuiltDirectory {
     let output = store
         .begin_build(batch_id)
         .unwrap_or_else(|error| panic!("release build must begin: {error}"));
     fs::write(output.path().join("index.html"), body)
         .unwrap_or_else(|error| panic!("release output must be written: {error}"));
-    output
+    built(output)
+}
+
+fn built(output: BuildDirectory) -> BuiltDirectory {
+    BuiltDirectory::new(output)
 }
 
 #[test]
@@ -227,7 +232,7 @@ fn resumes_from_a_durable_batch_intent_before_promotion() {
     let created_at = timestamp("2026-07-31T04:00:00Z");
     let content_revision = validate_release_tree_at(
         output.path(),
-        &output.batch_handle,
+        &output.0.batch_handle,
         ReleasePolicy::default(),
         false,
     )
@@ -776,7 +781,11 @@ fn build_directory_keeps_its_identity_after_entry_replacement() {
     assert!(detached.join("site").join("index.html").is_file());
     assert!(!configured.join("site").join("index.html").exists());
     assert!(matches!(
-        store.prepare(output, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z")),
+        store.prepare(
+            built(output),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z"),
+        ),
         Err(ReleaseError::StorageBindingMismatch)
     ));
     assert!(
@@ -807,7 +816,11 @@ fn active_build_lease_blocks_prepare_and_discard() {
         Err(ReleaseError::ReleaseStoreBusy)
     ));
     store
-        .prepare(output, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z"))
+        .prepare(
+            built(output),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z"),
+        )
         .unwrap_or_else(|error| panic!("finished build must prepare: {error}"));
 }
 
@@ -856,7 +869,11 @@ fn rejects_generated_symlinks_before_publication() {
     symlink("/fictional/private", output.path().join("escape"))
         .unwrap_or_else(|error| panic!("unsafe fixture symlink must be created: {error}"));
     assert!(matches!(
-        store.prepare(output, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z")),
+        store.prepare(
+            built(output),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z"),
+        ),
         Err(ReleaseError::UnsafeOutput(_))
     ));
     assert!(
@@ -894,7 +911,11 @@ fn invalid_new_output_keeps_the_previous_release_active() {
     symlink("/fictional/private", output.path().join("escape"))
         .unwrap_or_else(|error| panic!("unsafe fixture symlink must be created: {error}"));
     assert!(matches!(
-        store.prepare(output, SECOND_COMMIT, timestamp("2026-07-31T04:05:00Z")),
+        store.prepare(
+            built(output),
+            SECOND_COMMIT,
+            timestamp("2026-07-31T04:05:00Z"),
+        ),
         Err(ReleaseError::UnsafeOutput(_))
     ));
     assert_eq!(
@@ -1093,7 +1114,11 @@ fn enforces_aggregate_generated_output_limit() {
     fs::write(output.path().join("page.html"), "123456789012")
         .unwrap_or_else(|error| panic!("second output file must be written: {error}"));
     assert!(matches!(
-        store.prepare(output, FIRST_COMMIT, timestamp("2026-07-31T04:00:00Z")),
+        store.prepare(
+            built(output),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z"),
+        ),
         Err(ReleaseError::OutputTooLarge)
     ));
 }

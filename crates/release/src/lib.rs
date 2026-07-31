@@ -5,5 +5,6 @@ mod store;
 
 pub use builder::{QuartzBuildError, QuartzBuilder};
 pub use store::{
-    ActiveRelease, BuildDirectory, PreparedRelease, ReleaseError, ReleasePolicy, ReleaseStore,
+    ActiveRelease, BuildDirectory, BuiltDirectory, PreparedRelease, ReleaseError, ReleasePolicy,
+    ReleaseStore,
 };

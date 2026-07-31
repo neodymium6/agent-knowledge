@@ -4,11 +4,19 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(unix)]
+use agent_knowledge_core::BatchId;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use time::OffsetDateTime;
 use ulid::Ulid;
 
-use super::{BUILD_PROCESS_LEASE, QuartzBuildError, QuartzBuilder, enforce_output_limits};
+use super::{
+    BUILD_PROCESS_LEASE, BuildProcessLease, QuartzBuildError, QuartzBuilder, enforce_output_limits,
+};
 use crate::ReleasePolicy;
+#[cfg(unix)]
+use crate::ReleaseStore;
 
 struct TestDirectory(PathBuf);
 
@@ -78,13 +86,91 @@ fn invokes_quartz_with_fixed_content_and_output_arguments() {
     .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     builder
-        .build(&content, &output)
+        .build_path(&content, &output)
         .unwrap_or_else(|error| panic!("fake Quartz build must succeed: {error}"));
     assert_eq!(
         fs::read_to_string(output.join("index.html"))
             .unwrap_or_else(|error| panic!("fake output must be readable: {error}")),
         "<p>fictional release</p>\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_build_returns_the_only_preparation_capability() {
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    fs::create_dir(&integration)
+        .unwrap_or_else(|error| panic!("integration directory must be created: {error}"));
+    fs::create_dir(&content)
+        .unwrap_or_else(|error| panic!("content directory must be created: {error}"));
+    let program = root.0.join("fake-quartz");
+    executable(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' '<p>safe</p>' > \"$5/index.html\"\n",
+    );
+    let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let batch_id: BatchId = "01K00000000000000000000001"
+        .parse()
+        .unwrap_or_else(|error| panic!("batch ID must parse: {error}"));
+    let build = store
+        .begin_build(batch_id)
+        .unwrap_or_else(|error| panic!("release build must begin: {error}"));
+    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+
+    let built = builder
+        .build(&content, build)
+        .unwrap_or_else(|error| panic!("Quartz build must return a capability: {error}"));
+    let prepared = store
+        .prepare(
+            built,
+            "1111111111111111111111111111111111111111",
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap_or_else(|error| panic!("successful build must prepare: {error}"));
+
+    assert_eq!(
+        prepared.commit(),
+        "1111111111111111111111111111111111111111"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_build_leaves_staging_only_discardable() {
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    fs::create_dir(&integration)
+        .unwrap_or_else(|error| panic!("integration directory must be created: {error}"));
+    fs::create_dir(&content)
+        .unwrap_or_else(|error| panic!("content directory must be created: {error}"));
+    let program = root.0.join("fake-failing-quartz");
+    executable(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' partial > \"$5/index.html\"\nexit 17\n",
+    );
+    let store = ReleaseStore::open(root.0.join("releases"), ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let batch_id: BatchId = "01K00000000000000000000001"
+        .parse()
+        .unwrap_or_else(|error| panic!("batch ID must parse: {error}"));
+    let build = store
+        .begin_build(batch_id)
+        .unwrap_or_else(|error| panic!("release build must begin: {error}"));
+    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+
+    assert!(matches!(
+        builder.build(&content, build),
+        Err(QuartzBuildError::CommandFailed { .. })
+    ));
+    store
+        .discard_build(batch_id)
+        .unwrap_or_else(|error| panic!("failed staging output must be discardable: {error}"));
 }
 
 #[cfg(target_os = "linux")]
@@ -122,7 +208,7 @@ fn allows_quartz_to_replace_output_below_a_pinned_container() {
         .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     builder
-        .build(&content, &output)
+        .build_path(&content, &output)
         .unwrap_or_else(|error| panic!("Quartz-style output replacement must succeed: {error}"));
     assert!(container.join("site").join("index.html").is_file());
 }
@@ -149,7 +235,7 @@ fn terminates_a_quartz_command_after_its_deadline() {
     .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     assert!(matches!(
-        builder.build(&content, &output),
+        builder.build_path(&content, &output),
         Err(QuartzBuildError::TimedOut { .. })
     ));
 }
@@ -181,7 +267,7 @@ fn terminates_quartz_descendants_after_a_timeout() {
     .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     assert!(matches!(
-        builder.build(&content, &output),
+        builder.build_path(&content, &output),
         Err(QuartzBuildError::TimedOut { .. })
     ));
     std::thread::sleep(Duration::from_millis(250));
@@ -216,7 +302,7 @@ fn reaps_descendants_before_scanning_successful_output() {
         .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     builder
-        .build(&content, &output)
+        .build_path(&content, &output)
         .unwrap_or_else(|error| panic!("bounded Quartz build must succeed: {error}"));
     std::thread::sleep(Duration::from_millis(100));
     assert!(!output.join("escaped").exists());
@@ -228,7 +314,7 @@ fn restores_the_process_subreaper_setting_after_a_build() {
     let original = {
         let _lease = BUILD_PROCESS_LEASE
             .lock()
-            .unwrap_or_else(|error| panic!("build process lease must be available: {error}"));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         nix::sys::prctl::get_child_subreaper()
             .unwrap_or_else(|error| panic!("subreaper setting must be readable: {error}"))
     };
@@ -249,12 +335,12 @@ fn restores_the_process_subreaper_setting_after_a_build() {
         .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     builder
-        .build(&content, &output)
+        .build_path(&content, &output)
         .unwrap_or_else(|error| panic!("Quartz build must succeed: {error}"));
 
     let _lease = BUILD_PROCESS_LEASE
         .lock()
-        .unwrap_or_else(|error| panic!("build process lease must be available: {error}"));
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(
         nix::sys::prctl::get_child_subreaper()
             .unwrap_or_else(|error| panic!("subreaper setting must be readable: {error}")),
@@ -295,7 +381,7 @@ fn serializes_concurrent_quartz_process_ownership() {
         threads.push(std::thread::spawn(move || {
             barrier.wait();
             builder
-                .build(&content, &output)
+                .build_path(&content, &output)
                 .unwrap_or_else(|error| panic!("serialized Quartz build must succeed: {error}"));
         }));
     }
@@ -308,6 +394,22 @@ fn serializes_concurrent_quartz_process_ownership() {
             .unwrap_or_else(|_| panic!("Quartz build thread must finish"));
     }
     assert!(started.elapsed() >= Duration::from_millis(180));
+}
+
+#[test]
+fn recovers_the_build_process_lease_after_a_panic() {
+    BUILD_PROCESS_LEASE.clear_poison();
+    let result = std::panic::catch_unwind(|| {
+        let _lease = BuildProcessLease::acquire()
+            .unwrap_or_else(|error| panic!("build process lease must be acquired: {error}"));
+        panic!("fictional build panic");
+    });
+    assert!(result.is_err());
+
+    let lease = BuildProcessLease::acquire()
+        .unwrap_or_else(|error| panic!("poisoned build process lease must recover: {error}"));
+    drop(lease);
+    BUILD_PROCESS_LEASE.clear_poison();
 }
 
 #[cfg(unix)]
@@ -343,7 +445,7 @@ fn terminates_quartz_when_live_output_exceeds_policy() {
 
     let started = std::time::Instant::now();
     assert!(matches!(
-        builder.build(&content, &output),
+        builder.build_path(&content, &output),
         Err(QuartzBuildError::OutputLimitExceeded)
     ));
     assert!(started.elapsed() < Duration::from_secs(2));
@@ -452,7 +554,7 @@ fn rejects_replaced_command_configuration() {
     );
 
     assert!(matches!(
-        builder.build(&content, &output),
+        builder.build_path(&content, &output),
         Err(QuartzBuildError::CommandIdentityChanged)
     ));
     assert!(
@@ -480,7 +582,7 @@ fn rejects_a_successful_command_that_produces_no_site() {
         .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     assert!(matches!(
-        builder.build(&content, &output),
+        builder.build_path(&content, &output),
         Err(QuartzBuildError::OutputEmpty)
     ));
 }
