@@ -18,7 +18,7 @@ use agent_knowledge_repository::{
 };
 use time::OffsetDateTime;
 
-use super::BatchProcessor;
+use super::{BatchProcessor, StartupOutcome, WorkerRunOutcome, WorkerRuntime};
 
 const REQUEST_ID: &str = "01K00000000000000000000001";
 const DOCUMENT_ID: &str = "01K00000000000000000000002";
@@ -217,6 +217,13 @@ fn created_at() -> OffsetDateTime {
 }
 
 fn enqueue_and_claim(queue: &FileQueue, worker: &mut WorkerSession) -> ClaimedPackage {
+    enqueue_create(queue);
+    worker
+        .claim(request_id(), batch_id())
+        .unwrap_or_else(|error| panic!("package must be claimed: {error}"))
+}
+
+fn enqueue_create(queue: &FileQueue) {
     let request = format!(
         "{{\n\
          \"protocol_version\": 1,\n\
@@ -258,9 +265,6 @@ fn enqueue_and_claim(queue: &FileQueue, worker: &mut WorkerSession) -> ClaimedPa
     incoming
         .accept()
         .unwrap_or_else(|error| panic!("package must be accepted: {error}"));
-    worker
-        .claim(request_id(), batch_id())
-        .unwrap_or_else(|error| panic!("package must be claimed: {error}"))
 }
 
 fn enqueue_missing_update(queue: &FileQueue, worker: &mut WorkerSession) -> ClaimedPackage {
@@ -535,5 +539,203 @@ fn all_failed_batch_reconciles_without_creating_a_release() {
             .unwrap_or_else(|error| panic!("transactions must be readable: {error}"))
             .count(),
         0
+    );
+}
+
+#[test]
+fn runtime_starts_clean_and_reports_an_empty_snapshot() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
+
+    let (mut runtime, startup) = WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("runtime must start: {error}"));
+    assert_eq!(startup, StartupOutcome::Clean);
+    assert_eq!(
+        runtime
+            .run_once(created_at())
+            .unwrap_or_else(|error| panic!("empty cycle must complete: {error}")),
+        WorkerRunOutcome::Idle
+    );
+}
+
+#[test]
+fn runtime_requeues_pretransaction_claims_then_processes_them() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let (queue, mut worker) = fixture.queue_and_worker();
+    let claim = enqueue_and_claim(&queue, &mut worker);
+    let interrupted_batch = claim.token().batch_id();
+    drop(worker);
+
+    let (mut runtime, startup) = WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("runtime must requeue the interrupted claim: {error}"));
+    assert_eq!(
+        startup,
+        StartupOutcome::Requeued {
+            batch_id: interrupted_batch,
+            requests: 1,
+        }
+    );
+    assert!(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/{}/{REQUEST_ID}", QueueState::Pending))
+            .is_dir()
+    );
+
+    let outcome = runtime
+        .run_once(created_at())
+        .unwrap_or_else(|error| panic!("requeued request must publish: {error}"));
+    assert!(matches!(
+        outcome,
+        WorkerRunOutcome::Processed {
+            outcome: BatchCommitOutcome::Committed { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn runtime_resumes_a_terminal_repository_transaction() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let (queue, mut worker) = fixture.queue_and_worker();
+    let claim = enqueue_and_claim(&queue, &mut worker);
+    let built = RefCell::new(None);
+    let result = repository.apply_batch_with_publication(
+        &mut worker,
+        batch_id(),
+        std::slice::from_ref(&claim),
+        ContentPolicy::default(),
+        &PackagePolicy::default(),
+        BatchPublication::new(
+            |content: &Path| {
+                let build = fixture
+                    .releases
+                    .begin_build(batch_id())
+                    .map_err(|_| PublicationError::new())?;
+                let output = fixture
+                    .quartz
+                    .build(content, build)
+                    .map_err(|_| PublicationError::new())?;
+                built.replace(Some(output));
+                Ok(())
+            },
+            |_: &Path, commit: &str| {
+                let output = built.take().ok_or_else(PublicationError::new)?;
+                fixture
+                    .releases
+                    .prepare(output, commit, created_at())
+                    .map_err(|_| PublicationError::new())?;
+                Err(PublicationError::new())
+            },
+        ),
+    );
+    assert!(matches!(result, Err(GitTransactionError::TrialBuildFailed)));
+    drop(worker);
+
+    let (_runtime, startup) = WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("runtime must resume publication: {error}"));
+    assert!(matches!(
+        startup,
+        StartupOutcome::Resumed {
+            batch_id: resumed_batch,
+            outcome: BatchCommitOutcome::Committed { .. },
+        } if resumed_batch == batch_id()
+    ));
+    assert!(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/{}/{REQUEST_ID}", QueueState::Completed))
+            .is_dir()
+    );
+}
+
+#[test]
+fn runtime_replays_a_preparing_repository_transaction() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let (queue, mut worker) = fixture.queue_and_worker();
+    let claim = enqueue_and_claim(&queue, &mut worker);
+    let queue_identity = worker
+        .queue_identity()
+        .unwrap_or_else(|error| panic!("queue identity must remain available: {error}"));
+    let output = Command::new("git")
+        .arg(format!("--git-dir={}", fixture.repository_path.display()))
+        .args(["rev-parse", "main"])
+        .output()
+        .unwrap_or_else(|error| panic!("base commit command must run: {error}"));
+    assert!(output.status.success());
+    let base_commit = String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| panic!("base commit must be UTF-8: {error}"));
+    let acceptance_sequence = claim
+        .package()
+        .acceptance()
+        .unwrap_or_else(|| panic!("claimed package must retain acceptance metadata"))
+        .sequence;
+    let journal = format!(
+        "{{\n\
+         \"schema_version\": 2,\n\
+         \"batch_id\": \"{BATCH_ID}\",\n\
+         \"queue_identity\": \"{queue_identity}\",\n\
+         \"base_commit\": \"{}\",\n\
+         \"claims\": [{{\n\
+           \"request_id\": \"{REQUEST_ID}\",\n\
+           \"attempt\": {},\n\
+           \"acceptance_sequence\": {acceptance_sequence}\n\
+         }}],\n\
+         \"state\": {{\"phase\": \"preparing\"}}\n\
+         }}\n",
+        base_commit.trim(),
+        claim.token().attempt()
+    );
+    fs::write(
+        fixture
+            .work_path
+            .join(format!("transactions/{BATCH_ID}.json")),
+        journal,
+    )
+    .unwrap_or_else(|error| panic!("preparing journal fixture must be written: {error}"));
+    drop(worker);
+
+    let (_runtime, startup) = WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("runtime must replay preparation: {error}"));
+    assert!(matches!(
+        startup,
+        StartupOutcome::Resumed {
+            batch_id: resumed_batch,
+            outcome: BatchCommitOutcome::Committed { .. },
+        } if resumed_batch == batch_id()
+    ));
+    assert!(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/{}/{REQUEST_ID}", QueueState::Completed))
+            .is_dir()
     );
 }
