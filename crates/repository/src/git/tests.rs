@@ -16,8 +16,9 @@ use agent_knowledge_queue::{
 use ulid::Ulid;
 
 use super::{
-    BatchCommitOutcome, GitIdentity, GitRepository, GitTransactionError, TransactionHooks,
-    accept_trial_build, interrupt_publication, parse_git_version, parse_text, staged_stats,
+    BatchCommitOutcome, GitIdentity, GitRepository, GitTransactionError, RepositoryTransaction,
+    TransactionHooks, accept_trial_build, interrupt_publication, parse_git_version, parse_text,
+    staged_stats,
 };
 use crate::ContentPolicy;
 use crate::apply::AppliedMove;
@@ -575,8 +576,9 @@ fn trial_build_failure_keeps_the_official_commit_unchanged() {
         ),
         &markdown(FIRST_REQUEST_ID, "Build-breaking fictional experiment"),
     );
+    let repository = git.open();
     assert!(matches!(
-        git.open().apply_batch(
+        repository.apply_batch(
             &mut worker,
             parse_batch_id(),
             &[claim],
@@ -589,6 +591,14 @@ fn trial_build_failure_keeps_the_official_commit_unchanged() {
     assert_eq!(git.official_commit(), base);
     assert_eq!(git.transaction_count(), 1);
     assert_eq!(git.worktree_count(), 1);
+    assert_eq!(
+        repository
+            .unfinished_transaction(&worker)
+            .unwrap_or_else(|error| panic!("unfinished transaction must be discoverable: {error}")),
+        Some(RepositoryTransaction::Preparing {
+            batch_id: parse_batch_id(),
+        })
+    );
 }
 
 #[test]
@@ -1124,6 +1134,14 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
     assert_eq!(git.official_commit(), base);
     assert_eq!(git.transaction_count(), 1);
     assert_eq!(git.worktree_count(), 1);
+    assert_eq!(
+        repository
+            .unfinished_transaction(&worker)
+            .unwrap_or_else(|error| panic!("unfinished transaction must be discoverable: {error}")),
+        Some(RepositoryTransaction::Recoverable {
+            batch_id: parse_batch_id(),
+        })
+    );
     let journal_path = git.work.join(format!("transactions/{BATCH_ID}.json"));
     let original_journal = match fs::read(&journal_path) {
         Ok(bytes) => bytes,

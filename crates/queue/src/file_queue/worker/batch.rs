@@ -32,6 +32,12 @@ pub struct WorkerSession {
     pub(super) processing_recovery_complete: bool,
 }
 
+impl Drop for WorkerSession {
+    fn drop(&mut self) {
+        let _ = self._writer_lock.unlock();
+    }
+}
+
 #[derive(Debug, Default)]
 struct PendingBatchScan {
     entries: Option<fs::ReadDir>,

@@ -12,7 +12,7 @@ use agent_knowledge_release::{
 };
 use agent_knowledge_repository::{
     BatchCommitOutcome, BatchPublication, ContentPolicy, GitRepository, GitTransactionError,
-    PublicationError, RequestFailure,
+    PublicationError, RepositoryTransaction, RequestFailure,
 };
 use time::OffsetDateTime;
 
@@ -43,6 +43,21 @@ impl BatchProcessor {
             content_policy,
             package_policy,
         }
+    }
+
+    /// Discovers durable repository work that must be resumed at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the repository journal or its queue binding is
+    /// invalid.
+    pub fn unfinished_transaction(
+        &self,
+        worker: &WorkerSession,
+    ) -> Result<Option<RepositoryTransaction>, BatchProcessorError> {
+        self.repository
+            .unfinished_transaction(worker)
+            .map_err(BatchProcessorError::repository)
     }
 
     /// Applies, publishes, reconciles, and finalizes one claimed batch.
@@ -273,6 +288,11 @@ impl BatchProcessor {
             .map_err(BatchProcessorError::repository)
     }
 }
+
+mod runtime;
+pub use runtime::{
+    StartupOutcome, WorkerRunError, WorkerRunLimits, WorkerRunOutcome, WorkerRuntime,
+};
 
 fn outcome_tokens(outcome: &BatchCommitOutcome) -> (&[ClaimToken], Vec<(ClaimToken, ErrorCode)>) {
     match outcome {
