@@ -2,6 +2,8 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use std::ffi::OsString;
@@ -23,6 +25,10 @@ const MAXIMUM_FD_INFO_BYTES: u64 = 16 * 1024;
 #[derive(Clone, Debug)]
 pub struct PathAttestation {
     canonical_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    stable_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    _anchor: Arc<File>,
     #[cfg(target_os = "linux")]
     object: Option<FilesystemObjectId>,
     #[cfg(target_os = "linux")]
@@ -67,11 +73,11 @@ impl PathAttestation {
             loop {
                 match fs::canonicalize(existing) {
                     Ok(resolved) => {
-                        let metadata = fs::metadata(&resolved).map_err(PathAttestationError::Io)?;
+                        let pinned = File::open(&resolved).map_err(PathAttestationError::Io)?;
+                        let metadata = pinned.metadata().map_err(PathAttestationError::Io)?;
                         if !metadata.is_dir() && !metadata.is_file() {
                             return Err(PathAttestationError::BindingMismatch);
                         }
-                        let pinned = File::open(&resolved).map_err(PathAttestationError::Io)?;
                         let mut attestation = Self::capture_linux(&resolved, &pinned)?;
                         if missing.is_empty() {
                             return Ok(attestation);
@@ -84,6 +90,7 @@ impl PathAttestation {
                         }
                         for component in missing.iter().rev() {
                             attestation.canonical_path.push(component);
+                            attestation.stable_path.push(component);
                             attestation.backing.path.push(component);
                         }
                         return Ok(attestation);
@@ -115,6 +122,19 @@ impl PathAttestation {
         &self.canonical_path
     }
 
+    /// Returns a descriptor-backed path that retains the resolved destination.
+    #[must_use]
+    pub fn stable_path(&self) -> &Path {
+        #[cfg(target_os = "linux")]
+        {
+            &self.stable_path
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            &self.canonical_path
+        }
+    }
+
     /// Returns whether this object or destination is equal to or below `other`.
     #[must_use]
     pub fn is_within(&self, other: &Self) -> bool {
@@ -137,19 +157,10 @@ impl PathAttestation {
     #[cfg(target_os = "linux")]
     fn capture_linux(path: &Path, pinned: &File) -> Result<Self, PathAttestationError> {
         let canonical_path = fs::canonicalize(path).map_err(PathAttestationError::Io)?;
-        let live = fs::metadata(&canonical_path).map_err(PathAttestationError::Io)?;
         let live_handle = File::open(&canonical_path).map_err(PathAttestationError::Io)?;
-        let pinned_metadata = pinned.metadata().map_err(PathAttestationError::Io)?;
-        if FilesystemObjectId::from_metadata(&live)
-            != FilesystemObjectId::from_metadata(&pinned_metadata)
-        {
-            return Err(PathAttestationError::BindingMismatch);
-        }
-        let pinned_mount_id = linux_mount_id(pinned)?;
-        if linux_mount_id(&live_handle)? != pinned_mount_id {
-            return Err(PathAttestationError::BindingMismatch);
-        }
-        let object = Some(FilesystemObjectId::from_metadata(&pinned_metadata));
+        let (object, pinned_mount_id, is_directory) = validate_linux_binding(&live_handle, pinned)?;
+        let object = Some(object);
+        let stable_path = linux_stable_path(&live_handle, is_directory);
         let ancestors = canonical_path
             .ancestors()
             .skip(1)
@@ -166,11 +177,36 @@ impl PathAttestation {
         )?;
         Ok(Self {
             canonical_path,
+            stable_path,
+            _anchor: Arc::new(live_handle),
             object,
             ancestors,
             backing,
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_binding(
+    live: &File,
+    pinned: &File,
+) -> Result<(FilesystemObjectId, u64, bool), PathAttestationError> {
+    let live_metadata = live.metadata().map_err(PathAttestationError::Io)?;
+    let pinned_metadata = pinned.metadata().map_err(PathAttestationError::Io)?;
+    let live_object = FilesystemObjectId::from_metadata(&live_metadata);
+    let pinned_object = FilesystemObjectId::from_metadata(&pinned_metadata);
+    let live_mount_id = linux_mount_id(live)?;
+    let pinned_mount_id = linux_mount_id(pinned)?;
+    if live_object != pinned_object || live_mount_id != pinned_mount_id {
+        return Err(PathAttestationError::BindingMismatch);
+    }
+    Ok((pinned_object, pinned_mount_id, pinned_metadata.is_dir()))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_stable_path(file: &File, is_directory: bool) -> PathBuf {
+    let path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    if is_directory { path.join(".") } else { path }
 }
 
 #[cfg(target_os = "linux")]
@@ -372,10 +408,29 @@ impl std::error::Error for PathAttestationError {
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
+    use std::fs::File;
+    #[cfg(target_os = "linux")]
     use std::path::Path;
 
     #[cfg(target_os = "linux")]
-    use super::{linux_backing_location_from, parse_linux_device};
+    use super::{
+        PathAttestationError, linux_backing_location_from, parse_linux_device,
+        validate_linux_binding,
+    };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn binding_rejects_different_handles_on_the_same_mount() {
+        let live = File::open("/proc/self/status")
+            .unwrap_or_else(|error| panic!("live fixture must open: {error}"));
+        let pinned = File::open("/proc/self/mountinfo")
+            .unwrap_or_else(|error| panic!("pinned fixture must open: {error}"));
+
+        assert!(matches!(
+            validate_linux_binding(&live, &pinned),
+            Err(PathAttestationError::BindingMismatch)
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
