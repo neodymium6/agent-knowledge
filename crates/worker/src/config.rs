@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
@@ -38,13 +38,26 @@ pub struct WorkerSettings {
 impl WorkerSettings {
     /// Loads and validates one bounded YAML configuration file.
     ///
+    /// Symbolic links to regular files are supported for Kubernetes projected
+    /// configuration. The selected target is opened once, validated through
+    /// that descriptor, and retained through the complete bounded read.
+    ///
     /// # Errors
     ///
     /// Returns an error for I/O failures, non-regular files, oversized input,
     /// invalid YAML, unsupported versions, or invalid operational values.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, WorkerConfigError> {
         let path = path.as_ref();
-        let metadata = fs::symlink_metadata(path).map_err(WorkerConfigError::Io)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
+        }
+        let file = options.open(path).map_err(WorkerConfigError::Io)?;
+        let metadata = file.metadata().map_err(WorkerConfigError::Io)?;
         if !metadata.file_type().is_file() {
             return Err(WorkerConfigError::InvalidFileType);
         }
@@ -54,9 +67,7 @@ impl WorkerSettings {
             });
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        File::open(path)
-            .map_err(WorkerConfigError::Io)?
-            .take(MAXIMUM_WORKER_CONFIG_BYTES + 1)
+        file.take(MAXIMUM_WORKER_CONFIG_BYTES + 1)
             .read_to_end(&mut bytes)
             .map_err(WorkerConfigError::Io)?;
         if bytes.len() as u64 > MAXIMUM_WORKER_CONFIG_BYTES {
@@ -201,6 +212,7 @@ impl TryFrom<WireWorkerConfig> for WorkerSettings {
         validate_storage_paths(&storage)?;
         validate_absolute_path("quartz.program", &wire.quartz.program)?;
         validate_absolute_path("quartz.integration_root", &wire.quartz.integration_root)?;
+        validate_trusted_inputs(&storage, &wire.quartz)?;
         if wire.repository.official_branch.trim().is_empty()
             || wire
                 .repository
@@ -285,6 +297,26 @@ fn validate_storage_paths(paths: &[(&'static str, &PathBuf)]) -> Result<(), Work
                 return Err(WorkerConfigError::OverlappingPaths {
                     first: field,
                     second: other_field,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_trusted_inputs(
+    storage: &[(&'static str, &PathBuf)],
+    quartz: &WireQuartz,
+) -> Result<(), WorkerConfigError> {
+    for (storage_field, storage_path) in storage {
+        for (trusted_field, trusted_path) in [
+            ("quartz.program", &quartz.program),
+            ("quartz.integration_root", &quartz.integration_root),
+        ] {
+            if storage_path.starts_with(trusted_path) || trusted_path.starts_with(storage_path) {
+                return Err(WorkerConfigError::OverlappingPaths {
+                    first: storage_field,
+                    second: trusted_field,
                 });
             }
         }
@@ -405,7 +437,7 @@ pub enum WorkerConfigError {
         /// Invalid configuration field.
         field: &'static str,
     },
-    /// Two durable storage roots were equal or nested.
+    /// Two configured storage or trusted-input paths were equal or nested.
     OverlappingPaths {
         /// First conflicting field.
         first: &'static str,
@@ -441,7 +473,7 @@ impl fmt::Display for WorkerConfigError {
             ),
             Self::OverlappingPaths { first, second } => write!(
                 formatter,
-                "Worker storage paths `{first}` and `{second}` must not overlap"
+                "Worker paths `{first}` and `{second}` must not overlap"
             ),
             Self::InvalidValue { field } => {
                 write!(formatter, "Worker configuration value `{field}` is invalid")

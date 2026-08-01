@@ -147,6 +147,15 @@ fn rejects_unsafe_paths_and_invalid_operational_bounds() {
         Err(WorkerConfigError::OverlappingPaths { .. })
     ));
 
+    let mutable_quartz = valid_yaml(root).replace(
+        "/srv/fictional-knowledge/quartz-integration",
+        "/srv/fictional-knowledge/content/quartz-integration",
+    );
+    assert!(matches!(
+        WorkerSettings::decode(&mutable_quartz),
+        Err(WorkerConfigError::OverlappingPaths { .. })
+    ));
+
     let zero_limit = valid_yaml(root).replace("maximum_requests: 100", "maximum_requests: 0");
     assert!(matches!(
         WorkerSettings::decode(&zero_limit),
@@ -178,9 +187,9 @@ fn rejects_unsafe_paths_and_invalid_operational_bounds() {
     ));
 }
 
-#[cfg(unix)]
 #[test]
-fn load_rejects_a_symlinked_configuration_file() {
+#[cfg(unix)]
+fn load_pins_a_regular_projected_configuration_target() {
     use std::os::unix::fs::symlink;
 
     let root = TestDirectory::create();
@@ -191,8 +200,24 @@ fn load_rejects_a_symlinked_configuration_file() {
     symlink(&target, &link)
         .unwrap_or_else(|error| panic!("configuration symlink must be created: {error}"));
 
+    let settings = WorkerSettings::load(&link)
+        .unwrap_or_else(|error| panic!("projected configuration must load: {error}"));
+    assert_eq!(settings.schedule().debounce(), Duration::seconds(30));
+}
+
+#[test]
+#[cfg(unix)]
+fn load_rejects_a_fifo_without_blocking() {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    let root = TestDirectory::create();
+    let fifo = root.path().join("worker.yaml");
+    mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR)
+        .unwrap_or_else(|error| panic!("configuration FIFO must be created: {error}"));
+
     assert!(matches!(
-        WorkerSettings::load(&link),
+        WorkerSettings::load(&fifo),
         Err(WorkerConfigError::InvalidFileType)
     ));
 }
