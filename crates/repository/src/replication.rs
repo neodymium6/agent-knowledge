@@ -145,14 +145,7 @@ impl RemoteReplicator {
             None,
         )
         .map_err(|_| RemoteReplicationError::InvalidPolicy("branch"))?;
-        let remote_urls = run_git_for_read(
-            None,
-            Some(repository.git_directory()),
-            ["remote", "get-url", "--push", "--all", policy.remote()],
-            None,
-        )
-        .map_err(|_| RemoteReplicationError::RemoteUnavailable)?;
-        fingerprint_remote_urls(&remote_urls.stdout)?;
+        configured_remote_fingerprint(&repository, &policy)?;
         let configured_state_directory = fs::canonicalize(repository.repository_state_directory())
             .map_err(RemoteReplicationError::Io)?;
         let (state_directory_handle, state_directory) =
@@ -246,24 +239,11 @@ impl RemoteReplicator {
             &self.state_directory_handle,
         )
         .map_err(RemoteReplicationError::repository)?;
-        let (target, remote_fingerprint) = {
-            let _writer = self
-                .repository
-                .lock_writer()
-                .map_err(RemoteReplicationError::repository)?;
-            let target = self
-                .repository
-                .resolve_commit(self.repository.official_ref())
-                .map_err(RemoteReplicationError::repository)?;
-            let urls = run_git_for_read(
-                None,
-                Some(self.repository.git_directory()),
-                ["remote", "get-url", "--push", "--all", self.policy.remote()],
-                None,
-            )
-            .map_err(|_| RemoteReplicationError::RemoteUnavailable)?;
-            (target, fingerprint_remote_urls(&urls.stdout)?)
-        };
+        let target = self
+            .repository
+            .resolve_commit(self.repository.official_ref())
+            .map_err(RemoteReplicationError::repository)?;
+        let remote_fingerprint = configured_remote_fingerprint(&self.repository, &self.policy)?;
         let mut state = read_state(&self.state_path)?.unwrap_or_else(|| {
             ReplicationState::new(
                 self.policy.remote(),
@@ -409,6 +389,38 @@ fn fingerprint_remote_urls(urls: &[u8]) -> Result<Revision, RemoteReplicationErr
         return Err(RemoteReplicationError::RemoteUnavailable);
     }
     Ok(Revision::from_bytes(Sha256::digest(urls).into()))
+}
+
+fn configured_remote_fingerprint(
+    repository: &GitRepository,
+    policy: &RemoteReplicationPolicy,
+) -> Result<Revision, RemoteReplicationError> {
+    let mirror_key = format!("remote.{}.mirror", policy.remote());
+    let mirror = run_git_for_read(
+        None,
+        Some(repository.git_directory()),
+        [
+            "config",
+            "--local",
+            "--type=bool",
+            "--default=false",
+            "--get",
+            mirror_key.as_str(),
+        ],
+        None,
+    )
+    .map_err(RemoteReplicationError::repository)?;
+    if mirror.stdout != b"false\n" {
+        return Err(RemoteReplicationError::InvalidPolicy("remote.mirror"));
+    }
+    let urls = run_git_for_read(
+        None,
+        Some(repository.git_directory()),
+        ["remote", "get-url", "--push", "--all", policy.remote()],
+        None,
+    )
+    .map_err(|_| RemoteReplicationError::RemoteUnavailable)?;
+    fingerprint_remote_urls(&urls.stdout)
 }
 
 fn validate_state(state: &ReplicationState) -> Result<(), RemoteReplicationError> {
@@ -748,6 +760,52 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_mirror_remote_before_replication_starts() {
+        let fixture = Fixture::create();
+        let repository = fixture.repository();
+        let git_directory = format!("--git-dir={}", fixture.repository.display());
+        git(
+            None,
+            [
+                git_directory.as_str(),
+                "config",
+                "remote.fictional-backup.mirror",
+                "true",
+            ],
+            None,
+        );
+
+        assert!(matches!(
+            RemoteReplicator::open(repository, fixture.policy()),
+            Err(RemoteReplicationError::InvalidPolicy("remote.mirror"))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_remote_changed_to_mirror_mode_before_a_push() {
+        let fixture = Fixture::create();
+        let repository = fixture.repository();
+        let replicator = RemoteReplicator::open(repository, fixture.policy())
+            .unwrap_or_else(|error| panic!("replicator must open: {error}"));
+        let git_directory = format!("--git-dir={}", fixture.repository.display());
+        git(
+            None,
+            [
+                git_directory.as_str(),
+                "config",
+                "remote.fictional-backup.mirror",
+                "true",
+            ],
+            None,
+        );
+
+        assert!(matches!(
+            replicator.replicate(OffsetDateTime::UNIX_EPOCH),
+            Err(RemoteReplicationError::InvalidPolicy("remote.mirror"))
+        ));
+    }
+
+    #[test]
     fn pushes_each_new_official_commit_and_records_success() {
         let fixture = Fixture::create();
         let replicator = RemoteReplicator::open(fixture.repository(), fixture.policy())
@@ -779,6 +837,22 @@ mod tests {
             }
         );
         assert_eq!(fixture.remote_commit(), advanced);
+    }
+
+    #[test]
+    fn foreground_writer_ownership_does_not_block_replication_reads() {
+        let fixture = Fixture::create();
+        let repository = fixture.repository();
+        let replicator = RemoteReplicator::open(repository.clone(), fixture.policy())
+            .unwrap_or_else(|error| panic!("replicator must open: {error}"));
+        let _writer = repository
+            .lock_writer()
+            .unwrap_or_else(|error| panic!("foreground writer lock must be acquired: {error}"));
+
+        assert!(matches!(
+            replicate(&replicator, OffsetDateTime::UNIX_EPOCH),
+            RemoteReplicationOutcome::Pushed { .. }
+        ));
     }
 
     #[test]

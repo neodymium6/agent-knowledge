@@ -139,6 +139,76 @@ fn configured_replication_runs_in_the_background_after_startup() {
     ));
 }
 
+#[test]
+fn background_replication_preserves_events_while_the_receiver_is_delayed() {
+    let root = TestDirectory::create();
+    initialize_repository(root.path());
+    initialize_quartz(root.path());
+    let backup = root.path().join("fictional-backup");
+    run_git(
+        None,
+        ["init", "--bare", "--initial-branch=main"],
+        Some(&backup),
+    );
+    run_git(
+        Some(&root.path().join("repository")),
+        ["remote", "add", "fictional-backup"],
+        Some(&backup),
+    );
+    let yaml = valid_yaml(root.path()).replace(
+        "  author_email: worker@example.invalid\n",
+        "  author_email: worker@example.invalid\n  replication:\n    remote: fictional-backup\n    branch: main\n    timeout_seconds: 5\n    initial_backoff_seconds: 1\n    maximum_backoff_seconds: 4\n",
+    );
+    let settings = WorkerSettings::decode(&yaml)
+        .unwrap_or_else(|error| panic!("fixture settings must decode: {error}"));
+    let bootstrap = WorkerBootstrap::open(settings)
+        .unwrap_or_else(|error| panic!("configured components must open: {error}"));
+    fs::remove_dir_all(&backup)
+        .unwrap_or_else(|error| panic!("backup outage must be simulated: {error}"));
+    let (runtime, _, _) = bootstrap
+        .start(created_at())
+        .unwrap_or_else(|error| panic!("configured Worker must start: {error}"));
+    let state = root
+        .path()
+        .join("repository/agent-knowledge/remote-replication-v1.json");
+    wait_until("failed replication state", || state.exists());
+
+    run_git(
+        None,
+        ["init", "--bare", "--initial-branch=main"],
+        Some(&backup),
+    );
+    wait_until("replicated backup ref", || {
+        Command::new("git")
+            .arg(format!("--git-dir={}", backup.display()))
+            .args(["rev-parse", "--verify", "refs/heads/main"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    });
+
+    let deadline = Instant::now() + StandardDuration::from_secs(5);
+    let mut outcomes = Vec::new();
+    while outcomes.len() < 2 {
+        if let Some(outcome) = runtime.take_replication_event() {
+            outcomes.push(outcome);
+            continue;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both replication events must remain available"
+        );
+        thread::sleep(StandardDuration::from_millis(10));
+    }
+    assert!(matches!(
+        outcomes.first(),
+        Some(Ok(RemoteReplicationOutcome::Failed { .. }))
+    ));
+    assert!(matches!(
+        outcomes.get(1),
+        Some(Ok(RemoteReplicationOutcome::Pushed { .. }))
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_resolved_storage_aliases_before_initialization() {
@@ -308,6 +378,17 @@ fn run_git<const N: usize>(working: Option<&Path>, arguments: [&str; N], path: O
         .status()
         .unwrap_or_else(|error| panic!("Git fixture command must run: {error}"));
     assert!(status.success());
+}
+
+fn wait_until(description: &str, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + StandardDuration::from_secs(5);
+    while !condition() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {description}"
+        );
+        thread::sleep(StandardDuration::from_millis(10));
+    }
 }
 
 fn created_at() -> OffsetDateTime {

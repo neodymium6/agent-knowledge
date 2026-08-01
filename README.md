@@ -85,16 +85,18 @@ batch:
   maximum_recovery_requests: 10000
 ```
 
-`repository.replication` is optional. When present, the named remote must
-already exist in the bare repository. Authentication belongs in the service
-account's Git/SSH deployment configuration; credentials are not accepted in
-the Worker configuration. A push failure never rolls back the local commit,
-canonical content, active Quartz release, or completed request. The Worker
-performs pushes on an independent background thread, so a slow remote does not
-delay queue processing. It persists the last confirmed commit, a fingerprint
-of the configured push URL, and an exponential retry deadline under the bare
-repository. It caps delay at `maximum_backoff_seconds`, disables interactive
-Git and SSH credential prompts, and applies `timeout_seconds` to every attempt.
+`repository.replication` is optional. When present, the named non-mirror remote
+must already exist in the bare repository. Authentication belongs in the
+service account's Git/SSH deployment configuration; credentials are not
+accepted in the Worker configuration. A push failure never rolls back the local
+commit, canonical content, active Quartz release, or completed request. The
+Worker performs pushes on an independent background thread, so a slow remote
+does not delay queue processing. Local publication wakes that thread; otherwise
+it sleeps until a retry is due, with a bounded low-frequency verification poll.
+It persists the last confirmed commit, a fingerprint of the configured push
+URL, and an exponential retry deadline under the bare repository. It caps delay
+at `maximum_backoff_seconds`, disables interactive Git and SSH credential
+prompts, and applies `timeout_seconds` to every attempt.
 
 Submit a validated request package through an SSH host alias:
 
@@ -194,6 +196,8 @@ confirmed and `remote_replication_failed` with `commit`,
 `consecutive_failures`, and `retry_at` after a failed attempt. Durable-state
 validation failures emit `remote_replication_state_error` once until the state
 becomes readable again. Up-to-date and deferred polls are intentionally quiet.
+Reportable events use a bounded in-process queue; when that queue is full,
+replication pauses instead of overwriting an unread event.
 
 `SIGINT` and `SIGTERM` request graceful shutdown before a new durable
 transaction or after the current transaction completes. An in-flight remote

@@ -2,6 +2,7 @@ use std::fmt;
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration as StandardDuration;
@@ -19,7 +20,11 @@ use time::OffsetDateTime;
 
 use crate::{BatchCloseReason, BatchProcessor, BatchProcessorError, BatchReadiness, BatchSchedule};
 
-const REPLICATION_POLL_INTERVAL: StandardDuration = StandardDuration::from_millis(250);
+const REPLICATION_VERIFICATION_INTERVAL: StandardDuration = StandardDuration::from_secs(30);
+const REPLICATION_EVENT_RETRY_INTERVAL: StandardDuration = StandardDuration::from_millis(100);
+const REPLICATION_EVENT_CAPACITY: usize = 64;
+
+type ReplicationEvent = Result<RemoteReplicationOutcome, RemoteReplicationError>;
 
 /// Bounded queue scan and batch-size limits for one Worker process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -199,14 +204,14 @@ pub enum WorkerPollOutcome {
 #[derive(Debug)]
 struct ReplicationBackground {
     control: Arc<ReplicationControl>,
-    event: Arc<Mutex<Option<Result<RemoteReplicationOutcome, RemoteReplicationError>>>>,
+    events: Receiver<ReplicationEvent>,
     thread: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug)]
 struct ReplicationControl {
     stopping: AtomicBool,
-    wait: Mutex<()>,
+    generation: Mutex<u64>,
     wake: Condvar,
 }
 
@@ -214,56 +219,114 @@ impl ReplicationBackground {
     fn start(replication: RemoteReplicator) -> Result<Self, io::Error> {
         let control = Arc::new(ReplicationControl {
             stopping: AtomicBool::new(false),
-            wait: Mutex::new(()),
+            generation: Mutex::new(0),
             wake: Condvar::new(),
         });
-        let event = Arc::new(Mutex::new(None));
+        let (event_sender, events) = sync_channel(REPLICATION_EVENT_CAPACITY);
         let thread_control = Arc::clone(&control);
-        let thread_event = Arc::clone(&event);
         let thread = thread::Builder::new()
             .name("knowledge-git-replication".into())
-            .spawn(move || replication_loop(replication, &thread_control, &thread_event))?;
+            .spawn(move || replication_loop(replication, &thread_control, &event_sender))?;
         Ok(Self {
             control,
-            event,
+            events,
             thread: Some(thread),
         })
     }
 
-    fn take_event(&self) -> Option<Result<RemoteReplicationOutcome, RemoteReplicationError>> {
-        match self.event.lock() {
-            Ok(mut event) => event.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        }
+    fn wake(&self) {
+        self.control.wake();
+    }
+
+    fn take_event(&self) -> Option<ReplicationEvent> {
+        self.events.try_recv().ok()
     }
 }
 
 impl Drop for ReplicationBackground {
     fn drop(&mut self) {
-        self.control.stopping.store(true, Ordering::Release);
-        self.control.wake.notify_all();
+        self.control.stop();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
 
+impl ReplicationControl {
+    fn generation(&self) -> u64 {
+        match self.generation.lock() {
+            Ok(generation) => *generation,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn wake(&self) {
+        let mut generation = match self.generation.lock() {
+            Ok(generation) => generation,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *generation = generation.wrapping_add(1);
+        self.wake.notify_all();
+    }
+
+    fn stop(&self) {
+        let generation = match self.generation.lock() {
+            Ok(generation) => generation,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.stopping.store(true, Ordering::Release);
+        self.wake.notify_all();
+        drop(generation);
+    }
+
+    fn wait_after(&self, observed_generation: u64, timeout: StandardDuration) {
+        let generation = match self.generation.lock() {
+            Ok(generation) => generation,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.stopping.load(Ordering::Acquire) || *generation != observed_generation {
+            return;
+        }
+        drop(
+            self.wake
+                .wait_timeout_while(generation, timeout, |generation| {
+                    !self.stopping.load(Ordering::Acquire) && *generation == observed_generation
+                }),
+        );
+    }
+}
+
 fn replication_loop(
     replication: RemoteReplicator,
     control: &ReplicationControl,
-    event: &Mutex<Option<Result<RemoteReplicationOutcome, RemoteReplicationError>>>,
+    events: &SyncSender<ReplicationEvent>,
 ) {
     let mut error_reported = false;
+    let mut pending_event = None;
     while !control.stopping.load(Ordering::Acquire) {
+        if let Some(event) = pending_event.take() {
+            match events.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(event)) => {
+                    pending_event = Some(event);
+                    let generation = control.generation();
+                    control.wait_after(generation, REPLICATION_EVENT_RETRY_INTERVAL);
+                    continue;
+                }
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
+        let generation = control.generation();
         let outcome = replication.replicate_interruptible(OffsetDateTime::now_utc(), &|| {
             control.stopping.load(Ordering::Acquire)
         });
+        let wait = replication_wait(&outcome);
         match outcome {
             Ok(RemoteReplicationOutcome::Cancelled) => break,
             Ok(outcome @ RemoteReplicationOutcome::Pushed { .. })
             | Ok(outcome @ RemoteReplicationOutcome::Failed { .. }) => {
                 error_reported = false;
-                replace_replication_event(event, Ok(outcome));
+                pending_event = try_send_replication_event(events, Ok(outcome));
             }
             Ok(RemoteReplicationOutcome::UpToDate { .. })
             | Ok(RemoteReplicationOutcome::Deferred { .. }) => {
@@ -271,28 +334,48 @@ fn replication_loop(
             }
             Err(error) if !error_reported => {
                 error_reported = true;
-                replace_replication_event(event, Err(error));
+                pending_event = try_send_replication_event(events, Err(error));
             }
             Err(_) => {}
         }
-        let guard = match control.wait.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if control.stopping.load(Ordering::Acquire) {
-            break;
-        }
-        drop(control.wake.wait_timeout(guard, REPLICATION_POLL_INTERVAL));
+        control.wait_after(
+            generation,
+            if pending_event.is_some() {
+                REPLICATION_EVENT_RETRY_INTERVAL
+            } else {
+                wait
+            },
+        );
     }
 }
 
-fn replace_replication_event(
-    event: &Mutex<Option<Result<RemoteReplicationOutcome, RemoteReplicationError>>>,
-    outcome: Result<RemoteReplicationOutcome, RemoteReplicationError>,
-) {
-    match event.lock() {
-        Ok(mut event) => *event = Some(outcome),
-        Err(poisoned) => *poisoned.into_inner() = Some(outcome),
+fn try_send_replication_event(
+    events: &SyncSender<ReplicationEvent>,
+    event: ReplicationEvent,
+) -> Option<ReplicationEvent> {
+    match events.try_send(event) {
+        Ok(()) => None,
+        Err(TrySendError::Full(event)) => Some(event),
+        Err(TrySendError::Disconnected(_)) => None,
+    }
+}
+
+fn replication_wait(
+    outcome: &Result<RemoteReplicationOutcome, RemoteReplicationError>,
+) -> StandardDuration {
+    let retry_at = match outcome {
+        Ok(
+            RemoteReplicationOutcome::Failed { retry_at, .. }
+            | RemoteReplicationOutcome::Deferred { retry_at, .. },
+        ) => Some(*retry_at),
+        _ => None,
+    };
+    match retry_at.map(|retry_at| retry_at - OffsetDateTime::now_utc()) {
+        Some(remaining) if remaining.is_positive() => StandardDuration::try_from(remaining)
+            .unwrap_or(REPLICATION_VERIFICATION_INTERVAL)
+            .min(REPLICATION_VERIFICATION_INTERVAL),
+        Some(_) => StandardDuration::ZERO,
+        None => REPLICATION_VERIFICATION_INTERVAL,
     }
 }
 
@@ -679,6 +762,9 @@ impl WorkerRuntime {
                 created_at,
             )
             .map_err(|error| WorkerRunError::processor(error, claim_failures))?;
+        if let Some(replication) = &self.replication {
+            replication.wake();
+        }
         Ok(WorkerRunProgress::Complete(WorkerRunOutcome::Processed {
             batch_id,
             outcome,
