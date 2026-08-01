@@ -59,4 +59,4 @@ tar.workspace = true
 time.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.30.1", features = ["poll"] }
+nix = { version = "0.30.1", features = ["fs", "poll", "process", "signal"] }

@@ -3,10 +3,11 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_knowledge_core::{BoundedFileError, PinnedRegularFile, RequestId, Revision};
+use agent_knowledge_core::{BoundedFileError, PinnedDirectory, RequestId, Revision};
 use agent_knowledge_protocol::{
     CURRENT_GATEWAY_PROTOCOL_VERSION, ProtocolErrorResponse, SUBMIT_COMMAND, SubmitOutcome,
     SubmitResponse,
@@ -14,6 +15,7 @@ use agent_knowledge_protocol::{
 use agent_knowledge_queue::{
     PackagePolicy, PackageValidationError, PayloadMetadata, ValidatedPackage, validate_package,
 };
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
 
@@ -53,7 +55,8 @@ fn submit_with_program(
 
     let package = PreparedPackage::open(package_root)?;
     let expectation = package.expectation();
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .arg("-T")
         .arg("-o")
         .arg("BatchMode=yes")
@@ -72,26 +75,51 @@ fn submit_with_program(
         .arg(SUBMIT_COMMAND)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(ClientCommandError::StartSsh)?;
+        .stderr(Stdio::piped());
+    configure_process_group(&mut command);
+    let mut child = command.spawn().map_err(ClientCommandError::StartSsh)?;
     let Some(stdin) = child.stdin.take() else {
-        terminate(&mut child);
+        terminate_process_group(&mut child);
         return Err(ClientCommandError::MissingSshPipe);
     };
     let Some(mut stdout) = child.stdout.take() else {
-        terminate(&mut child);
+        terminate_process_group(&mut child);
         return Err(ClientCommandError::MissingSshPipe);
     };
     let Some(mut stderr) = child.stderr.take() else {
-        terminate(&mut child);
+        terminate_process_group(&mut child);
         return Err(ClientCommandError::MissingSshPipe);
     };
 
-    let archive = thread::spawn(move || package.write_archive(stdin));
-    let response = thread::spawn(move || read_bounded_response(&mut stdout));
-    let diagnostic = thread::spawn(move || read_bounded_diagnostic(&mut stderr));
-    let wait_result = wait_with_deadline(&mut child, timeout);
+    let (events, event_receiver) = mpsc::sync_channel(3);
+    let archive_events = events.clone();
+    let archive = thread::spawn(move || {
+        let result = package.write_archive(stdin);
+        notify_transfer(&archive_events, TransferEvent::Archive);
+        result
+    });
+    let response_events = events.clone();
+    let response = thread::spawn(move || {
+        let result = read_bounded_response(&mut stdout);
+        notify_transfer(
+            &response_events,
+            TransferEvent::Response {
+                failed: result.is_err(),
+            },
+        );
+        result
+    });
+    let diagnostic = thread::spawn(move || {
+        let result = read_bounded_diagnostic(&mut stderr);
+        notify_transfer(
+            &events,
+            TransferEvent::Diagnostic {
+                failed: result.is_err(),
+            },
+        );
+        result
+    });
+    let wait_result = supervise_transfer(&mut child, timeout, &event_receiver);
     let archive_result = archive
         .join()
         .map_err(|_| ClientCommandError::ArchiveThreadPanicked)
@@ -107,25 +135,18 @@ fn submit_with_program(
     let status = wait_result?;
 
     if !status.success() {
-        if let Ok(response) = serde_json::from_slice::<ProtocolErrorResponse>(&diagnostic) {
-            if response.protocol_version != CURRENT_GATEWAY_PROTOCOL_VERSION {
-                return Err(ClientCommandError::UnsupportedProtocolVersion {
-                    actual: response.protocol_version,
-                });
-            }
+        if let Some(response) = decode_gateway_error(&diagnostic)? {
             return Err(ClientCommandError::GatewayRejected(response));
         }
         return Err(ClientCommandError::SshFailed { status, diagnostic });
     }
     archive_result?;
 
+    let protocol_version =
+        decode_protocol_version(&response).map_err(ClientCommandError::InvalidResponse)?;
+    require_current_protocol(protocol_version)?;
     let response: SubmitResponse =
         serde_json::from_slice(&response).map_err(ClientCommandError::InvalidResponse)?;
-    if response.protocol_version != CURRENT_GATEWAY_PROTOCOL_VERSION {
-        return Err(ClientCommandError::UnsupportedProtocolVersion {
-            actual: response.protocol_version,
-        });
-    }
     expectation.verify(&response)?;
     diagnostic_output
         .write_all(&diagnostic)
@@ -134,32 +155,161 @@ fn submit_with_program(
     output.write_all(b"\n").map_err(ClientCommandError::Output)
 }
 
-fn wait_with_deadline(
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[derive(Clone, Copy)]
+enum TransferEvent {
+    Archive,
+    Response { failed: bool },
+    Diagnostic { failed: bool },
+}
+
+fn notify_transfer(events: &SyncSender<TransferEvent>, event: TransferEvent) {
+    let _ = events.send(event);
+}
+
+#[derive(Default)]
+struct TransferProgress {
+    archive_done: bool,
+    response_done: bool,
+    diagnostic_done: bool,
+}
+
+impl TransferProgress {
+    fn observe(&mut self, event: TransferEvent) -> bool {
+        match event {
+            TransferEvent::Archive => self.archive_done = true,
+            TransferEvent::Response { failed } => {
+                self.response_done = true;
+                return failed;
+            }
+            TransferEvent::Diagnostic { failed } => {
+                self.diagnostic_done = true;
+                return failed;
+            }
+        }
+        false
+    }
+
+    const fn complete(&self) -> bool {
+        self.archive_done && self.response_done && self.diagnostic_done
+    }
+}
+
+fn supervise_transfer(
     child: &mut Child,
     timeout: Duration,
+    events: &Receiver<TransferEvent>,
 ) -> Result<ExitStatus, ClientCommandError> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(ClientCommandError::InvalidTimeout)?;
+    let mut progress = TransferProgress::default();
+    let mut exit_status = None;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                terminate(child);
-                return Err(ClientCommandError::SshTimedOut { timeout });
+        if exit_status.is_none() {
+            match child.try_wait() {
+                Ok(status) => exit_status = status,
+                Err(error) => {
+                    terminate_process_group(child);
+                    return Err(ClientCommandError::WaitForSsh(error));
+                }
             }
-            Err(error) => {
-                terminate(child);
-                return Err(ClientCommandError::WaitForSsh(error));
+        }
+        if exit_status.is_some() && progress.complete() {
+            return exit_status.ok_or(ClientCommandError::TransferState);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            terminate_process_group(child);
+            return Err(ClientCommandError::SshTimedOut { timeout });
+        }
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(10));
+        match events.recv_timeout(wait) {
+            Ok(event) if progress.observe(event) => {
+                terminate_process_group(child);
+                return Err(ClientCommandError::TransferCancelled);
+            }
+            Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) if progress.complete() => thread::sleep(wait),
+            Err(RecvTimeoutError::Disconnected) => {
+                terminate_process_group(child);
+                return Err(ClientCommandError::TransferState);
             }
         }
     }
 }
 
-fn terminate(child: &mut Child) {
+fn terminate_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(process_group) = i32::try_from(child.id()) {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+
+        let _ = killpg(Pid::from_raw(process_group), Signal::SIGKILL);
+    }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[derive(Deserialize)]
+struct ProtocolEnvelope {
+    protocol_version: u16,
+    #[serde(flatten)]
+    _remaining: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+fn decode_protocol_version(bytes: &[u8]) -> Result<u16, serde_json::Error> {
+    serde_json::from_slice::<ProtocolEnvelope>(bytes).map(|envelope| envelope.protocol_version)
+}
+
+fn require_current_protocol(protocol_version: u16) -> Result<(), ClientCommandError> {
+    if protocol_version != CURRENT_GATEWAY_PROTOCOL_VERSION {
+        return Err(ClientCommandError::UnsupportedProtocolVersion {
+            actual: protocol_version,
+        });
+    }
+    Ok(())
+}
+
+fn decode_gateway_error(
+    diagnostic: &[u8],
+) -> Result<Option<ProtocolErrorResponse>, ClientCommandError> {
+    let Some(line) = diagnostic
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .map(trim_ascii_whitespace)
+        .find(|line| !line.is_empty())
+    else {
+        return Ok(None);
+    };
+    let protocol_version = match decode_protocol_version(line) {
+        Ok(protocol_version) => protocol_version,
+        Err(_) => return Ok(None),
+    };
+    require_current_protocol(protocol_version)?;
+    Ok(serde_json::from_slice(line).ok())
+}
+
+fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
 }
 
 fn read_bounded_response(input: &mut impl Read) -> Result<Vec<u8>, ClientCommandError> {
@@ -199,7 +349,8 @@ impl PreparedPackage {
             .map_err(ClientCommandError::PackageValidation)?;
         let request =
             serde_json::to_vec(validated.request()).map_err(ClientCommandError::EncodeRequest)?;
-        let payload = prepare_payload(package_root, &validated)?;
+        let root = PinnedDirectory::open(package_root).map_err(ClientCommandError::OpenPackage)?;
+        let payload = prepare_payload(&root, &validated)?;
         Ok(Self {
             request,
             payload,
@@ -238,7 +389,7 @@ struct PreparedPayload {
 }
 
 fn prepare_payload(
-    package_root: &Path,
+    package_root: &PinnedDirectory,
     package: &ValidatedPackage,
 ) -> Result<Vec<PreparedPayload>, ClientCommandError> {
     package
@@ -249,11 +400,12 @@ fn prepare_payload(
 }
 
 fn open_payload(
-    package_root: &Path,
+    package_root: &PinnedDirectory,
     metadata: &PayloadMetadata,
 ) -> Result<PreparedPayload, ClientCommandError> {
     let relative = PathBuf::from(metadata.path().as_str());
-    let mut file = PinnedRegularFile::open_no_follow(package_root.join("payload").join(&relative))
+    let mut file = package_root
+        .open_regular_beneath(Path::new("payload").join(&relative))
         .map_err(|source| ClientCommandError::OpenPayload {
             path: relative.clone(),
             source,
@@ -346,6 +498,7 @@ pub(crate) enum ClientCommandError {
     EmptyDestination,
     PackageValidation(PackageValidationError),
     EncodeRequest(serde_json::Error),
+    OpenPackage(BoundedFileError),
     OpenPayload {
         path: PathBuf,
         source: BoundedFileError,
@@ -367,6 +520,8 @@ pub(crate) enum ClientCommandError {
     ResponseTooLarge,
     ReadDiagnostic(io::Error),
     DiagnosticTooLarge,
+    TransferCancelled,
+    TransferState,
     WaitForSsh(io::Error),
     InvalidTimeout,
     SshTimedOut {
@@ -414,6 +569,9 @@ impl fmt::Display for ClientCommandError {
                 write!(formatter, "package validation failed: {error}")
             }
             Self::EncodeRequest(error) => write!(formatter, "request encoding failed: {error}"),
+            Self::OpenPackage(error) => {
+                write!(formatter, "could not pin package directory: {error}")
+            }
             Self::OpenPayload { path, source } => write!(
                 formatter,
                 "could not pin payload `{}`: {source}",
@@ -451,6 +609,10 @@ impl fmt::Display for ClientCommandError {
                 formatter,
                 "ssh diagnostics exceed {MAXIMUM_RESPONSE_BYTES} bytes"
             ),
+            Self::TransferCancelled => {
+                formatter.write_str("ssh transfer was cancelled after a stream failure")
+            }
+            Self::TransferState => formatter.write_str("ssh transfer state became inconsistent"),
             Self::WaitForSsh(error) => write!(formatter, "could not wait for ssh: {error}"),
             Self::InvalidTimeout => formatter.write_str("SSH timeout must be positive"),
             Self::SshTimedOut { timeout } => {
@@ -496,6 +658,7 @@ impl std::error::Error for ClientCommandError {
             Self::EncodeRequest(error)
             | Self::InvalidResponse(error)
             | Self::EncodeResponse(error) => Some(error),
+            Self::OpenPackage(error) => Some(error),
             Self::OpenPayload { source, .. } => Some(source),
             Self::ReadPayload { source, .. }
             | Self::StartSsh(source)
@@ -513,6 +676,8 @@ impl std::error::Error for ClientCommandError {
             | Self::DiagnosticThreadPanicked
             | Self::ResponseTooLarge
             | Self::DiagnosticTooLarge
+            | Self::TransferCancelled
+            | Self::TransferState
             | Self::InvalidTimeout
             | Self::SshTimedOut { .. }
             | Self::SshFailed { .. }

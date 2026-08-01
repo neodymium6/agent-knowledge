@@ -38,7 +38,7 @@ fn open_regular_file(
     Ok(PinnedRegularFile {
         file,
         length: metadata.len(),
-        _anchor: anchor,
+        _anchor: Some(anchor),
     })
 }
 
@@ -86,7 +86,99 @@ pub struct PinnedRegularFile {
     file: File,
     length: u64,
     #[cfg(target_os = "linux")]
-    _anchor: File,
+    _anchor: Option<File>,
+}
+
+/// A directory descriptor used as a non-escaping path-resolution root.
+#[derive(Debug)]
+pub struct PinnedDirectory {
+    #[cfg(target_os = "linux")]
+    file: File,
+}
+
+impl PinnedDirectory {
+    /// Opens a real directory without following a final symbolic link.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for I/O failures or a non-directory target. This
+    /// capability is available only on the initial Linux deployment target.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, BoundedFileError> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(
+                    nix::libc::O_PATH
+                        | nix::libc::O_DIRECTORY
+                        | nix::libc::O_NOFOLLOW
+                        | nix::libc::O_CLOEXEC,
+                )
+                .open(path)
+                .map_err(BoundedFileError::Io)?;
+            if !file.metadata().map_err(BoundedFileError::Io)?.is_dir() {
+                return Err(BoundedFileError::InvalidFileType);
+            }
+            Ok(Self { file })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Err(BoundedFileError::InvalidFileType)
+        }
+    }
+
+    /// Opens a regular file strictly beneath this directory without resolving
+    /// any symbolic-link component.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path escapes, contains a symbolic link, does
+    /// not name a regular file, or cannot be opened.
+    pub fn open_regular_beneath(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<PinnedRegularFile, BoundedFileError> {
+        #[cfg(target_os = "linux")]
+        {
+            use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
+
+            let path = path.as_ref();
+            if path.is_absolute()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::CurDir | std::path::Component::ParentDir
+                    )
+                })
+            {
+                return Err(BoundedFileError::InvalidFileType);
+            }
+            let how = OpenHow::new()
+                .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
+                .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS);
+            let file = File::from(
+                openat2(&self.file, path, how)
+                    .map_err(|error| BoundedFileError::Io(error.into()))?,
+            );
+            let metadata = file.metadata().map_err(BoundedFileError::Io)?;
+            if !metadata.is_file() {
+                return Err(BoundedFileError::InvalidFileType);
+            }
+            Ok(PinnedRegularFile {
+                file,
+                length: metadata.len(),
+                _anchor: None,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Err(BoundedFileError::InvalidFileType)
+        }
+    }
 }
 
 impl PinnedRegularFile {
@@ -199,7 +291,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::PinnedRegularFile;
+    use super::{PinnedDirectory, PinnedRegularFile};
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -250,5 +342,29 @@ mod tests {
             .unwrap_or_else(|error| panic!("symlink fixture must be removed: {error}"));
         fs::remove_file(target)
             .unwrap_or_else(|error| panic!("symlink target must be removed: {error}"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn beneath_open_rejects_a_symbolic_link_in_a_parent_component() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_path();
+        let outside = test_path();
+        fs::create_dir(&root)
+            .unwrap_or_else(|error| panic!("pinned root fixture must be created: {error}"));
+        fs::create_dir(&outside)
+            .unwrap_or_else(|error| panic!("outside fixture must be created: {error}"));
+        fs::write(outside.join("document.md"), b"fictional")
+            .unwrap_or_else(|error| panic!("outside file must be written: {error}"));
+        symlink(&outside, root.join("linked"))
+            .unwrap_or_else(|error| panic!("parent symlink must be created: {error}"));
+        let pinned = PinnedDirectory::open(&root)
+            .unwrap_or_else(|error| panic!("root must be pinned: {error}"));
+        assert!(pinned.open_regular_beneath("linked/document.md").is_err());
+        fs::remove_dir_all(root)
+            .unwrap_or_else(|error| panic!("pinned root fixture must be removed: {error}"));
+        fs::remove_dir_all(outside)
+            .unwrap_or_else(|error| panic!("outside fixture must be removed: {error}"));
     }
 }

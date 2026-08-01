@@ -23,7 +23,10 @@ where
         .map_err(|error| GatewayCommandError::Config(Box::new(error)))?;
     let timeout = settings.submit_timeout();
     let stdin = io::stdin();
-    let input = DeadlineReader::new(stdin.lock(), timeout);
+    let input = std::fs::File::from(nix::unistd::dup(&stdin).map_err(|error| {
+        GatewayCommandError::InputSetup(io::Error::from_raw_os_error(error as i32))
+    })?);
+    let input = DeadlineReader::new(input, timeout);
     run_with_settings(settings, client_id, original_command, input, output)
 }
 
@@ -142,6 +145,7 @@ pub enum GatewayCommandError {
     ClientId(ClientIdError),
     Config(Box<GatewayConfigError>),
     Gateway(Box<GatewayError>),
+    InputSetup(io::Error),
     Json(serde_json::Error),
     Io(io::Error),
 }
@@ -155,6 +159,7 @@ impl GatewayCommandError {
             Self::InvalidClientIdEncoding
             | Self::ClientId(_)
             | Self::Config(_)
+            | Self::InputSetup(_)
             | Self::Json(_)
             | Self::Io(_) => ErrorCode::InternalError,
         }
@@ -180,6 +185,7 @@ impl fmt::Display for GatewayCommandError {
             }
             Self::Config(error) => write!(formatter, "Gateway configuration failed: {error}"),
             Self::Gateway(error) => error.fmt(formatter),
+            Self::InputSetup(error) => write!(formatter, "Gateway input setup failed: {error}"),
             Self::Json(error) => write!(formatter, "Gateway JSON encoding failed: {error}"),
             Self::Io(error) => write!(formatter, "Gateway response output failed: {error}"),
         }
@@ -192,6 +198,7 @@ impl std::error::Error for GatewayCommandError {
             Self::ClientId(error) => Some(error),
             Self::Config(error) => Some(error.as_ref()),
             Self::Gateway(error) => Some(error.as_ref()),
+            Self::InputSetup(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::MissingCommand | Self::InvalidCommand | Self::InvalidClientIdEncoding => None,

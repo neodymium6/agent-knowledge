@@ -3,15 +3,16 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use agent_knowledge_core::PinnedDirectory;
 use agent_knowledge_protocol::{ProtocolErrorResponse, SubmitResponse};
 use agent_knowledge_queue::{PackagePolicy, validate_package};
 use tar::Archive;
 
 use super::{
-    ClientCommandError, MAXIMUM_RESPONSE_BYTES, PreparedPackage, open_payload,
-    read_bounded_diagnostic, read_bounded_response, submit_with_program,
+    ClientCommandError, MAXIMUM_RESPONSE_BYTES, PreparedPackage, decode_protocol_version,
+    open_payload, read_bounded_diagnostic, read_bounded_response, submit_with_program,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -232,14 +233,16 @@ fn rejects_a_same_length_change_before_network_output() {
         "x".repeat(MARKDOWN.len()),
     )
     .unwrap_or_else(|error| panic!("changed payload must be written: {error}"));
+    let pinned = PinnedDirectory::open(&package)
+        .unwrap_or_else(|error| panic!("package root must be pinned: {error}"));
 
     assert!(matches!(
-        open_payload(&package, &validated.payload()[0]),
+        open_payload(&pinned, &validated.payload()[0]),
         Err(ClientCommandError::PackageChanged { .. })
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn rejects_a_payload_path_replaced_by_a_symbolic_link() {
     use std::os::unix::fs::symlink;
@@ -256,9 +259,38 @@ fn rejects_a_payload_path_replaced_by_a_symbolic_link() {
         .unwrap_or_else(|error| panic!("original payload must be removed: {error}"));
     symlink(&replacement, &payload)
         .unwrap_or_else(|error| panic!("payload symlink must be created: {error}"));
+    let pinned = PinnedDirectory::open(&package)
+        .unwrap_or_else(|error| panic!("package root must be pinned: {error}"));
 
     assert!(matches!(
-        open_payload(&package, &validated.payload()[0]),
+        open_payload(&pinned, &validated.payload()[0]),
+        Err(ClientCommandError::OpenPayload { .. })
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rejects_a_payload_parent_replaced_by_a_symbolic_link() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let validated = validate_package(&package, &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("package fixture must validate: {error}"));
+    let outside = root.path().join("fictional-outside");
+    fs::create_dir(&outside)
+        .unwrap_or_else(|error| panic!("outside fixture must be created: {error}"));
+    fs::write(outside.join("index.md"), MARKDOWN)
+        .unwrap_or_else(|error| panic!("outside payload must be written: {error}"));
+    fs::remove_dir_all(package.join("payload/run"))
+        .unwrap_or_else(|error| panic!("original payload parent must be removed: {error}"));
+    symlink(&outside, package.join("payload/run"))
+        .unwrap_or_else(|error| panic!("payload parent symlink must be created: {error}"));
+    let pinned = PinnedDirectory::open(&package)
+        .unwrap_or_else(|error| panic!("package root must be pinned: {error}"));
+
+    assert!(matches!(
+        open_payload(&pinned, &validated.payload()[0]),
         Err(ClientCommandError::OpenPayload { .. })
     ));
 }
@@ -301,6 +333,42 @@ fn decodes_a_bounded_gateway_rejection() {
 
 #[cfg(unix)]
 #[test]
+fn extracts_a_gateway_rejection_after_ssh_warnings() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let program = root.path().join("fictional-ssh");
+    write_program(
+        &program,
+        "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' 'Warning: fictional proxy' >&2\nprintf '%s\\n' '{\"protocol_version\":1,\"error_code\":\"TEMPORARY_FAILURE\"}' >&2\nexit 2\n",
+    );
+
+    let error = match submit_with_program(
+        program.as_os_str(),
+        OsStr::new("fictional-alias"),
+        &package,
+        Duration::from_secs(5),
+        Vec::new(),
+        Vec::new(),
+    ) {
+        Ok(()) => panic!("Gateway rejection after an SSH warning must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        ClientCommandError::GatewayRejected(ProtocolErrorResponse { .. })
+    ));
+    let mut diagnostic = Vec::new();
+    error
+        .write_diagnostic(&mut diagnostic)
+        .unwrap_or_else(|write_error| panic!("Gateway error must encode: {write_error}"));
+    assert_eq!(
+        diagnostic,
+        b"{\"protocol_version\":1,\"error_code\":\"TEMPORARY_FAILURE\"}\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn terminates_a_stalled_ssh_process_at_the_deadline() {
     let root = TestDirectory::create();
     let package = write_package(root.path());
@@ -318,6 +386,134 @@ fn terminates_a_stalled_ssh_process_at_the_deadline() {
         ),
         Err(ClientCommandError::SshTimedOut { .. })
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn terminates_descendants_that_keep_ssh_streams_open() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let program = root.path().join("fictional-ssh");
+    write_program(&program, "#!/bin/sh\ncat > /dev/null\nsleep 5 &\nexit 0\n");
+    let started = Instant::now();
+
+    assert!(matches!(
+        submit_with_program(
+            program.as_os_str(),
+            OsStr::new("fictional-alias"),
+            &package,
+            Duration::from_millis(50),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(ClientCommandError::SshTimedOut { .. })
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn cancels_ssh_immediately_when_stdout_exceeds_its_bound() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let program = root.path().join("fictional-ssh");
+    write_program(
+        &program,
+        "#!/bin/sh\ncat > /dev/null\nhead -c 65537 /dev/zero\nexec sleep 5\n",
+    );
+    let started = Instant::now();
+
+    assert!(matches!(
+        submit_with_program(
+            program.as_os_str(),
+            OsStr::new("fictional-alias"),
+            &package,
+            Duration::from_secs(5),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(ClientCommandError::ResponseTooLarge)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn cancels_ssh_immediately_when_stderr_exceeds_its_bound() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let program = root.path().join("fictional-ssh");
+    write_program(
+        &program,
+        "#!/bin/sh\ncat > /dev/null\nhead -c 65537 /dev/zero >&2\nexec sleep 5\n",
+    );
+    let started = Instant::now();
+
+    assert!(matches!(
+        submit_with_program(
+            program.as_os_str(),
+            OsStr::new("fictional-alias"),
+            &package,
+            Duration::from_secs(5),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(ClientCommandError::DiagnosticTooLarge)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn identifies_a_future_success_protocol_before_decoding_its_body() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let program = root.path().join("fictional-ssh");
+    write_program(
+        &program,
+        "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{\"protocol_version\":2,\"status\":\"queued\",\"ticket\":\"fictional\"}'\n",
+    );
+
+    assert!(matches!(
+        submit_with_program(
+            program.as_os_str(),
+            OsStr::new("fictional-alias"),
+            &package,
+            Duration::from_secs(5),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(ClientCommandError::UnsupportedProtocolVersion { actual: 2 })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn identifies_a_future_error_protocol_before_decoding_its_body() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let program = root.path().join("fictional-ssh");
+    write_program(
+        &program,
+        "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{\"protocol_version\":2,\"error_code\":\"RATE_LIMITED\",\"retry_after\":1}' >&2\nexit 2\n",
+    );
+
+    assert!(matches!(
+        submit_with_program(
+            program.as_os_str(),
+            OsStr::new("fictional-alias"),
+            &package,
+            Duration::from_secs(5),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(ClientCommandError::UnsupportedProtocolVersion { actual: 2 })
+    ));
+}
+
+#[test]
+fn rejects_duplicate_protocol_version_fields() {
+    assert!(decode_protocol_version(b"{\"protocol_version\":1,\"protocol_version\":2}").is_err());
 }
 
 #[test]
