@@ -119,6 +119,23 @@ impl PinnedDirectory {
         }
     }
 
+    /// Clones the pinned directory descriptor for identity attestation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor cannot be cloned. This capability
+    /// is available only on Linux.
+    pub fn try_clone_file(&self) -> Result<File, PinnedPathError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.file.try_clone().map_err(PinnedPathError::Io)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(PinnedPathError::UnsupportedPlatform)
+        }
+    }
+
     /// Opens a real directory without following a final symbolic link.
     ///
     /// # Errors
@@ -288,6 +305,15 @@ impl PinnedRegularFile {
     #[must_use]
     pub const fn byte_length(&self) -> u64 {
         self.length
+    }
+
+    /// Clones the pinned readable descriptor without resolving its path again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor cannot be cloned.
+    pub fn try_clone_file(&self) -> io::Result<File> {
+        self.file.try_clone()
     }
 }
 

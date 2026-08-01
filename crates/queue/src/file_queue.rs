@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use agent_knowledge_core::{
-    ErrorCode, PathAttestation, PathAttestationError, PayloadPath, RequestId, Revision,
+    BoundedFileError, ErrorCode, PathAttestation, PathAttestationError, PayloadPath,
+    PinnedRegularFile, RequestId, Revision,
 };
 use agent_knowledge_protocol::ClientId;
 use sha2::{Digest, Sha256};
@@ -26,6 +27,8 @@ pub use worker::{
     PendingSnapshot, ProcessingScanOutcome, WorkerPhase, WorkerPhaseRecord, WorkerQueueError,
     WorkerResultRecord, WorkerResultStatus, WorkerSession,
 };
+mod status;
+pub use status::{QueueReader, QueueRequestStatus};
 
 const REQUEST_FILE_NAME: &str = "request.json";
 const DIGEST_FILE_NAME: &str = "digest";
@@ -488,36 +491,17 @@ impl FileQueue {
     }
 
     fn current_identity_locked(&self) -> Result<Revision, QueueError> {
-        let current_canonical_root =
-            fs::canonicalize(&self.configured_queue_root).map_err(QueueError::Io)?;
-        if current_canonical_root != self.configured_queue_root {
-            return Err(QueueError::InvalidQueueIdentity);
-        }
-        #[cfg(target_os = "linux")]
-        {
-            validate_pinned_root(&self.configured_queue_root, &self.root_handle)?;
-        }
-        for directory in self.directories.all() {
-            validate_pinned_directory(directory)?;
-        }
-        validate_pinned_lock(&self.lock_file, &self.queue_lock_handle)?;
-        validate_pinned_lock(&self.worker_lock_file, &self.worker_lock_handle)?;
-        validate_queue_root_binding(
-            &self.queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
-            &self.configured_queue_root,
-            &self.root_handle,
-            &self.directories,
-            &self.queue_lock_handle,
-            &self.worker_lock_handle,
-        )?;
-        let stable_identity = read_queue_identity(&self.queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
-        let configured_identity =
-            read_queue_identity(&self.configured_queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
-        if stable_identity == self.identity && configured_identity == self.identity {
-            Ok(stable_identity)
-        } else {
-            Err(QueueError::InvalidQueueIdentity)
-        }
+        validate_current_queue(QueueBinding {
+            configured_queue_root: &self.configured_queue_root,
+            queue_root: &self.queue_root,
+            root_handle: &self.root_handle,
+            directories: &self.directories,
+            identity: self.identity,
+            lock_file: &self.lock_file,
+            queue_lock_handle: &self.queue_lock_handle,
+            worker_lock_file: &self.worker_lock_file,
+            worker_lock_handle: &self.worker_lock_handle,
+        })
     }
 
     fn find_existing(
@@ -1093,6 +1077,50 @@ impl Drop for IncomingPackage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+struct QueueBinding<'a> {
+    configured_queue_root: &'a Path,
+    queue_root: &'a Path,
+    root_handle: &'a File,
+    directories: &'a QueueDirectories,
+    identity: Revision,
+    lock_file: &'a Path,
+    queue_lock_handle: &'a File,
+    worker_lock_file: &'a Path,
+    worker_lock_handle: &'a File,
+}
+
+fn validate_current_queue(binding: QueueBinding<'_>) -> Result<Revision, QueueError> {
+    let current_canonical_root =
+        fs::canonicalize(binding.configured_queue_root).map_err(QueueError::Io)?;
+    if current_canonical_root != binding.configured_queue_root {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    #[cfg(target_os = "linux")]
+    validate_pinned_root(binding.configured_queue_root, binding.root_handle)?;
+    for directory in binding.directories.all() {
+        validate_pinned_directory(directory)?;
+    }
+    validate_pinned_lock(binding.lock_file, binding.queue_lock_handle)?;
+    validate_pinned_lock(binding.worker_lock_file, binding.worker_lock_handle)?;
+    validate_queue_root_binding(
+        &binding.queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
+        binding.configured_queue_root,
+        binding.root_handle,
+        binding.directories,
+        binding.queue_lock_handle,
+        binding.worker_lock_handle,
+    )?;
+    let stable_identity = read_queue_identity(&binding.queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
+    let configured_identity =
+        read_queue_identity(&binding.configured_queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
+    if stable_identity == binding.identity && configured_identity == binding.identity {
+        Ok(stable_identity)
+    } else {
+        Err(QueueError::InvalidQueueIdentity)
+    }
+}
+
 fn ensure_directory(path: &Path) -> Result<(), QueueError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
@@ -1262,19 +1290,11 @@ fn validate_queue_root_binding(
         queue_lock_handle,
         worker_lock_handle,
     )?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 16 * 1024 => {
-            if fs::read(path).map_err(QueueError::Io)? == expected {
-                Ok(())
-            } else {
-                Err(QueueError::InvalidQueueIdentity)
-            }
-        }
-        Ok(_) => Err(QueueError::InvalidQueueIdentity),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Err(QueueError::InvalidQueueIdentity)
-        }
-        Err(error) => Err(QueueError::Io(error)),
+    let bytes = read_identity_file(path, 16 * 1024)?;
+    if bytes == expected {
+        Ok(())
+    } else {
+        Err(QueueError::InvalidQueueIdentity)
     }
 }
 
@@ -1462,24 +1482,35 @@ fn stable_file_path(handle: &File, _fallback: &Path) -> Result<PathBuf, QueueErr
 }
 
 fn read_queue_identity(path: &Path) -> Result<Revision, QueueError> {
-    let metadata = fs::symlink_metadata(path).map_err(QueueError::Io)?;
-    if !metadata.file_type().is_file() || metadata.len() > MAXIMUM_QUEUE_IDENTITY_BYTES {
-        return Err(QueueError::InvalidQueueIdentity);
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    File::open(path)
-        .and_then(|file| {
-            file.take(MAXIMUM_QUEUE_IDENTITY_BYTES + 1)
-                .read_to_end(&mut bytes)
-        })
-        .map_err(QueueError::Io)?;
-    if bytes.len() as u64 > MAXIMUM_QUEUE_IDENTITY_BYTES {
-        return Err(QueueError::InvalidQueueIdentity);
-    }
+    let bytes = read_identity_file(path, MAXIMUM_QUEUE_IDENTITY_BYTES)?;
     let value = std::str::from_utf8(&bytes)
         .map_err(|_| QueueError::InvalidQueueIdentity)?
         .trim();
     value.parse().map_err(|_| QueueError::InvalidQueueIdentity)
+}
+
+fn read_identity_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, QueueError> {
+    let mut file = PinnedRegularFile::open_no_follow(path).map_err(|error| match error {
+        BoundedFileError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+            QueueError::InvalidQueueIdentity
+        }
+        BoundedFileError::Io(error) => QueueError::Io(error),
+        BoundedFileError::InvalidFileType | BoundedFileError::FileTooLarge { .. } => {
+            QueueError::InvalidQueueIdentity
+        }
+    })?;
+    if file.byte_length() > maximum_bytes {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    let mut bytes = Vec::with_capacity(file.byte_length() as usize);
+    file.by_ref()
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(QueueError::Io)?;
+    if bytes.len() as u64 > maximum_bytes {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    Ok(bytes)
 }
 
 fn accepted_states_are_empty(queue_root: &Path) -> Result<bool, QueueError> {
@@ -1765,6 +1796,8 @@ pub enum QueueError {
     SequenceExhausted,
     /// The durable queue acceptance sequence file was malformed.
     InvalidSequenceState,
+    /// A bounded read-only queue operation exceeded its deadline.
+    OperationDeadlineExceeded,
     /// The immutable queue instance identity was missing, malformed, or changed.
     InvalidQueueIdentity,
     /// An in-process maintenance scanner mutex was poisoned.
@@ -1790,7 +1823,9 @@ impl QueueError {
     #[must_use]
     pub const fn error_code(&self) -> ErrorCode {
         match self {
-            Self::Io(_) | Self::StagingNameExhausted => ErrorCode::TemporaryFailure,
+            Self::Io(_) | Self::StagingNameExhausted | Self::OperationDeadlineExceeded => {
+                ErrorCode::TemporaryFailure
+            }
             Self::Package(error) => error.error_code(),
             Self::RequestAlreadyWritten
             | Self::PayloadAlreadyWritten(_)
@@ -1866,6 +1901,9 @@ impl fmt::Display for QueueError {
             }
             Self::InvalidSequenceState => {
                 formatter.write_str("durable acceptance sequence state is invalid")
+            }
+            Self::OperationDeadlineExceeded => {
+                formatter.write_str("read-only queue operation deadline expired")
             }
             Self::InvalidQueueIdentity => {
                 formatter.write_str("durable queue instance identity is invalid")
