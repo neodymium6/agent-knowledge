@@ -75,6 +75,63 @@ fn migrates_schema_two_journals_for_every_recovery_phase() {
     }
 }
 
+#[test]
+fn rejects_unsupported_or_malformed_journal_schema_layouts() {
+    let base = serde_json::json!({
+        "schema_version": 3,
+        "batch_id": BATCH_ID,
+        "queue_identity": format!("sha256:{}", "0".repeat(64)),
+        "base_commit": "0123456789abcdef0123456789abcdef01234567",
+        "claims": [{
+            "request_id": FIRST_REQUEST_ID,
+            "attempt": 1,
+            "acceptance_sequence": 1
+        }],
+        "claim_failures": 2,
+        "state": {"phase": "preparing"}
+    });
+    let mut fixtures = Vec::new();
+
+    for schema_version in [1, 4] {
+        let mut fixture = base.clone();
+        fixture["schema_version"] = schema_version.into();
+        fixtures.push((format!("schema {schema_version}"), fixture));
+    }
+
+    let mut version_two_with_failure_count = base.clone();
+    version_two_with_failure_count["schema_version"] = 2.into();
+    fixtures.push((
+        "schema 2 with claim_failures".into(),
+        version_two_with_failure_count,
+    ));
+
+    let mut version_three_without_failure_count = base.clone();
+    let Some(version_three_fields) = version_three_without_failure_count.as_object_mut() else {
+        panic!("journal fixture must be an object");
+    };
+    version_three_fields.remove("claim_failures");
+    fixtures.push((
+        "schema 3 without claim_failures".into(),
+        version_three_without_failure_count,
+    ));
+
+    let mut unknown_field = base;
+    unknown_field["unexpected"] = true.into();
+    fixtures.push(("unknown field".into(), unknown_field));
+
+    for (name, fixture) in fixtures {
+        let bytes = serde_json::to_vec(&fixture)
+            .unwrap_or_else(|error| panic!("{name} fixture must encode: {error}"));
+        assert!(
+            matches!(
+                decode_journal(&bytes),
+                Err(GitTransactionError::InvalidJournal)
+            ),
+            "{name} must be rejected"
+        );
+    }
+}
+
 struct TestDirectory {
     path: PathBuf,
 }
