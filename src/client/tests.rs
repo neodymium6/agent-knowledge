@@ -6,13 +6,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use agent_knowledge_core::PinnedDirectory;
-use agent_knowledge_protocol::{ProtocolErrorResponse, SubmitResponse};
+use agent_knowledge_protocol::{
+    GetRequest, LIST_COMMAND, ListRequest, ListResponse, ProtocolErrorResponse, ReadFilterRequest,
+    SubmitResponse,
+};
 use agent_knowledge_queue::{PackagePolicy, validate_package};
 use tar::Archive;
 
 use super::{
-    ClientCommandError, MAXIMUM_RESPONSE_BYTES, PreparedPackage, decode_protocol_version,
-    open_payload, read_bounded_diagnostic, read_bounded_response, submit_with_program,
+    ClientCommandError, MAXIMUM_RESPONSE_BYTES, PreparedPackage, control_with_program,
+    decode_protocol_version, get_with_program, open_payload, read_bounded_diagnostic,
+    read_bounded_response, submit_with_program,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -169,6 +173,73 @@ fn invokes_system_ssh_without_a_shell_and_streams_a_valid_archive() {
         ]
     );
     assert_eq!(markdown.as_deref(), Some(MARKDOWN));
+}
+
+#[cfg(unix)]
+#[test]
+fn sends_typed_control_json_and_validates_the_response() {
+    let root = TestDirectory::create();
+    let arguments = root.path().join("control-arguments");
+    let request_file = root.path().join("control-request.json");
+    let program = root.path().join("fictional-control-ssh");
+    let response = "{\"protocol_version\":1,\"commit\":\"0123456789abcdef0123456789abcdef01234567\",\"documents\":[]}";
+    let script = format!(
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\nprintf '%s\\n' '{}'\n",
+        arguments.display(),
+        request_file.display(),
+        response,
+    );
+    write_program(&program, &script);
+    let request = ListRequest::new(ReadFilterRequest::default(), 25);
+    let mut output = Vec::new();
+    control_with_program::<_, ListResponse>(
+        program.as_os_str(),
+        OsStr::new("fictional-alias"),
+        LIST_COMMAND,
+        &request,
+        Duration::from_secs(5),
+        &mut output,
+        Vec::new(),
+    )
+    .unwrap_or_else(|error| panic!("client control operation must succeed: {error}"));
+
+    assert_eq!(
+        fs::read_to_string(arguments)
+            .unwrap_or_else(|error| panic!("control arguments must be readable: {error}")),
+        "-T\n-o\nBatchMode=yes\n-o\nClearAllForwardings=yes\n-o\nForwardAgent=no\n-o\nForwardX11=no\n-o\nStdinNull=no\n-o\nForkAfterAuthentication=no\n--\nfictional-alias\nakp-v1 list\n"
+    );
+    let sent: ListRequest = serde_json::from_slice(
+        &fs::read(request_file)
+            .unwrap_or_else(|error| panic!("control request must be readable: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("control request must decode: {error}"));
+    assert_eq!(sent, request);
+    assert_eq!(String::from_utf8_lossy(&output), format!("{response}\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_get_response_for_a_different_document() {
+    let root = TestDirectory::create();
+    let program = root.path().join("fictional-get-ssh");
+    write_program(
+        &program,
+        "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{\"protocol_version\":1,\"commit\":\"0123456789abcdef0123456789abcdef01234567\",\"document\":{\"summary\":{\"path\":\"projects/fictional-project/runbooks/fictional/index.md\",\"document_type\":\"runbook\",\"project\":\"fictional-project\",\"archived\":false,\"revision\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"metadata\":{\"schema_version\":1,\"document_id\":\"01K00000000000000000000002\",\"title\":\"Fictional response\",\"created\":\"2026-07-31T03:50:00Z\",\"request_id\":\"01K00000000000000000000003\",\"status\":\"active\"}},\"markdown\":\"---\\n---\\n\"}}'\n",
+    );
+    let requested = "01K00000000000000000000001"
+        .parse()
+        .unwrap_or_else(|error| panic!("requested document ID must parse: {error}"));
+    assert!(matches!(
+        get_with_program(
+            program.as_os_str(),
+            OsStr::new("fictional-alias"),
+            &GetRequest::new(requested),
+            Duration::from_secs(5),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(ClientCommandError::DocumentResponseMismatch)
+    ));
 }
 
 #[test]

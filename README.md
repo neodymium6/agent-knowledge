@@ -9,11 +9,12 @@ restricted gateway; they do not synchronize the repository with Git.
 
 ## Status
 
-The architecture is defined, and delivery increments 1 through 6 are
+The architecture is defined, and delivery increments 1 through 7 are
 implemented. The current executable can accept requests locally or through an
 OpenSSH forced command, process them through the single Writer, and publish
-immutable Quartz releases. Committed reads, search, remote-push retry, and
-packaging remain future increments.
+immutable Quartz releases. Coding agents can list, retrieve, and search an
+exact committed content snapshot through the same Gateway. Bundle export,
+request status, remote-push retry, retention, and packaging remain future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -58,6 +59,28 @@ agent-knowledge client submit \
   --timeout-seconds 300
 ```
 
+Search committed Markdown and configured metadata through that alias:
+
+```sh
+agent-knowledge client search \
+  --destination fictional-knowledge \
+  --query "fictional restart" \
+  --project fictional-project \
+  --maximum-results 25
+```
+
+The `list`, `recent`, `get`, and `search` commands return strict versioned JSON.
+Every successful response identifies the exact official Git commit used for
+the operation. List and search operations support exact project, tag, and
+session filters; archived documents are excluded unless `--include-archived`
+is supplied. After a complete control request is received, one read-operation
+deadline covers Gateway repository initialization, content indexing, query
+work, response encoding, and delivery to the SSH channel. The response-byte
+limit includes the JSON Lines framing newline. Read processes open only the
+committed repository and content checkout; submit processes open only the
+durable queue after preflighting all configured storage destinations for
+overlap.
+
 The client validates and snapshots at most 64 MiB of package data before
 network output. It then invokes the system `ssh` executable directly, uses
 non-interactive authentication, disables TTY allocation, forwarding, and SSH
@@ -73,9 +96,27 @@ reached, including when a proxy descendant retains an output pipe.
 The forced command requires a strict Gateway configuration such as:
 
 ```yaml
-schema_version: 1
+schema_version: 2
 storage:
   queue_root: /srv/fictional-knowledge/queue
+  git_directory: /srv/fictional-knowledge/repository
+  content_root: /srv/fictional-knowledge/content
+repository:
+  official_branch: main
+reads:
+  maximum_results: 100
+  maximum_query_characters: 512
+  maximum_index_entries: 100000
+  maximum_index_markdown_bytes: 536870912
+  maximum_search_documents: 10000
+  maximum_search_markdown_bytes: 536870912
+  operation_timeout_seconds: 30
+  maximum_response_bytes: 268435456
+  search_metadata:
+    node: true
+    agent: true
+    session: true
+    request_id: true
 transport:
   submit_timeout_seconds: 300
 ```

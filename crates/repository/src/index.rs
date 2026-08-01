@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use agent_knowledge_core::{
     AttachmentName, DocumentId, DocumentLimits, DocumentMetadata, DocumentParseError,
@@ -19,10 +20,14 @@ pub struct ContentPolicy {
     pub maximum_entry_count: usize,
     /// Maximum bytes in one Markdown document.
     pub maximum_markdown_bytes: u64,
+    /// Maximum aggregate Markdown bytes inspected while building the index.
+    pub maximum_total_markdown_bytes: u64,
     /// Maximum bytes in one Markdown front matter section.
     pub maximum_front_matter_bytes: usize,
     /// Shared typed metadata limits.
     pub document: DocumentLimits,
+    /// Optional absolute deadline for one index scan.
+    pub scan_deadline: Option<Instant>,
 }
 
 impl Default for ContentPolicy {
@@ -30,8 +35,10 @@ impl Default for ContentPolicy {
         Self {
             maximum_entry_count: 1_000_000,
             maximum_markdown_bytes: 32 * 1024 * 1024,
+            maximum_total_markdown_bytes: 8 * 1024 * 1024 * 1024,
             maximum_front_matter_bytes: 64 * 1024,
             document: DocumentLimits::default(),
+            scan_deadline: None,
         }
     }
 }
@@ -43,6 +50,7 @@ pub struct DocumentRecord {
     location: DocumentLocation,
     metadata: DocumentMetadata,
     revision: Revision,
+    byte_length: u64,
 }
 
 impl DocumentRecord {
@@ -68,6 +76,12 @@ impl DocumentRecord {
     #[must_use]
     pub const fn revision(&self) -> Revision {
         self.revision
+    }
+
+    /// Returns the validated byte length of the exact Markdown document.
+    #[must_use]
+    pub const fn byte_length(&self) -> u64 {
+        self.byte_length
     }
 }
 
@@ -126,14 +140,54 @@ impl ContentIndex {
             return Err(ContentIndexError::InvalidRoot);
         }
 
+        Self::build_validated(content_root, policy, package_policy)
+    }
+
+    /// Builds an index below a descriptor-backed stable directory path.
+    ///
+    /// The supplied path may be a Linux `/proc` descriptor projection, so the
+    /// root path itself is followed only after its identity is compared with
+    /// the already-open directory descriptor. Descendants retain the normal
+    /// strict no-link validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path and descriptor differ or normal content
+    /// validation fails.
+    pub fn build_from_pinned_root(
+        content_root: &Path,
+        pinned_root: &File,
+        policy: ContentPolicy,
+        package_policy: &PackagePolicy,
+    ) -> Result<Self, ContentIndexError> {
+        let root_metadata = fs::metadata(content_root).map_err(ContentIndexError::Io)?;
+        let pinned_metadata = pinned_root.metadata().map_err(ContentIndexError::Io)?;
+        if !root_metadata.file_type().is_dir()
+            || !pinned_metadata.file_type().is_dir()
+            || !same_root_identity(&root_metadata, &pinned_metadata)
+        {
+            return Err(ContentIndexError::InvalidRoot);
+        }
+
+        Self::build_validated(content_root, policy, package_policy)
+    }
+
+    fn build_validated(
+        content_root: &Path,
+        policy: ContentPolicy,
+        package_policy: &PackagePolicy,
+    ) -> Result<Self, ContentIndexError> {
         let mut documents = HashMap::<DocumentId, DocumentRecord>::new();
         let mut attachments = Vec::new();
         let mut pending = vec![content_root.to_path_buf()];
         let mut entry_count = 0_usize;
+        let mut markdown_bytes = 0_u64;
         while let Some(directory) = pending.pop() {
+            check_scan_deadline(policy.scan_deadline)?;
             let remaining = policy.maximum_entry_count.saturating_sub(entry_count);
             let mut entries = Vec::with_capacity(remaining.min(1_024));
             for entry in fs::read_dir(&directory).map_err(ContentIndexError::Io)? {
+                check_scan_deadline(policy.scan_deadline)?;
                 let entry = entry.map_err(ContentIndexError::Io)?;
                 if directory == content_root && entry.file_name() == ".git" {
                     continue;
@@ -151,6 +205,7 @@ impl ContentIndex {
             entries.sort_by_key(fs::DirEntry::file_name);
             let mut child_directories = Vec::new();
             for entry in entries {
+                check_scan_deadline(policy.scan_deadline)?;
                 entry_count =
                     entry_count
                         .checked_add(1)
@@ -205,15 +260,39 @@ impl ContentIndex {
                         actual: metadata.len(),
                     });
                 }
-
-                let bytes = read_bounded_file(&path, policy.maximum_markdown_bytes)?;
-                if bytes.len() as u64 > policy.maximum_markdown_bytes {
-                    return Err(ContentIndexError::MarkdownTooLarge {
-                        path: relative_path,
-                        maximum: policy.maximum_markdown_bytes,
-                        actual: bytes.len() as u64,
+                let remaining_total = policy
+                    .maximum_total_markdown_bytes
+                    .saturating_sub(markdown_bytes);
+                if metadata.len() > remaining_total {
+                    return Err(ContentIndexError::MarkdownByteLimitExceeded {
+                        maximum: policy.maximum_total_markdown_bytes,
                     });
                 }
+
+                let read_limit = policy.maximum_markdown_bytes.min(remaining_total);
+                let bytes = read_bounded_file(&path, read_limit, policy.scan_deadline)?;
+                check_scan_deadline(policy.scan_deadline)?;
+                if bytes.len() as u64 > read_limit {
+                    return Err(if read_limit == remaining_total {
+                        ContentIndexError::MarkdownByteLimitExceeded {
+                            maximum: policy.maximum_total_markdown_bytes,
+                        }
+                    } else {
+                        ContentIndexError::MarkdownTooLarge {
+                            path: relative_path,
+                            maximum: policy.maximum_markdown_bytes,
+                            actual: bytes.len() as u64,
+                        }
+                    });
+                }
+                if bytes.len() as u64 != metadata.len() {
+                    return Err(ContentIndexError::FileChangedDuringScan(relative_path));
+                }
+                markdown_bytes = markdown_bytes.checked_add(bytes.len() as u64).ok_or(
+                    ContentIndexError::MarkdownByteLimitExceeded {
+                        maximum: policy.maximum_total_markdown_bytes,
+                    },
+                )?;
                 let document = decode_document_metadata(&bytes, policy.maximum_front_matter_bytes)
                     .map_err(|source| ContentIndexError::InvalidDocument {
                         path: relative_path.clone(),
@@ -237,6 +316,7 @@ impl ContentIndex {
                     location,
                     metadata: document,
                     revision,
+                    byte_length: bytes.len() as u64,
                 };
                 if let Some(existing) = documents.insert(document_id, record) {
                     return Err(ContentIndexError::DuplicateDocumentId {
@@ -250,6 +330,7 @@ impl ContentIndex {
         }
 
         validate_attachment_locations(&attachments, &documents, package_policy)?;
+        check_scan_deadline(policy.scan_deadline)?;
 
         Ok(Self { documents })
     }
@@ -258,6 +339,14 @@ impl ContentIndex {
     #[must_use]
     pub fn get(&self, document_id: DocumentId) -> Option<&DocumentRecord> {
         self.documents.get(&document_id)
+    }
+
+    /// Iterates over every indexed Markdown document.
+    ///
+    /// The iteration order is unspecified. Callers that expose results must
+    /// apply an explicit deterministic ordering.
+    pub fn documents(&self) -> impl Iterator<Item = &DocumentRecord> {
+        self.documents.values()
     }
 
     /// Resolves a document and checks its exact byte revision.
@@ -297,12 +386,45 @@ impl ContentIndex {
     }
 }
 
-fn read_bounded_file(path: &Path, maximum: u64) -> Result<Vec<u8>, ContentIndexError> {
+fn check_scan_deadline(deadline: Option<Instant>) -> Result<(), ContentIndexError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(ContentIndexError::ScanDeadlineExceeded);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_root_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_root_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    true
+}
+
+fn read_bounded_file(
+    path: &Path,
+    maximum: u64,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>, ContentIndexError> {
     let capacity = usize::try_from(maximum.min(64 * 1024)).unwrap_or(64 * 1024);
     let mut bytes = Vec::with_capacity(capacity);
-    File::open(path)
-        .and_then(|file| file.take(maximum.saturating_add(1)).read_to_end(&mut bytes))
-        .map_err(ContentIndexError::Io)?;
+    let mut file = File::open(path)
+        .map_err(ContentIndexError::Io)?
+        .take(maximum.saturating_add(1));
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check_scan_deadline(deadline)?;
+        let count = file.read(&mut buffer).map_err(ContentIndexError::Io)?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    check_scan_deadline(deadline)?;
     Ok(bytes)
 }
 
@@ -618,6 +740,15 @@ pub enum ContentIndexError {
         /// Observed bytes.
         actual: u64,
     },
+    /// Aggregate Markdown bytes exceeded the configured index-work bound.
+    MarkdownByteLimitExceeded {
+        /// Configured maximum aggregate bytes.
+        maximum: u64,
+    },
+    /// The configured absolute index-scan deadline expired.
+    ScanDeadlineExceeded,
+    /// A Markdown file changed length while the index was reading it.
+    FileChangedDuringScan(PathBuf),
     /// Markdown front matter could not be decoded safely.
     InvalidDocument {
         /// Document path relative to the content root.
@@ -709,6 +840,18 @@ impl fmt::Display for ContentIndexError {
             } => write!(
                 formatter,
                 "Markdown `{}` is {actual} bytes; maximum is {maximum}",
+                path.display()
+            ),
+            Self::MarkdownByteLimitExceeded { maximum } => write!(
+                formatter,
+                "content hierarchy exceeds {maximum} aggregate Markdown bytes"
+            ),
+            Self::ScanDeadlineExceeded => {
+                formatter.write_str("content index scan deadline expired")
+            }
+            Self::FileChangedDuringScan(path) => write!(
+                formatter,
+                "Markdown `{}` changed while the index was reading it",
                 path.display()
             ),
             Self::InvalidDocument { path, source } => {

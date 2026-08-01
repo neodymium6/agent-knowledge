@@ -97,6 +97,28 @@ pub struct PinnedDirectory {
 }
 
 impl PinnedDirectory {
+    /// Clones an already-open directory descriptor into a path-resolution root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor cannot be cloned or does not name
+    /// a directory. This capability is available only on Linux.
+    pub fn try_clone_from(file: &File) -> Result<Self, PinnedPathError> {
+        #[cfg(target_os = "linux")]
+        {
+            let file = file.try_clone().map_err(PinnedPathError::Io)?;
+            if !file.metadata().map_err(PinnedPathError::Io)?.is_dir() {
+                return Err(PinnedPathError::ExpectedDirectory);
+            }
+            Ok(Self { file })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = file;
+            Err(PinnedPathError::UnsupportedPlatform)
+        }
+    }
+
     /// Opens a real directory without following a final symbolic link.
     ///
     /// # Errors

@@ -209,8 +209,8 @@ impl FileQueue {
         }
         ensure_directory(&configured_path)?;
         sync_directory(configured_parent)?;
+        let root_handle = Arc::new(File::open(&configured_path).map_err(QueueError::Io)?);
         let configured_queue_root = fs::canonicalize(&configured_path).map_err(QueueError::Io)?;
-        let root_handle = Arc::new(File::open(&configured_queue_root).map_err(QueueError::Io)?);
         #[cfg(target_os = "linux")]
         let queue_root = {
             use std::os::fd::AsRawFd;

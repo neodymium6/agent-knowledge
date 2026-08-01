@@ -163,6 +163,26 @@ impl PathAttestation {
         }
     }
 
+    /// Returns whether two attestations name the same pinned object or the
+    /// same not-yet-created destination below an identical backing path.
+    #[must_use]
+    pub fn matches_destination(&self, other: &Self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.canonical_path == other.canonical_path
+                && self.backing.device == other.backing.device
+                && self.backing.path == other.backing.path
+                && self
+                    .object
+                    .is_none_or(|object| other.object == Some(object))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = other;
+            false
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn capture_linux(path: &Path, pinned: &File) -> Result<Self, PathAttestationError> {
         let canonical_path = fs::canonicalize(path).map_err(PathAttestationError::Io)?;

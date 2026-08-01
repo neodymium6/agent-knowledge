@@ -20,7 +20,7 @@ pub use input::{
     BoundedFileError, PinnedDirectory, PinnedPathError, PinnedRegularFile,
     read_bounded_regular_file,
 };
-pub use markdown::{DocumentParseError, decode_document_metadata};
+pub use markdown::{DocumentParseError, decode_document_metadata, markdown_body};
 pub use path::{AttachmentName, PathValidationError, PayloadPath, ProjectId};
 pub use request::{
     CURRENT_PROTOCOL_VERSION, ChangeRequest, DocumentType, Operation, RequestDecodeError,

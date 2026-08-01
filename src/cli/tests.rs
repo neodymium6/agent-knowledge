@@ -203,6 +203,96 @@ fn parses_the_ssh_client_submission_command() {
 }
 
 #[test]
+fn parses_committed_read_and_search_commands() {
+    let list = parse_arguments([
+        "agent-knowledge".into(),
+        "client".into(),
+        "recent".into(),
+        "--destination".into(),
+        "fictional-knowledge".into(),
+        "--project".into(),
+        "fictional-project".into(),
+        "--tag".into(),
+        "operations".into(),
+        "--include-archived".into(),
+        "--maximum-results".into(),
+        "25".into(),
+    ])
+    .unwrap_or_else(|error| panic!("client recent command must parse: {error}"));
+    assert!(matches!(
+        list,
+        Command::ClientList { destination, request, recent: true, timeout }
+            if destination == "fictional-knowledge"
+                && request.filter.project.is_some()
+                && request.filter.tag.as_deref() == Some("operations")
+                && request.filter.include_archived
+                && request.maximum_results == 25
+                && timeout == std::time::Duration::from_secs(300)
+    ));
+
+    let search = parse_arguments([
+        "agent-knowledge".into(),
+        "client".into(),
+        "search".into(),
+        "--destination".into(),
+        "fictional-knowledge".into(),
+        "--query".into(),
+        "restart procedure".into(),
+    ])
+    .unwrap_or_else(|error| panic!("client search command must parse: {error}"));
+    assert!(matches!(
+        search,
+        Command::ClientSearch { request, .. }
+            if request.query == "restart procedure" && request.maximum_results == 100
+    ));
+
+    let get = parse_arguments([
+        "agent-knowledge".into(),
+        "client".into(),
+        "get".into(),
+        "--destination".into(),
+        "fictional-knowledge".into(),
+        "--document-id".into(),
+        "01K00000000000000000000001".into(),
+    ])
+    .unwrap_or_else(|error| panic!("client get command must parse: {error}"));
+    assert!(matches!(get, Command::ClientGet { .. }));
+}
+
+#[test]
+fn rejects_invalid_committed_read_arguments() {
+    for arguments in [
+        vec![
+            "agent-knowledge".into(),
+            "client".into(),
+            "search".into(),
+            "--destination".into(),
+            "fictional-knowledge".into(),
+        ],
+        vec![
+            "agent-knowledge".into(),
+            "client".into(),
+            "list".into(),
+            "--destination".into(),
+            "fictional-knowledge".into(),
+            "--maximum-results".into(),
+            "0".into(),
+        ],
+        vec![
+            "agent-knowledge".into(),
+            "client".into(),
+            "get".into(),
+            "--destination".into(),
+            "fictional-knowledge".into(),
+            "--document-id".into(),
+            "invalid".into(),
+        ],
+    ] {
+        assert!(matches!(parse_arguments(arguments), Err(CliError::Usage)));
+    }
+}
+
+#[test]
 fn parses_and_bounds_the_ssh_client_timeout() {
     let command = parse_arguments([
         "agent-knowledge".into(),
