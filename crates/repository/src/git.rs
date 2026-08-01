@@ -1105,7 +1105,7 @@ impl GitRepository {
         self.validate_live_storage()
     }
 
-    fn lock_writer(&self) -> Result<RepositoryWriter, GitTransactionError> {
+    pub(crate) fn lock_writer(&self) -> Result<RepositoryWriter, GitTransactionError> {
         let writer = lock_root_paths(
             &self.git_directory,
             &self.configured_git_directory,
@@ -1114,6 +1114,15 @@ impl GitRepository {
         )?;
         self.validate_live_storage()?;
         Ok(writer)
+    }
+
+    pub(crate) fn validate_replication_read(
+        &self,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(), GitTransactionError> {
+        validate_pinned_directory(&self.configured_git_directory, &self.git_root_handle)?;
+        validate_local_git_config_controlled(&self.git_directory, deadline, cancelled)
     }
 
     fn validate_live_storage(&self) -> Result<(), GitTransactionError> {
@@ -1386,7 +1395,7 @@ impl GitRepository {
         }
     }
 
-    fn resolve_commit(&self, revision: &str) -> Result<String, GitTransactionError> {
+    pub(crate) fn resolve_commit(&self, revision: &str) -> Result<String, GitTransactionError> {
         let expression = format!("{revision}^{{commit}}");
         let output = run_git(
             None,
@@ -1396,6 +1405,27 @@ impl GitRepository {
                 OsStr::new("--verify"),
                 OsStr::new(&expression),
             ],
+        )?;
+        parse_object_id(&output.stdout)
+    }
+
+    pub(crate) fn resolve_commit_controlled(
+        &self,
+        revision: &str,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<String, GitTransactionError> {
+        let expression = format!("{revision}^{{commit}}");
+        let output = run_git_until_controlled(
+            None,
+            Some(&self.git_directory),
+            [
+                OsStr::new("rev-parse"),
+                OsStr::new("--verify"),
+                OsStr::new(&expression),
+            ],
+            deadline,
+            cancelled,
         )?;
         parse_object_id(&output.stdout)
     }
@@ -1601,7 +1631,7 @@ pub(crate) fn ensure_canonical_worktree_clean_until(
     }
 }
 
-struct RepositoryWriter {
+pub(crate) struct RepositoryWriter {
     _repository: File,
     _work_root: File,
 }
@@ -2063,7 +2093,10 @@ fn lock_root_paths(
     }
 }
 
-fn validate_pinned_directory(configured: &Path, pinned: &File) -> Result<(), GitTransactionError> {
+pub(crate) fn validate_pinned_directory(
+    configured: &Path,
+    pinned: &File,
+) -> Result<(), GitTransactionError> {
     let configured_metadata = fs::symlink_metadata(configured).map_err(GitTransactionError::Io)?;
     let pinned_metadata = pinned.metadata().map_err(GitTransactionError::Io)?;
     if !configured_metadata.file_type().is_dir()
@@ -2075,13 +2108,13 @@ fn validate_pinned_directory(configured: &Path, pinned: &File) -> Result<(), Git
 }
 
 #[cfg(unix)]
-fn same_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+pub(crate) fn same_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 #[cfg(not(unix))]
-fn same_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+pub(crate) fn same_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.file_type() == right.file_type()
         && left.len() == right.len()
         && left.modified().ok() == right.modified().ok()
@@ -2458,23 +2491,81 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    match deadline {
-        Some(deadline) => run_git_until(working_directory, git_directory, arguments, deadline),
-        None => run_git(working_directory, git_directory, arguments),
-    }
+    run_git_for_read_controlled(
+        working_directory,
+        git_directory,
+        arguments,
+        deadline,
+        &|| false,
+    )
 }
 
-fn run_git_until<I, S>(
+pub(crate) fn run_git_for_read_controlled<I, S>(
     working_directory: Option<&Path>,
     git_directory: Option<&Path>,
     arguments: I,
-    deadline: Instant,
+    deadline: Option<Instant>,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<Output, GitTransactionError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    match deadline {
+        Some(deadline) => run_git_until_controlled(
+            working_directory,
+            git_directory,
+            arguments,
+            deadline,
+            cancelled,
+        ),
+        None => run_git(working_directory, git_directory, arguments),
+    }
+}
+
+pub(crate) fn run_git_until_controlled<I, S>(
+    working_directory: Option<&Path>,
+    git_directory: Option<&Path>,
+    arguments: I,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Output, GitTransactionError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_git_until_controlled_with_environment(
+        working_directory,
+        git_directory,
+        arguments,
+        deadline,
+        cancelled,
+        None,
+    )
+}
+
+pub(crate) fn run_git_until_controlled_with_environment<I, S>(
+    working_directory: Option<&Path>,
+    git_directory: Option<&Path>,
+    arguments: I,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+    environment: Option<(&OsStr, &OsStr)>,
+) -> Result<Output, GitTransactionError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    if cancelled() {
+        return Err(GitTransactionError::GitCancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(GitTransactionError::GitDeadlineExceeded);
+    }
     let mut command = git_command();
+    if let Some((name, value)) = environment {
+        command.env(name, value);
+    }
     if let Some(working_directory) = working_directory {
         command.arg("-C").arg(working_directory);
     }
@@ -2505,16 +2596,39 @@ where
     };
     let (capture_sender, capture_receiver) = mpsc::channel();
     let stdout_sender = capture_sender.clone();
-    let stdout_reader = thread::spawn(move || {
-        let _ = stdout_sender.send((0_usize, capture_bounded_output(stdout)));
-    });
-    let stderr_reader = thread::spawn(move || {
-        let _ = capture_sender.send((1_usize, capture_bounded_output(stderr)));
-    });
+    let stdout_reader = match thread::Builder::new()
+        .name("knowledge-git-stdout".into())
+        .spawn(move || {
+            let _ = stdout_sender.send((0_usize, capture_bounded_output(stdout)));
+        }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            kill_timed_git_process(&mut child);
+            let _ = child.wait();
+            return Err(GitTransactionError::Io(error));
+        }
+    };
+    let stderr_reader = match thread::Builder::new()
+        .name("knowledge-git-stderr".into())
+        .spawn(move || {
+            let _ = capture_sender.send((1_usize, capture_bounded_output(stderr)));
+        }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            kill_timed_git_process(&mut child);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            return Err(GitTransactionError::Io(error));
+        }
+    };
 
     let mut status = None;
     let mut captured = [None, None];
     while status.is_none() || captured.iter().any(Option::is_none) {
+        if cancelled() {
+            terminate_timed_git(&mut child, stdout_reader, stderr_reader);
+            return Err(GitTransactionError::GitCancelled);
+        }
         let now = Instant::now();
         if now >= deadline {
             terminate_timed_git(&mut child, stdout_reader, stderr_reader);
@@ -2694,6 +2808,12 @@ fn git_command() -> Command {
     command
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -oBatchMode=yes -oClearAllForwardings=yes",
+        )
         .args([
             "-c",
             "core.fsync=all",
@@ -2713,6 +2833,20 @@ fn git_command() -> Command {
     command
 }
 
+impl GitRepository {
+    pub(crate) fn git_directory(&self) -> &Path {
+        &self.git_directory
+    }
+
+    pub(crate) fn official_ref(&self) -> &str {
+        &self.official_ref
+    }
+
+    pub(crate) fn repository_state_directory(&self) -> PathBuf {
+        self.git_directory.join("agent-knowledge")
+    }
+}
+
 pub(crate) fn validate_local_git_config(git_directory: &Path) -> Result<(), GitTransactionError> {
     validate_local_git_config_until(git_directory, None)
 }
@@ -2721,7 +2855,16 @@ pub(crate) fn validate_local_git_config_until(
     git_directory: &Path,
     deadline: Option<Instant>,
 ) -> Result<(), GitTransactionError> {
-    let output = run_git_for_read(
+    validate_local_git_config_controlled(git_directory, deadline, &|| false)
+}
+
+fn validate_local_git_config_controlled(
+    git_directory: &Path,
+    deadline: impl Into<Option<Instant>>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), GitTransactionError> {
+    let deadline = deadline.into();
+    let output = run_git_for_read_controlled(
         None,
         Some(git_directory),
         [
@@ -2732,6 +2875,7 @@ pub(crate) fn validate_local_git_config_until(
             OsStr::new("--list"),
         ],
         deadline,
+        cancelled,
     )?;
     for key in output.stdout.split(|byte| *byte == 0) {
         if key.is_empty() {
@@ -2750,18 +2894,19 @@ pub(crate) fn validate_local_git_config_until(
             return Err(GitTransactionError::UnsafeGitConfig);
         }
     }
-    require_local_boolean(git_directory, "core.bare", true, deadline)?;
-    require_local_boolean(git_directory, "core.filemode", true, deadline)?;
+    require_local_boolean_controlled(git_directory, "core.bare", true, deadline, cancelled)?;
+    require_local_boolean_controlled(git_directory, "core.filemode", true, deadline, cancelled)?;
     Ok(())
 }
 
-fn require_local_boolean(
+fn require_local_boolean_controlled(
     git_directory: &Path,
     key: &str,
     expected: bool,
     deadline: Option<Instant>,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<(), GitTransactionError> {
-    let output = run_git_for_read(
+    let output = run_git_for_read_controlled(
         None,
         Some(git_directory),
         [
@@ -2772,6 +2917,7 @@ fn require_local_boolean(
             OsStr::new(key),
         ],
         deadline,
+        cancelled,
     )?;
     if parse_text(&output.stdout)? == if expected { "true" } else { "false" } {
         Ok(())
@@ -3063,8 +3209,10 @@ pub enum GitTransactionError {
     },
     /// Git returned malformed machine-readable output.
     InvalidGitOutput,
-    /// A read-only Git inspection exceeded its absolute operation deadline.
+    /// A Git operation exceeded its absolute deadline.
     GitDeadlineExceeded,
+    /// A controlled Git subprocess was cancelled before its deadline.
+    GitCancelled,
     /// A transaction attempted a physical content deletion.
     PhysicalDeletion,
     /// A Git subprocess failed.
@@ -3170,9 +3318,8 @@ impl fmt::Display for GitTransactionError {
                 "official commit `{commit}` advanced but transaction cleanup failed: {source}"
             ),
             Self::InvalidGitOutput => formatter.write_str("Git returned invalid output"),
-            Self::GitDeadlineExceeded => {
-                formatter.write_str("read-only Git inspection exceeded its deadline")
-            }
+            Self::GitDeadlineExceeded => formatter.write_str("Git operation exceeded its deadline"),
+            Self::GitCancelled => formatter.write_str("Git operation was cancelled"),
             Self::PhysicalDeletion => {
                 formatter.write_str("Git transaction attempted a physical content deletion")
             }

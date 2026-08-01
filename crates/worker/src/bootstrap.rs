@@ -6,7 +6,9 @@ use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueError};
 use agent_knowledge_release::{
     QuartzBuildError, QuartzBuilder, ReleaseError, ReleasePolicy, ReleaseStore,
 };
-use agent_knowledge_repository::{ContentPolicy, GitRepository, GitTransactionError};
+use agent_knowledge_repository::{
+    ContentPolicy, GitRepository, GitTransactionError, RemoteReplicationError, RemoteReplicator,
+};
 use time::OffsetDateTime;
 
 use crate::{
@@ -19,6 +21,7 @@ use crate::{
 pub struct WorkerBootstrap {
     queue: FileQueue,
     processor: BatchProcessor,
+    replication: Option<RemoteReplicator>,
     limits: WorkerRunLimits,
     schedule: BatchSchedule,
 }
@@ -50,6 +53,12 @@ impl WorkerBootstrap {
             settings.identity().clone(),
         )
         .map_err(|error| WorkerOpenError::Repository(Box::new(error)))?;
+        let replication = settings
+            .replication()
+            .cloned()
+            .map(|policy| RemoteReplicator::open(repository.clone(), policy))
+            .transpose()
+            .map_err(|error| WorkerOpenError::Replication(Box::new(error)))?;
         let release_policy = ReleasePolicy::default();
         let quartz = QuartzBuilder::new_with_policy(
             topology.quartz_program.stable_path(),
@@ -75,6 +84,7 @@ impl WorkerBootstrap {
         Ok(Self {
             queue,
             processor,
+            replication,
             limits: settings.limits(),
             schedule: settings.schedule(),
         })
@@ -110,9 +120,10 @@ impl WorkerBootstrap {
         should_stop: &impl Fn() -> bool,
     ) -> Result<InterruptibleStart<(WorkerRuntime, StartupOutcome, BatchSchedule)>, WorkerRunError>
     {
-        let started = WorkerRuntime::start_interruptible(
+        let started = WorkerRuntime::start_interruptible_with_replication(
             &self.queue,
             self.processor,
+            self.replication,
             self.limits,
             created_at,
             should_stop,
@@ -150,6 +161,8 @@ pub enum WorkerOpenError {
     },
     /// The repository transaction boundary was invalid.
     Repository(Box<GitTransactionError>),
+    /// Git remote replication could not be initialized.
+    Replication(Box<RemoteReplicationError>),
     /// The configured Quartz command could not be pinned.
     Quartz(Box<QuartzBuildError>),
     /// The release store could not be opened.
@@ -169,6 +182,9 @@ impl fmt::Display for WorkerOpenError {
                 write!(formatter, "could not attest {component}: {source}")
             }
             Self::Repository(error) => write!(formatter, "could not open repository: {error}"),
+            Self::Replication(error) => {
+                write!(formatter, "could not open Git remote replication: {error}")
+            }
             Self::Quartz(error) => write!(formatter, "could not open Quartz builder: {error}"),
             Self::Release(error) => write!(formatter, "could not open release store: {error}"),
             Self::Queue(error) => write!(formatter, "could not open durable queue: {error}"),
@@ -182,6 +198,7 @@ impl std::error::Error for WorkerOpenError {
             Self::OverlappingPaths { .. } => None,
             Self::Attestation { source, .. } => Some(source),
             Self::Repository(error) => Some(error),
+            Self::Replication(error) => Some(error),
             Self::Quartz(error) => Some(error),
             Self::Release(error) => Some(error),
             Self::Queue(error) => Some(error),

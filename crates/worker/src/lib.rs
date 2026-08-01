@@ -10,7 +10,9 @@ use agent_knowledge_release::{
     ActiveRelease, BuiltDirectory, PreparedRelease, QuartzBuildError, QuartzBuilder, ReleaseError,
     ReleaseStore,
 };
-pub use agent_knowledge_repository::BatchCommitOutcome;
+pub use agent_knowledge_repository::{
+    BatchCommitOutcome, RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicationPolicy,
+};
 use agent_knowledge_repository::{
     BatchPublication, ClaimedBatch, ContentPolicy, GitRepository, GitTransactionError,
     PublicationError, RepositoryTransaction, RequestFailure,
@@ -316,8 +318,8 @@ impl BatchProcessor {
 
 mod runtime;
 pub use runtime::{
-    InterruptibleStart, StartupOutcome, WorkerPollOutcome, WorkerRunError, WorkerRunLimits,
-    WorkerRunOutcome, WorkerRuntime,
+    InterruptibleStart, ReplicationEventError, StartupOutcome, WorkerPollOutcome, WorkerRunError,
+    WorkerRunLimits, WorkerRunOutcome, WorkerRuntime,
 };
 mod schedule;
 pub use schedule::{BatchCloseReason, BatchReadiness, BatchSchedule, BatchScheduleError};

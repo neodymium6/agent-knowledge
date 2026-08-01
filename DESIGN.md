@@ -310,7 +310,27 @@ that escapes the group before restarting recovery.
 
 The remote is an asynchronous backup target. A remote push failure does not
 roll back a locally committed and published change. The Worker records that the
-remote is behind and retries the push.
+remote is behind and retries the push. The current official commit is the
+authoritative synchronization target, so a crash between local publication and
+retry-state persistence cannot lose a push. The Worker durably records the last
+confirmed remote commit, consecutive failures, and the next retry time. Pushes
+run on an independent background thread that is woken by local publication and
+otherwise sleeps until a retry or bounded low-frequency verification poll is
+due. They use an exact commit-to-branch refspec, non-interactive Git and SSH
+credential modes, a per-attempt timeout, shutdown cancellation, and capped
+exponential backoff. Mirror remotes and multiple push destinations are
+incompatible and rejected. Pushes never force-update the remote branch, and
+replication inspection does not acquire the local repository writer lock. A
+fingerprint of the configured push URL is part
+of the durable destination identity, so repointing a named remote invalidates
+its previous success record without persisting sensitive URL text. Reportable
+events are retained in a bounded queue; replication pauses when it is full
+rather than overwriting an unread event. Each attempt revalidates the pinned
+repository identity and local Git configuration without taking writer
+ownership, then pushes through an isolated temporary Git directory to the exact
+validated URL snapshot. One absolute deadline and the shutdown signal cover
+every Git subprocess in the attempt. An unexpected replication-thread exit is
+a distinct operational error rather than an idle state.
 
 ## 8. Storage layout
 
@@ -1420,7 +1440,7 @@ Configuration, rather than architecture, controls:
 - Git remote name and branch;
 - Quartz command and configuration;
 - release retention;
-- retry limits and backoff;
+- retry timeouts and backoff;
 - title length;
 - search backend; and
 - CLI output format.
@@ -1522,7 +1542,7 @@ Implementation proceeds in these increments:
 5. Quartz trial builds and atomic releases.
 6. OpenSSH forced-command Gateway and client SSH transport.
 7. Committed reads and initial full-text search.
-8. Request status (implemented), remote push retry, operational status, and
+8. Request status and remote push retry (implemented), operational status, and
    retention.
 9. Optional container and single-replica Kubernetes packaging.
 

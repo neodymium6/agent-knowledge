@@ -83,6 +83,22 @@ fn decodes_strict_versioned_operational_settings() {
 }
 
 #[test]
+fn decodes_optional_remote_replication_policy() {
+    let yaml = valid_yaml(Path::new("/srv/fictional-knowledge")).replace(
+        "  author_email: worker@example.invalid\n",
+        "  author_email: worker@example.invalid\n  replication:\n    remote: fictional-backup\n    branch: main\n    timeout_seconds: 30\n    initial_backoff_seconds: 10\n    maximum_backoff_seconds: 3600\n",
+    );
+    let settings = WorkerSettings::decode(&yaml)
+        .unwrap_or_else(|error| panic!("replication settings must decode: {error}"));
+    let replication = settings
+        .replication()
+        .unwrap_or_else(|| panic!("replication policy must be present"));
+
+    assert_eq!(replication.remote(), "fictional-backup");
+    assert_eq!(replication.branch(), "main");
+}
+
+#[test]
 fn rejects_unknown_fields_aliases_and_multiple_documents() {
     let root = Path::new("/srv/fictional-knowledge");
     let mut unknown = valid_yaml(root);
@@ -190,6 +206,28 @@ fn rejects_unsafe_paths_and_invalid_operational_bounds() {
         WorkerSettings::decode(&excessive_timeout),
         Err(WorkerConfigError::InvalidValue {
             field: "quartz.timeout_seconds"
+        })
+    ));
+
+    let invalid_replication = valid_yaml(root).replace(
+        "  author_email: worker@example.invalid\n",
+        "  author_email: worker@example.invalid\n  replication:\n    remote: --upload-pack=fictional\n    branch: main\n    timeout_seconds: 30\n    initial_backoff_seconds: 10\n    maximum_backoff_seconds: 3600\n",
+    );
+    assert!(matches!(
+        WorkerSettings::decode(&invalid_replication),
+        Err(WorkerConfigError::InvalidValue {
+            field: "repository.replication"
+        })
+    ));
+
+    let excessive_backoff = valid_yaml(root).replace(
+        "  author_email: worker@example.invalid\n",
+        "  author_email: worker@example.invalid\n  replication:\n    remote: fictional-backup\n    branch: main\n    timeout_seconds: 30\n    initial_backoff_seconds: 10\n    maximum_backoff_seconds: 9223372036854775807\n",
+    );
+    assert!(matches!(
+        WorkerSettings::decode(&excessive_backoff),
+        Err(WorkerConfigError::InvalidValue {
+            field: "repository.replication.maximum_backoff_seconds"
         })
     ));
 }

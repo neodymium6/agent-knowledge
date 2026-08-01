@@ -6,7 +6,7 @@ use std::time::Duration as StandardDuration;
 use std::time::Instant;
 
 use agent_knowledge_core::{BoundedFileError, read_bounded_regular_file};
-use agent_knowledge_repository::GitIdentity;
+use agent_knowledge_repository::{GitIdentity, RemoteReplicationPolicy};
 use serde::Deserialize;
 use time::Duration;
 
@@ -26,6 +26,7 @@ pub struct WorkerSettings {
     release_root: PathBuf,
     official_branch: String,
     identity: GitIdentity,
+    replication: Option<RemoteReplicationPolicy>,
     quartz_program: PathBuf,
     quartz_integration_root: PathBuf,
     quartz_timeout: StandardDuration,
@@ -129,6 +130,12 @@ impl WorkerSettings {
         &self.identity
     }
 
+    /// Returns optional asynchronous Git remote replication settings.
+    #[must_use]
+    pub const fn replication(&self) -> Option<&RemoteReplicationPolicy> {
+        self.replication.as_ref()
+    }
+
     /// Returns the trusted Quartz executable path.
     #[must_use]
     pub fn quartz_program(&self) -> &Path {
@@ -197,6 +204,34 @@ impl TryFrom<WireWorkerConfig> for WorkerSettings {
                     field: "repository author identity",
                 },
             )?;
+        let replication = wire
+            .repository
+            .replication
+            .map(|replication| {
+                let timeout = positive_standard_duration(
+                    "repository.replication.timeout_seconds",
+                    replication.timeout_seconds,
+                )?;
+                let initial_backoff = positive_standard_duration(
+                    "repository.replication.initial_backoff_seconds",
+                    replication.initial_backoff_seconds,
+                )?;
+                let maximum_backoff = positive_standard_duration(
+                    "repository.replication.maximum_backoff_seconds",
+                    replication.maximum_backoff_seconds,
+                )?;
+                RemoteReplicationPolicy::new(
+                    &replication.remote,
+                    &replication.branch,
+                    timeout,
+                    initial_backoff,
+                    maximum_backoff,
+                )
+                .map_err(|_| WorkerConfigError::InvalidValue {
+                    field: "repository.replication",
+                })
+            })
+            .transpose()?;
         let quartz_timeout =
             positive_standard_duration("quartz.timeout_seconds", wire.quartz.timeout_seconds)?;
         let debounce =
@@ -231,6 +266,7 @@ impl TryFrom<WireWorkerConfig> for WorkerSettings {
             release_root: wire.storage.release_root,
             official_branch: wire.repository.official_branch,
             identity,
+            replication,
             quartz_program: wire.quartz.program,
             quartz_integration_root: wire.quartz.integration_root,
             quartz_timeout,
@@ -346,6 +382,17 @@ struct WireRepository {
     official_branch: String,
     author_name: String,
     author_email: String,
+    replication: Option<WireReplication>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireReplication {
+    remote: String,
+    branch: String,
+    timeout_seconds: u64,
+    initial_backoff_seconds: u64,
+    maximum_backoff_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]

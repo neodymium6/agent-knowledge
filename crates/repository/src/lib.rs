@@ -4,6 +4,7 @@ mod apply;
 mod git;
 mod index;
 mod read;
+mod replication;
 
 pub use apply::ApplyError;
 pub use git::{
@@ -17,4 +18,7 @@ pub use index::{
 pub use read::{
     CommittedDocument, CommittedReadError, CommittedSnapshot, CommittedStore, LinearSearch,
     ReadFilter, SearchBackend, SearchMetadataFields, SearchPolicy,
+};
+pub use replication::{
+    RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicationPolicy, RemoteReplicator,
 };

@@ -7,8 +7,9 @@ use std::thread;
 use std::time::{Duration as StandardDuration, Instant};
 
 use agent_knowledge_worker::{
-    BatchCloseReason, BatchCommitOutcome, InterruptibleStart, StartupOutcome, WorkerBootstrap,
-    WorkerConfigError, WorkerOpenError, WorkerPollOutcome, WorkerRunError, WorkerSettings,
+    BatchCloseReason, BatchCommitOutcome, InterruptibleStart, RemoteReplicationOutcome,
+    ReplicationEventError, StartupOutcome, WorkerBootstrap, WorkerConfigError, WorkerOpenError,
+    WorkerPollOutcome, WorkerRunError, WorkerSettings,
 };
 use serde::Serialize;
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -93,11 +94,76 @@ where
             break;
         }
         write_poll_log(output, completed_at, &outcome)?;
+        if let Some(replication) = runtime.take_replication_event() {
+            match replication {
+                Ok(outcome) => write_replication_log(output, completed_at, Some(&outcome))?,
+                Err(error) => write_replication_error_log(output, completed_at, &error)?,
+            }
+        }
         if let Some(duration) = wait_after_poll(&outcome, completed_at) {
             let _ = wait_for_termination(&stopping, duration);
         }
     }
     write_stopped_log(output, stopped_failures)
+}
+
+fn write_replication_log<W>(
+    output: &mut W,
+    timestamp: OffsetDateTime,
+    outcome: Option<&RemoteReplicationOutcome>,
+) -> Result<(), WorkerCommandError>
+where
+    W: Write,
+{
+    let record = match outcome {
+        Some(RemoteReplicationOutcome::Pushed { commit }) => {
+            let mut record = WorkerLogRecord::new(timestamp, "remote_replication_succeeded");
+            record.commit = Some(commit.clone());
+            Some(record)
+        }
+        Some(RemoteReplicationOutcome::Failed {
+            commit,
+            consecutive_failures,
+            retry_at,
+        }) => {
+            let mut record = WorkerLogRecord::new(timestamp, "remote_replication_failed");
+            record.severity = "warning";
+            record.commit = Some(commit.clone());
+            record.consecutive_failures = Some(*consecutive_failures);
+            record.retry_at = Some(
+                retry_at
+                    .format(&Rfc3339)
+                    .map_err(WorkerCommandError::Timestamp)?,
+            );
+            Some(record)
+        }
+        None
+        | Some(RemoteReplicationOutcome::Cancelled)
+        | Some(RemoteReplicationOutcome::UpToDate { .. })
+        | Some(RemoteReplicationOutcome::Deferred { .. }) => None,
+    };
+    match record {
+        Some(record) => write_worker_log(output, record),
+        None => Ok(()),
+    }
+}
+
+fn write_replication_error_log<W>(
+    output: &mut W,
+    timestamp: OffsetDateTime,
+    error: &ReplicationEventError,
+) -> Result<(), WorkerCommandError>
+where
+    W: Write,
+{
+    let event = match error {
+        ReplicationEventError::Attempt(_) => "remote_replication_state_error",
+        ReplicationEventError::ThreadStopped => "remote_replication_thread_stopped",
+    };
+    let mut record = WorkerLogRecord::new(timestamp, event);
+    record.severity = "error";
+    record.error_code = Some(event);
+    write_worker_log(output, record)
 }
 
 fn write_stopped_log<W>(output: &mut W, failed_requests: usize) -> Result<(), WorkerCommandError>
@@ -296,6 +362,10 @@ struct WorkerLogRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     failed_requests: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    consecutive_failures: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error_code: Option<&'static str>,
 }
 
@@ -314,6 +384,8 @@ impl WorkerLogRecord {
             commit: None,
             successful_requests: None,
             failed_requests: None,
+            consecutive_failures: None,
+            retry_at: None,
             error_code: None,
         }
     }

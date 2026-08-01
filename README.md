@@ -10,13 +10,14 @@ restricted gateway; they do not synchronize the repository with Git.
 ## Status
 
 The architecture is defined, delivery increments 1 through 7 are implemented,
-and the request-status portion of increment 8 is complete. The current
+and the request-status and Git-replication portions of increment 8 are complete. The current
 executable can accept requests locally or through an
 OpenSSH forced command, process them through the single Writer, and publish
 immutable Quartz releases. Coding agents can list, retrieve, and search an
 exact committed content snapshot and inspect durable request state through the
-same Gateway. Bundle export, remote-push retry, retention, and packaging remain
-future work.
+same Gateway. Git remote replication runs asynchronously with durable retry
+state. Bundle export, operational status, retention, and packaging remain future
+work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -51,6 +52,57 @@ Run the Repository Worker with a validated deployment configuration:
 ```sh
 agent-knowledge worker run --config /srv/agent-knowledge/worker.yaml
 ```
+
+The Worker accepts a strict configuration such as:
+
+```yaml
+schema_version: 1
+storage:
+  queue_root: /srv/fictional-knowledge/queue
+  repository_root: /srv/fictional-knowledge/repository
+  content_root: /srv/fictional-knowledge/content
+  work_root: /srv/fictional-knowledge/work
+  release_root: /srv/fictional-knowledge/releases
+repository:
+  official_branch: main
+  author_name: Fictional Knowledge Worker
+  author_email: worker@example.invalid
+  replication:
+    remote: fictional-backup
+    branch: main
+    timeout_seconds: 30
+    initial_backoff_seconds: 10
+    maximum_backoff_seconds: 3600
+quartz:
+  program: /opt/fictional-quartz/bin/build-site
+  integration_root: /opt/fictional-quartz
+  timeout_seconds: 300
+batch:
+  debounce_seconds: 30
+  maximum_age_seconds: 300
+  maximum_scan_entries: 1024
+  maximum_requests: 100
+  maximum_recovery_requests: 10000
+```
+
+`repository.replication` is optional. When present, the named non-mirror remote
+must already exist in the bare repository and resolve to exactly one push URL.
+Authentication belongs in the service account's Git/SSH deployment
+configuration; credentials are not
+accepted in the Worker configuration. A push failure never rolls back the local
+commit, canonical content, active Quartz release, or completed request. The
+Worker performs pushes on an independent background thread, so a slow remote
+does not delay queue processing. Local publication wakes that thread; otherwise
+it sleeps until a retry is due, with a bounded low-frequency verification poll.
+It persists the last confirmed commit, a fingerprint of the configured push
+URL, and an exponential retry deadline under the bare repository. It caps delay
+at `maximum_backoff_seconds`, disables interactive Git and SSH credential
+prompts, and applies one `timeout_seconds` deadline to every Git subprocess in
+an attempt, including local Git inspection. Local replication-state filesystem
+I/O is outside that subprocess deadline. Each push uses an isolated temporary
+Git directory and the exact validated URL snapshot, so later changes to the
+main repository's local Git configuration cannot change that attempt's
+destination or behavior.
 
 Submit a validated request package through an SSH host alias:
 
@@ -145,8 +197,18 @@ repository application. Queue-validation counts are retained in the durable
 repository transaction journal, so resumed batch events preserve them.
 Terminal process failures use a stable `error_code` and include any requests
 already rejected during the interrupted cycle.
+Remote replication emits `remote_replication_succeeded` after a new commit is
+confirmed and `remote_replication_failed` with `commit`,
+`consecutive_failures`, and `retry_at` after a failed attempt. Durable-state
+validation failures emit `remote_replication_state_error` once until the state
+becomes readable again. Up-to-date and deferred polls are intentionally quiet.
+Reportable events use a bounded in-process queue; when that queue is full,
+replication pauses instead of overwriting an unread event.
+An unexpected background-thread exit emits
+`remote_replication_thread_stopped` instead of appearing as an idle poll.
 
 `SIGINT` and `SIGTERM` request graceful shutdown before a new durable
-transaction or after the current transaction completes. A supervisor must
-signal only the main Worker process initially and reserve group-wide `SIGKILL`
-for its hard-stop timeout.
+transaction or after the current transaction completes. An in-flight remote
+push is cancelled when the Worker runtime shuts down. A supervisor must signal
+only the main Worker process initially and reserve group-wide `SIGKILL` for its
+hard-stop timeout.

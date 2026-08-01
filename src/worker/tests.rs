@@ -3,14 +3,15 @@ use std::time::Duration as StandardDuration;
 
 use agent_knowledge_queue::WorkerQueueError;
 use agent_knowledge_worker::{
-    BatchCommitOutcome, StartupOutcome, WorkerPollOutcome, WorkerRunError, WorkerSettings,
+    BatchCommitOutcome, RemoteReplicationError, RemoteReplicationOutcome, ReplicationEventError,
+    StartupOutcome, WorkerPollOutcome, WorkerRunError, WorkerSettings,
 };
 use time::{Duration, OffsetDateTime};
 
 use super::{
     MAXIMUM_SIGNAL_WAIT, WorkerCommandError, WorkerLogRecord, add_commit_outcome, wait_after_poll,
-    wait_for_termination, write_failure_log, write_poll_log, write_startup_log, write_stopped_log,
-    write_worker_log,
+    wait_for_termination, write_failure_log, write_poll_log, write_replication_error_log,
+    write_replication_log, write_startup_log, write_stopped_log, write_worker_log,
 };
 
 #[test]
@@ -66,6 +67,79 @@ fn startup_log_is_structured_json() {
     assert_eq!(value["component"], "worker");
     assert_eq!(value["event"], "worker_started");
     assert!(value.get("batch_id").is_none());
+}
+
+#[test]
+fn remote_replication_attempts_have_stable_structured_events() {
+    let timestamp = OffsetDateTime::parse(
+        "2026-08-01T04:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap_or_else(|error| panic!("fixture timestamp must parse: {error}"));
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let retry_at = timestamp + Duration::seconds(30);
+    let mut output = Vec::new();
+
+    write_replication_log(
+        &mut output,
+        timestamp,
+        Some(&RemoteReplicationOutcome::Failed {
+            commit: commit.into(),
+            consecutive_failures: 2,
+            retry_at,
+        }),
+    )
+    .unwrap_or_else(|error| panic!("failure event must serialize: {error}"));
+    let failed: serde_json::Value = serde_json::from_slice(&output)
+        .unwrap_or_else(|error| panic!("failure event must be JSON: {error}"));
+    assert_eq!(failed["event"], "remote_replication_failed");
+    assert_eq!(failed["severity"], "warning");
+    assert_eq!(failed["commit"], commit);
+    assert_eq!(failed["consecutive_failures"], 2);
+    assert_eq!(failed["retry_at"], "2026-08-01T04:00:30Z");
+
+    output.clear();
+    write_replication_log(
+        &mut output,
+        timestamp,
+        Some(&RemoteReplicationOutcome::Pushed {
+            commit: commit.into(),
+        }),
+    )
+    .unwrap_or_else(|error| panic!("success event must serialize: {error}"));
+    let succeeded: serde_json::Value = serde_json::from_slice(&output)
+        .unwrap_or_else(|error| panic!("success event must be JSON: {error}"));
+    assert_eq!(succeeded["event"], "remote_replication_succeeded");
+    assert_eq!(succeeded["commit"], commit);
+
+    output.clear();
+    write_replication_error_log(
+        &mut output,
+        timestamp,
+        &ReplicationEventError::Attempt(RemoteReplicationError::InvalidState),
+    )
+    .unwrap_or_else(|error| panic!("state error event must serialize: {error}"));
+    let state_error: serde_json::Value = serde_json::from_slice(&output)
+        .unwrap_or_else(|error| panic!("state error event must be JSON: {error}"));
+    assert_eq!(state_error["event"], "remote_replication_state_error");
+    assert_eq!(state_error["severity"], "error");
+    assert_eq!(state_error["error_code"], "remote_replication_state_error");
+
+    output.clear();
+    write_replication_error_log(
+        &mut output,
+        timestamp,
+        &ReplicationEventError::ThreadStopped,
+    )
+    .unwrap_or_else(|error| panic!("thread failure event must serialize: {error}"));
+    let thread_error: serde_json::Value = serde_json::from_slice(&output)
+        .unwrap_or_else(|error| panic!("thread failure event must be JSON: {error}"));
+    assert_eq!(thread_error["event"], "remote_replication_thread_stopped");
+    assert_eq!(thread_error["severity"], "error");
+    assert_eq!(
+        thread_error["error_code"],
+        "remote_replication_thread_stopped"
+    );
 }
 
 #[test]
