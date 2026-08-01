@@ -6,7 +6,8 @@ use std::path::Path;
 use agent_knowledge_core::{BatchId, RequestId, Revision};
 
 use super::{
-    ClaimedPackage, PendingObservationScan, WorkerQueueError, next_attempt, revalidate_accepted,
+    ClaimedPackage, PendingObservationScan, WorkerQueueError, current_maximum_sequence,
+    next_attempt, revalidate_accepted,
 };
 use crate::file_queue::{FileQueue, NEXT_SEQUENCE_FILE_NAME, QueueState, read_next_sequence};
 
@@ -457,6 +458,13 @@ fn inspect_pending_candidate(
     })?;
     let sequence = acceptance.sequence.get();
     if sequence > scan.maximum_sequence {
+        if sequence > current_maximum_sequence(queue)? {
+            return Err(WorkerQueueError::CorruptState {
+                request_id,
+                state: QueueState::Pending,
+                detail: "acceptance sequence exceeds the queue allocation state",
+            });
+        }
         return Ok(None);
     }
     let _ = next_attempt(path, request_id, QueueState::Pending)?;

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use agent_knowledge_core::RequestId;
 use time::OffsetDateTime;
 
-use super::{WorkerQueueError, WorkerSession};
+use super::{WorkerQueueError, WorkerSession, current_maximum_sequence};
 use crate::PackageValidationError;
 use crate::file_queue::{NEXT_SEQUENCE_FILE_NAME, QueueState, read_next_sequence};
 use crate::package::read_acceptance_file;
@@ -100,6 +100,14 @@ impl PendingObservationScan {
 }
 
 impl WorkerSession {
+    /// Discards an unfinished read-only pending observation.
+    ///
+    /// This does not change queue contents and allows a caller to replace a
+    /// partially observed schedule snapshot with an immediate batch claim.
+    pub fn discard_pending_observation(&mut self) {
+        self.pending_observation = PendingObservationScan::default();
+    }
+
     /// Incrementally observes a fixed pending acceptance snapshot.
     ///
     /// Each invocation inspects at most `maximum_scan_entries`. Requests
@@ -157,9 +165,9 @@ impl WorkerSession {
                 break;
             };
             scanned_entries += 1;
-            let result = entry
-                .map_err(WorkerQueueError::Io)
-                .and_then(|entry| inspect_pending(&mut self.pending_observation, entry));
+            let result = entry.map_err(WorkerQueueError::Io).and_then(|entry| {
+                inspect_pending(&self.queue, &mut self.pending_observation, entry)
+            });
             if let Err(error) = result {
                 self.pending_observation = PendingObservationScan::default();
                 return Err(error);
@@ -180,6 +188,7 @@ impl WorkerSession {
 }
 
 fn inspect_pending(
+    queue: &crate::FileQueue,
     scan: &mut PendingObservationScan,
     entry: fs::DirEntry,
 ) -> Result<(), WorkerQueueError> {
@@ -194,6 +203,10 @@ fn inspect_pending(
         }
     };
     if acceptance.sequence.get() > scan.maximum_sequence {
+        if acceptance.sequence.get() > current_maximum_sequence(queue)? {
+            scan.requests = scan.requests.saturating_add(1);
+            scan.has_invalid_acceptance = true;
+        }
         return Ok(());
     }
     scan.requests = scan.requests.saturating_add(1);

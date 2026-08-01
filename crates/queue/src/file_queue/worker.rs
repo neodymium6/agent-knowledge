@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use super::{FileQueue, QueueError, QueueState, sync_directory};
+use super::{
+    FileQueue, NEXT_SEQUENCE_FILE_NAME, QueueError, QueueState, read_next_sequence, sync_directory,
+};
 use crate::{PackageValidationError, ValidatedPackage, validate_accepted_package};
 
 mod batch;
@@ -796,3 +798,14 @@ impl std::error::Error for WorkerQueueError {
 
 #[cfg(test)]
 mod tests;
+
+pub(super) fn current_maximum_sequence(queue: &FileQueue) -> Result<u64, WorkerQueueError> {
+    let queue_lock = queue.open_queue_lock().map_err(WorkerQueueError::Queue)?;
+    queue_lock.lock().map_err(WorkerQueueError::Io)?;
+    queue
+        .current_identity_locked()
+        .map_err(WorkerQueueError::Queue)?;
+    let next_sequence = read_next_sequence(&queue.queue_root.join(NEXT_SEQUENCE_FILE_NAME))
+        .map_err(WorkerQueueError::Queue)?;
+    Ok(next_sequence - 1)
+}
