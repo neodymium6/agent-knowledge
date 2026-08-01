@@ -581,7 +581,7 @@ fn runtime_starts_clean_and_reports_an_empty_snapshot() {
         runtime
             .run_once(created_at())
             .unwrap_or_else(|error| panic!("empty cycle must complete: {error}")),
-        WorkerRunOutcome::Idle
+        WorkerRunOutcome::Idle { failed_requests: 0 }
     );
 }
 
@@ -916,6 +916,10 @@ fn shutdown_between_claim_scans_prevents_a_new_transaction() {
             .count(),
         0
     );
+    assert!(matches!(
+        runtime.poll_once(BatchSchedule::default(), ready_time),
+        Err(WorkerRunError::RecoveryRequired)
+    ));
 
     drop(runtime);
     let startup_checks = Cell::new(0_u8);
@@ -1014,9 +1018,61 @@ fn scheduler_reports_invalid_only_snapshots_without_a_commit() {
             .unwrap_or_else(|error| panic!("invalid snapshot must close: {error}")),
         WorkerPollOutcome::ClosedWithoutCommit {
             reason: BatchCloseReason::InvalidAcceptance,
-            requests: 1,
+            failed_requests: 1,
         }
     );
+    assert!(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/{}/{REQUEST_ID}", QueueState::Failed))
+            .is_dir()
+    );
+}
+
+#[test]
+fn scheduler_reports_claim_failures_in_a_committed_mixed_batch() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
+    enqueue_create(&queue);
+    enqueue_create_with_ids(&queue, SECOND_REQUEST_ID, SECOND_DOCUMENT_ID);
+    fs::write(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/pending/{REQUEST_ID}/digest")),
+        b"not-a-digest\n",
+    )
+    .unwrap_or_else(|error| panic!("corrupt package fixture must be written: {error}"));
+    let (mut runtime, startup) = WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("runtime must start: {error}"));
+    assert_eq!(startup, StartupOutcome::Clean);
+
+    let outcome = runtime
+        .poll_once(
+            BatchSchedule::default(),
+            OffsetDateTime::now_utc() + TimeDuration::minutes(10),
+        )
+        .unwrap_or_else(|error| panic!("mixed batch must finish: {error}"));
+    assert!(matches!(
+        outcome,
+        WorkerPollOutcome::Processed {
+            claim_failures: 1,
+            outcome: BatchCommitOutcome::Committed {
+                successful,
+                failures,
+                ..
+            },
+            ..
+        } if successful.len() == 1 && failures.is_empty()
+    ));
     assert!(
         fixture
             .root
@@ -1060,6 +1116,6 @@ fn immediate_run_discards_a_partial_scheduler_observation() {
         runtime
             .run_once(OffsetDateTime::now_utc())
             .unwrap_or_else(|error| panic!("runtime must remain reusable: {error}")),
-        WorkerRunOutcome::Idle
+        WorkerRunOutcome::Idle { failed_requests: 0 }
     );
 }

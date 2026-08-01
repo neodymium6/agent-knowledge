@@ -22,7 +22,12 @@ pub enum BatchClaimOutcome {
         retained_candidates: usize,
     },
     /// The complete snapshot was scanned and its earliest requests were claimed.
-    Claimed(Vec<ClaimedPackage>),
+    Claimed {
+        /// Valid requests durably moved to processing.
+        claims: Vec<ClaimedPackage>,
+        /// Corrupt requests durably moved to failed while scanning.
+        failed_requests: usize,
+    },
 }
 
 /// Exclusive Repository Worker access to one file queue.
@@ -49,6 +54,7 @@ struct PendingBatchScan {
     batch_id: Option<BatchId>,
     maximum_requests: usize,
     maximum_sequence: u64,
+    failed_requests: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -324,6 +330,7 @@ impl WorkerSession {
         }
 
         let candidates = std::mem::take(&mut self.pending_scan.candidates).into_sorted_vec();
+        let failed_requests = self.pending_scan.failed_requests;
         self.pending_scan = PendingBatchScan::default();
         let mut prepared = Vec::with_capacity(candidates.len());
         for candidate in candidates {
@@ -342,7 +349,10 @@ impl WorkerSession {
                 }
             }
         }
-        Ok(BatchClaimOutcome::Claimed(claimed))
+        Ok(BatchClaimOutcome::Claimed {
+            claims: claimed,
+            failed_requests,
+        })
     }
 
     pub(super) fn ensure_no_active_scan(&self) -> Result<(), WorkerQueueError> {
@@ -423,6 +433,7 @@ fn retain_pending_candidate(
             ) =>
         {
             queue.fail_pending(request_id, batch_id, error.error_code())?;
+            scan.failed_requests = scan.failed_requests.saturating_add(1);
             return Ok(());
         }
         Err(error) => return Err(error),

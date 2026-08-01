@@ -23,22 +23,30 @@ where
 {
     match run_inner(config, &mut output) {
         Ok(()) => Ok(()),
-        Err(error) => {
-            let Some(error_code) = error.stable_code() else {
-                return Err(error);
-            };
-            let mut record = WorkerLogRecord::new(OffsetDateTime::now_utc(), "worker_failed");
-            record.severity = "error";
-            record.error_code = Some(error_code);
-            match write_worker_log(&mut output, record) {
-                Ok(()) => Err(error),
-                Err(reporting) => Err(WorkerCommandError::FailureReporting {
-                    operation: Box::new(error),
-                    reporting: Box::new(reporting),
-                }),
-            }
-        }
+        Err(error) => match write_failure_log(&mut output, &error) {
+            Ok(()) => Err(error),
+            Err(reporting) => Err(WorkerCommandError::FailureReporting {
+                operation: Box::new(error),
+                reporting: Box::new(reporting),
+            }),
+        },
     }
+}
+
+fn write_failure_log<W>(
+    output: &mut W,
+    error: &WorkerCommandError,
+) -> Result<(), WorkerCommandError>
+where
+    W: Write,
+{
+    let Some(error_code) = error.stable_code() else {
+        return Ok(());
+    };
+    let mut record = WorkerLogRecord::new(OffsetDateTime::now_utc(), "worker_failed");
+    record.severity = "error";
+    record.error_code = Some(error_code);
+    write_worker_log(output, record)
 }
 
 fn run_inner<W>(config: &Path, output: &mut W) -> Result<(), WorkerCommandError>
@@ -144,7 +152,7 @@ where
         StartupOutcome::Resumed { batch_id, outcome } => {
             let mut record = WorkerLogRecord::new(timestamp, "worker_resumed_batch");
             record.batch_id = Some(batch_id.to_string());
-            add_commit_outcome(&mut record, outcome);
+            add_commit_outcome(&mut record, outcome, 0);
             record
         }
     };
@@ -160,24 +168,28 @@ where
     W: Write,
 {
     let record = match outcome {
-        WorkerPollOutcome::ClosedWithoutCommit { reason, requests } => {
+        WorkerPollOutcome::ClosedWithoutCommit {
+            reason,
+            failed_requests,
+        } => {
             let mut record = WorkerLogRecord::new(timestamp, "batch_closed_without_commit");
             record.severity = "warning";
             record.close_reason = Some(close_reason_name(*reason));
             record.outcome = Some("no_claimable_requests");
             record.successful_requests = Some(0);
-            record.failed_requests = Some(*requests);
+            record.failed_requests = Some(*failed_requests);
             Some(record)
         }
         WorkerPollOutcome::Processed {
             reason,
             batch_id,
             outcome,
+            claim_failures,
         } => {
             let mut record = WorkerLogRecord::new(timestamp, "batch_processed");
             record.batch_id = Some(batch_id.to_string());
             record.close_reason = Some(close_reason_name(*reason));
-            add_commit_outcome(&mut record, outcome);
+            add_commit_outcome(&mut record, outcome, *claim_failures);
             Some(record)
         }
         WorkerPollOutcome::Stopped
@@ -191,26 +203,30 @@ where
     }
 }
 
-fn add_commit_outcome(record: &mut WorkerLogRecord, outcome: &BatchCommitOutcome) {
+fn add_commit_outcome(
+    record: &mut WorkerLogRecord,
+    outcome: &BatchCommitOutcome,
+    claim_failures: usize,
+) {
     match outcome {
         BatchCommitOutcome::NoChanges { failures } => {
             record.severity = "warning";
             record.outcome = Some("no_changes");
             record.successful_requests = Some(0);
-            record.failed_requests = Some(failures.len());
+            record.failed_requests = Some(claim_failures.saturating_add(failures.len()));
         }
         BatchCommitOutcome::Committed {
             commit,
             successful,
             failures,
         } => {
-            if !failures.is_empty() {
+            if claim_failures > 0 || !failures.is_empty() {
                 record.severity = "warning";
             }
             record.outcome = Some("committed");
             record.commit = Some(commit.clone());
             record.successful_requests = Some(successful.len());
-            record.failed_requests = Some(failures.len());
+            record.failed_requests = Some(claim_failures.saturating_add(failures.len()));
         }
     }
 }

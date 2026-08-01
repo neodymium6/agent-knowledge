@@ -100,6 +100,8 @@ impl WorkerBootstrap {
     /// # Errors
     ///
     /// Returns an error when interrupted durable work cannot be recovered.
+    /// Returns `Ok(None)` when shutdown is requested before recovery starts a
+    /// repository transaction.
     pub fn start_interruptible(
         self,
         created_at: OffsetDateTime,

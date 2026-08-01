@@ -1402,9 +1402,11 @@ Processes emit structured logs with:
 Worker JSON Lines records always contain `timestamp`, `severity`, `component`,
 and a stable `event`. Completed and resumed batch records contain an
 `outcome`, `successful_requests`, and `failed_requests`; committed outcomes
-also contain the Git `commit`. Terminal process failures contain a stable
-`error_code`. The Worker resamples time after recovery or batch processing, so
-completion events record completion rather than operation-start time.
+also contain the Git `commit`. Failure counts include queue validation failures
+detected while claiming and repository application failures. Terminal process
+failures contain a stable `error_code`. The Worker resamples time after
+recovery or batch processing, so completion events record completion rather
+than operation-start time.
 
 Logs must not contain document bodies, attachment contents, private keys,
 tokens, or Git credentials.

@@ -100,13 +100,18 @@ pub enum StartupOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerRunOutcome {
     /// The fixed pending snapshot contained no requests.
-    Idle,
+    Idle {
+        /// Requests rejected while the snapshot was claimed.
+        failed_requests: usize,
+    },
     /// One newly claimed batch reached its terminal outcome.
     Processed {
         /// Newly generated batch identifier.
         batch_id: BatchId,
         /// Exact committed or no-change result.
         outcome: BatchCommitOutcome,
+        /// Requests rejected before repository processing began.
+        claim_failures: usize,
     },
 }
 
@@ -114,6 +119,9 @@ pub enum WorkerRunOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerPollOutcome {
     /// Shutdown was requested before a repository transaction began.
+    ///
+    /// This is terminal for the runtime; the caller must discard it and use
+    /// startup recovery before processing more work.
     Stopped,
     /// One bounded portion of the pending directory was observed.
     Scanning {
@@ -134,7 +142,7 @@ pub enum WorkerPollOutcome {
         /// Threshold responsible for closing the snapshot.
         reason: BatchCloseReason,
         /// Requests rejected while the snapshot was claimed.
-        requests: usize,
+        failed_requests: usize,
     },
     /// A ready snapshot was claimed and processed.
     Processed {
@@ -144,6 +152,8 @@ pub enum WorkerPollOutcome {
         batch_id: BatchId,
         /// Exact committed or no-change result.
         outcome: BatchCommitOutcome,
+        /// Requests rejected before repository processing began.
+        claim_failures: usize,
     },
 }
 
@@ -183,6 +193,8 @@ impl WorkerRuntime {
     ///
     /// Returns an error when queue recovery, repository discovery, transaction
     /// resumption, or safe pre-transaction requeueing fails.
+    /// Returns `Ok(None)` when shutdown is requested; any durable partial
+    /// claims remain safe for the next startup recovery.
     pub fn start_interruptible(
         queue: &FileQueue,
         processor: BatchProcessor,
@@ -310,6 +322,7 @@ impl WorkerRuntime {
     ///
     /// Returns an error when observation, claiming, repository application, or
     /// publication fails. A failed processing cycle requires startup recovery.
+    /// [`WorkerPollOutcome::Stopped`] is also terminal for this runtime.
     pub fn poll_once_interruptible(
         &mut self,
         schedule: BatchSchedule,
@@ -320,7 +333,7 @@ impl WorkerRuntime {
             return Err(WorkerRunError::RecoveryRequired);
         }
         if should_stop() {
-            return Ok(WorkerPollOutcome::Stopped);
+            return Ok(self.stop());
         }
         let snapshot = match self
             .session
@@ -332,7 +345,7 @@ impl WorkerRuntime {
                 observed_requests,
             } => {
                 if should_stop() {
-                    return Ok(WorkerPollOutcome::Stopped);
+                    return Ok(self.stop());
                 }
                 return Ok(WorkerPollOutcome::Scanning {
                     scanned_entries,
@@ -342,13 +355,12 @@ impl WorkerRuntime {
             PendingScanOutcome::Complete(snapshot) => snapshot,
         };
         if should_stop() {
-            return Ok(WorkerPollOutcome::Stopped);
+            return Ok(self.stop());
         }
         match schedule.readiness(snapshot, self.limits.maximum_requests, now) {
             BatchReadiness::Empty => Ok(WorkerPollOutcome::Idle),
             BatchReadiness::Waiting { ready_at } => Ok(WorkerPollOutcome::Waiting { ready_at }),
             BatchReadiness::Ready { reason } => {
-                let requests = snapshot.requests();
                 self.ready = false;
                 let outcome =
                     self.run_once_inner(now, Some(snapshot.maximum_sequence()), should_stop);
@@ -356,20 +368,22 @@ impl WorkerRuntime {
                     self.ready = true;
                 }
                 match outcome? {
-                    WorkerRunProgress::Stopped => {
-                        self.ready = false;
-                        Ok(WorkerPollOutcome::Stopped)
-                    }
-                    WorkerRunProgress::Complete(WorkerRunOutcome::Idle) => {
-                        Ok(WorkerPollOutcome::ClosedWithoutCommit { reason, requests })
+                    WorkerRunProgress::Stopped => Ok(self.stop()),
+                    WorkerRunProgress::Complete(WorkerRunOutcome::Idle { failed_requests }) => {
+                        Ok(WorkerPollOutcome::ClosedWithoutCommit {
+                            reason,
+                            failed_requests,
+                        })
                     }
                     WorkerRunProgress::Complete(WorkerRunOutcome::Processed {
                         batch_id,
                         outcome,
+                        claim_failures,
                     }) => Ok(WorkerPollOutcome::Processed {
                         reason,
                         batch_id,
                         outcome,
+                        claim_failures,
                     }),
                 }
             }
@@ -383,7 +397,7 @@ impl WorkerRuntime {
         should_stop: &impl Fn() -> bool,
     ) -> Result<WorkerRunProgress, WorkerRunError> {
         let batch_id = BatchId::generate();
-        let claims = loop {
+        let (claims, claim_failures) = loop {
             let outcome = match maximum_sequence {
                 Some(maximum_sequence) => self.session.claim_batch_through(
                     batch_id,
@@ -403,7 +417,10 @@ impl WorkerRuntime {
                         return Ok(WorkerRunProgress::Stopped);
                     }
                 }
-                Ok(BatchClaimOutcome::Claimed(claims)) => break claims,
+                Ok(BatchClaimOutcome::Claimed {
+                    claims,
+                    failed_requests,
+                }) => break (claims, failed_requests),
                 Err(error) => return Err(WorkerRunError::queue(error)),
             }
         };
@@ -411,7 +428,9 @@ impl WorkerRuntime {
             return Ok(WorkerRunProgress::Stopped);
         }
         if claims.is_empty() {
-            return Ok(WorkerRunProgress::Complete(WorkerRunOutcome::Idle));
+            return Ok(WorkerRunProgress::Complete(WorkerRunOutcome::Idle {
+                failed_requests: claim_failures,
+            }));
         }
         let outcome = self
             .processor
@@ -419,7 +438,13 @@ impl WorkerRuntime {
         Ok(WorkerRunProgress::Complete(WorkerRunOutcome::Processed {
             batch_id,
             outcome,
+            claim_failures,
         }))
+    }
+
+    fn stop(&mut self) -> WorkerPollOutcome {
+        self.ready = false;
+        WorkerPollOutcome::Stopped
     }
 }
 

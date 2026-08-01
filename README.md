@@ -49,7 +49,8 @@ agent-knowledge worker run --config /srv/agent-knowledge/worker.yaml
 The Worker emits JSON Lines operational events. Every record includes
 `timestamp`, `severity`, `component`, and `event`. Terminal batch records also
 include `outcome`, `successful_requests`, and `failed_requests`; committed
-batches include `commit`. Terminal process failures use a stable `error_code`.
+batches include `commit`. Failure counts include both queue validation and
+repository application. Terminal process failures use a stable `error_code`.
 
 `SIGINT` and `SIGTERM` request graceful shutdown before a new durable
 transaction or after the current transaction completes. A supervisor must

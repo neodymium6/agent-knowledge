@@ -1,13 +1,14 @@
-use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration as StandardDuration;
 
-use agent_knowledge_worker::{BatchCommitOutcome, StartupOutcome, WorkerPollOutcome};
+use agent_knowledge_worker::{
+    BatchCommitOutcome, StartupOutcome, WorkerPollOutcome, WorkerSettings,
+};
 use time::{Duration, OffsetDateTime};
 
 use super::{
-    MAXIMUM_SIGNAL_WAIT, WorkerCommandError, WorkerLogRecord, add_commit_outcome, run,
-    wait_after_poll, wait_for_termination, write_poll_log, write_startup_log, write_worker_log,
+    MAXIMUM_SIGNAL_WAIT, WorkerCommandError, WorkerLogRecord, add_commit_outcome, wait_after_poll,
+    wait_for_termination, write_failure_log, write_poll_log, write_startup_log, write_worker_log,
 };
 
 #[test]
@@ -75,7 +76,7 @@ fn commit_outcomes_have_stable_structured_fields() {
 
     for outcome in cases {
         let mut record = WorkerLogRecord::new(timestamp, "batch_processed");
-        add_commit_outcome(&mut record, &outcome);
+        add_commit_outcome(&mut record, &outcome, 0);
         let mut output = Vec::new();
         write_worker_log(&mut output, record)
             .unwrap_or_else(|error| panic!("outcome log must serialize: {error}"));
@@ -118,15 +119,17 @@ fn terminal_batch_events_report_request_outcomes() {
                 successful: Vec::new(),
                 failures: Vec::new(),
             },
+            claim_failures: 2,
         },
     )
     .unwrap_or_else(|error| panic!("processed event must serialize: {error}"));
     let processed: serde_json::Value = serde_json::from_slice(&output)
         .unwrap_or_else(|error| panic!("processed event must be JSON: {error}"));
     assert_eq!(processed["event"], "batch_processed");
+    assert_eq!(processed["severity"], "warning");
     assert_eq!(processed["outcome"], "committed");
     assert_eq!(processed["successful_requests"], 0);
-    assert_eq!(processed["failed_requests"], 0);
+    assert_eq!(processed["failed_requests"], 2);
 
     output.clear();
     write_poll_log(
@@ -134,7 +137,7 @@ fn terminal_batch_events_report_request_outcomes() {
         timestamp,
         &WorkerPollOutcome::ClosedWithoutCommit {
             reason: agent_knowledge_worker::BatchCloseReason::InvalidAcceptance,
-            requests: 3,
+            failed_requests: 3,
         },
     )
     .unwrap_or_else(|error| panic!("closed event must serialize: {error}"));
@@ -148,10 +151,15 @@ fn terminal_batch_events_report_request_outcomes() {
 
 #[test]
 fn configuration_failures_emit_a_structured_terminal_event() {
+    let config_error = match WorkerSettings::decode("") {
+        Ok(_) => panic!("an empty Worker configuration must be rejected"),
+        Err(error) => error,
+    };
+    let error = WorkerCommandError::Config(config_error);
     let mut output = Vec::new();
-    let result = run(Path::new(""), &mut output);
+    let result = write_failure_log(&mut output, &error);
 
-    assert!(matches!(result, Err(WorkerCommandError::Config(_))));
+    assert!(result.is_ok());
     let value: serde_json::Value = serde_json::from_slice(&output)
         .unwrap_or_else(|error| panic!("failure log must be JSON: {error}"));
     assert_eq!(value["severity"], "error");
