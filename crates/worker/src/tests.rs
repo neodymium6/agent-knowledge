@@ -954,3 +954,41 @@ fn scheduler_reports_invalid_only_snapshots_without_a_commit() {
             .is_dir()
     );
 }
+
+#[test]
+fn immediate_run_discards_a_partial_scheduler_observation() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
+    enqueue_create(&queue);
+    enqueue_create_with_ids(&queue, SECOND_REQUEST_ID, SECOND_DOCUMENT_ID);
+    let one = NonZeroUsize::MIN;
+    let one_hundred = NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN);
+    let limits = WorkerRunLimits::new(one, one_hundred, one_hundred);
+    let (mut runtime, startup) =
+        WorkerRuntime::start(&queue, fixture.processor(repository), limits, created_at())
+            .unwrap_or_else(|error| panic!("runtime must start: {error}"));
+    assert_eq!(startup, StartupOutcome::Clean);
+    assert!(matches!(
+        runtime.poll_once(BatchSchedule::default(), OffsetDateTime::now_utc()),
+        Ok(WorkerPollOutcome::Scanning {
+            scanned_entries: 1,
+            ..
+        })
+    ));
+
+    assert!(matches!(
+        runtime.run_once(OffsetDateTime::now_utc()),
+        Ok(WorkerRunOutcome::Processed {
+            outcome: BatchCommitOutcome::Committed { .. },
+            ..
+        })
+    ));
+    assert_eq!(
+        runtime
+            .run_once(OffsetDateTime::now_utc())
+            .unwrap_or_else(|error| panic!("runtime must remain reusable: {error}")),
+        WorkerRunOutcome::Idle
+    );
+}

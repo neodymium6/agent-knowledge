@@ -228,6 +228,7 @@ impl WorkerRuntime {
         if !self.ready {
             return Err(WorkerRunError::RecoveryRequired);
         }
+        self.session.discard_pending_observation();
         self.ready = false;
         let outcome = self.run_once_inner(created_at, None);
         if outcome.is_ok() {
