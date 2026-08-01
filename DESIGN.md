@@ -623,9 +623,9 @@ akp-v1 search
 ```
 
 The Gateway parses this string itself. It never evaluates it as a shell
-command. The current implementation accepts only `akp-v1 submit`; the other
-listed operations describe the version-one namespace reserved for later
-delivery increments.
+command. The current implementation accepts `submit`, `list`, `recent`, `get`,
+and `search`. The `status` and `export` names remain reserved in the version-one
+namespace for later delivery increments.
 
 The current client invokes the equivalent of:
 
@@ -1287,6 +1287,12 @@ operations include:
 - tag filtering;
 - session lookup; and
 - request-status lookup.
+
+The current delivery implements directory-ordered listing, recent documents,
+document lookup with exact Markdown retrieval, project/tag/session filtering,
+and full-text search. Document-bundle export and request-status lookup remain
+separate follow-up increments because they cross attachment streaming and queue
+state boundaries respectively.
 
 Each content read pins the official commit at operation start. Pending and
 processing data is visible only through status operations, never through
