@@ -1065,6 +1065,9 @@ impl GitRepository {
         publication_started: bool,
     ) -> Result<(), GitTransactionError> {
         self.validate_live_storage()?;
+        let canonical_lock =
+            File::open(&self.canonical_worktree).map_err(GitTransactionError::Io)?;
+        canonical_lock.lock().map_err(GitTransactionError::Io)?;
         let actual = self.resolve_commit(&self.official_ref)?;
         if actual == base {
             self.ensure_canonical_clean()?;
@@ -1213,22 +1216,7 @@ impl GitRepository {
     }
 
     fn ensure_canonical_clean(&self) -> Result<(), GitTransactionError> {
-        let output = run_git(
-            Some(&self.canonical_worktree),
-            None,
-            [
-                OsStr::new("status"),
-                OsStr::new("--porcelain=v1"),
-                OsStr::new("-z"),
-                OsStr::new("--untracked-files=all"),
-                OsStr::new("--ignored=matching"),
-            ],
-        )?;
-        if output.stdout.is_empty() {
-            Ok(())
-        } else {
-            Err(GitTransactionError::CanonicalWorktreeDirty)
-        }
+        ensure_canonical_worktree_clean(&self.canonical_worktree)
     }
 
     fn ensure_prepared_worktree_unchanged(
@@ -1570,6 +1558,27 @@ impl GitRepository {
                 stderr: diagnostic(&output.stderr),
             })
         }
+    }
+}
+
+pub(crate) fn ensure_canonical_worktree_clean(
+    canonical_worktree: &Path,
+) -> Result<(), GitTransactionError> {
+    let output = run_git(
+        Some(canonical_worktree),
+        None,
+        [
+            OsStr::new("status"),
+            OsStr::new("--porcelain=v1"),
+            OsStr::new("-z"),
+            OsStr::new("--untracked-files=all"),
+            OsStr::new("--ignored=matching"),
+        ],
+    )?;
+    if output.stdout.is_empty() {
+        Ok(())
+    } else {
+        Err(GitTransactionError::CanonicalWorktreeDirty)
     }
 }
 
@@ -1937,7 +1946,7 @@ fn reset_worktree(worktree: &Path, tree: &str) -> Result<(), GitTransactionError
     Ok(())
 }
 
-fn ensure_real_directory(path: &Path) -> Result<(), GitTransactionError> {
+pub(crate) fn ensure_real_directory(path: &Path) -> Result<(), GitTransactionError> {
     let metadata = fs::symlink_metadata(path).map_err(GitTransactionError::Io)?;
     if !metadata.file_type().is_dir() {
         return Err(GitTransactionError::InvalidDirectory(path.into()));
@@ -1973,7 +1982,9 @@ fn ensure_or_create_real_directory(path: &Path) -> Result<(), GitTransactionErro
     }
 }
 
-fn open_stable_directory(path: &Path) -> Result<(Arc<File>, PathBuf), GitTransactionError> {
+pub(crate) fn open_stable_directory(
+    path: &Path,
+) -> Result<(Arc<File>, PathBuf), GitTransactionError> {
     let handle = Arc::new(File::open(path).map_err(GitTransactionError::Io)?);
     #[cfg(target_os = "linux")]
     {
@@ -2141,7 +2152,7 @@ fn append_directory_binding(
     Ok(())
 }
 
-fn validate_repository_layout(
+pub(crate) fn validate_repository_layout(
     git_directory: &Path,
     canonical_worktree: &Path,
     official_ref: &str,
@@ -2392,7 +2403,7 @@ fn commit_message(
     message
 }
 
-fn run_git<I, S>(
+pub(crate) fn run_git<I, S>(
     working_directory: Option<&Path>,
     git_directory: Option<&Path>,
     arguments: I,
@@ -2488,7 +2499,7 @@ fn git_command() -> Command {
     command
 }
 
-fn validate_local_git_config(git_directory: &Path) -> Result<(), GitTransactionError> {
+pub(crate) fn validate_local_git_config(git_directory: &Path) -> Result<(), GitTransactionError> {
     let output = run_git(
         None,
         Some(git_directory),
@@ -2651,7 +2662,7 @@ fn hash_worktree_file(worktree: &Path, path: &Path) -> Result<String, GitTransac
     parse_object_id(&output.stdout)
 }
 
-fn ensure_supported_git() -> Result<(), GitTransactionError> {
+pub(crate) fn ensure_supported_git() -> Result<(), GitTransactionError> {
     let output = git_command()
         .arg("--version")
         .output()
@@ -2720,7 +2731,7 @@ fn parse_git_path(output: &[u8]) -> Result<PathBuf, GitTransactionError> {
     }
 }
 
-fn parse_object_id(output: &[u8]) -> Result<String, GitTransactionError> {
+pub(crate) fn parse_object_id(output: &[u8]) -> Result<String, GitTransactionError> {
     let value = parse_text(output)?;
     if !valid_object_id(value) {
         return Err(GitTransactionError::InvalidGitOutput);

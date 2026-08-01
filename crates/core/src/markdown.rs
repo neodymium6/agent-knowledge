@@ -37,6 +37,32 @@ pub fn decode_document_metadata(
         .map_err(|source| DocumentParseError::InvalidYaml(Box::new(source)))
 }
 
+/// Returns the Markdown body after the required YAML front matter.
+///
+/// # Errors
+///
+/// Returns an error when the bytes are not UTF-8 or the required front-matter
+/// delimiters are missing.
+pub fn markdown_body(markdown: &[u8]) -> Result<&str, DocumentParseError> {
+    let markdown = std::str::from_utf8(markdown).map_err(|_| DocumentParseError::InvalidUtf8)?;
+    let remainder = markdown
+        .strip_prefix("---\n")
+        .or_else(|| markdown.strip_prefix("---\r\n"))
+        .ok_or(DocumentParseError::MissingOpeningDelimiter)?;
+    let mut body_offset = 0_usize;
+    for line in remainder.split_inclusive('\n') {
+        let without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let content = without_newline
+            .strip_suffix('\r')
+            .unwrap_or(without_newline);
+        body_offset += line.len();
+        if content == "---" {
+            return Ok(&remainder[body_offset..]);
+        }
+    }
+    Err(DocumentParseError::MissingClosingDelimiter)
+}
+
 fn extract_front_matter(markdown: &str, maximum_bytes: usize) -> Result<&str, DocumentParseError> {
     let remainder = markdown
         .strip_prefix("---\n")
@@ -120,7 +146,7 @@ impl std::error::Error for DocumentParseError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DocumentParseError, extract_front_matter};
+    use super::{DocumentParseError, extract_front_matter, markdown_body};
 
     #[test]
     fn extracts_lf_and_crlf_front_matter() {
@@ -154,6 +180,18 @@ mod tests {
                 maximum: 4,
                 actual: 17
             })
+        ));
+    }
+
+    #[test]
+    fn returns_only_the_markdown_body_for_lf_and_crlf_documents() {
+        assert!(matches!(
+            markdown_body(b"---\ntitle: Fictional\n---\nBody\n"),
+            Ok("Body\n")
+        ));
+        assert!(matches!(
+            markdown_body(b"---\r\ntitle: Fictional\r\n---\r\nBody\r\n"),
+            Ok("Body\r\n")
         ));
     }
 }

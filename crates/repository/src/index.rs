@@ -126,6 +126,43 @@ impl ContentIndex {
             return Err(ContentIndexError::InvalidRoot);
         }
 
+        Self::build_validated(content_root, policy, package_policy)
+    }
+
+    /// Builds an index below a descriptor-backed stable directory path.
+    ///
+    /// The supplied path may be a Linux `/proc` descriptor projection, so the
+    /// root path itself is followed only after its identity is compared with
+    /// the already-open directory descriptor. Descendants retain the normal
+    /// strict no-link validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path and descriptor differ or normal content
+    /// validation fails.
+    pub fn build_from_pinned_root(
+        content_root: &Path,
+        pinned_root: &File,
+        policy: ContentPolicy,
+        package_policy: &PackagePolicy,
+    ) -> Result<Self, ContentIndexError> {
+        let root_metadata = fs::metadata(content_root).map_err(ContentIndexError::Io)?;
+        let pinned_metadata = pinned_root.metadata().map_err(ContentIndexError::Io)?;
+        if !root_metadata.file_type().is_dir()
+            || !pinned_metadata.file_type().is_dir()
+            || !same_root_identity(&root_metadata, &pinned_metadata)
+        {
+            return Err(ContentIndexError::InvalidRoot);
+        }
+
+        Self::build_validated(content_root, policy, package_policy)
+    }
+
+    fn build_validated(
+        content_root: &Path,
+        policy: ContentPolicy,
+        package_policy: &PackagePolicy,
+    ) -> Result<Self, ContentIndexError> {
         let mut documents = HashMap::<DocumentId, DocumentRecord>::new();
         let mut attachments = Vec::new();
         let mut pending = vec![content_root.to_path_buf()];
@@ -260,6 +297,14 @@ impl ContentIndex {
         self.documents.get(&document_id)
     }
 
+    /// Iterates over every indexed Markdown document.
+    ///
+    /// The iteration order is unspecified. Callers that expose results must
+    /// apply an explicit deterministic ordering.
+    pub fn documents(&self) -> impl Iterator<Item = &DocumentRecord> {
+        self.documents.values()
+    }
+
     /// Resolves a document and checks its exact byte revision.
     ///
     /// # Errors
@@ -295,6 +340,18 @@ impl ContentIndex {
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
     }
+}
+
+#[cfg(unix)]
+fn same_root_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_root_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    true
 }
 
 fn read_bounded_file(path: &Path, maximum: u64) -> Result<Vec<u8>, ContentIndexError> {

@@ -3,6 +3,7 @@
 mod apply;
 mod git;
 mod index;
+mod read;
 
 pub use apply::ApplyError;
 pub use git::{
@@ -12,4 +13,8 @@ pub use git::{
 pub use index::{
     ContentIndex, ContentIndexError, ContentPolicy, DocumentLocation, DocumentRecord,
     RevisionCheckError,
+};
+pub use read::{
+    CommittedDocument, CommittedReadError, CommittedSnapshot, CommittedStore, LinearSearch,
+    ReadFilter, SearchBackend, SearchMetadataFields,
 };
