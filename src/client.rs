@@ -16,11 +16,15 @@ use agent_knowledge_queue::{
     PackagePolicy, PackageValidationError, PayloadMetadata, ValidatedPackage, validate_package,
 };
 use serde::Deserialize;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
 
 const SSH_PROGRAM: &str = "ssh";
 const MAXIMUM_RESPONSE_BYTES: u64 = 64 * 1024;
+const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
+const MAXIMUM_CONTROL_RESPONSE_BYTES: u64 = 96 * 1024 * 1024;
 
 pub(crate) fn submit(
     destination: &OsStr,
@@ -36,6 +40,156 @@ pub(crate) fn submit(
         output,
         io::stderr(),
     )
+}
+
+pub(crate) fn control<Request, Response>(
+    destination: &OsStr,
+    remote_command: &str,
+    request: &Request,
+    timeout: Duration,
+    output: impl Write,
+) -> Result<(), ClientCommandError>
+where
+    Request: Serialize,
+    Response: DeserializeOwned + Serialize,
+{
+    control_with_program::<Request, Response>(
+        OsStr::new(SSH_PROGRAM),
+        destination,
+        remote_command,
+        request,
+        timeout,
+        output,
+        io::stderr(),
+    )
+}
+
+fn control_with_program<Request, Response>(
+    program: &OsStr,
+    destination: &OsStr,
+    remote_command: &str,
+    request: &Request,
+    timeout: Duration,
+    mut output: impl Write,
+    mut diagnostic_output: impl Write,
+) -> Result<(), ClientCommandError>
+where
+    Request: Serialize,
+    Response: DeserializeOwned + Serialize,
+{
+    if destination.is_empty() {
+        return Err(ClientCommandError::EmptyDestination);
+    }
+    if timeout.is_zero() {
+        return Err(ClientCommandError::InvalidTimeout);
+    }
+    let request = serde_json::to_vec(request).map_err(ClientCommandError::EncodeControlRequest)?;
+    if request.len() as u64 > MAXIMUM_CONTROL_REQUEST_BYTES {
+        return Err(ClientCommandError::ControlRequestTooLarge);
+    }
+
+    let mut command = Command::new(program);
+    configure_ssh_command(&mut command, destination, remote_command);
+    let mut child = command.spawn().map_err(ClientCommandError::StartSsh)?;
+    let Some(mut stdin) = child.stdin.take() else {
+        terminate_process_group(&mut child);
+        return Err(ClientCommandError::MissingSshPipe);
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate_process_group(&mut child);
+        return Err(ClientCommandError::MissingSshPipe);
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        terminate_process_group(&mut child);
+        return Err(ClientCommandError::MissingSshPipe);
+    };
+
+    let (events, event_receiver) = mpsc::sync_channel(3);
+    let input_events = events.clone();
+    let input = thread::spawn(move || {
+        let result = stdin
+            .write_all(&request)
+            .map_err(ClientCommandError::WriteControlRequest);
+        notify_transfer(&input_events, TransferEvent::Archive);
+        result
+    });
+    let response_events = events.clone();
+    let response = thread::spawn(move || {
+        let result = read_bounded_control_response(&mut stdout);
+        notify_transfer(
+            &response_events,
+            TransferEvent::Response {
+                failed: result.is_err(),
+            },
+        );
+        result
+    });
+    let diagnostic = thread::spawn(move || {
+        let result = read_bounded_diagnostic(&mut stderr);
+        notify_transfer(
+            &events,
+            TransferEvent::Diagnostic {
+                failed: result.is_err(),
+            },
+        );
+        result
+    });
+
+    let wait_result = supervise_transfer(&mut child, timeout, &event_receiver);
+    let input_result = input
+        .join()
+        .map_err(|_| ClientCommandError::ControlRequestThreadPanicked)
+        .and_then(std::convert::identity);
+    let response = response
+        .join()
+        .map_err(|_| ClientCommandError::ResponseThreadPanicked)
+        .and_then(std::convert::identity)?;
+    let diagnostic = diagnostic
+        .join()
+        .map_err(|_| ClientCommandError::DiagnosticThreadPanicked)
+        .and_then(std::convert::identity)?;
+    let status = wait_result?;
+    if !status.success() {
+        if let Some(response) = decode_gateway_error(&diagnostic)? {
+            return Err(ClientCommandError::GatewayRejected(response));
+        }
+        return Err(ClientCommandError::SshFailed { status, diagnostic });
+    }
+    input_result?;
+    let protocol_version =
+        decode_protocol_version(&response).map_err(ClientCommandError::InvalidResponse)?;
+    require_current_protocol(protocol_version)?;
+    let response: Response =
+        serde_json::from_slice(&response).map_err(ClientCommandError::InvalidResponse)?;
+    diagnostic_output
+        .write_all(&diagnostic)
+        .map_err(ClientCommandError::DiagnosticOutput)?;
+    serde_json::to_writer(&mut output, &response).map_err(ClientCommandError::EncodeResponse)?;
+    output.write_all(b"\n").map_err(ClientCommandError::Output)
+}
+
+fn configure_ssh_command(command: &mut Command, destination: &OsStr, remote_command: &str) {
+    command
+        .arg("-T")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ClearAllForwardings=yes")
+        .arg("-o")
+        .arg("ForwardAgent=no")
+        .arg("-o")
+        .arg("ForwardX11=no")
+        .arg("-o")
+        .arg("StdinNull=no")
+        .arg("-o")
+        .arg("ForkAfterAuthentication=no")
+        .arg("--")
+        .arg(destination)
+        .arg(remote_command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_process_group(command);
 }
 
 fn submit_with_program(
@@ -56,27 +210,7 @@ fn submit_with_program(
     let package = PreparedPackage::open(package_root)?;
     let expectation = package.expectation();
     let mut command = Command::new(program);
-    command
-        .arg("-T")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ClearAllForwardings=yes")
-        .arg("-o")
-        .arg("ForwardAgent=no")
-        .arg("-o")
-        .arg("ForwardX11=no")
-        .arg("-o")
-        .arg("StdinNull=no")
-        .arg("-o")
-        .arg("ForkAfterAuthentication=no")
-        .arg("--")
-        .arg(destination)
-        .arg(SUBMIT_COMMAND)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_process_group(&mut command);
+    configure_ssh_command(&mut command, destination, SUBMIT_COMMAND);
     let mut child = command.spawn().map_err(ClientCommandError::StartSsh)?;
     let Some(stdin) = child.stdin.take() else {
         terminate_process_group(&mut child);
@@ -324,6 +458,18 @@ fn read_bounded_response(input: &mut impl Read) -> Result<Vec<u8>, ClientCommand
     Ok(response)
 }
 
+fn read_bounded_control_response(input: &mut impl Read) -> Result<Vec<u8>, ClientCommandError> {
+    let mut response = Vec::new();
+    input
+        .take(MAXIMUM_CONTROL_RESPONSE_BYTES.saturating_add(1))
+        .read_to_end(&mut response)
+        .map_err(ClientCommandError::ReadResponse)?;
+    if response.len() as u64 > MAXIMUM_CONTROL_RESPONSE_BYTES {
+        return Err(ClientCommandError::ControlResponseTooLarge);
+    }
+    Ok(response)
+}
+
 fn read_bounded_diagnostic(input: &mut impl Read) -> Result<Vec<u8>, ClientCommandError> {
     let mut diagnostic = Vec::new();
     input
@@ -514,10 +660,15 @@ pub(crate) enum ClientCommandError {
     MissingSshPipe,
     WriteArchive(io::Error),
     ArchiveThreadPanicked,
+    EncodeControlRequest(serde_json::Error),
+    ControlRequestTooLarge,
+    WriteControlRequest(io::Error),
+    ControlRequestThreadPanicked,
     ResponseThreadPanicked,
     DiagnosticThreadPanicked,
     ReadResponse(io::Error),
     ResponseTooLarge,
+    ControlResponseTooLarge,
     ReadDiagnostic(io::Error),
     DiagnosticTooLarge,
     TransferCancelled,
@@ -593,6 +744,22 @@ impl fmt::Display for ClientCommandError {
                 write!(formatter, "could not stream package archive: {error}")
             }
             Self::ArchiveThreadPanicked => formatter.write_str("package archive writer panicked"),
+            Self::EncodeControlRequest(error) => {
+                write!(formatter, "control request encoding failed: {error}")
+            }
+            Self::ControlRequestTooLarge => write!(
+                formatter,
+                "control request exceeds {MAXIMUM_CONTROL_REQUEST_BYTES} bytes"
+            ),
+            Self::WriteControlRequest(error) => {
+                write!(
+                    formatter,
+                    "could not write Gateway control request: {error}"
+                )
+            }
+            Self::ControlRequestThreadPanicked => {
+                formatter.write_str("Gateway control request writer panicked")
+            }
             Self::ResponseThreadPanicked => formatter.write_str("ssh response reader panicked"),
             Self::DiagnosticThreadPanicked => formatter.write_str("ssh diagnostic reader panicked"),
             Self::ReadResponse(error) => {
@@ -601,6 +768,10 @@ impl fmt::Display for ClientCommandError {
             Self::ResponseTooLarge => write!(
                 formatter,
                 "Gateway response exceeds {MAXIMUM_RESPONSE_BYTES} bytes"
+            ),
+            Self::ControlResponseTooLarge => write!(
+                formatter,
+                "Gateway control response exceeds {MAXIMUM_CONTROL_RESPONSE_BYTES} bytes"
             ),
             Self::ReadDiagnostic(error) => {
                 write!(formatter, "could not read ssh diagnostics: {error}")
@@ -656,6 +827,7 @@ impl std::error::Error for ClientCommandError {
         match self {
             Self::PackageValidation(error) => Some(error),
             Self::EncodeRequest(error)
+            | Self::EncodeControlRequest(error)
             | Self::InvalidResponse(error)
             | Self::EncodeResponse(error) => Some(error),
             Self::OpenPackage(error) => Some(error),
@@ -663,6 +835,7 @@ impl std::error::Error for ClientCommandError {
             Self::ReadPayload { source, .. }
             | Self::StartSsh(source)
             | Self::WriteArchive(source)
+            | Self::WriteControlRequest(source)
             | Self::ReadResponse(source)
             | Self::ReadDiagnostic(source)
             | Self::WaitForSsh(source)
@@ -672,9 +845,12 @@ impl std::error::Error for ClientCommandError {
             | Self::PackageChanged { .. }
             | Self::MissingSshPipe
             | Self::ArchiveThreadPanicked
+            | Self::ControlRequestTooLarge
+            | Self::ControlRequestThreadPanicked
             | Self::ResponseThreadPanicked
             | Self::DiagnosticThreadPanicked
             | Self::ResponseTooLarge
+            | Self::ControlResponseTooLarge
             | Self::DiagnosticTooLarge
             | Self::TransferCancelled
             | Self::TransferState
