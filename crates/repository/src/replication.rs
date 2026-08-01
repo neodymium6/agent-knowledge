@@ -1302,7 +1302,8 @@ mod tests {
 
     #[test]
     fn unlock_failure_takes_precedence_over_every_replication_result() {
-        let results: [Result<RemoteReplicationOutcome, RemoteReplicationError>; 2] = [
+        let results: [Result<RemoteReplicationOutcome, RemoteReplicationError>; 3] = [
+            Ok(RemoteReplicationOutcome::Cancelled),
             Err(RemoteReplicationError::Repository(Box::new(
                 GitTransactionError::GitCancelled,
             ))),
