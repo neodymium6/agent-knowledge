@@ -665,7 +665,9 @@ directory, and validated payload files. Before starting SSH, it pins the
 package directory and opens each payload beneath that descriptor without
 resolving any symbolic-link component. It verifies each byte length and SHA-256
 revision and retains a bounded immutable byte snapshot. A successful response
-is accepted only when its request ID and digest match that snapshot.
+is accepted only when its request ID and digest match that snapshot. Linux uses
+`openat2` for this resolution when available and otherwise walks each component
+from pinned directory descriptors with `openat` and `O_NOFOLLOW`.
 
 Gateway configuration supplies a positive `transport.submit_timeout_seconds`,
 bounded to 3,600 seconds. On Linux the forced-command process polls standard

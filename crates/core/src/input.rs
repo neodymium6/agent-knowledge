@@ -103,7 +103,7 @@ impl PinnedDirectory {
     ///
     /// Returns an error for I/O failures or a non-directory target. This
     /// capability is available only on the initial Linux deployment target.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, BoundedFileError> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, PinnedPathError> {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -117,16 +117,22 @@ impl PinnedDirectory {
                         | nix::libc::O_CLOEXEC,
                 )
                 .open(path)
-                .map_err(BoundedFileError::Io)?;
-            if !file.metadata().map_err(BoundedFileError::Io)?.is_dir() {
-                return Err(BoundedFileError::InvalidFileType);
+                .map_err(|error| {
+                    if error.raw_os_error() == Some(nix::libc::ENOTDIR) {
+                        PinnedPathError::ExpectedDirectory
+                    } else {
+                        PinnedPathError::Io(error)
+                    }
+                })?;
+            if !file.metadata().map_err(PinnedPathError::Io)?.is_dir() {
+                return Err(PinnedPathError::ExpectedDirectory);
             }
             Ok(Self { file })
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = path;
-            Err(BoundedFileError::InvalidFileType)
+            Err(PinnedPathError::UnsupportedPlatform)
         }
     }
 
@@ -140,45 +146,98 @@ impl PinnedDirectory {
     pub fn open_regular_beneath(
         &self,
         path: impl AsRef<Path>,
-    ) -> Result<PinnedRegularFile, BoundedFileError> {
+    ) -> Result<PinnedRegularFile, PinnedPathError> {
         #[cfg(target_os = "linux")]
         {
+            use nix::errno::Errno;
             use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
 
             let path = path.as_ref();
-            if path.is_absolute()
-                || path.components().any(|component| {
-                    matches!(
-                        component,
-                        std::path::Component::CurDir | std::path::Component::ParentDir
-                    )
-                })
-            {
-                return Err(BoundedFileError::InvalidFileType);
-            }
+            validate_beneath_path(path)?;
             let how = OpenHow::new()
                 .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
                 .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS);
-            let file = File::from(
-                openat2(&self.file, path, how)
-                    .map_err(|error| BoundedFileError::Io(error.into()))?,
-            );
-            let metadata = file.metadata().map_err(BoundedFileError::Io)?;
-            if !metadata.is_file() {
-                return Err(BoundedFileError::InvalidFileType);
+            match openat2(&self.file, path, how) {
+                Ok(file) => pinned_regular_file(File::from(file)),
+                Err(Errno::ENOSYS | Errno::EPERM) => self.open_regular_beneath_with_openat(path),
+                Err(error) => Err(PinnedPathError::Io(error.into())),
             }
-            Ok(PinnedRegularFile {
-                file,
-                length: metadata.len(),
-                _anchor: None,
-            })
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = path;
-            Err(BoundedFileError::InvalidFileType)
+            Err(PinnedPathError::UnsupportedPlatform)
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn open_regular_beneath_with_openat(
+        &self,
+        path: &Path,
+    ) -> Result<PinnedRegularFile, PinnedPathError> {
+        use nix::fcntl::{OFlag, openat};
+        use nix::sys::stat::Mode;
+
+        validate_beneath_path(path)?;
+        let mut directory =
+            nix::unistd::dup(&self.file).map_err(|error| PinnedPathError::Io(error.into()))?;
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(PinnedPathError::InvalidRelativePath);
+            };
+            if components.peek().is_some() {
+                directory = openat(
+                    &directory,
+                    name,
+                    OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| PinnedPathError::Io(error.into()))?;
+            } else {
+                let file = openat(
+                    &directory,
+                    name,
+                    OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+                    Mode::empty(),
+                )
+                .map_err(|error| PinnedPathError::Io(error.into()))?;
+                return pinned_regular_file(File::from(file));
+            }
+        }
+        Err(PinnedPathError::InvalidRelativePath)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_beneath_path(path: &Path) -> Result<(), PinnedPathError> {
+    if path.is_absolute() {
+        return Err(PinnedPathError::InvalidRelativePath);
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(PinnedPathError::InvalidRelativePath);
+        };
+        normalized.push(name);
+    }
+    if normalized.as_os_str().is_empty() || normalized.as_os_str() != path.as_os_str() {
+        return Err(PinnedPathError::InvalidRelativePath);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn pinned_regular_file(file: File) -> Result<PinnedRegularFile, PinnedPathError> {
+    let metadata = file.metadata().map_err(PinnedPathError::Io)?;
+    if !metadata.is_file() {
+        return Err(PinnedPathError::ExpectedRegularFile);
+    }
+    Ok(PinnedRegularFile {
+        file,
+        length: metadata.len(),
+        _anchor: None,
+    })
 }
 
 impl PinnedRegularFile {
@@ -284,11 +343,54 @@ impl std::error::Error for BoundedFileError {
     }
 }
 
+/// Failure while pinning a directory or resolving a file beneath it.
+#[derive(Debug)]
+pub enum PinnedPathError {
+    /// A directory or descendant could not be opened or inspected.
+    Io(io::Error),
+    /// The root target was not a directory.
+    ExpectedDirectory,
+    /// The descendant target was not a regular file.
+    ExpectedRegularFile,
+    /// The descendant path was not a normalized, nonempty relative path.
+    InvalidRelativePath,
+    /// Descriptor-relative safe path resolution is unavailable on this target.
+    UnsupportedPlatform,
+}
+
+impl fmt::Display for PinnedPathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "could not resolve pinned path: {error}"),
+            Self::ExpectedDirectory => formatter.write_str("input must be a directory"),
+            Self::ExpectedRegularFile => formatter.write_str("input must be a regular file"),
+            Self::InvalidRelativePath => {
+                formatter.write_str("path must be a normalized, nonempty relative path")
+            }
+            Self::UnsupportedPlatform => {
+                formatter.write_str("pinned directory resolution is unsupported on this platform")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PinnedPathError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::ExpectedDirectory
+            | Self::ExpectedRegularFile
+            | Self::InvalidRelativePath
+            | Self::UnsupportedPlatform => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::Read;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{PinnedDirectory, PinnedRegularFile};
@@ -366,5 +468,51 @@ mod tests {
             .unwrap_or_else(|error| panic!("pinned root fixture must be removed: {error}"));
         fs::remove_dir_all(outside)
             .unwrap_or_else(|error| panic!("outside fixture must be removed: {error}"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn openat_fallback_is_contained_and_reports_directory_types() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_path();
+        let outside = test_path();
+        let regular = test_path();
+        fs::create_dir_all(root.join("real"))
+            .unwrap_or_else(|error| panic!("fallback root fixture must be created: {error}"));
+        fs::create_dir(&outside)
+            .unwrap_or_else(|error| panic!("outside fixture must be created: {error}"));
+        fs::write(root.join("real/document.md"), b"fictional")
+            .unwrap_or_else(|error| panic!("fallback file must be written: {error}"));
+        fs::write(outside.join("document.md"), b"fictional")
+            .unwrap_or_else(|error| panic!("outside file must be written: {error}"));
+        fs::write(&regular, b"not a directory")
+            .unwrap_or_else(|error| panic!("regular fixture must be written: {error}"));
+        symlink(&outside, root.join("linked"))
+            .unwrap_or_else(|error| panic!("parent symlink must be created: {error}"));
+        let pinned = PinnedDirectory::open(&root)
+            .unwrap_or_else(|error| panic!("root must be pinned: {error}"));
+
+        assert!(
+            pinned
+                .open_regular_beneath_with_openat(Path::new("real/document.md"))
+                .is_ok()
+        );
+        assert!(
+            pinned
+                .open_regular_beneath_with_openat(Path::new("linked/document.md"))
+                .is_err()
+        );
+        assert!(matches!(
+            PinnedDirectory::open(&regular),
+            Err(super::PinnedPathError::ExpectedDirectory)
+        ));
+
+        fs::remove_dir_all(root)
+            .unwrap_or_else(|error| panic!("fallback root fixture must be removed: {error}"));
+        fs::remove_dir_all(outside)
+            .unwrap_or_else(|error| panic!("outside fixture must be removed: {error}"));
+        fs::remove_file(regular)
+            .unwrap_or_else(|error| panic!("regular fixture must be removed: {error}"));
     }
 }

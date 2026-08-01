@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_knowledge_core::{BoundedFileError, PinnedDirectory, RequestId, Revision};
+use agent_knowledge_core::{PinnedDirectory, PinnedPathError, RequestId, Revision};
 use agent_knowledge_protocol::{
     CURRENT_GATEWAY_PROTOCOL_VERSION, ProtocolErrorResponse, SUBMIT_COMMAND, SubmitOutcome,
     SubmitResponse,
@@ -498,10 +498,10 @@ pub(crate) enum ClientCommandError {
     EmptyDestination,
     PackageValidation(PackageValidationError),
     EncodeRequest(serde_json::Error),
-    OpenPackage(BoundedFileError),
+    OpenPackage(PinnedPathError),
     OpenPayload {
         path: PathBuf,
-        source: BoundedFileError,
+        source: PinnedPathError,
     },
     ReadPayload {
         path: PathBuf,
