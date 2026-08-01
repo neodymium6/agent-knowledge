@@ -13,7 +13,9 @@ dependencies = [
  "agent-knowledge-worker",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
+ "tar",
  "time",
 ]
 

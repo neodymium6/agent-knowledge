@@ -9,11 +9,13 @@ use agent_knowledge_queue::{
 };
 use serde::Serialize;
 
+use crate::client::{self, ClientCommandError};
 use crate::gateway::{self, GatewayCommandError};
 use crate::worker::{self, WorkerCommandError};
 
 const USAGE: &str = "usage:\n\
     agent-knowledge admin submit --queue-root <path> --package-root <path>\n\
+    agent-knowledge client submit --destination <ssh-destination> --package-root <path>\n\
     agent-knowledge gateway --config <path> --client-id <id>\n\
     agent-knowledge worker run --config <path>";
 
@@ -36,6 +38,10 @@ where
             output,
         )
         .map_err(CliError::Gateway),
+        Command::ClientSubmit {
+            destination,
+            package_root,
+        } => client::submit(&destination, &package_root, output).map_err(CliError::Client),
     }
 }
 
@@ -50,6 +56,10 @@ enum Command {
     RunGateway {
         config: PathBuf,
         client_id: OsString,
+    },
+    ClientSubmit {
+        destination: OsString,
+        package_root: PathBuf,
     },
 }
 
@@ -66,6 +76,12 @@ where
     }
     match (namespace.as_deref(), action.as_deref()) {
         (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("client")
+                && action == std::ffi::OsStr::new("submit") =>
+        {
+            parse_client_submit_arguments(arguments)
+        }
+        (Some(namespace), Some(action))
             if namespace == std::ffi::OsStr::new("admin")
                 && action == std::ffi::OsStr::new("submit") =>
         {
@@ -79,6 +95,28 @@ where
         }
         _ => Err(CliError::Usage),
     }
+}
+
+fn parse_client_submit_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut destination = None;
+    let mut package_root = None;
+    while let Some(flag) = arguments.next() {
+        let value = arguments.next().ok_or(CliError::Usage)?;
+        match flag.to_str() {
+            Some("--destination") if destination.is_none() => destination = Some(value),
+            Some("--package-root") if package_root.is_none() => {
+                package_root = Some(PathBuf::from(value));
+            }
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(Command::ClientSubmit {
+        destination: destination.ok_or(CliError::Usage)?,
+        package_root: package_root.ok_or(CliError::Usage)?,
+    })
 }
 
 fn parse_gateway_arguments<I>(mut arguments: I) -> Result<Command, CliError>
@@ -213,6 +251,7 @@ pub enum CliError {
     Queue(QueueError),
     Worker(WorkerCommandError),
     Gateway(GatewayCommandError),
+    Client(ClientCommandError),
     Json(serde_json::Error),
 }
 
@@ -236,6 +275,7 @@ impl fmt::Display for CliError {
             Self::Queue(error) => write!(formatter, "durable queue submission failed: {error}"),
             Self::Worker(error) => error.fmt(formatter),
             Self::Gateway(error) => error.fmt(formatter),
+            Self::Client(error) => error.fmt(formatter),
             Self::Json(error) => write!(formatter, "JSON output encoding failed: {error}"),
         }
     }
@@ -249,6 +289,7 @@ impl std::error::Error for CliError {
             Self::Queue(error) => Some(error),
             Self::Worker(error) => Some(error),
             Self::Gateway(error) => Some(error),
+            Self::Client(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Usage => None,
         }

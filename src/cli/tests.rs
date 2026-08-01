@@ -179,3 +179,24 @@ fn parses_the_forced_command_gateway_configuration() {
                 && client_id == "fictional-node-a"
     ));
 }
+
+#[test]
+fn parses_the_ssh_client_submission_command() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "client".into(),
+        "submit".into(),
+        "--destination".into(),
+        "fictional-knowledge".into(),
+        "--package-root".into(),
+        "/tmp/fictional-package".into(),
+    ])
+    .unwrap_or_else(|error| panic!("client submit command must parse: {error}"));
+
+    assert!(matches!(
+        command,
+        Command::ClientSubmit { destination, package_root }
+            if destination == "fictional-knowledge"
+                && package_root == Path::new("/tmp/fictional-package")
+    ));
+}

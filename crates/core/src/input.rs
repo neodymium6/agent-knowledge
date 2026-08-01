@@ -1,10 +1,10 @@
 use std::fmt;
-use std::fs::{File, Metadata, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
-fn open_regular_file(path: &Path) -> Result<(File, Metadata, File), BoundedFileError> {
+fn open_regular_file(path: &Path) -> Result<PinnedRegularFile, BoundedFileError> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
@@ -27,11 +27,15 @@ fn open_regular_file(path: &Path) -> Result<(File, Metadata, File), BoundedFileE
     if metadata.dev() != read_metadata.dev() || metadata.ino() != read_metadata.ino() {
         return Err(BoundedFileError::InvalidFileType);
     }
-    Ok((file, metadata, anchor))
+    Ok(PinnedRegularFile {
+        file,
+        length: metadata.len(),
+        _anchor: anchor,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_regular_file(path: &Path) -> Result<(File, Metadata), BoundedFileError> {
+fn open_regular_file(path: &Path) -> Result<PinnedRegularFile, BoundedFileError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -42,7 +46,46 @@ fn open_regular_file(path: &Path) -> Result<(File, Metadata), BoundedFileError> 
     }
     let file = options.open(path).map_err(BoundedFileError::Io)?;
     let metadata = file.metadata().map_err(BoundedFileError::Io)?;
-    Ok((file, metadata))
+    if !metadata.file_type().is_file() {
+        return Err(BoundedFileError::InvalidFileType);
+    }
+    Ok(PinnedRegularFile {
+        file,
+        length: metadata.len(),
+    })
+}
+
+/// A regular file pinned to the object selected when it was opened.
+#[derive(Debug)]
+pub struct PinnedRegularFile {
+    file: File,
+    length: u64,
+    #[cfg(target_os = "linux")]
+    _anchor: File,
+}
+
+impl PinnedRegularFile {
+    /// Opens a regular file without blocking on a replaced FIFO or following a
+    /// replacement after the selected object has been pinned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for I/O failures or a non-regular selected target.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, BoundedFileError> {
+        open_regular_file(path.as_ref())
+    }
+
+    /// Returns the byte length observed from the pinned file descriptor.
+    #[must_use]
+    pub const fn byte_length(&self) -> u64 {
+        self.length
+    }
+}
+
+impl Read for PinnedRegularFile {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buffer)
+    }
 }
 
 /// Reads one regular file while enforcing a byte bound before deserialization.
@@ -57,23 +100,17 @@ pub fn read_bounded_regular_file(
     path: impl AsRef<Path>,
     maximum_bytes: u64,
 ) -> Result<Vec<u8>, BoundedFileError> {
-    let path = path.as_ref();
-    #[cfg(target_os = "linux")]
-    let (file, metadata, _anchor) = open_regular_file(path)?;
-    #[cfg(not(target_os = "linux"))]
-    let (file, metadata) = open_regular_file(path)?;
-    if !metadata.file_type().is_file() {
-        return Err(BoundedFileError::InvalidFileType);
-    }
-    if metadata.len() > maximum_bytes {
+    let mut file = PinnedRegularFile::open(path)?;
+    if file.byte_length() > maximum_bytes {
         return Err(BoundedFileError::FileTooLarge {
             maximum: maximum_bytes,
         });
     }
-    let capacity = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    let capacity = usize::try_from(file.byte_length()).unwrap_or(usize::MAX);
     let maximum_capacity = usize::try_from(maximum_bytes).unwrap_or(usize::MAX);
     let mut bytes = Vec::with_capacity(capacity.min(maximum_capacity));
-    file.take(maximum_bytes.saturating_add(1))
+    file.by_ref()
+        .take(maximum_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(BoundedFileError::Io)?;
     if bytes.len() as u64 > maximum_bytes {
@@ -116,5 +153,48 @@ impl std::error::Error for BoundedFileError {
             Self::Io(error) => Some(error),
             Self::InvalidFileType | Self::FileTooLarge { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::Read;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::PinnedRegularFile;
+
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    fn test_path() -> PathBuf {
+        let sequence = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "agent-knowledge-pinned-file-test-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn reads_the_regular_file_selected_when_opened() {
+        let path = test_path();
+        fs::write(&path, b"original")
+            .unwrap_or_else(|error| panic!("fixture must be written: {error}"));
+        let mut pinned = PinnedRegularFile::open(&path)
+            .unwrap_or_else(|error| panic!("regular file must be pinned: {error}"));
+        fs::remove_file(&path)
+            .unwrap_or_else(|error| panic!("fixture path must be removed: {error}"));
+        fs::write(&path, b"replacement")
+            .unwrap_or_else(|error| panic!("replacement fixture must be written: {error}"));
+
+        let mut contents = String::new();
+        pinned
+            .read_to_string(&mut contents)
+            .unwrap_or_else(|error| panic!("pinned file must be readable: {error}"));
+        assert_eq!(contents, "original");
+        assert_eq!(pinned.byte_length(), 8);
+
+        fs::remove_file(path)
+            .unwrap_or_else(|error| panic!("replacement fixture must be removed: {error}"));
     }
 }

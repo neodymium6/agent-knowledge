@@ -16,7 +16,7 @@ pub use document::{
 pub use error_code::{DocumentStatus, ErrorCode};
 pub use filesystem::{PathAttestation, PathAttestationError};
 pub use id::{BatchId, DocumentId, RequestId, SessionId};
-pub use input::{BoundedFileError, read_bounded_regular_file};
+pub use input::{BoundedFileError, PinnedRegularFile, read_bounded_regular_file};
 pub use markdown::{DocumentParseError, decode_document_metadata};
 pub use path::{AttachmentName, PathValidationError, PayloadPath, ProjectId};
 pub use request::{

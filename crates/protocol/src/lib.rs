@@ -163,7 +163,6 @@ pub enum RequestState {
 
 /// One successful Gateway submission response.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct SubmitResponse {
     /// Independent Gateway protocol version.
     pub protocol_version: u16,
@@ -283,5 +282,13 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn submit_response_round_trips_and_rejects_unknown_fields() {
+        let response = "{\"protocol_version\":1,\"status\":\"accepted\",\"request_id\":\"01K00000000000000000000000\",\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"}";
+        assert!(serde_json::from_str::<super::SubmitResponse>(response).is_ok());
+        let response_with_extra = response.replace("}", ",\"extra\":true}");
+        assert!(serde_json::from_str::<super::SubmitResponse>(&response_with_extra).is_err());
     }
 }
