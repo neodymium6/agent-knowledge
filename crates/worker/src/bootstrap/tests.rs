@@ -69,6 +69,32 @@ fn invalid_repository_fails_before_queue_initialization() {
     assert!(!root.path().join("queue").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn rejects_resolved_storage_aliases_before_initialization() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::create();
+    initialize_repository(root.path());
+    initialize_quartz(root.path());
+    let alias = root.path().join("aliased-storage");
+    symlink(root.path().join("content"), &alias)
+        .unwrap_or_else(|error| panic!("storage alias must be created: {error}"));
+    let yaml = valid_yaml(root.path()).replace(
+        &root.path().join("queue").display().to_string(),
+        &alias.join("queue").display().to_string(),
+    );
+    let settings = WorkerSettings::decode(&yaml)
+        .unwrap_or_else(|error| panic!("lexically distinct settings must decode: {error}"));
+
+    assert!(matches!(
+        WorkerBootstrap::open(settings),
+        Err(WorkerOpenError::OverlappingPaths { .. })
+    ));
+    assert!(!root.path().join("content/queue").exists());
+    assert!(!root.path().join("releases").exists());
+}
+
 fn valid_yaml(root: &Path) -> String {
     format!(
         r#"schema_version: 1
