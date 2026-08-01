@@ -17,11 +17,11 @@ use agent_knowledge_repository::{
     BatchCommitOutcome, BatchPublication, ContentPolicy, GitIdentity, GitRepository,
     GitTransactionError, PublicationError,
 };
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
-    BatchProcessor, StartupOutcome, WorkerRunError, WorkerRunLimits, WorkerRunOutcome,
-    WorkerRuntime,
+    BatchCloseReason, BatchProcessor, BatchSchedule, StartupOutcome, WorkerPollOutcome,
+    WorkerRunError, WorkerRunLimits, WorkerRunOutcome, WorkerRuntime,
 };
 
 const REQUEST_ID: &str = "01K00000000000000000000001";
@@ -29,6 +29,8 @@ const DOCUMENT_ID: &str = "01K00000000000000000000002";
 const BATCH_ID: &str = "01K00000000000000000000003";
 const SECOND_REQUEST_ID: &str = "01K00000000000000000000004";
 const SECOND_DOCUMENT_ID: &str = "01K00000000000000000000005";
+const THIRD_REQUEST_ID: &str = "01K00000000000000000000006";
+const THIRD_DOCUMENT_ID: &str = "01K00000000000000000000007";
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory(PathBuf);
@@ -827,4 +829,128 @@ fn separate_recovery_limit_allows_an_older_larger_batch() {
         startup,
         StartupOutcome::Requeued { requests: 2, .. }
     ));
+}
+
+#[test]
+fn scheduler_waits_for_debounce_before_processing() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
+    enqueue_create(&queue);
+    let (mut runtime, startup) = WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("runtime must start: {error}"));
+    assert_eq!(startup, StartupOutcome::Clean);
+
+    assert!(matches!(
+        runtime.poll_once(BatchSchedule::default(), OffsetDateTime::now_utc()),
+        Ok(WorkerPollOutcome::Waiting { .. })
+    ));
+    let outcome = runtime
+        .poll_once(
+            BatchSchedule::default(),
+            OffsetDateTime::now_utc() + TimeDuration::minutes(1),
+        )
+        .unwrap_or_else(|error| panic!("debounced batch must process: {error}"));
+    assert!(matches!(
+        outcome,
+        WorkerPollOutcome::Processed {
+            outcome: BatchCommitOutcome::Committed { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn scheduler_leaves_arrivals_after_observation_for_the_next_batch() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
+    enqueue_create(&queue);
+    enqueue_create_with_ids(&queue, SECOND_REQUEST_ID, SECOND_DOCUMENT_ID);
+    let one = NonZeroUsize::MIN;
+    let one_hundred = NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN);
+    let limits = WorkerRunLimits::new(one, one_hundred, one_hundred);
+    let (mut runtime, startup) =
+        WorkerRuntime::start(&queue, fixture.processor(repository), limits, created_at())
+            .unwrap_or_else(|error| panic!("runtime must start: {error}"));
+    assert_eq!(startup, StartupOutcome::Clean);
+    let ready_time = OffsetDateTime::now_utc() + TimeDuration::minutes(10);
+    assert!(matches!(
+        runtime.poll_once(BatchSchedule::default(), ready_time),
+        Ok(WorkerPollOutcome::Scanning {
+            scanned_entries: 1,
+            ..
+        })
+    ));
+
+    enqueue_create_with_ids(&queue, THIRD_REQUEST_ID, THIRD_DOCUMENT_ID);
+    let outcome = loop {
+        match runtime.poll_once(BatchSchedule::default(), ready_time) {
+            Ok(WorkerPollOutcome::Scanning { .. }) => {}
+            Ok(outcome) => break outcome,
+            Err(error) => panic!("fixed snapshot must process: {error}"),
+        }
+    };
+    assert!(matches!(
+        outcome,
+        WorkerPollOutcome::Processed {
+            outcome: BatchCommitOutcome::Committed { .. },
+            ..
+        }
+    ));
+    assert!(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/{}/{THIRD_REQUEST_ID}", QueueState::Pending))
+            .is_dir()
+    );
+}
+
+#[test]
+fn scheduler_reports_invalid_only_snapshots_without_a_commit() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
+    enqueue_create(&queue);
+    fs::write(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/pending/{REQUEST_ID}/acceptance.json")),
+        b"invalid acceptance metadata\n",
+    )
+    .unwrap_or_else(|error| panic!("acceptance fixture must be corrupted: {error}"));
+    let (mut runtime, startup) = WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("runtime must start: {error}"));
+    assert_eq!(startup, StartupOutcome::Clean);
+
+    assert_eq!(
+        runtime
+            .poll_once(BatchSchedule::default(), OffsetDateTime::now_utc())
+            .unwrap_or_else(|error| panic!("invalid snapshot must close: {error}")),
+        WorkerPollOutcome::ClosedWithoutCommit {
+            reason: BatchCloseReason::InvalidAcceptance,
+        }
+    );
+    assert!(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/{}/{REQUEST_ID}", QueueState::Failed))
+            .is_dir()
+    );
 }

@@ -3,13 +3,13 @@ use std::num::NonZeroUsize;
 
 use agent_knowledge_core::BatchId;
 use agent_knowledge_queue::{
-    BatchClaimOutcome, ClaimedPackage, FileQueue, ProcessingScanOutcome, WorkerQueueError,
-    WorkerSession,
+    BatchClaimOutcome, ClaimedPackage, FileQueue, PendingScanOutcome, ProcessingScanOutcome,
+    WorkerQueueError, WorkerSession,
 };
 use agent_knowledge_repository::{BatchCommitOutcome, RepositoryTransaction};
 use time::OffsetDateTime;
 
-use crate::{BatchProcessor, BatchProcessorError};
+use crate::{BatchCloseReason, BatchProcessor, BatchProcessorError, BatchReadiness, BatchSchedule};
 
 /// Bounded queue scan and batch-size limits for one Worker process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +110,39 @@ pub enum WorkerRunOutcome {
     },
 }
 
+/// Progress made by one nonblocking scheduler poll.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkerPollOutcome {
+    /// One bounded portion of the pending directory was observed.
+    Scanning {
+        /// Directory entries inspected by this poll.
+        scanned_entries: usize,
+        /// Requests observed in the fixed snapshot so far.
+        observed_requests: usize,
+    },
+    /// The complete fixed snapshot contained no requests.
+    Idle,
+    /// The snapshot remains open until a time threshold is reached.
+    Waiting {
+        /// Earliest time at which an unchanged snapshot becomes ready.
+        ready_at: OffsetDateTime,
+    },
+    /// A ready snapshot contained only entries failed during claim validation.
+    ClosedWithoutCommit {
+        /// Threshold responsible for closing the snapshot.
+        reason: BatchCloseReason,
+    },
+    /// A ready snapshot was claimed and processed.
+    Processed {
+        /// Threshold responsible for closing the batch.
+        reason: BatchCloseReason,
+        /// Newly generated batch identifier.
+        batch_id: BatchId,
+        /// Exact committed or no-change result.
+        outcome: BatchCommitOutcome,
+    },
+}
+
 /// Exclusive, recovered Worker state ready to process new batches.
 #[derive(Debug)]
 pub struct WorkerRuntime {
@@ -196,24 +229,91 @@ impl WorkerRuntime {
             return Err(WorkerRunError::RecoveryRequired);
         }
         self.ready = false;
-        let outcome = self.run_once_inner(created_at);
+        let outcome = self.run_once_inner(created_at, None);
         if outcome.is_ok() {
             self.ready = true;
         }
         outcome
     }
 
+    /// Observes pending work once and processes it only when a threshold closes.
+    ///
+    /// Repeated calls incrementally finish a fixed acceptance snapshot. A
+    /// ready snapshot is claimed only through its observed sequence boundary,
+    /// so requests arriving after observation remain in the next batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when observation, claiming, repository application, or
+    /// publication fails. A failed processing cycle requires startup recovery.
+    pub fn poll_once(
+        &mut self,
+        schedule: BatchSchedule,
+        now: OffsetDateTime,
+    ) -> Result<WorkerPollOutcome, WorkerRunError> {
+        if !self.ready {
+            return Err(WorkerRunError::RecoveryRequired);
+        }
+        let snapshot = match self
+            .session
+            .scan_pending(self.limits.maximum_scan_entries.get())
+            .map_err(WorkerRunError::queue)?
+        {
+            PendingScanOutcome::Scanning {
+                scanned_entries,
+                observed_requests,
+            } => {
+                return Ok(WorkerPollOutcome::Scanning {
+                    scanned_entries,
+                    observed_requests,
+                });
+            }
+            PendingScanOutcome::Complete(snapshot) => snapshot,
+        };
+        match schedule.readiness(snapshot, self.limits.maximum_requests, now) {
+            BatchReadiness::Empty => Ok(WorkerPollOutcome::Idle),
+            BatchReadiness::Waiting { ready_at } => Ok(WorkerPollOutcome::Waiting { ready_at }),
+            BatchReadiness::Ready { reason } => {
+                self.ready = false;
+                let outcome = self.run_once_inner(now, Some(snapshot.maximum_sequence()));
+                if outcome.is_ok() {
+                    self.ready = true;
+                }
+                match outcome? {
+                    WorkerRunOutcome::Idle => Ok(WorkerPollOutcome::ClosedWithoutCommit { reason }),
+                    WorkerRunOutcome::Processed { batch_id, outcome } => {
+                        Ok(WorkerPollOutcome::Processed {
+                            reason,
+                            batch_id,
+                            outcome,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
     fn run_once_inner(
         &mut self,
         created_at: OffsetDateTime,
+        maximum_sequence: Option<u64>,
     ) -> Result<WorkerRunOutcome, WorkerRunError> {
         let batch_id = BatchId::generate();
         let claims = loop {
-            match self.session.claim_next_batch(
-                batch_id,
-                self.limits.maximum_scan_entries.get(),
-                self.limits.maximum_requests.get(),
-            ) {
+            let outcome = match maximum_sequence {
+                Some(maximum_sequence) => self.session.claim_batch_through(
+                    batch_id,
+                    maximum_sequence,
+                    self.limits.maximum_scan_entries.get(),
+                    self.limits.maximum_requests.get(),
+                ),
+                None => self.session.claim_next_batch(
+                    batch_id,
+                    self.limits.maximum_scan_entries.get(),
+                    self.limits.maximum_requests.get(),
+                ),
+            };
+            match outcome {
                 Ok(BatchClaimOutcome::Scanning { .. }) => {}
                 Ok(BatchClaimOutcome::Claimed(claims)) => break claims,
                 Err(error) => return Err(WorkerRunError::queue(error)),
