@@ -1,0 +1,17 @@
+[package]
+name = "agent-knowledge-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-knowledge-core = { path = "../core" }
+agent-knowledge-protocol = { path = "../protocol" }
+agent-knowledge-queue = { path = "../queue" }
+serde.workspace = true
+serde-saphyr.workspace = true
+tar.workspace = true

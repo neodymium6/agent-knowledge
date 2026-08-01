@@ -167,6 +167,12 @@ struct PinnedDirectory {
 }
 
 impl FileQueue {
+    /// Returns the immutable package validation policy for this queue handle.
+    #[must_use]
+    pub const fn policy(&self) -> &PackagePolicy {
+        &self.policy
+    }
+
     /// Attests the queue root selected and pinned during initialization.
     ///
     /// # Errors
