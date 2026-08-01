@@ -232,16 +232,7 @@ impl RemoteReplicator {
         let result = validate_lock_file(&self.configured_lock_path, &self.lock)
             .and_then(|()| self.replicate_locked(now, completed_at, cancelled));
         let unlock = self.lock.unlock().map_err(RemoteReplicationError::Io);
-        match (result, unlock) {
-            (Ok(outcome), Ok(())) => Ok(outcome),
-            (Err(RemoteReplicationError::Repository(error)), _)
-                if matches!(*error, GitTransactionError::GitCancelled) =>
-            {
-                Ok(RemoteReplicationOutcome::Cancelled)
-            }
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-        }
+        finish_replication(result, unlock)
     }
 
     fn replicate_locked(
@@ -329,6 +320,27 @@ impl RemoteReplicator {
             Err(GitTransactionError::GitCancelled) => Ok(RemoteReplicationOutcome::Cancelled),
             Err(error) => Err(RemoteReplicationError::repository(error)),
         }
+    }
+}
+
+fn finish_replication(
+    result: Result<RemoteReplicationOutcome, RemoteReplicationError>,
+    unlock: Result<(), RemoteReplicationError>,
+) -> Result<RemoteReplicationOutcome, RemoteReplicationError> {
+    match (result, unlock) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(RemoteReplicationError::Repository(error)), Err(unlock_error))
+            if matches!(*error, GitTransactionError::GitCancelled) =>
+        {
+            Err(unlock_error)
+        }
+        (Err(RemoteReplicationError::Repository(error)), Ok(()))
+            if matches!(*error, GitTransactionError::GitCancelled) =>
+        {
+            Ok(RemoteReplicationOutcome::Cancelled)
+        }
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
     }
 }
 
@@ -772,8 +784,9 @@ mod tests {
     use ulid::Ulid;
 
     use super::{
-        LOCK_FILE_NAME, PushRepository, RemoteReplicationError, RemoteReplicationOutcome,
-        RemoteReplicationPolicy, RemoteReplicator, STATE_FILE_NAME, configured_remote_snapshot,
+        GitTransactionError, LOCK_FILE_NAME, PushRepository, RemoteReplicationError,
+        RemoteReplicationOutcome, RemoteReplicationPolicy, RemoteReplicator, STATE_FILE_NAME,
+        configured_remote_snapshot, finish_replication,
     };
     use crate::{GitIdentity, GitRepository};
 
@@ -1290,6 +1303,22 @@ mod tests {
                 .join(STATE_FILE_NAME)
                 .exists()
         );
+    }
+
+    #[test]
+    fn unlock_failure_takes_precedence_over_pre_push_cancellation() {
+        let cancellation = Err(RemoteReplicationError::Repository(Box::new(
+            GitTransactionError::GitCancelled,
+        )));
+        let unlock = Err(RemoteReplicationError::Io(std::io::Error::other(
+            "fictional unlock failure",
+        )));
+
+        assert!(matches!(
+            finish_replication(cancellation, unlock),
+            Err(RemoteReplicationError::Io(error))
+                if error.to_string() == "fictional unlock failure"
+        ));
     }
 
     #[cfg(target_os = "linux")]
