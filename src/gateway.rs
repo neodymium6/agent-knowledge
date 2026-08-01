@@ -1,6 +1,8 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
@@ -26,8 +28,12 @@ pub fn run_stdio(
     let input = std::fs::File::from(nix::unistd::dup(&stdin).map_err(|error| {
         GatewayCommandError::InputSetup(io::Error::from_raw_os_error(error as i32))
     })?);
+    let stdout = io::stdout();
+    let output = std::fs::File::from(nix::unistd::dup(&stdout).map_err(|error| {
+        GatewayCommandError::OutputSetup(io::Error::from_raw_os_error(error as i32))
+    })?);
     let input = DeadlineReader::new(input, timeout);
-    run_with_settings(settings, client_id, original_command, input, io::stdout())
+    run_with_settings(settings, client_id, original_command, input, output)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -56,7 +62,7 @@ fn run_with_settings<R, W>(
 ) -> Result<(), GatewayCommandError>
 where
     R: Read,
-    W: Write + Send + 'static,
+    W: Write + AsFd,
 {
     let client_id = client_id
         .to_str()
@@ -135,37 +141,84 @@ fn decode_control_request<T: DeserializeOwned>(
 }
 
 fn write_encoded_response_until<W>(
-    mut output: W,
+    output: W,
     response: Vec<u8>,
     deadline: Instant,
 ) -> Result<(), GatewayCommandError>
 where
-    W: Write + Send + 'static,
+    W: AsFd,
 {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or(GatewayCommandError::OutputDeadline)?;
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let writer = std::thread::spawn(move || {
-        let result = output.write_all(&response);
-        let _ = sender.send(result);
-    });
-    match receiver.recv_timeout(remaining) {
-        Ok(result) => {
-            if writer.join().is_err() {
-                return Err(GatewayCommandError::Io(io::Error::other(
-                    "Gateway response writer panicked",
+    use nix::errno::Errno;
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+    let original_flags =
+        OFlag::from_bits_truncate(fcntl(&output, FcntlArg::F_GETFL).map_err(|error| {
+            GatewayCommandError::Io(io::Error::from_raw_os_error(error as i32))
+        })?);
+    fcntl(
+        &output,
+        FcntlArg::F_SETFL(original_flags | OFlag::O_NONBLOCK),
+    )
+    .map_err(|error| GatewayCommandError::Io(io::Error::from_raw_os_error(error as i32)))?;
+    let _flags = OutputFlagGuard {
+        output: &output,
+        original_flags,
+    };
+    let mut written = 0_usize;
+    while written < response.len() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(GatewayCommandError::OutputDeadline);
+        }
+        let timeout = PollTimeout::try_from(deadline.saturating_duration_since(now))
+            .unwrap_or(PollTimeout::MAX);
+        let mut descriptors = [PollFd::new(output.as_fd(), PollFlags::POLLOUT)];
+        match poll(&mut descriptors, timeout) {
+            Ok(0) => return Err(GatewayCommandError::OutputDeadline),
+            Ok(_) => match nix::unistd::write(&output, &response[written..]) {
+                Ok(0) => {
+                    return Err(GatewayCommandError::Io(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "Gateway response output stopped accepting bytes",
+                    )));
+                }
+                Ok(count) => written += count,
+                Err(Errno::EAGAIN) => {}
+                Err(Errno::EINTR) => {}
+                Err(error) => {
+                    return Err(GatewayCommandError::Io(io::Error::from_raw_os_error(
+                        error as i32,
+                    )));
+                }
+            },
+            Err(Errno::EINTR) => {}
+            Err(error) => {
+                return Err(GatewayCommandError::Io(io::Error::from_raw_os_error(
+                    error as i32,
                 )));
             }
-            result.map_err(GatewayCommandError::Io)
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(GatewayCommandError::OutputDeadline),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = writer.join();
-            Err(GatewayCommandError::Io(io::Error::other(
-                "Gateway response writer stopped",
-            )))
-        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+struct OutputFlagGuard<'a, W: AsFd> {
+    output: &'a W,
+    original_flags: nix::fcntl::OFlag,
+}
+
+#[cfg(target_os = "linux")]
+impl<W> Drop for OutputFlagGuard<'_, W>
+where
+    W: AsFd,
+{
+    fn drop(&mut self) {
+        let _ = nix::fcntl::fcntl(
+            self.output,
+            nix::fcntl::FcntlArg::F_SETFL(self.original_flags),
+        );
     }
 }
 
@@ -236,6 +289,7 @@ pub enum GatewayCommandError {
     Config(Box<GatewayConfigError>),
     Gateway(Box<GatewayError>),
     InputSetup(io::Error),
+    OutputSetup(io::Error),
     ControlInput(io::Error),
     ControlRequestTooLarge,
     ControlJson(serde_json::Error),
@@ -261,6 +315,7 @@ impl GatewayCommandError {
             | Self::ClientId(_)
             | Self::Config(_)
             | Self::InputSetup(_)
+            | Self::OutputSetup(_)
             | Self::ControlInput(_)
             | Self::Json(_)
             | Self::Io(_) => ErrorCode::InternalError,
@@ -288,6 +343,7 @@ impl fmt::Display for GatewayCommandError {
             Self::Config(error) => write!(formatter, "Gateway configuration failed: {error}"),
             Self::Gateway(error) => error.fmt(formatter),
             Self::InputSetup(error) => write!(formatter, "Gateway input setup failed: {error}"),
+            Self::OutputSetup(error) => write!(formatter, "Gateway output setup failed: {error}"),
             Self::ControlInput(error) => write!(formatter, "Gateway control input failed: {error}"),
             Self::ControlRequestTooLarge => write!(
                 formatter,
@@ -308,6 +364,7 @@ impl std::error::Error for GatewayCommandError {
             Self::Config(error) => Some(error.as_ref()),
             Self::Gateway(error) => Some(error.as_ref()),
             Self::InputSetup(error) => Some(error),
+            Self::OutputSetup(error) => Some(error),
             Self::ControlInput(error) => Some(error),
             Self::ControlJson(error) => Some(error),
             Self::Json(error) => Some(error),
@@ -325,7 +382,7 @@ impl std::error::Error for GatewayCommandError {
 mod tests {
     use std::ffi::OsStr;
     #[cfg(target_os = "linux")]
-    use std::io::{self, Read, Write};
+    use std::io::Read;
     #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixStream;
     #[cfg(target_os = "linux")]
@@ -381,29 +438,21 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn committed_response_write_stops_waiting_at_the_operation_deadline() {
-        struct SlowWriter;
-
-        impl Write for SlowWriter {
-            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-                std::thread::sleep(Duration::from_secs(1));
-                Ok(buffer.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
+    fn committed_response_timeout_closes_the_output_without_a_writer_thread() {
+        let (writer, mut reader) = UnixStream::pair()
+            .unwrap_or_else(|error| panic!("response stream pair must open: {error}"));
+        let response = vec![b'x'; 8 * 1024 * 1024];
+        let response_length = response.len();
         let started = Instant::now();
         assert!(matches!(
-            write_encoded_response_until(
-                SlowWriter,
-                b"{\"fictional\":true}\n".to_vec(),
-                started + Duration::from_millis(25),
-            ),
+            write_encoded_response_until(writer, response, started + Duration::from_millis(25),),
             Err(GatewayCommandError::OutputDeadline)
         ));
         assert!(started.elapsed() < Duration::from_millis(500));
+        let mut delivered = Vec::new();
+        reader
+            .read_to_end(&mut delivered)
+            .unwrap_or_else(|error| panic!("closed response stream must drain: {error}"));
+        assert!(delivered.len() < response_length);
     }
 }

@@ -312,6 +312,7 @@ pub(super) fn committed_error_code(error: &CommittedReadError) -> ErrorCode {
             if matches!(
                 source.as_ref(),
                 agent_knowledge_repository::ContentIndexError::ScanDeadlineExceeded
+                    | agent_knowledge_repository::ContentIndexError::FileChangedDuringScan(_)
             ) =>
         {
             ErrorCode::TemporaryFailure
@@ -418,10 +419,13 @@ impl std::error::Error for ReadRequestError {}
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::path::PathBuf;
 
+    use agent_knowledge_core::ErrorCode;
     use agent_knowledge_protocol::ListResponse;
+    use agent_knowledge_repository::{CommittedReadError, ContentIndexError};
 
-    use super::{ReadRequestError, ResponseBuffer, prepare_response};
+    use super::{ReadRequestError, ResponseBuffer, committed_error_code, prepare_response};
     use crate::{GatewayError, GatewaySettings};
 
     #[test]
@@ -459,5 +463,13 @@ mod tests {
             .write_all(b"1234567")
             .unwrap_or_else(|error| panic!("seven JSON bytes should fit: {error}"));
         assert!(counter.write_all(b"8").is_err());
+    }
+
+    #[test]
+    fn classifies_a_file_changed_during_scan_as_retryable() {
+        let error = CommittedReadError::Content(Box::new(
+            ContentIndexError::FileChangedDuringScan(PathBuf::from("fictional.md")),
+        ));
+        assert_eq!(committed_error_code(&error), ErrorCode::TemporaryFailure);
     }
 }

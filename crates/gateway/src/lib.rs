@@ -21,7 +21,7 @@ pub use submit::ArchiveError;
 /// Opened Gateway dependencies for one forced-command process.
 #[derive(Debug)]
 pub struct Gateway {
-    queue: FileQueue,
+    queue: Option<FileQueue>,
     committed: CommittedStore,
     settings: GatewaySettings,
 }
@@ -33,7 +33,7 @@ impl Gateway {
     ///
     /// Returns an error when the queue cannot be initialized or pinned.
     pub fn open(settings: &GatewaySettings) -> Result<Self, GatewayError> {
-        Self::open_until(settings, None)
+        Self::open_dependencies(settings, None, true)
     }
 
     /// Opens Gateway dependencies while applying an optional read deadline to
@@ -41,6 +41,14 @@ impl Gateway {
     pub fn open_until(
         settings: &GatewaySettings,
         deadline: Option<std::time::Instant>,
+    ) -> Result<Self, GatewayError> {
+        Self::open_dependencies(settings, deadline, false)
+    }
+
+    fn open_dependencies(
+        settings: &GatewaySettings,
+        deadline: Option<std::time::Instant>,
+        include_queue: bool,
     ) -> Result<Self, GatewayError> {
         let resolved = [
             PathAttestation::resolve_destination(settings.queue_root())
@@ -59,26 +67,37 @@ impl Gateway {
         )
         .map_err(|error| GatewayError::CommittedRead(Box::new(error)))?;
         ensure_deadline(deadline)?;
-        let queue = FileQueue::initialize(resolved[0].stable_path(), PackagePolicy::default())
-            .map_err(|error| GatewayError::Queue(Box::new(error)))?;
-        ensure_deadline(deadline)?;
         let [repository, content] = committed
             .storage_attestations()
             .map_err(GatewayError::Attestation)?;
-        let queue_storage = queue
-            .storage_attestation()
-            .map_err(GatewayError::Attestation)?;
-        let opened = [queue_storage, repository, content];
-        validate_disjoint_storage(&opened)?;
-        if resolved
-            .iter()
-            .zip(opened.iter())
-            .any(|(expected, actual)| !expected.matches_destination(actual))
+        if !resolved[1].matches_destination(&repository)
+            || !resolved[2].matches_destination(&content)
         {
             return Err(GatewayError::Attestation(
                 PathAttestationError::BindingMismatch,
             ));
         }
+        let queue = if include_queue {
+            let queue = FileQueue::initialize(resolved[0].stable_path(), PackagePolicy::default())
+                .map_err(|error| GatewayError::Queue(Box::new(error)))?;
+            let queue_storage = queue
+                .storage_attestation()
+                .map_err(GatewayError::Attestation)?;
+            validate_disjoint_storage(&[
+                queue_storage.clone(),
+                repository.clone(),
+                content.clone(),
+            ])?;
+            if !resolved[0].matches_destination(&queue_storage) {
+                return Err(GatewayError::Attestation(
+                    PathAttestationError::BindingMismatch,
+                ));
+            }
+            Some(queue)
+        } else {
+            None
+        };
+        ensure_deadline(deadline)?;
         Ok(Self {
             queue,
             committed,
@@ -97,7 +116,8 @@ impl Gateway {
         client_id: ClientId,
         input: impl Read,
     ) -> Result<SubmitResponse, GatewayError> {
-        submit::submit(&self.queue, client_id, input)
+        let queue = self.queue.as_ref().ok_or(GatewayError::QueueUnavailable)?;
+        submit::submit(queue, client_id, input)
     }
 
     /// Lists matching committed documents in canonical path order.
@@ -181,6 +201,8 @@ pub enum GatewayError {
     Attestation(PathAttestationError),
     /// Two configured storage roots resolve to overlapping locations.
     OverlappingStorage,
+    /// A submit operation was attempted through a read-only Gateway instance.
+    QueueUnavailable,
 }
 
 impl GatewayError {
@@ -192,7 +214,9 @@ impl GatewayError {
             Self::Archive(error) => error.error_code(),
             Self::ReadRequest(error) => error.error_code(),
             Self::CommittedRead(error) => read::committed_error_code(error),
-            Self::Attestation(_) | Self::OverlappingStorage => ErrorCode::InternalError,
+            Self::Attestation(_) | Self::OverlappingStorage | Self::QueueUnavailable => {
+                ErrorCode::InternalError
+            }
         }
     }
 }
@@ -210,6 +234,9 @@ impl fmt::Display for GatewayError {
             Self::OverlappingStorage => {
                 formatter.write_str("Gateway storage roots must not overlap")
             }
+            Self::QueueUnavailable => {
+                formatter.write_str("Gateway queue is unavailable for submission")
+            }
         }
     }
 }
@@ -222,7 +249,7 @@ impl std::error::Error for GatewayError {
             Self::ReadRequest(error) => Some(error),
             Self::CommittedRead(error) => Some(error.as_ref()),
             Self::Attestation(error) => Some(error),
-            Self::OverlappingStorage => None,
+            Self::OverlappingStorage | Self::QueueUnavailable => None,
         }
     }
 }
