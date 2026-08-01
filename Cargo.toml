@@ -1,8 +1,9 @@
 [workspace]
 members = [
-  ".",
-  "crates/core",
-  "crates/queue",
+    ".",
+    "crates/core",
+    "crates/protocol",
+    "crates/queue",
   "crates/release",
   "crates/repository",
   "crates/worker",

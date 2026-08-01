@@ -1,0 +1,14 @@
+[package]
+name = "agent-knowledge-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-knowledge-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
