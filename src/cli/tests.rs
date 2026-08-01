@@ -159,3 +159,23 @@ fn parses_the_worker_configuration_command() {
             if config == Path::new("/srv/fictional-knowledge/worker.yaml")
     ));
 }
+
+#[test]
+fn parses_the_forced_command_gateway_configuration() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "gateway".into(),
+        "--config".into(),
+        "/srv/fictional-knowledge/gateway.yaml".into(),
+        "--client-id".into(),
+        "fictional-node-a".into(),
+    ])
+    .unwrap_or_else(|error| panic!("Gateway command must parse: {error}"));
+
+    assert!(matches!(
+        command,
+        Command::RunGateway { config, client_id }
+            if config == Path::new("/srv/fictional-knowledge/gateway.yaml")
+                && client_id == "fictional-node-a"
+    ));
+}
