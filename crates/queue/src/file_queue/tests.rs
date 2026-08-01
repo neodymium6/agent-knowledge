@@ -7,13 +7,14 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use agent_knowledge_core::{ErrorCode, PayloadPath};
+use agent_knowledge_core::{BatchId, ErrorCode, PayloadPath, RequestId};
 use agent_knowledge_protocol::ClientId;
 
+use super::status::StatusObservationHook;
 use super::{
-    AcceptanceHook, AcceptancePhase, DirectoryScanner, EnqueueOutcome, FileQueue, IncomingPackage,
-    QueueError, QueueLimit, QueueState, StaleAgeSource, WorkerQueueError,
-    inactive_stale_directories,
+    AcceptanceHook, AcceptancePhase, ClaimToken, DirectoryScanner, EnqueueOutcome, FileQueue,
+    IncomingPackage, ProcessingScanOutcome, QueueError, QueueLimit, QueueReader,
+    QueueRequestStatus, QueueState, StaleAgeSource, WorkerQueueError, inactive_stale_directories,
 };
 use crate::{PackageLimits, PackagePolicy, validate_accepted_package};
 
@@ -171,6 +172,204 @@ fn copy_tree(source: &Path, destination: &Path) {
             panic!("queue fixture must contain only directories and regular files");
         }
     }
+}
+
+fn request_id(value: &str) -> RequestId {
+    value
+        .parse()
+        .unwrap_or_else(|error| panic!("fixture request ID must parse: {error}"))
+}
+
+fn batch_id(value: &str) -> BatchId {
+    value
+        .parse()
+        .unwrap_or_else(|error| panic!("fixture batch ID must parse: {error}"))
+}
+
+#[test]
+fn read_only_status_observes_every_request_state_without_taking_queue_locks() {
+    const SECOND_REQUEST_ID: &str = "01K00000000000000000000010";
+    const FIRST_BATCH_ID: &str = "01K00000000000000000000020";
+    const SECOND_BATCH_ID: &str = "01K00000000000000000000021";
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    let first_request = request_id("01K00000000000000000000000");
+
+    let lock = queue
+        .open_queue_lock()
+        .unwrap_or_else(|error| panic!("queue lock fixture must open: {error}"));
+    lock.lock()
+        .unwrap_or_else(|error| panic!("queue lock fixture must lock: {error}"));
+    let reader = QueueReader::open_until(root.path().join("queue"), None).unwrap_or_else(|error| {
+        panic!("read-only queue must open without taking the lock: {error}")
+    });
+    assert_eq!(
+        reader
+            .status_until(first_request, None)
+            .unwrap_or_else(|error| panic!("pending status must be readable: {error}")),
+        Some(QueueRequestStatus::Pending)
+    );
+    drop(lock);
+
+    let mut worker = queue
+        .try_worker_session()
+        .unwrap_or_else(|error| panic!("Worker fixture must open: {error}"));
+    assert!(matches!(
+        worker.scan_processing(16),
+        Ok(ProcessingScanOutcome::Complete { ref claims, .. }) if claims.is_empty()
+    ));
+    let completed = worker
+        .claim(first_request, batch_id(FIRST_BATCH_ID))
+        .unwrap_or_else(|error| panic!("first request must be claimed: {error}"))
+        .token();
+    assert_eq!(
+        reader
+            .status_until(first_request, None)
+            .unwrap_or_else(|error| panic!("processing status must be readable: {error}")),
+        Some(QueueRequestStatus::Processing)
+    );
+    worker
+        .reconcile_batch(batch_id(FIRST_BATCH_ID), &[completed], &[])
+        .unwrap_or_else(|error| panic!("first request must complete: {error}"));
+    assert_eq!(
+        reader
+            .status_until(first_request, None)
+            .unwrap_or_else(|error| panic!("completed status must be readable: {error}")),
+        Some(QueueRequestStatus::Completed)
+    );
+
+    accept(stage_package_with_request_id(
+        &queue,
+        RESULTS,
+        SECOND_REQUEST_ID,
+    ));
+    let second_request = request_id(SECOND_REQUEST_ID);
+    let failed = worker
+        .claim(second_request, batch_id(SECOND_BATCH_ID))
+        .unwrap_or_else(|error| panic!("second request must be claimed: {error}"))
+        .token();
+    worker
+        .reconcile_batch(
+            batch_id(SECOND_BATCH_ID),
+            &[],
+            &[(failed, ErrorCode::RevisionConflict)],
+        )
+        .unwrap_or_else(|error| panic!("second request must fail: {error}"));
+    assert!(matches!(
+        reader
+            .status_until(second_request, None)
+            .unwrap_or_else(|error| panic!("failed status must be readable: {error}")),
+        Some(QueueRequestStatus::Failed {
+            error_code: ErrorCode::RevisionConflict,
+            ..
+        })
+    ));
+    assert_eq!(
+        reader
+            .status_until(request_id("01K00000000000000000000099"), None)
+            .unwrap_or_else(|error| panic!("missing status lookup must succeed: {error}")),
+        None
+    );
+}
+
+#[test]
+fn read_only_status_requires_an_existing_queue_and_honors_deadlines() {
+    let root = TestDirectory::create();
+    let queue_root = root.path().join("queue");
+    assert!(matches!(
+        QueueReader::open_until(&queue_root, None),
+        Err(QueueError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+    ));
+    assert!(!queue_root.exists());
+
+    let _queue = initialize_queue(root.path(), PackagePolicy::default());
+    assert!(matches!(
+        QueueReader::open_until(&queue_root, Some(std::time::Instant::now())),
+        Err(QueueError::OperationDeadlineExceeded)
+    ));
+
+    let reader = QueueReader::open_until(&queue_root, None)
+        .unwrap_or_else(|error| panic!("read-only queue fixture must open: {error}"));
+    assert!(matches!(
+        reader.status_until(
+            request_id("01K00000000000000000000099"),
+            Some(std::time::Instant::now())
+        ),
+        Err(QueueError::OperationDeadlineExceeded)
+    ));
+}
+
+#[test]
+fn read_only_status_rejects_queue_replacement() {
+    let root = TestDirectory::create();
+    let queue_root = root.path().join("queue");
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    let reader = QueueReader::open_until(&queue_root, None)
+        .unwrap_or_else(|error| panic!("read-only queue fixture must open: {error}"));
+
+    fs::rename(&queue_root, root.path().join("detached-queue"))
+        .unwrap_or_else(|error| panic!("queue fixture must be detached: {error}"));
+    FileQueue::initialize(&queue_root, PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("replacement queue fixture must initialize: {error}"));
+    assert!(matches!(
+        reader.status_until(request_id("01K00000000000000000000000"), None),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+}
+
+#[test]
+fn read_only_status_retries_an_empty_observation_during_requeue() {
+    const BATCH_ID: &str = "01K00000000000000000000020";
+
+    struct RequeueAfterPending<'a> {
+        worker: &'a mut super::WorkerSession,
+        token: Option<ClaimToken>,
+    }
+
+    impl StatusObservationHook for RequeueAfterPending<'_> {
+        fn after_state(&mut self, state: QueueState) {
+            if state == QueueState::Pending
+                && let Some(token) = self.token.take()
+            {
+                self.worker.requeue_claimed(token).unwrap_or_else(|error| {
+                    panic!("processing request must be requeued during observation: {error}")
+                });
+            }
+        }
+    }
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    let request_id = request_id("01K00000000000000000000000");
+    let mut worker = queue
+        .try_worker_session()
+        .unwrap_or_else(|error| panic!("Worker fixture must open: {error}"));
+    assert!(matches!(
+        worker.scan_processing(16),
+        Ok(ProcessingScanOutcome::Complete { ref claims, .. }) if claims.is_empty()
+    ));
+    let token = worker
+        .claim(request_id, batch_id(BATCH_ID))
+        .unwrap_or_else(|error| panic!("request must be claimed: {error}"))
+        .token();
+    let reader = QueueReader::open_until(root.path().join("queue"), None)
+        .unwrap_or_else(|error| panic!("read-only queue fixture must open: {error}"));
+    let mut hook = RequeueAfterPending {
+        worker: &mut worker,
+        token: Some(token),
+    };
+
+    assert_eq!(
+        reader
+            .status_until_with_hook(request_id, None, &mut hook)
+            .unwrap_or_else(|error| panic!("requeued status must be retried: {error}")),
+        Some(QueueRequestStatus::Pending)
+    );
+    assert!(hook.token.is_none());
 }
 
 #[test]

@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use agent_knowledge_core::ErrorCode;
 use agent_knowledge_gateway::{
-    GatewayConfigError, GatewayError, GatewaySettings, ReadGateway, SubmitGateway,
+    GatewayConfigError, GatewayError, GatewaySettings, ReadGateway, StatusGateway, SubmitGateway,
 };
 use agent_knowledge_protocol::{ClientId, ClientIdError, GatewayCommand, ProtocolErrorResponse};
 use serde::de::DeserializeOwned;
@@ -121,6 +121,16 @@ where
                 ReadGateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
             let encoded = gateway
                 .search_encoded_until(&request, deadline)
+                .map_err(gateway_error)?;
+            write_encoded_response_until(output, encoded, deadline)
+        }
+        GatewayCommand::Status => {
+            let request = decode_control_request(input)?;
+            let deadline = read_deadline(&settings);
+            let gateway =
+                StatusGateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
+            let encoded = gateway
+                .status_encoded_until(request, deadline)
                 .map_err(gateway_error)?;
             write_encoded_response_until(output, encoded, deadline)
         }

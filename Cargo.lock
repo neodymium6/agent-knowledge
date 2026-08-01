@@ -53,6 +53,7 @@ dependencies = [
  "agent-knowledge-core",
  "serde",
  "serde_json",
+ "time",
 ]
 
 [[package]]

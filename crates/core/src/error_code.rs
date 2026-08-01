@@ -34,6 +34,8 @@ pub enum ErrorCode {
     LimitExceeded,
     /// A request ID was reused with different content.
     RequestIdReused,
+    /// A requested change request does not exist in durable queue state.
+    RequestNotFound,
     /// A document ID already exists.
     DocumentIdConflict,
     /// A requested document does not exist.
@@ -62,6 +64,7 @@ impl fmt::Display for ErrorCode {
             Self::UnsupportedFileType => "UNSUPPORTED_FILE_TYPE",
             Self::LimitExceeded => "LIMIT_EXCEEDED",
             Self::RequestIdReused => "REQUEST_ID_REUSED",
+            Self::RequestNotFound => "REQUEST_NOT_FOUND",
             Self::DocumentIdConflict => "DOCUMENT_ID_CONFLICT",
             Self::DocumentNotFound => "DOCUMENT_NOT_FOUND",
             Self::RevisionConflict => "REVISION_CONFLICT",
@@ -89,6 +92,7 @@ mod tests {
             (ErrorCode::UnsupportedFileType, "UNSUPPORTED_FILE_TYPE"),
             (ErrorCode::LimitExceeded, "LIMIT_EXCEEDED"),
             (ErrorCode::RequestIdReused, "REQUEST_ID_REUSED"),
+            (ErrorCode::RequestNotFound, "REQUEST_NOT_FOUND"),
             (ErrorCode::DocumentIdConflict, "DOCUMENT_ID_CONFLICT"),
             (ErrorCode::DocumentNotFound, "DOCUMENT_NOT_FOUND"),
             (ErrorCode::RevisionConflict, "REVISION_CONFLICT"),

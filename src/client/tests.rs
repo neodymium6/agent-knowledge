@@ -8,15 +8,15 @@ use std::time::{Duration, Instant};
 use agent_knowledge_core::PinnedDirectory;
 use agent_knowledge_protocol::{
     GetRequest, LIST_COMMAND, ListRequest, ListResponse, ProtocolErrorResponse, ReadFilterRequest,
-    SubmitResponse,
+    StatusRequest, SubmitResponse,
 };
 use agent_knowledge_queue::{PackagePolicy, validate_package};
 use tar::Archive;
 
 use super::{
-    ClientCommandError, MAXIMUM_RESPONSE_BYTES, PreparedPackage, control_with_program,
-    decode_protocol_version, get_with_program, open_payload, read_bounded_diagnostic,
-    read_bounded_response, submit_with_program,
+    ClientCommandError, ControlOperation, MAXIMUM_CONTROL_RESPONSE_BYTES, MAXIMUM_RESPONSE_BYTES,
+    PreparedPackage, control_with_program, decode_protocol_version, get_with_program, open_payload,
+    read_bounded_diagnostic, read_bounded_response, status_with_program, submit_with_program,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -195,7 +195,7 @@ fn sends_typed_control_json_and_validates_the_response() {
     control_with_program::<_, ListResponse>(
         program.as_os_str(),
         OsStr::new("fictional-alias"),
-        LIST_COMMAND,
+        ControlOperation::new(LIST_COMMAND, MAXIMUM_CONTROL_RESPONSE_BYTES),
         &request,
         Duration::from_secs(5),
         &mut output,
@@ -239,6 +239,63 @@ fn rejects_a_get_response_for_a_different_document() {
             Vec::new(),
         ),
         Err(ClientCommandError::DocumentResponseMismatch)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn sends_status_request_and_rejects_a_mismatched_response() {
+    let root = TestDirectory::create();
+    let arguments = root.path().join("status-arguments");
+    let request_file = root.path().join("status-request.json");
+    let program = root.path().join("fictional-status-ssh");
+    let script = format!(
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\nprintf '%s\\n' '{{\"status\":\"pending\",\"protocol_version\":1,\"request_id\":\"01K00000000000000000000099\"}}'\n",
+        arguments.display(),
+        request_file.display(),
+    );
+    write_program(&program, &script);
+    let request_id = "01K00000000000000000000000"
+        .parse()
+        .unwrap_or_else(|error| panic!("request ID fixture must parse: {error}"));
+    assert!(matches!(
+        status_with_program(
+            program.as_os_str(),
+            OsStr::new("fictional-alias"),
+            &StatusRequest::new(request_id),
+            Duration::from_secs(5),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(ClientCommandError::RequestStatusResponseMismatch)
+    ));
+    assert_eq!(
+        fs::read_to_string(arguments)
+            .unwrap_or_else(|error| panic!("status arguments must be readable: {error}")),
+        "-T\n-o\nBatchMode=yes\n-o\nClearAllForwardings=yes\n-o\nForwardAgent=no\n-o\nForwardX11=no\n-o\nStdinNull=no\n-o\nForkAfterAuthentication=no\n--\nfictional-alias\nakp-v1 status\n"
+    );
+    let sent: StatusRequest = serde_json::from_slice(
+        &fs::read(request_file)
+            .unwrap_or_else(|error| panic!("status request must be readable: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("status request must decode: {error}"));
+    assert_eq!(sent.request_id, request_id);
+
+    let oversized_program = root.path().join("fictional-oversized-status-ssh");
+    write_program(
+        &oversized_program,
+        "#!/bin/sh\ncat > /dev/null\nhead -c 4097 /dev/zero\n",
+    );
+    assert!(matches!(
+        status_with_program(
+            oversized_program.as_os_str(),
+            OsStr::new("fictional-alias"),
+            &StatusRequest::new(request_id),
+            Duration::from_secs(5),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(ClientCommandError::ControlResponseTooLarge { maximum: 4096 })
     ));
 }
 

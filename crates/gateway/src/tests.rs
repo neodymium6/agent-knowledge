@@ -6,12 +6,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_knowledge_core::ErrorCode;
 use agent_knowledge_protocol::{
-    ClientId, GetRequest, ListRequest, ReadFilterRequest, SearchRequest, SubmitOutcome,
+    ClientId, GetRequest, ListRequest, ReadFilterRequest, RequestStatus, SearchRequest,
+    StatusRequest, SubmitOutcome,
 };
 use agent_knowledge_queue::{PackagePolicy, validate_accepted_package};
 use tar::{Builder, EntryType, Header};
 
-use super::{ArchiveError, GatewayError, GatewaySettings, ReadGateway, SubmitGateway};
+use super::{
+    ArchiveError, GatewayError, GatewaySettings, ReadGateway, StatusGateway, SubmitGateway,
+};
 
 const REQUEST_ID: &str = "01K00000000000000000000000";
 const REQUEST_JSON: &[u8] = br#"{
@@ -232,6 +235,43 @@ fn committed_reads_do_not_open_the_queue_path() {
         .unwrap_or_else(|error| panic!("committed list must succeed: {error}"));
     assert_eq!(response.documents.len(), 1);
     drop(queue_socket);
+}
+
+#[cfg(target_family = "unix")]
+#[test]
+fn request_status_reads_only_the_existing_queue() {
+    use std::os::unix::net::UnixListener;
+
+    let root = TestDirectory::create();
+    let settings = settings(&root);
+    SubmitGateway::open(&settings)
+        .unwrap_or_else(|error| panic!("submit Gateway fixture must open: {error}"))
+        .submit(client_id(), Cursor::new(valid_archive()))
+        .unwrap_or_else(|error| panic!("Gateway archive fixture must be accepted: {error}"));
+    let repository_socket = UnixListener::bind(settings.git_directory())
+        .unwrap_or_else(|error| panic!("fictional repository socket must bind: {error}"));
+    let content_socket = UnixListener::bind(settings.content_root())
+        .unwrap_or_else(|error| panic!("fictional content socket must bind: {error}"));
+
+    let gateway = StatusGateway::open_until(&settings, None)
+        .unwrap_or_else(|error| panic!("status Gateway must ignore committed storage: {error}"));
+    let request_id = REQUEST_ID
+        .parse()
+        .unwrap_or_else(|error| panic!("request ID fixture must parse: {error}"));
+    let response = gateway
+        .status(StatusRequest::new(request_id))
+        .unwrap_or_else(|error| panic!("pending request status must succeed: {error}"));
+    assert_eq!(response.request_id(), request_id);
+    assert_eq!(response.request_status(), RequestStatus::Pending);
+
+    let missing = "01K00000000000000000000099"
+        .parse()
+        .unwrap_or_else(|error| panic!("missing request ID fixture must parse: {error}"));
+    assert!(matches!(
+        gateway.status(StatusRequest::new(missing)),
+        Err(GatewayError::RequestNotFound { request_id }) if request_id == missing
+    ));
+    drop((repository_socket, content_socket));
 }
 
 #[test]

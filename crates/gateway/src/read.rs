@@ -142,7 +142,7 @@ pub(super) fn read_deadline(settings: &GatewaySettings) -> Result<Instant, Gatew
         .ok_or(GatewayError::ReadRequest(ReadRequestError::InvalidDeadline))
 }
 
-fn prepare_response<T>(
+pub(super) fn prepare_response<T>(
     settings: &GatewaySettings,
     response: T,
     deadline: Instant,
@@ -161,7 +161,7 @@ where
         .and_then(|()| buffer.write_all(b"\n").map_err(serde_json::Error::io));
     if encoded.is_err() {
         if buffer.deadline_exceeded {
-            return Err(committed(CommittedReadError::OperationDeadlineExceeded));
+            return Err(GatewayError::OperationDeadlineExceeded);
         }
         if buffer.limit_exceeded {
             return Err(GatewayError::ReadRequest(
@@ -175,7 +175,7 @@ where
         ));
     }
     if Instant::now() >= deadline {
-        return Err(committed(CommittedReadError::OperationDeadlineExceeded));
+        return Err(GatewayError::OperationDeadlineExceeded);
     }
     Ok(PreparedResponse {
         response,
@@ -248,7 +248,7 @@ fn document_summary(record: &DocumentRecord) -> Result<DocumentSummary, GatewayE
     })
 }
 
-fn validate_version(version: u16) -> Result<(), GatewayError> {
+pub(super) fn validate_version(version: u16) -> Result<(), GatewayError> {
     if version != CURRENT_GATEWAY_PROTOCOL_VERSION {
         return Err(GatewayError::ReadRequest(
             ReadRequestError::UnsupportedProtocolVersion { found: version },

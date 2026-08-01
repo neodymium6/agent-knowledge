@@ -2,16 +2,18 @@
 
 mod config;
 mod read;
+mod status;
 mod submit;
 
 use std::fmt;
 use std::io::Read;
 
-use agent_knowledge_core::{ErrorCode, PathAttestation, PathAttestationError};
+use agent_knowledge_core::{ErrorCode, PathAttestation, PathAttestationError, RequestId};
 use agent_knowledge_protocol::{
-    ClientId, GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest, SubmitResponse,
+    ClientId, GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest, StatusRequest,
+    StatusResponse, SubmitResponse,
 };
-use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueError};
+use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueError, QueueReader};
 use agent_knowledge_repository::{CommittedReadError, CommittedStore};
 
 pub use config::{CURRENT_GATEWAY_CONFIG_VERSION, GatewayConfigError, GatewaySettings};
@@ -65,6 +67,60 @@ impl SubmitGateway {
         input: impl Read,
     ) -> Result<SubmitResponse, GatewayError> {
         submit::submit(&self.queue, client_id, input)
+    }
+}
+
+/// Gateway state opened exclusively for durable request-status reads.
+#[derive(Debug)]
+pub struct StatusGateway {
+    queue: QueueReader,
+    settings: GatewaySettings,
+}
+
+impl StatusGateway {
+    /// Opens an existing durable queue without initializing or locking it.
+    ///
+    /// The repository and content paths are intentionally not opened because
+    /// request state is owned entirely by the durable queue.
+    pub fn open_until(
+        settings: &GatewaySettings,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self, GatewayError> {
+        let resolved = PathAttestation::resolve_destination(settings.queue_root())
+            .map_err(GatewayError::Attestation)?;
+        let queue = QueueReader::open_until(resolved.stable_path(), deadline)
+            .map_err(|error| GatewayError::Queue(Box::new(error)))?;
+        ensure_deadline(deadline)?;
+        let queue_storage = queue
+            .storage_attestation()
+            .map_err(GatewayError::Attestation)?;
+        if !resolved.matches_destination(&queue_storage) {
+            return Err(GatewayError::Attestation(
+                PathAttestationError::BindingMismatch,
+            ));
+        }
+        ensure_deadline(deadline)?;
+        Ok(Self {
+            queue,
+            settings: settings.clone(),
+        })
+    }
+
+    /// Retrieves one durable request state under the configured read budget.
+    pub fn status(&self, request: StatusRequest) -> Result<StatusResponse, GatewayError> {
+        let deadline = read::read_deadline(&self.settings)?;
+        status::status(&self.settings, &self.queue, request, deadline)
+            .map(|prepared| prepared.response)
+    }
+
+    /// Encodes one durable request-state response under an absolute deadline.
+    pub fn status_encoded_until(
+        &self,
+        request: StatusRequest,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, GatewayError> {
+        status::status(&self.settings, &self.queue, request, deadline)
+            .map(|prepared| prepared.encoded)
     }
 }
 
@@ -172,9 +228,7 @@ impl ReadGateway {
 
 fn ensure_deadline(deadline: Option<std::time::Instant>) -> Result<(), GatewayError> {
     if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-        Err(GatewayError::CommittedRead(Box::new(
-            CommittedReadError::OperationDeadlineExceeded,
-        )))
+        Err(GatewayError::OperationDeadlineExceeded)
     } else {
         Ok(())
     }
@@ -195,6 +249,13 @@ pub enum GatewayError {
     Attestation(PathAttestationError),
     /// Two configured storage roots resolve to overlapping locations.
     OverlappingStorage,
+    /// A bounded Gateway operation exceeded its absolute deadline.
+    OperationDeadlineExceeded,
+    /// No durable state exists for the requested change request.
+    RequestNotFound {
+        /// Requested immutable change-request identifier.
+        request_id: RequestId,
+    },
 }
 
 impl GatewayError {
@@ -207,6 +268,8 @@ impl GatewayError {
             Self::ReadRequest(error) => error.error_code(),
             Self::CommittedRead(error) => read::committed_error_code(error),
             Self::Attestation(_) | Self::OverlappingStorage => ErrorCode::InternalError,
+            Self::OperationDeadlineExceeded => ErrorCode::TemporaryFailure,
+            Self::RequestNotFound { .. } => ErrorCode::RequestNotFound,
         }
     }
 }
@@ -224,6 +287,15 @@ impl fmt::Display for GatewayError {
             Self::OverlappingStorage => {
                 formatter.write_str("Gateway storage roots must not overlap")
             }
+            Self::OperationDeadlineExceeded => {
+                formatter.write_str("Gateway operation deadline expired")
+            }
+            Self::RequestNotFound { request_id } => {
+                write!(
+                    formatter,
+                    "request {request_id} does not exist in durable queue state"
+                )
+            }
         }
     }
 }
@@ -236,7 +308,9 @@ impl std::error::Error for GatewayError {
             Self::ReadRequest(error) => Some(error),
             Self::CommittedRead(error) => Some(error.as_ref()),
             Self::Attestation(error) => Some(error),
-            Self::OverlappingStorage => None,
+            Self::OverlappingStorage
+            | Self::OperationDeadlineExceeded
+            | Self::RequestNotFound { .. } => None,
         }
     }
 }
