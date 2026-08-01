@@ -640,7 +640,9 @@ ssh -T -o BatchMode=yes -o ClearAllForwardings=yes \
 The client does not accept arbitrary SSH arguments or construct a shell
 command. A positive `--timeout-seconds` value applies one absolute deadline to
 process execution and all three SSH streams; it defaults to 300 seconds and is
-bounded to 3,600 seconds.
+bounded to 3,600 seconds. The client starts SSH in a dedicated process group.
+If the deadline or a stream-size limit is reached, it terminates and reaps the
+group so proxy or jump-host descendants cannot retain a pipe past the deadline.
 
 ### 13.3 Encoding
 
@@ -659,10 +661,11 @@ directories are accepted. Duplicate names, sparse files, links, devices,
 PAX extensions, unexpected top-level entries, nonzero trailing data, excessive
 counts, and limit violations are rejected. The official client produces
 deterministic GNU headers and streams only `request.json`, the `payload/`
-directory, and validated payload files. Before starting SSH, it opens each
-payload without following a final symbolic link, verifies its byte length and
-SHA-256 revision, and retains a bounded immutable byte snapshot. A successful
-response is accepted only when its request ID and digest match that snapshot.
+directory, and validated payload files. Before starting SSH, it pins the
+package directory and opens each payload beneath that descriptor without
+resolving any symbolic-link component. It verifies each byte length and SHA-256
+revision and retains a bounded immutable byte snapshot. A successful response
+is accepted only when its request ID and digest match that snapshot.
 
 Gateway configuration supplies a positive `transport.submit_timeout_seconds`,
 bounded to 3,600 seconds. On Linux the forced-command process polls standard
@@ -1385,6 +1388,7 @@ Configuration, rather than architecture, controls:
 - maximum directory and total package-entry counts;
 - maximum payload path components;
 - maximum front-matter bytes;
+- Gateway submit and client transfer timeouts;
 - incoming quarantine and reap age thresholds;
 - allowed attachment extensions;
 - project identifiers;

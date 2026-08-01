@@ -65,7 +65,10 @@ backgrounding/stdin overrides, and streams an uncompressed tar archive to the
 exact remote command `akp-v1 submit`. SSH identity, host-key, proxy, and
 destination settings belong in the user's SSH configuration. The timeout is an
 absolute transfer deadline; it defaults to 300 seconds and is bounded to 3,600
-seconds.
+seconds. The client resolves payloads beneath a pinned package directory
+without following symbolic-link components. It runs SSH in a dedicated process
+group and terminates that group when the deadline or a stream-size limit is
+reached, including when a proxy descendant retains an output pipe.
 
 The forced command requires a strict Gateway configuration such as:
 
