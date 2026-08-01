@@ -3,6 +3,8 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::ffi::OsString;
@@ -15,6 +17,8 @@ use agent_knowledge_queue::{
 };
 use ulid::Ulid;
 
+#[cfg(target_os = "linux")]
+use super::run_git_until;
 use super::{
     BatchCommitOutcome, ClaimedBatch, GitIdentity, GitRepository, GitTransactionError,
     RepositoryTransaction, TransactionHooks, accept_trial_build, decode_journal,
@@ -28,6 +32,28 @@ const SECOND_REQUEST_ID: &str = "01K00000000000000000000002";
 const DOCUMENT_ID: &str = "01K00000000000000000000003";
 const BATCH_ID: &str = "01K00000000000000000000004";
 const SECOND_BATCH_ID: &str = "01K00000000000000000000005";
+
+#[cfg(target_os = "linux")]
+#[test]
+fn terminates_a_read_only_git_process_group_at_the_deadline() {
+    let started = Instant::now();
+    let result = run_git_until(
+        None,
+        None,
+        [
+            OsStr::new("-c"),
+            OsStr::new("alias.fictional-delay=!sleep 5"),
+            OsStr::new("fictional-delay"),
+        ],
+        started + Duration::from_millis(50),
+    );
+
+    assert!(matches!(
+        result,
+        Err(GitTransactionError::GitDeadlineExceeded)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
 
 #[test]
 fn migrates_schema_two_journals_for_every_recovery_phase() {

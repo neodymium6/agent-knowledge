@@ -50,6 +50,7 @@ pub struct DocumentRecord {
     location: DocumentLocation,
     metadata: DocumentMetadata,
     revision: Revision,
+    byte_length: u64,
 }
 
 impl DocumentRecord {
@@ -75,6 +76,12 @@ impl DocumentRecord {
     #[must_use]
     pub const fn revision(&self) -> Revision {
         self.revision
+    }
+
+    /// Returns the validated byte length of the exact Markdown document.
+    #[must_use]
+    pub const fn byte_length(&self) -> u64 {
+        self.byte_length
     }
 }
 
@@ -180,6 +187,7 @@ impl ContentIndex {
             let remaining = policy.maximum_entry_count.saturating_sub(entry_count);
             let mut entries = Vec::with_capacity(remaining.min(1_024));
             for entry in fs::read_dir(&directory).map_err(ContentIndexError::Io)? {
+                check_scan_deadline(policy.scan_deadline)?;
                 let entry = entry.map_err(ContentIndexError::Io)?;
                 if directory == content_root && entry.file_name() == ".git" {
                     continue;
@@ -263,7 +271,9 @@ impl ContentIndex {
                     });
                 }
 
-                let bytes = read_bounded_file(&path, policy.maximum_markdown_bytes)?;
+                let bytes =
+                    read_bounded_file(&path, policy.maximum_markdown_bytes, policy.scan_deadline)?;
+                check_scan_deadline(policy.scan_deadline)?;
                 if bytes.len() as u64 > policy.maximum_markdown_bytes {
                     return Err(ContentIndexError::MarkdownTooLarge {
                         path: relative_path,
@@ -294,6 +304,7 @@ impl ContentIndex {
                     location,
                     metadata: document,
                     revision,
+                    byte_length: metadata.len(),
                 };
                 if let Some(existing) = documents.insert(document_id, record) {
                     return Err(ContentIndexError::DuplicateDocumentId {
@@ -307,6 +318,7 @@ impl ContentIndex {
         }
 
         validate_attachment_locations(&attachments, &documents, package_policy)?;
+        check_scan_deadline(policy.scan_deadline)?;
 
         Ok(Self { documents })
     }
@@ -381,12 +393,26 @@ fn same_root_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
     true
 }
 
-fn read_bounded_file(path: &Path, maximum: u64) -> Result<Vec<u8>, ContentIndexError> {
+fn read_bounded_file(
+    path: &Path,
+    maximum: u64,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>, ContentIndexError> {
     let capacity = usize::try_from(maximum.min(64 * 1024)).unwrap_or(64 * 1024);
     let mut bytes = Vec::with_capacity(capacity);
-    File::open(path)
-        .and_then(|file| file.take(maximum.saturating_add(1)).read_to_end(&mut bytes))
-        .map_err(ContentIndexError::Io)?;
+    let mut file = File::open(path)
+        .map_err(ContentIndexError::Io)?
+        .take(maximum.saturating_add(1));
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check_scan_deadline(deadline)?;
+        let count = file.read(&mut buffer).map_err(ContentIndexError::Io)?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    check_scan_deadline(deadline)?;
     Ok(bytes)
 }
 

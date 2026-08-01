@@ -14,9 +14,9 @@ use agent_knowledge_queue::PackagePolicy;
 use sha2::{Digest, Sha256};
 
 use crate::git::{
-    ensure_canonical_worktree_clean, ensure_real_directory, ensure_supported_git,
-    open_stable_directory, parse_object_id, run_git, validate_local_git_config,
-    validate_repository_layout,
+    ensure_canonical_worktree_clean_until, ensure_real_directory, ensure_supported_git,
+    open_stable_directory, parse_object_id, run_git, run_git_for_read, validate_local_git_config,
+    validate_local_git_config_until, validate_repository_layout, validate_repository_layout_until,
 };
 use crate::{ContentIndex, ContentIndexError, ContentPolicy, DocumentRecord, GitTransactionError};
 
@@ -127,13 +127,21 @@ impl CommittedStore {
         }
         validate_same_directory(&self.configured_git_directory, &self.git_root_handle)?;
         validate_same_directory(&self.configured_content_root, &self.content_root_handle)?;
-        validate_local_git_config(&self.git_directory).map_err(CommittedReadError::repository)?;
-        validate_repository_layout(&self.git_directory, &self.content_root, &self.official_ref)
+        let deadline = content_policy.scan_deadline;
+        check_operation_deadline(deadline)?;
+        validate_local_git_config_until(&self.git_directory, deadline)
             .map_err(CommittedReadError::repository)?;
-        ensure_canonical_worktree_clean(&self.content_root)
+        validate_repository_layout_until(
+            &self.git_directory,
+            &self.content_root,
+            &self.official_ref,
+            deadline,
+        )
+        .map_err(CommittedReadError::repository)?;
+        ensure_canonical_worktree_clean_until(&self.content_root, deadline)
             .map_err(CommittedReadError::repository)?;
 
-        let official = run_git(
+        let official = run_git_for_read(
             None,
             Some(&self.git_directory),
             [
@@ -141,10 +149,11 @@ impl CommittedStore {
                 OsStr::new("--verify"),
                 OsStr::new(&self.official_ref),
             ],
+            deadline,
         )
         .and_then(|output| parse_object_id(&output.stdout))
         .map_err(CommittedReadError::repository)?;
-        let checked_out = run_git(
+        let checked_out = run_git_for_read(
             Some(&self.content_root),
             None,
             [
@@ -152,6 +161,7 @@ impl CommittedStore {
                 OsStr::new("--verify"),
                 OsStr::new("HEAD"),
             ],
+            deadline,
         )
         .and_then(|output| parse_object_id(&output.stdout))
         .map_err(CommittedReadError::repository)?;
@@ -176,6 +186,7 @@ impl CommittedStore {
             index,
             root,
             maximum_markdown_bytes: content_policy.maximum_markdown_bytes,
+            deadline,
             _content_lock: content_lock,
         })
     }
@@ -209,6 +220,7 @@ pub struct CommittedSnapshot {
     index: ContentIndex,
     root: PinnedDirectory,
     maximum_markdown_bytes: u64,
+    deadline: Option<Instant>,
     _content_lock: File,
 }
 
@@ -229,13 +241,16 @@ impl CommittedSnapshot {
         filter: &ReadFilter,
         maximum_results: usize,
     ) -> Result<Vec<&DocumentRecord>, CommittedReadError> {
+        check_operation_deadline(self.deadline)?;
         validate_result_limit(maximum_results)?;
         let mut documents = self
             .index
             .documents()
             .filter(|document| filter.matches(document))
             .collect::<Vec<_>>();
+        check_operation_deadline(self.deadline)?;
         documents.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
+        check_operation_deadline(self.deadline)?;
         documents.truncate(maximum_results);
         Ok(documents)
     }
@@ -250,12 +265,14 @@ impl CommittedSnapshot {
         filter: &ReadFilter,
         maximum_results: usize,
     ) -> Result<Vec<&DocumentRecord>, CommittedReadError> {
+        check_operation_deadline(self.deadline)?;
         validate_result_limit(maximum_results)?;
         let mut documents = self
             .index
             .documents()
             .filter(|document| filter.matches(document))
             .collect::<Vec<_>>();
+        check_operation_deadline(self.deadline)?;
         documents.sort_by(|left, right| {
             let left_time = left.metadata().updated.unwrap_or(left.metadata().created);
             let right_time = right.metadata().updated.unwrap_or(right.metadata().created);
@@ -265,6 +282,7 @@ impl CommittedSnapshot {
                     .cmp(&right.metadata().document_id)
             })
         });
+        check_operation_deadline(self.deadline)?;
         documents.truncate(maximum_results);
         Ok(documents)
     }
@@ -279,15 +297,18 @@ impl CommittedSnapshot {
         &self,
         document_id: DocumentId,
     ) -> Result<CommittedDocument<'_>, CommittedReadError> {
+        check_operation_deadline(self.deadline)?;
         let record = self
             .index
             .get(document_id)
             .ok_or(CommittedReadError::DocumentNotFound { document_id })?;
         let markdown = self.read_markdown(record)?;
+        check_operation_deadline(self.deadline)?;
         Ok(CommittedDocument { record, markdown })
     }
 
     fn read_markdown(&self, record: &DocumentRecord) -> Result<Vec<u8>, CommittedReadError> {
+        check_operation_deadline(self.deadline)?;
         let mut file = self
             .root
             .open_regular_beneath(record.relative_path())
@@ -299,10 +320,19 @@ impl CommittedSnapshot {
         }
         let capacity = usize::try_from(file.byte_length().min(64 * 1024)).unwrap_or(64 * 1024);
         let mut markdown = Vec::with_capacity(capacity);
-        file.by_ref()
-            .take(self.maximum_markdown_bytes.saturating_add(1))
-            .read_to_end(&mut markdown)
-            .map_err(CommittedReadError::Io)?;
+        let mut bounded = file
+            .by_ref()
+            .take(self.maximum_markdown_bytes.saturating_add(1));
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            check_operation_deadline(self.deadline)?;
+            let count = bounded.read(&mut buffer).map_err(CommittedReadError::Io)?;
+            if count == 0 {
+                break;
+            }
+            markdown.extend_from_slice(&buffer[..count]);
+        }
+        check_operation_deadline(self.deadline)?;
         let revision = Revision::from_bytes(Sha256::digest(&markdown).into());
         if markdown.len() as u64 != file.byte_length() || revision != record.revision() {
             return Err(CommittedReadError::ContentChanged {
@@ -316,6 +346,14 @@ impl CommittedSnapshot {
 fn validate_result_limit(maximum_results: usize) -> Result<(), CommittedReadError> {
     if maximum_results == 0 {
         Err(CommittedReadError::InvalidResultLimit)
+    } else {
+        Ok(())
+    }
+}
+
+fn check_operation_deadline(deadline: Option<Instant>) -> Result<(), CommittedReadError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(CommittedReadError::OperationDeadlineExceeded)
     } else {
         Ok(())
     }
@@ -510,12 +548,7 @@ impl SearchBackend for LinearSearch {
             .documents()
             .filter(|record| filter.matches(record))
         {
-            if policy
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                return Err(CommittedReadError::SearchDeadlineExceeded);
-            }
+            check_operation_deadline(policy.deadline)?;
             scanned_documents = scanned_documents.saturating_add(1);
             if scanned_documents > policy.maximum_scanned_documents {
                 return Err(CommittedReadError::SearchDocumentLimitExceeded {
@@ -556,6 +589,14 @@ impl SearchBackend for LinearSearch {
             let markdown_match = if fixed_match || optional_match {
                 false
             } else {
+                let remaining = policy
+                    .maximum_scanned_markdown_bytes
+                    .saturating_sub(scanned_markdown_bytes);
+                if record.byte_length() > remaining {
+                    return Err(CommittedReadError::SearchMarkdownByteLimitExceeded {
+                        maximum: policy.maximum_scanned_markdown_bytes,
+                    });
+                }
                 let markdown = snapshot.read_markdown(record)?;
                 scanned_markdown_bytes = scanned_markdown_bytes
                     .checked_add(markdown.len() as u64)
@@ -579,6 +620,7 @@ impl SearchBackend for LinearSearch {
             }
         }
         matches.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
+        check_operation_deadline(policy.deadline)?;
         matches.truncate(policy.maximum_results);
         Ok(matches)
     }
@@ -646,8 +688,8 @@ pub enum CommittedReadError {
         /// Configured maximum inspected Markdown bytes.
         maximum: u64,
     },
-    /// The configured absolute search deadline expired.
-    SearchDeadlineExceeded,
+    /// The configured absolute committed-read deadline expired.
+    OperationDeadlineExceeded,
 }
 
 impl fmt::Display for CommittedReadError {
@@ -703,7 +745,9 @@ impl fmt::Display for CommittedReadError {
                     "search exceeds {maximum} inspected Markdown bytes"
                 )
             }
-            Self::SearchDeadlineExceeded => formatter.write_str("search deadline expired"),
+            Self::OperationDeadlineExceeded => {
+                formatter.write_str("committed read deadline expired")
+            }
         }
     }
 }

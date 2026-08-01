@@ -43,12 +43,12 @@ impl Gateway {
         ];
         validate_disjoint_storage(&resolved)?;
         let committed = CommittedStore::open(
-            settings.git_directory(),
-            settings.content_root(),
+            resolved[1].stable_path(),
+            resolved[2].stable_path(),
             settings.official_branch(),
         )
         .map_err(|error| GatewayError::CommittedRead(Box::new(error)))?;
-        let queue = FileQueue::initialize(settings.queue_root(), PackagePolicy::default())
+        let queue = FileQueue::initialize(resolved[0].stable_path(), PackagePolicy::default())
             .map_err(|error| GatewayError::Queue(Box::new(error)))?;
         let [repository, content] = committed
             .storage_attestations()

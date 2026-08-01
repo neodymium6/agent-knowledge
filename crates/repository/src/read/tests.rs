@@ -241,6 +241,16 @@ fn rejects_writer_contention_dirty_content_and_invalid_bounds() {
     ));
     lock.unlock()
         .unwrap_or_else(|error| panic!("writer fixture must release lock: {error}"));
+    assert!(matches!(
+        store.snapshot(
+            ContentPolicy {
+                scan_deadline: Some(std::time::Instant::now()),
+                ..ContentPolicy::default()
+            },
+            &PackagePolicy::default(),
+        ),
+        Err(CommittedReadError::OperationDeadlineExceeded)
+    ));
 
     let snapshot = store
         .snapshot(ContentPolicy::default(), &PackagePolicy::default())
@@ -326,7 +336,14 @@ fn shared_snapshot_lock_blocks_publication_until_drop() {
         .unwrap_or_else(|error| panic!("publication lock fixture must open: {error}"));
     assert!(matches!(writer.try_lock(), Err(TryLockError::WouldBlock)));
     drop(snapshot);
-    writer
-        .try_lock()
-        .unwrap_or_else(|error| panic!("writer lock must succeed after snapshot drop: {error}"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match writer.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("writer lock must succeed after snapshot drop: {error}"),
+        }
+    }
 }

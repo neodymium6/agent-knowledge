@@ -256,7 +256,9 @@ The Gateway:
 - searches committed Markdown and permitted metadata; and
 - reports request status.
 
-The Gateway does not write `content/`, run Git, or run Quartz.
+The Gateway does not write `content/`, mutate Git state, or run Quartz. Committed
+reads may invoke allowlisted, read-only Git inspection commands to verify that
+the canonical worktree still represents the official branch.
 
 ### 7.2 Repository Worker
 
@@ -1296,7 +1298,10 @@ state boundaries respectively.
 
 Each content read pins the official commit at operation start. Pending and
 processing data is visible only through status operations, never through
-normal content reads.
+normal content reads. One absolute deadline bounds read-only Git validation,
+content indexing, query work, and successful-response encoding. Deadline-aware
+Git inspection runs in an isolated process group that is terminated and reaped
+on expiry. The encoded-response budget includes the JSON Lines framing newline.
 
 ## 24. Search
 
@@ -1398,7 +1403,8 @@ Configuration, rather than architecture, controls:
 - maximum front-matter bytes;
 - Gateway submit and client transfer timeouts;
 - committed-index entry and aggregate Markdown-byte limits;
-- search document, Markdown-byte, and execution-time limits;
+- committed-read execution-time and response-byte limits;
+- search document and Markdown-byte limits;
 - encoded read-response byte limits;
 - incoming quarantine and reap age thresholds;
 - allowed attachment extensions;

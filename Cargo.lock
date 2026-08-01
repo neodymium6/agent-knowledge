@@ -89,6 +89,7 @@ dependencies = [
  "agent-knowledge-core",
  "agent-knowledge-queue",
  "agent-knowledge-release",
+ "nix",
  "serde",
  "serde-saphyr",
  "serde_json",

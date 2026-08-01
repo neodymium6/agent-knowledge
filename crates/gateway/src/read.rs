@@ -38,7 +38,8 @@ pub(super) fn list(
         .map(document_summary)
         .collect::<Result<Vec<_>, _>>()?;
     let response = ListResponse::new(snapshot.commit().to_owned(), documents);
-    ensure_response_size(settings, &response)?;
+    drop(snapshot);
+    ensure_response_size(settings, &response, Some(deadline))?;
     Ok(response)
 }
 
@@ -63,7 +64,8 @@ pub(super) fn get(
         snapshot.commit().to_owned(),
         DocumentContent { summary, markdown },
     );
-    ensure_response_size(settings, &response)?;
+    drop(snapshot);
+    ensure_response_size(settings, &response, Some(deadline))?;
     Ok(response)
 }
 
@@ -100,7 +102,8 @@ pub(super) fn search(
         .map(document_summary)
         .collect::<Result<Vec<_>, _>>()?;
     let response = ListResponse::new(snapshot.commit().to_owned(), documents);
-    ensure_response_size(settings, &response)?;
+    drop(snapshot);
+    ensure_response_size(settings, &response, Some(deadline))?;
     Ok(response)
 }
 
@@ -129,17 +132,28 @@ fn read_deadline(settings: &GatewaySettings) -> Result<Instant, GatewayError> {
 fn ensure_response_size(
     settings: &GatewaySettings,
     response: &impl serde::Serialize,
+    deadline: Option<Instant>,
 ) -> Result<(), GatewayError> {
     let mut counter = ResponseCounter {
-        written: 0,
+        // Successful control responses are newline-delimited JSON. Reserve the
+        // framing byte so server and client enforce the same wire-byte limit.
+        written: 1,
         maximum: settings.maximum_response_bytes(),
+        deadline,
+        deadline_exceeded: false,
     };
     if serde_json::to_writer(&mut counter, response).is_err() {
+        if counter.deadline_exceeded {
+            return Err(committed(CommittedReadError::OperationDeadlineExceeded));
+        }
         return Err(GatewayError::ReadRequest(
             ReadRequestError::ResponseTooLarge {
                 maximum: settings.maximum_response_bytes(),
             },
         ));
+    }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(committed(CommittedReadError::OperationDeadlineExceeded));
     }
     Ok(())
 }
@@ -147,10 +161,19 @@ fn ensure_response_size(
 struct ResponseCounter {
     written: u64,
     maximum: u64,
+    deadline: Option<Instant>,
+    deadline_exceeded: bool,
 }
 
 impl Write for ResponseCounter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.deadline_exceeded = true;
+            return Err(io::Error::other("response deadline exceeded"));
+        }
         let next = self
             .written
             .checked_add(buffer.len() as u64)
@@ -274,7 +297,7 @@ pub(super) fn committed_error_code(error: &CommittedReadError) -> ErrorCode {
         | CommittedReadError::CanonicalOutOfDate { .. }
         | CommittedReadError::PinnedPath(_)
         | CommittedReadError::ContentChanged { .. }
-        | CommittedReadError::SearchDeadlineExceeded => ErrorCode::TemporaryFailure,
+        | CommittedReadError::OperationDeadlineExceeded => ErrorCode::TemporaryFailure,
     }
 }
 
@@ -359,9 +382,11 @@ impl std::error::Error for ReadRequestError {}
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use agent_knowledge_protocol::ListResponse;
 
-    use super::{ReadRequestError, ensure_response_size};
+    use super::{ReadRequestError, ResponseCounter, ensure_response_size};
     use crate::{GatewayError, GatewaySettings};
 
     #[test]
@@ -375,10 +400,24 @@ mod tests {
             Vec::new(),
         );
         assert!(matches!(
-            ensure_response_size(&settings, &response),
+            ensure_response_size(&settings, &response, None),
             Err(GatewayError::ReadRequest(
                 ReadRequestError::ResponseTooLarge { maximum: 8 }
             ))
         ));
+    }
+
+    #[test]
+    fn response_counter_reserves_the_newline_framing_byte() {
+        let mut counter = ResponseCounter {
+            written: 1,
+            maximum: 8,
+            deadline: None,
+            deadline_exceeded: false,
+        };
+        counter
+            .write_all(b"1234567")
+            .unwrap_or_else(|error| panic!("seven JSON bytes should fit: {error}"));
+        assert!(counter.write_all(b"8").is_err());
     }
 }

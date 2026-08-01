@@ -7,6 +7,16 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+
+#[cfg(target_os = "linux")]
+use nix::sys::signal::{Signal, kill};
+#[cfg(target_os = "linux")]
+use nix::unistd::Pid;
 
 use agent_knowledge_core::{
     BatchId, ErrorCode, PathAttestation, PathAttestationError, RequestId, Revision,
@@ -24,6 +34,7 @@ use crate::{ApplyError, ContentPolicy};
 const MAXIMUM_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const MAXIMUM_JOURNAL_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_BINDING_BYTES: usize = 64 * 1024;
+const MAXIMUM_TIMED_GIT_OUTPUT_BYTES: usize = 1024 * 1024;
 const PREVIOUS_JOURNAL_SCHEMA_VERSION: u16 = 2;
 const JOURNAL_SCHEMA_VERSION: u16 = 3;
 
@@ -1564,7 +1575,14 @@ impl GitRepository {
 pub(crate) fn ensure_canonical_worktree_clean(
     canonical_worktree: &Path,
 ) -> Result<(), GitTransactionError> {
-    let output = run_git(
+    ensure_canonical_worktree_clean_until(canonical_worktree, None)
+}
+
+pub(crate) fn ensure_canonical_worktree_clean_until(
+    canonical_worktree: &Path,
+    deadline: Option<Instant>,
+) -> Result<(), GitTransactionError> {
+    let output = run_git_for_read(
         Some(canonical_worktree),
         None,
         [
@@ -1574,6 +1592,7 @@ pub(crate) fn ensure_canonical_worktree_clean(
             OsStr::new("--untracked-files=all"),
             OsStr::new("--ignored=matching"),
         ],
+        deadline,
     )?;
     if output.stdout.is_empty() {
         Ok(())
@@ -2157,23 +2176,34 @@ pub(crate) fn validate_repository_layout(
     canonical_worktree: &Path,
     official_ref: &str,
 ) -> Result<(), GitTransactionError> {
-    let bare = run_git(
+    validate_repository_layout_until(git_directory, canonical_worktree, official_ref, None)
+}
+
+pub(crate) fn validate_repository_layout_until(
+    git_directory: &Path,
+    canonical_worktree: &Path,
+    official_ref: &str,
+    deadline: Option<Instant>,
+) -> Result<(), GitTransactionError> {
+    let bare = run_git_for_read(
         None,
         Some(git_directory),
         [OsStr::new("rev-parse"), OsStr::new("--is-bare-repository")],
+        deadline,
     )?;
     if parse_text(&bare.stdout)? != "true" {
         return Err(GitTransactionError::RepositoryNotBare);
     }
-    let inside = run_git(
+    let inside = run_git_for_read(
         Some(canonical_worktree),
         None,
         [OsStr::new("rev-parse"), OsStr::new("--is-inside-work-tree")],
+        deadline,
     )?;
     if parse_text(&inside.stdout)? != "true" {
         return Err(GitTransactionError::CanonicalWorktreeMismatch);
     }
-    let top_level = run_git(
+    let top_level = run_git_for_read(
         Some(canonical_worktree),
         None,
         [
@@ -2181,13 +2211,14 @@ pub(crate) fn validate_repository_layout(
             OsStr::new("--path-format=absolute"),
             OsStr::new("--show-toplevel"),
         ],
+        deadline,
     )?;
     let top_level =
         fs::canonicalize(parse_git_path(&top_level.stdout)?).map_err(GitTransactionError::Io)?;
     if !same_directory(&top_level, canonical_worktree)? {
         return Err(GitTransactionError::CanonicalWorktreeMismatch);
     }
-    let common_directory = run_git(
+    let common_directory = run_git_for_read(
         Some(canonical_worktree),
         None,
         [
@@ -2195,16 +2226,18 @@ pub(crate) fn validate_repository_layout(
             OsStr::new("--path-format=absolute"),
             OsStr::new("--git-common-dir"),
         ],
+        deadline,
     )?;
     let common_directory = fs::canonicalize(parse_git_path(&common_directory.stdout)?)
         .map_err(GitTransactionError::Io)?;
     if !same_directory(&common_directory, git_directory)? {
         return Err(GitTransactionError::CanonicalWorktreeMismatch);
     }
-    let symbolic_head = run_git(
+    let symbolic_head = run_git_for_read(
         Some(canonical_worktree),
         None,
         [OsStr::new("symbolic-ref"), OsStr::new("HEAD")],
+        deadline,
     )?;
     if parse_text(&symbolic_head.stdout)? != official_ref {
         return Err(GitTransactionError::CanonicalWorktreeBranchMismatch);
@@ -2415,6 +2448,142 @@ where
     run_git_with_input(working_directory, git_directory, arguments, &[])
 }
 
+pub(crate) fn run_git_for_read<I, S>(
+    working_directory: Option<&Path>,
+    git_directory: Option<&Path>,
+    arguments: I,
+    deadline: Option<Instant>,
+) -> Result<Output, GitTransactionError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    match deadline {
+        Some(deadline) => run_git_until(working_directory, git_directory, arguments, deadline),
+        None => run_git(working_directory, git_directory, arguments),
+    }
+}
+
+fn run_git_until<I, S>(
+    working_directory: Option<&Path>,
+    git_directory: Option<&Path>,
+    arguments: I,
+    deadline: Instant,
+) -> Result<Output, GitTransactionError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = git_command();
+    if let Some(working_directory) = working_directory {
+        command.arg("-C").arg(working_directory);
+    }
+    if let Some(git_directory) = git_directory {
+        command.arg(git_directory_argument(git_directory));
+    }
+    let arguments = arguments
+        .into_iter()
+        .map(|argument| argument.as_ref().to_os_string())
+        .collect::<Vec<OsString>>();
+    command
+        .args(&arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "linux")]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(GitTransactionError::Io)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(GitTransactionError::InvalidGitOutput)?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(GitTransactionError::InvalidGitOutput)?;
+    let stdout_reader = thread::spawn(move || capture_bounded_output(stdout));
+    let stderr_reader = thread::spawn(move || capture_bounded_output(stderr));
+
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(GitTransactionError::Io)? {
+            break status;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            kill_timed_git_process(&mut child);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(GitTransactionError::GitDeadlineExceeded);
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(10)),
+        );
+    };
+    let stdout = join_captured_output(stdout_reader)?;
+    let stderr = join_captured_output(stderr_reader)?;
+    if status.success() {
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    } else {
+        Err(GitTransactionError::GitCommand {
+            arguments,
+            stderr: diagnostic(&stderr),
+        })
+    }
+}
+
+fn kill_timed_git_process(child: &mut std::process::Child) {
+    #[cfg(target_os = "linux")]
+    {
+        let killed_group = i32::try_from(child.id())
+            .ok()
+            .is_some_and(|process_id| kill(Pid::from_raw(-process_id), Signal::SIGKILL).is_ok());
+        if !killed_group {
+            let _ = child.kill();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = child.kill();
+    }
+}
+
+fn capture_bounded_output(mut reader: impl Read) -> io::Result<(Vec<u8>, bool)> {
+    let mut captured = Vec::new();
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = MAXIMUM_TIMED_GIT_OUTPUT_BYTES.saturating_sub(captured.len());
+        captured.extend_from_slice(&buffer[..count.min(remaining)]);
+        exceeded |= count > remaining;
+    }
+    Ok((captured, exceeded))
+}
+
+fn join_captured_output(
+    reader: thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
+) -> Result<Vec<u8>, GitTransactionError> {
+    let (captured, exceeded) = reader
+        .join()
+        .map_err(|_| GitTransactionError::InvalidGitOutput)?
+        .map_err(GitTransactionError::Io)?;
+    if exceeded {
+        Err(GitTransactionError::InvalidGitOutput)
+    } else {
+        Ok(captured)
+    }
+}
+
 fn run_git_with_input<I, S>(
     working_directory: Option<&Path>,
     git_directory: Option<&Path>,
@@ -2500,7 +2669,14 @@ fn git_command() -> Command {
 }
 
 pub(crate) fn validate_local_git_config(git_directory: &Path) -> Result<(), GitTransactionError> {
-    let output = run_git(
+    validate_local_git_config_until(git_directory, None)
+}
+
+pub(crate) fn validate_local_git_config_until(
+    git_directory: &Path,
+    deadline: Option<Instant>,
+) -> Result<(), GitTransactionError> {
+    let output = run_git_for_read(
         None,
         Some(git_directory),
         [
@@ -2510,6 +2686,7 @@ pub(crate) fn validate_local_git_config(git_directory: &Path) -> Result<(), GitT
             OsStr::new("--null"),
             OsStr::new("--list"),
         ],
+        deadline,
     )?;
     for key in output.stdout.split(|byte| *byte == 0) {
         if key.is_empty() {
@@ -2528,8 +2705,8 @@ pub(crate) fn validate_local_git_config(git_directory: &Path) -> Result<(), GitT
             return Err(GitTransactionError::UnsafeGitConfig);
         }
     }
-    require_local_boolean(git_directory, "core.bare", true)?;
-    require_local_boolean(git_directory, "core.filemode", true)?;
+    require_local_boolean(git_directory, "core.bare", true, deadline)?;
+    require_local_boolean(git_directory, "core.filemode", true, deadline)?;
     Ok(())
 }
 
@@ -2537,8 +2714,9 @@ fn require_local_boolean(
     git_directory: &Path,
     key: &str,
     expected: bool,
+    deadline: Option<Instant>,
 ) -> Result<(), GitTransactionError> {
-    let output = run_git(
+    let output = run_git_for_read(
         None,
         Some(git_directory),
         [
@@ -2548,6 +2726,7 @@ fn require_local_boolean(
             OsStr::new("--get"),
             OsStr::new(key),
         ],
+        deadline,
     )?;
     if parse_text(&output.stdout)? == if expected { "true" } else { "false" } {
         Ok(())
@@ -2842,6 +3021,8 @@ pub enum GitTransactionError {
     },
     /// Git returned malformed machine-readable output.
     InvalidGitOutput,
+    /// A read-only Git inspection exceeded its absolute operation deadline.
+    GitDeadlineExceeded,
     /// A transaction attempted a physical content deletion.
     PhysicalDeletion,
     /// A Git subprocess failed.
@@ -2947,6 +3128,9 @@ impl fmt::Display for GitTransactionError {
                 "official commit `{commit}` advanced but transaction cleanup failed: {source}"
             ),
             Self::InvalidGitOutput => formatter.write_str("Git returned invalid output"),
+            Self::GitDeadlineExceeded => {
+                formatter.write_str("read-only Git inspection exceeded its deadline")
+            }
             Self::PhysicalDeletion => {
                 formatter.write_str("Git transaction attempted a physical content deletion")
             }
