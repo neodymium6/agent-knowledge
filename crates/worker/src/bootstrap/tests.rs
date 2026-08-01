@@ -98,6 +98,39 @@ fn rejects_resolved_storage_aliases_before_initialization() {
     assert!(!root.path().join("releases").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn initialization_uses_the_destination_resolved_during_preflight() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::create();
+    initialize_repository(root.path());
+    initialize_quartz(root.path());
+    let safe_storage = root.path().join("safe-storage");
+    fs::create_dir(&safe_storage)
+        .unwrap_or_else(|error| panic!("safe storage must be created: {error}"));
+    let alias = root.path().join("queue-alias");
+    symlink(&safe_storage, &alias)
+        .unwrap_or_else(|error| panic!("queue alias must be created: {error}"));
+    let yaml = valid_yaml(root.path()).replace(
+        &root.path().join("queue").display().to_string(),
+        &alias.join("queue").display().to_string(),
+    );
+    let settings = WorkerSettings::decode(&yaml)
+        .unwrap_or_else(|error| panic!("fixture settings must decode: {error}"));
+
+    WorkerBootstrap::open_with_preflight_hook(settings, || {
+        fs::remove_file(&alias)
+            .unwrap_or_else(|error| panic!("original queue alias must be removed: {error}"));
+        symlink(root.path().join("content"), &alias)
+            .unwrap_or_else(|error| panic!("replacement queue alias must be created: {error}"));
+    })
+    .unwrap_or_else(|error| panic!("resolved configuration must open: {error}"));
+
+    assert!(safe_storage.join("queue").is_dir());
+    assert!(!root.path().join("content/queue").exists());
+}
+
 fn valid_yaml(root: &Path) -> String {
     format!(
         r#"schema_version: 1

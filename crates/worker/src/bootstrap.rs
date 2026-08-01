@@ -33,28 +33,37 @@ impl WorkerBootstrap {
     ///
     /// Returns the exact component boundary that could not be opened.
     pub fn open(settings: WorkerSettings) -> Result<Self, WorkerOpenError> {
-        validate_resolved_topology(&settings)?;
+        Self::open_with_preflight_hook(settings, || {})
+    }
+
+    fn open_with_preflight_hook(
+        settings: WorkerSettings,
+        after_preflight: impl FnOnce(),
+    ) -> Result<Self, WorkerOpenError> {
+        let topology = validate_resolved_topology(&settings)?;
+        after_preflight();
         let repository = GitRepository::open(
-            settings.repository_root(),
-            settings.content_root(),
-            settings.work_root(),
+            topology.repository_root.stable_path(),
+            topology.content_root.stable_path(),
+            topology.work_root.stable_path(),
             settings.official_branch(),
             settings.identity().clone(),
         )
         .map_err(|error| WorkerOpenError::Repository(Box::new(error)))?;
         let release_policy = ReleasePolicy::default();
         let quartz = QuartzBuilder::new_with_policy(
-            settings.quartz_program(),
-            settings.quartz_integration_root(),
+            topology.quartz_program.stable_path(),
+            topology.quartz_integration_root.stable_path(),
             settings.quartz_timeout(),
             release_policy,
         )
         .map_err(|error| WorkerOpenError::Quartz(Box::new(error)))?;
-        let releases = ReleaseStore::open(settings.release_root(), release_policy)
+        let releases = ReleaseStore::open(topology.release_root.stable_path(), release_policy)
             .map_err(|error| WorkerOpenError::Release(Box::new(error)))?;
         let package_policy = PackagePolicy::default();
-        let queue = FileQueue::initialize(settings.queue_root(), package_policy.clone())
-            .map_err(|error| WorkerOpenError::Queue(Box::new(error)))?;
+        let queue =
+            FileQueue::initialize(topology.queue_root.stable_path(), package_policy.clone())
+                .map_err(|error| WorkerOpenError::Queue(Box::new(error)))?;
         validate_opened_topology(&repository, &quartz, &releases, &queue)?;
         let processor = BatchProcessor::new(
             repository,
@@ -84,6 +93,16 @@ impl WorkerBootstrap {
             WorkerRuntime::start(&self.queue, self.processor, self.limits, created_at)?;
         Ok((runtime, startup, self.schedule))
     }
+}
+
+struct ResolvedTopology {
+    queue_root: PathAttestation,
+    repository_root: PathAttestation,
+    content_root: PathAttestation,
+    work_root: PathAttestation,
+    release_root: PathAttestation,
+    quartz_program: PathAttestation,
+    quartz_integration_root: PathAttestation,
 }
 
 /// Failure while opening lifetime-pinned Worker components.
@@ -207,7 +226,9 @@ fn validate_opened_topology(
     Ok(())
 }
 
-fn validate_resolved_topology(settings: &WorkerSettings) -> Result<(), WorkerOpenError> {
+fn validate_resolved_topology(
+    settings: &WorkerSettings,
+) -> Result<ResolvedTopology, WorkerOpenError> {
     let storage = [
         (
             "storage.queue_root",
@@ -259,7 +280,23 @@ fn validate_resolved_topology(settings: &WorkerSettings) -> Result<(), WorkerOpe
             )?;
         }
     }
-    Ok(())
+    let [
+        (_, queue_root),
+        (_, repository_root),
+        (_, content_root),
+        (_, work_root),
+        (_, release_root),
+    ] = storage;
+    let [(_, quartz_program), (_, quartz_integration_root)] = trusted;
+    Ok(ResolvedTopology {
+        queue_root,
+        repository_root,
+        content_root,
+        work_root,
+        release_root,
+        quartz_program,
+        quartz_integration_root,
+    })
 }
 
 fn attest_destination(
