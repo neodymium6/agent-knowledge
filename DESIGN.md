@@ -146,14 +146,22 @@ requires:
 - advisory `flock` locking on regular files and read-only directory
   descriptors;
 - normal POSIX file and directory semantics; and
-- a mounted `/proc` file system exposing `/proc/self/fd` and allowing same-UID
-  Git descendants to resolve `/proc/<worker-pid>/fd`.
+- a mounted `/proc` file system exposing `/proc/self/fd` and
+  `/proc/self/mountinfo`, and allowing same-UID Git descendants to resolve
+  `/proc/<worker-pid>/fd`.
 
 All durable paths are configurable. Processes handle termination signals and
 shut down at transaction boundaries. The configured queue root may be created
 by the application, but its parent directory must already exist so the
 application can durably synchronize the new root entry without recursively
 creating unsynchronized ancestors.
+
+Before creating any storage root, the Worker pins each existing root or its
+nearest existing ancestor and compares canonical paths, device and inode
+identities, and Linux mount roots. This rejects equal, nested, symlink-aliased,
+and bind-mounted aliases, including Kubernetes `subPath` mounts that expose a
+subdirectory at an unrelated namespace path. The opened components attest the
+same topology again from their retained handles before startup completes.
 
 The queue root and every fixed queue child directory must be on the same Linux
 mount so all queue transitions have atomic-rename semantics. Initialization

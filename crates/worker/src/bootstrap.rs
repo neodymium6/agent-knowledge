@@ -1,8 +1,5 @@
-use std::ffi::OsString;
 use std::fmt;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use agent_knowledge_core::{PathAttestation, PathAttestationError};
 use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueError};
@@ -92,13 +89,6 @@ impl WorkerBootstrap {
 /// Failure while opening lifetime-pinned Worker components.
 #[derive(Debug)]
 pub enum WorkerOpenError {
-    /// A configured path could not be resolved against the live filesystem.
-    PathResolution {
-        /// Configuration field whose path could not be resolved.
-        field: &'static str,
-        /// Filesystem error returned while resolving the path.
-        source: io::Error,
-    },
     /// Two configured paths resolve to equal or nested filesystem locations.
     OverlappingPaths {
         /// First conflicting configuration field.
@@ -126,12 +116,6 @@ pub enum WorkerOpenError {
 impl fmt::Display for WorkerOpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PathResolution { field, source } => {
-                write!(
-                    formatter,
-                    "could not resolve Worker path `{field}`: {source}"
-                )
-            }
             Self::OverlappingPaths { first, second } => write!(
                 formatter,
                 "Worker paths `{first}` and `{second}` resolve to overlapping locations"
@@ -150,7 +134,6 @@ impl fmt::Display for WorkerOpenError {
 impl std::error::Error for WorkerOpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::PathResolution { source, .. } => Some(source),
             Self::OverlappingPaths { .. } => None,
             Self::Attestation { source, .. } => Some(source),
             Self::Repository(error) => Some(error),
@@ -228,88 +211,65 @@ fn validate_resolved_topology(settings: &WorkerSettings) -> Result<(), WorkerOpe
     let storage = [
         (
             "storage.queue_root",
-            resolve_destination("storage.queue_root", settings.queue_root())?,
+            attest_destination("storage.queue_root", settings.queue_root())?,
         ),
         (
             "storage.repository_root",
-            resolve_destination("storage.repository_root", settings.repository_root())?,
+            attest_destination("storage.repository_root", settings.repository_root())?,
         ),
         (
             "storage.content_root",
-            resolve_destination("storage.content_root", settings.content_root())?,
+            attest_destination("storage.content_root", settings.content_root())?,
         ),
         (
             "storage.work_root",
-            resolve_destination("storage.work_root", settings.work_root())?,
+            attest_destination("storage.work_root", settings.work_root())?,
         ),
         (
             "storage.release_root",
-            resolve_destination("storage.release_root", settings.release_root())?,
+            attest_destination("storage.release_root", settings.release_root())?,
         ),
     ];
-    for (index, (field, path)) in storage.iter().enumerate() {
-        for (other_field, other_path) in &storage[index + 1..] {
-            reject_overlap(field, path, other_field, other_path)?;
+    for (index, (field, attestation)) in storage.iter().enumerate() {
+        for (other_field, other_attestation) in &storage[index + 1..] {
+            reject_attested_overlap(field, attestation, other_field, other_attestation)?;
         }
     }
 
     let trusted = [
         (
             "quartz.program",
-            resolve_destination("quartz.program", settings.quartz_program())?,
+            attest_destination("quartz.program", settings.quartz_program())?,
         ),
         (
             "quartz.integration_root",
-            resolve_destination(
+            attest_destination(
                 "quartz.integration_root",
                 settings.quartz_integration_root(),
             )?,
         ),
     ];
-    for (storage_field, storage_path) in &storage {
-        for (trusted_field, trusted_path) in &trusted {
-            reject_overlap(storage_field, storage_path, trusted_field, trusted_path)?;
+    for (storage_field, storage_attestation) in &storage {
+        for (trusted_field, trusted_attestation) in &trusted {
+            reject_attested_overlap(
+                storage_field,
+                storage_attestation,
+                trusted_field,
+                trusted_attestation,
+            )?;
         }
     }
     Ok(())
 }
 
-fn resolve_destination(field: &'static str, path: &Path) -> Result<PathBuf, WorkerOpenError> {
-    let mut existing = path;
-    let mut missing = Vec::<OsString>::new();
-    loop {
-        match fs::canonicalize(existing) {
-            Ok(mut resolved) => {
-                for component in missing.iter().rev() {
-                    resolved.push(component);
-                }
-                return Ok(resolved);
-            }
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                let Some(component) = existing.file_name() else {
-                    return Err(WorkerOpenError::PathResolution { field, source });
-                };
-                missing.push(component.to_os_string());
-                let Some(parent) = existing.parent() else {
-                    return Err(WorkerOpenError::PathResolution { field, source });
-                };
-                existing = parent;
-            }
-            Err(source) => return Err(WorkerOpenError::PathResolution { field, source }),
-        }
-    }
-}
-
-fn reject_overlap(
-    first: &'static str,
-    first_path: &Path,
-    second: &'static str,
-    second_path: &Path,
-) -> Result<(), WorkerOpenError> {
-    if first_path.starts_with(second_path) || second_path.starts_with(first_path) {
-        return Err(WorkerOpenError::OverlappingPaths { first, second });
-    }
-    Ok(())
+fn attest_destination(
+    field: &'static str,
+    path: &Path,
+) -> Result<PathAttestation, WorkerOpenError> {
+    PathAttestation::resolve_destination(path).map_err(|source| WorkerOpenError::Attestation {
+        component: field,
+        source,
+    })
 }
 
 fn reject_attested_overlap(
