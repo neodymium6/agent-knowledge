@@ -2,6 +2,7 @@
 
 mod document;
 mod error_code;
+mod filesystem;
 mod id;
 mod markdown;
 mod path;
@@ -12,6 +13,7 @@ pub use document::{
     CURRENT_DOCUMENT_SCHEMA_VERSION, DocumentLimits, DocumentMetadata, DocumentValidationError,
 };
 pub use error_code::{DocumentStatus, ErrorCode};
+pub use filesystem::{PathAttestation, PathAttestationError};
 pub use id::{BatchId, DocumentId, RequestId, SessionId};
 pub use markdown::{DocumentParseError, decode_document_metadata};
 pub use path::{AttachmentName, PathValidationError, PayloadPath, ProjectId};

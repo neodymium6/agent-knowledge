@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use agent_knowledge_core::{ErrorCode, PayloadPath, RequestId, Revision};
+use agent_knowledge_core::{
+    ErrorCode, PathAttestation, PathAttestationError, PayloadPath, RequestId, Revision,
+};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
@@ -164,6 +166,16 @@ struct PinnedDirectory {
 }
 
 impl FileQueue {
+    /// Attests the queue root selected and pinned during initialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured root no longer names the pinned
+    /// queue object or its ancestry cannot be inspected.
+    pub fn storage_attestation(&self) -> Result<PathAttestation, PathAttestationError> {
+        PathAttestation::capture(&self.configured_queue_root, &self.root_handle)
+    }
+
     /// Creates missing queue-state directories and opens a queue handle.
     ///
     /// The queue root and all state directories must reside on the same file

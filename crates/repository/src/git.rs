@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
-use agent_knowledge_core::{BatchId, ErrorCode, RequestId, Revision};
+use agent_knowledge_core::{
+    BatchId, ErrorCode, PathAttestation, PathAttestationError, RequestId, Revision,
+};
 use agent_knowledge_queue::{
     BatchReconciliation, ClaimToken, ClaimedPackage, PackagePolicy, WorkerQueueError, WorkerSession,
 };
@@ -226,6 +228,23 @@ struct JournalFailure {
 }
 
 impl GitRepository {
+    /// Attests the repository, canonical content, and disposable work roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured root no longer names its pinned
+    /// object or its ancestry cannot be inspected.
+    pub fn storage_attestations(&self) -> Result<[PathAttestation; 3], PathAttestationError> {
+        Ok([
+            PathAttestation::capture(&self.configured_git_directory, &self.git_root_handle)?,
+            PathAttestation::capture(
+                &self.configured_canonical_worktree,
+                &self.canonical_root_handle,
+            )?,
+            PathAttestation::capture(&self.configured_work_root, &self.work_root_handle)?,
+        ])
+    }
+
     /// Opens and validates a bare repository transaction boundary.
     ///
     /// # Errors

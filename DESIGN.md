@@ -146,14 +146,22 @@ requires:
 - advisory `flock` locking on regular files and read-only directory
   descriptors;
 - normal POSIX file and directory semantics; and
-- a mounted `/proc` file system exposing `/proc/self/fd` and allowing same-UID
-  Git descendants to resolve `/proc/<worker-pid>/fd`.
+- a mounted `/proc` file system exposing `/proc/self/fd` and
+  `/proc/self/mountinfo`, and allowing same-UID Git and Quartz descendants to
+  resolve `/proc/<worker-pid>/fd`.
 
 All durable paths are configurable. Processes handle termination signals and
 shut down at transaction boundaries. The configured queue root may be created
 by the application, but its parent directory must already exist so the
 application can durably synchronize the new root entry without recursively
 creating unsynchronized ancestors.
+
+Before creating any storage root, the Worker pins each existing root or its
+nearest existing ancestor and compares canonical paths, device and inode
+identities, and Linux mount roots. This rejects equal, nested, symlink-aliased,
+and bind-mounted aliases, including Kubernetes `subPath` mounts that expose a
+subdirectory at an unrelated namespace path. The opened components attest the
+same topology again from their retained handles before startup completes.
 
 The queue root and every fixed queue child directory must be on the same Linux
 mount so all queue transitions have atomic-rename semantics. Initialization
@@ -263,19 +271,24 @@ The Repository Worker is the only writer to authoritative content. It:
 Quartz receives a committed content tree and produces a static site in a
 temporary release directory. It never changes authoritative content.
 
-The Quartz command, configuration path, and integration directory are
-configuration values. A trial build must finish successfully before a release
-can become current. They are trusted deployment inputs, not request data. The
-configured program and complete integration tree, including plugins and
-runtime dependencies, must be versioned and deployed immutably for the
-Worker's lifetime; changing them requires constructing a new Worker.
+The Quartz launcher and integration directory are configuration values. A
+trial build must finish successfully before a release can become current. They
+are trusted deployment inputs, not request data. The configured launcher and
+complete integration tree, including plugins and runtime dependencies, must
+be versioned and deployed immutably for the Worker's lifetime; changing them
+requires constructing a new Worker. The launcher is the complete executable
+boundary: deployments that require `npx quartz` provide an immutable wrapper
+instead of adding free-form command-prefix arguments to Worker configuration.
 
-The Rust builder resolves a canonical absolute executable and integration
-directory at startup, preserves the executable's original path semantics,
-passes arguments without a shell, and appends Quartz's
-`build -d <content> -o <output>` interface. Standard input and process output
-are disconnected from request data and logs, and every invocation has a
-positive execution deadline. Each invocation runs in an isolated process
+The Rust builder pins the launcher and integration directory at startup and
+invokes the launcher through its descriptor-backed `/proc/<worker-pid>/fd`
+path as `<launcher> build -d <content> -o <output>` without a shell. The pinned
+integration directory is the process working directory. Launchers must resolve
+plugins and other resources from that working directory; they must not depend
+on `$0`, `/proc/self/exe`, or ELF `$ORIGIN` naming the configured launcher path.
+Standard input and process output are disconnected from request data and logs,
+and every invocation has a positive execution deadline. Each invocation runs in
+an isolated process
 group; the builder kills that group on timeout and after the command wrapper
 exits. The service supervisor remains responsible for terminating any process
 that escapes the group before restarting recovery.

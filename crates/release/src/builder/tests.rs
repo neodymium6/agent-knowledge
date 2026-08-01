@@ -16,6 +16,8 @@ use super::{
     BUILD_PROCESS_LEASE, BuildProcessLease, ChildGuard, QuartzBuildError, QuartzBuilder,
     enforce_output_limits, spawn_quartz,
 };
+#[cfg(unix)]
+use super::{pin_executable_program, validate_executable_program};
 use crate::ReleasePolicy;
 #[cfg(unix)]
 use crate::ReleaseStore;
@@ -77,6 +79,11 @@ fn invokes_quartz_with_fixed_content_and_output_arguments() {
     let output = root.0.join("output");
     fs::create_dir(&integration)
         .unwrap_or_else(|error| panic!("integration directory must be created: {error}"));
+    fs::write(
+        integration.join("fictional-resource.txt"),
+        "integration resource\n",
+    )
+    .unwrap_or_else(|error| panic!("integration resource must be written: {error}"));
     fs::create_dir(&content)
         .unwrap_or_else(|error| panic!("content directory must be created: {error}"));
     fs::create_dir(&output)
@@ -85,20 +92,15 @@ fn invokes_quartz_with_fixed_content_and_output_arguments() {
     executable(
         &program,
         "#!/bin/sh\n\
-         test \"$1\" = \"fictional-prefix\" || exit 11\n\
-         test \"$2\" = \"build\" || exit 12\n\
-         test \"$3\" = \"-d\" || exit 13\n\
-         test \"$5\" = \"-o\" || exit 14\n\
-         printf '%s\\n' \"$0\" > \"$6/program-path.txt\"\n\
-         printf '%s\\n' '<p>fictional release</p>' > \"$6/index.html\"\n",
+         test \"$1\" = \"build\" || exit 11\n\
+         test \"$2\" = \"-d\" || exit 12\n\
+         test \"$4\" = \"-o\" || exit 14\n\
+         printf '%s\\n' \"$0\" > \"$5/program-path.txt\"\n\
+         cp fictional-resource.txt \"$5/integration-resource.txt\"\n\
+         printf '%s\\n' '<p>fictional release</p>' > \"$5/index.html\"\n",
     );
-    let builder = QuartzBuilder::new(
-        &program,
-        &integration,
-        vec!["fictional-prefix".into()],
-        Duration::from_secs(2),
-    )
-    .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     builder
         .build_path(&content, &output)
@@ -111,7 +113,13 @@ fn invokes_quartz_with_fixed_content_and_output_arguments() {
     assert_eq!(
         fs::read_to_string(output.join("program-path.txt"))
             .unwrap_or_else(|error| panic!("program path must be readable: {error}")),
-        format!("{}\n", program.display())
+        format!("{}\n", builder.program.display())
+    );
+    assert_eq!(
+        fs::read_to_string(output.join("integration-resource.txt")).unwrap_or_else(|error| panic!(
+            "integration resource output must be readable: {error}"
+        )),
+        "integration resource\n"
     );
 }
 
@@ -204,7 +212,7 @@ fn successful_build_returns_the_only_preparation_capability() {
     let build = store
         .begin_build(batch_id)
         .unwrap_or_else(|error| panic!("release build must begin: {error}"));
-    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
         .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     let built = builder
@@ -247,7 +255,7 @@ fn failed_build_leaves_staging_only_discardable() {
     let build = store
         .begin_build(batch_id)
         .unwrap_or_else(|error| panic!("release build must begin: {error}"));
-    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
         .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     assert!(matches!(
@@ -290,7 +298,7 @@ fn allows_quartz_to_replace_output_below_a_pinned_container() {
          mkdir \"$5\" || exit 22\n\
          printf '%s\\n' '<p>fictional replaced release</p>' > \"$5/index.html\"\n",
     );
-    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
         .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     builder
@@ -312,13 +320,8 @@ fn terminates_a_quartz_command_after_its_deadline() {
     }
     let program = root.0.join("fake-hanging-quartz");
     executable(&program, "#!/bin/sh\nwhile :; do :; done\n");
-    let builder = QuartzBuilder::new(
-        &program,
-        &integration,
-        Vec::new(),
-        Duration::from_millis(25),
-    )
-    .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_millis(25))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     assert!(matches!(
         builder.build_path(&content, &output),
@@ -344,13 +347,8 @@ fn terminates_quartz_descendants_after_a_timeout() {
          (sleep 0.15; printf '%s\\n' escaped > \"$5/escaped\") &\n\
          while :; do :; done\n",
     );
-    let builder = QuartzBuilder::new(
-        &program,
-        &integration,
-        Vec::new(),
-        Duration::from_millis(25),
-    )
-    .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_millis(25))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     assert!(matches!(
         builder.build_path(&content, &output),
@@ -384,7 +382,7 @@ fn reaps_descendants_before_scanning_successful_output() {
            index=$((index + 1))\n\
          done\n",
     );
-    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(5))
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(5))
         .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     builder
@@ -417,7 +415,7 @@ fn restores_the_process_subreaper_setting_after_a_build() {
         &program,
         "#!/bin/sh\nprintf '%s\\n' safe > \"$5/index.html\"\n",
     );
-    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
         .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     builder
@@ -452,7 +450,7 @@ fn serializes_concurrent_quartz_process_ownership() {
         "#!/bin/sh\nsleep 0.1\nprintf '%s\\n' safe > \"$5/index.html\"\n",
     );
     let builder = Arc::new(
-        QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+        QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
             .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}")),
     );
     let barrier = Arc::new(Barrier::new(3));
@@ -519,7 +517,6 @@ fn terminates_quartz_when_live_output_exceeds_policy() {
     let builder = QuartzBuilder::new_with_policy(
         &program,
         &integration,
-        Vec::new(),
         Duration::from_secs(3),
         ReleasePolicy {
             maximum_entries: 10,
@@ -609,8 +606,68 @@ fn rejects_a_deadline_that_cannot_be_represented() {
     executable(&program, "#!/bin/sh\nexit 0\n");
 
     assert!(matches!(
-        QuartzBuilder::new(&program, &integration, Vec::new(), Duration::MAX),
+        QuartzBuilder::new(&program, &integration, Duration::MAX),
         Err(QuartzBuildError::InvalidTimeout)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_non_executable_launcher_during_initialization() {
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    fs::create_dir(&integration)
+        .unwrap_or_else(|error| panic!("integration directory must be created: {error}"));
+    let program = root.0.join("non-executable-quartz");
+    fs::write(&program, b"#!/bin/sh\nexit 0\n")
+        .unwrap_or_else(|error| panic!("launcher fixture must be written: {error}"));
+
+    assert!(matches!(
+        QuartzBuilder::new(&program, &integration, Duration::from_secs(2)),
+        Err(QuartzBuildError::InvalidProgram)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn executable_validation_rejects_a_launcher_replaced_after_open() {
+    let root = TestDirectory::new();
+    let program = root.0.join("quartz-launcher");
+    fs::write(&program, b"#!/bin/sh\nexit 0\n")
+        .unwrap_or_else(|error| panic!("non-executable launcher must be written: {error}"));
+    let pinned =
+        fs::File::open(&program).unwrap_or_else(|error| panic!("launcher must be pinned: {error}"));
+    fs::rename(&program, root.0.join("pinned-non-executable"))
+        .unwrap_or_else(|error| panic!("pinned launcher must be moved: {error}"));
+    executable(&program, "#!/bin/sh\nexit 0\n");
+
+    assert!(matches!(
+        validate_executable_program(&program, &program, &pinned),
+        Err(QuartzBuildError::CommandIdentityChanged)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn program_pinning_rejects_a_fifo_replacement_without_opening_it() {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    let root = TestDirectory::new();
+    let program = root.0.join("quartz-launcher");
+    let detached = root.0.join("pinned-quartz-launcher");
+    executable(&program, "#!/bin/sh\nexit 0\n");
+
+    let result = pin_executable_program(&program, || {
+        fs::rename(&program, &detached)
+            .unwrap_or_else(|error| panic!("pinned launcher must be moved: {error}"));
+        mkfifo(&program, Mode::S_IRUSR | Mode::S_IWUSR)
+            .unwrap_or_else(|error| panic!("replacement FIFO must be created: {error}"));
+    });
+
+    assert!(matches!(
+        result,
+        Err(QuartzBuildError::CommandIdentityChanged)
     ));
 }
 
@@ -630,7 +687,7 @@ fn rejects_replaced_command_configuration() {
         &program,
         "#!/bin/sh\nprintf '%s\\n' safe > \"$5/index.html\"\n",
     );
-    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
         .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
     fs::rename(&program, root.0.join("detached-fake-quartz"))
         .unwrap_or_else(|error| panic!("configured program must be moved: {error}"));
@@ -651,6 +708,51 @@ fn rejects_replaced_command_configuration() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn launch_uses_the_pinned_program_after_path_replacement() {
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    let output = root.0.join("output");
+    for directory in [&integration, &content, &output] {
+        fs::create_dir(directory)
+            .unwrap_or_else(|error| panic!("fixture directory must be created: {error}"));
+    }
+    let program = root.0.join("fake-quartz");
+    let detached = root.0.join("pinned-fake-quartz");
+    let replacement_marker = root.0.join("replacement-ran");
+    executable(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' pinned > \"$5/index.html\"\n",
+    );
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+
+    let result = builder.build_path_with_hook(&content, &output, || {
+        fs::rename(&program, &detached)
+            .unwrap_or_else(|error| panic!("pinned program must be moved: {error}"));
+        executable(
+            &program,
+            &format!(
+                "#!/bin/sh\nprintf replacement > '{}'\nprintf '%s\\n' replacement > \"$5/index.html\"\n",
+                replacement_marker.display()
+            ),
+        );
+    });
+
+    assert!(matches!(
+        result,
+        Err(QuartzBuildError::CommandIdentityChanged)
+    ));
+    assert_eq!(
+        fs::read_to_string(output.join("index.html"))
+            .unwrap_or_else(|error| panic!("pinned output must be readable: {error}")),
+        "pinned\n"
+    );
+    assert!(!replacement_marker.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_a_successful_command_that_produces_no_site() {
@@ -664,7 +766,7 @@ fn rejects_a_successful_command_that_produces_no_site() {
     }
     let program = root.0.join("fake-empty-quartz");
     executable(&program, "#!/bin/sh\nexit 0\n");
-    let builder = QuartzBuilder::new(&program, &integration, Vec::new(), Duration::from_secs(2))
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
         .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
 
     assert!(matches!(
