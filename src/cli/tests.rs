@@ -1,10 +1,9 @@
+use super::{CliError, Command, parse_arguments, run};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-
-use super::{CliError, run};
 
 const REQUEST_JSON: &str = r#"{
     "protocol_version": 1,
@@ -130,6 +129,7 @@ fn rejects_unknown_or_incomplete_command_lines() {
     for arguments in [
         vec!["agent-knowledge".into()],
         vec!["agent-knowledge".into(), "admin".into(), "unknown".into()],
+        vec!["agent-knowledge".into(), "worker".into(), "run".into()],
         vec![
             "agent-knowledge".into(),
             "admin".into(),
@@ -140,4 +140,22 @@ fn rejects_unknown_or_incomplete_command_lines() {
     ] {
         assert!(matches!(run(arguments, Vec::new()), Err(CliError::Usage)));
     }
+}
+
+#[test]
+fn parses_the_worker_configuration_command() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "worker".into(),
+        "run".into(),
+        "--config".into(),
+        "/srv/fictional-knowledge/worker.yaml".into(),
+    ])
+    .unwrap_or_else(|error| panic!("Worker command must parse: {error}"));
+
+    assert!(matches!(
+        command,
+        Command::RunWorker { config }
+            if config == Path::new("/srv/fictional-knowledge/worker.yaml")
+    ));
 }

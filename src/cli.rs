@@ -9,8 +9,11 @@ use agent_knowledge_queue::{
 };
 use serde::Serialize;
 
-const USAGE: &str = "usage: agent-knowledge admin submit \
-    --queue-root <path> --package-root <path>";
+use crate::worker::{self, WorkerCommandError};
+
+const USAGE: &str = "usage:\n\
+    agent-knowledge admin submit --queue-root <path> --package-root <path>\n\
+    agent-knowledge worker run --config <path>";
 
 pub fn run<I, W>(arguments: I, output: W) -> Result<(), CliError>
 where
@@ -22,6 +25,7 @@ where
             queue_root,
             package_root,
         } => submit_directory(&queue_root, &package_root, output),
+        Command::RunWorker { config } => worker::run(&config, output).map_err(CliError::Worker),
     }
 }
 
@@ -29,6 +33,9 @@ enum Command {
     Submit {
         queue_root: PathBuf,
         package_root: PathBuf,
+    },
+    RunWorker {
+        config: PathBuf,
     },
 }
 
@@ -38,12 +45,29 @@ where
 {
     let mut arguments = arguments.into_iter();
     let _program = arguments.next();
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("admin"))
-        || arguments.next().as_deref() != Some(std::ffi::OsStr::new("submit"))
-    {
-        return Err(CliError::Usage);
+    let namespace = arguments.next();
+    let action = arguments.next();
+    match (namespace.as_deref(), action.as_deref()) {
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("admin")
+                && action == std::ffi::OsStr::new("submit") =>
+        {
+            parse_submit_arguments(arguments)
+        }
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("worker")
+                && action == std::ffi::OsStr::new("run") =>
+        {
+            parse_worker_arguments(arguments)
+        }
+        _ => Err(CliError::Usage),
     }
+}
 
+fn parse_submit_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
     let mut queue_root = None;
     let mut package_root = None;
     while let Some(flag) = arguments.next() {
@@ -60,6 +84,23 @@ where
     Ok(Command::Submit {
         queue_root: queue_root.ok_or(CliError::Usage)?,
         package_root: package_root.ok_or(CliError::Usage)?,
+    })
+}
+
+fn parse_worker_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut config = None;
+    while let Some(flag) = arguments.next() {
+        let value = arguments.next().ok_or(CliError::Usage)?;
+        match flag.to_str() {
+            Some("--config") if config.is_none() => config = Some(PathBuf::from(value)),
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(Command::RunWorker {
+        config: config.ok_or(CliError::Usage)?,
     })
 }
 
@@ -89,7 +130,7 @@ where
     }
 
     let response = SubmitResponse::from(incoming.accept().map_err(CliError::Queue)?);
-    serde_json::to_writer(&mut output, &response).map_err(CliError::Response)?;
+    serde_json::to_writer(&mut output, &response).map_err(CliError::Json)?;
     output.write_all(b"\n").map_err(CliError::Io)
 }
 
@@ -133,7 +174,8 @@ pub enum CliError {
     Io(io::Error),
     PackageValidation(PackageValidationError),
     Queue(QueueError),
-    Response(serde_json::Error),
+    Worker(WorkerCommandError),
+    Json(serde_json::Error),
 }
 
 impl fmt::Display for CliError {
@@ -145,7 +187,8 @@ impl fmt::Display for CliError {
                 write!(formatter, "local package validation failed: {error}")
             }
             Self::Queue(error) => write!(formatter, "durable queue submission failed: {error}"),
-            Self::Response(error) => write!(formatter, "response JSON encoding failed: {error}"),
+            Self::Worker(error) => error.fmt(formatter),
+            Self::Json(error) => write!(formatter, "JSON output encoding failed: {error}"),
         }
     }
 }
@@ -156,7 +199,8 @@ impl std::error::Error for CliError {
             Self::Io(error) => Some(error),
             Self::PackageValidation(error) => Some(error),
             Self::Queue(error) => Some(error),
-            Self::Response(error) => Some(error),
+            Self::Worker(error) => Some(error),
+            Self::Json(error) => Some(error),
             Self::Usage => None,
         }
     }
