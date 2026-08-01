@@ -10,6 +10,7 @@ use agent_knowledge_core::{
     ChangeRequest, DocumentLimits, ErrorCode, Operation, PayloadPath, RequestDecodeError,
     RequestLimits, RequestValidationError, Revision, RevisionParseError,
 };
+use agent_knowledge_protocol::ClientId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -29,7 +30,7 @@ const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
 const MAXIMUM_ACCEPTANCE_FILE_BYTES: u64 = 256;
 
 /// Immutable Gateway-owned ordering metadata for an accepted package.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptanceMetadata {
     /// Queue-local durable acceptance order, starting at one.
@@ -37,6 +38,11 @@ pub struct AcceptanceMetadata {
     /// Central-server timestamp recorded while holding the acceptance lock.
     #[serde(with = "time::serde::rfc3339")]
     pub accepted_at: OffsetDateTime,
+    /// Authenticated SSH client that first submitted the package.
+    ///
+    /// Local administrative intake predating the Gateway leaves this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<ClientId>,
 }
 
 /// Configurable byte and file-count limits for one request package.
@@ -254,8 +260,8 @@ impl ValidatedPackage {
     ///
     /// Incoming packages do not have acceptance metadata yet.
     #[must_use]
-    pub const fn acceptance(&self) -> Option<AcceptanceMetadata> {
-        self.acceptance
+    pub const fn acceptance(&self) -> Option<&AcceptanceMetadata> {
+        self.acceptance.as_ref()
     }
 }
 

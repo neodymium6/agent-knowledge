@@ -98,8 +98,8 @@ agent-knowledge worker ...
 agent-knowledge admin ...
 ```
 
-The implementation bootstrap exposes one local-only administrative intake
-command before the SSH Gateway is added:
+The executable retains a local-only administrative intake command for
+operators and tests:
 
 ```text
 agent-knowledge admin submit \
@@ -109,7 +109,7 @@ agent-knowledge admin submit \
 
 `package-root` contains extracted `request.json` and `payload/` entries. The
 command validates that directory, restreams every permitted file through the
-same `FileQueue` limits as the future Gateway, and prints one JSON acceptance
+same `FileQueue` limits as the Gateway, and prints one JSON acceptance
 result. It never copies an unchecked directory into an accepted queue state.
 
 The same executable can be used with different entry-point arguments in a
@@ -595,14 +595,16 @@ account uses OpenSSH public-key authentication and per-key forced commands.
 A fictional `authorized_keys` entry has this form:
 
 ```text
-restrict,command="/usr/local/bin/agent-knowledge gateway --client-id fictional-node-a" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFictionalKeyMaterialOnly
+restrict,command="/usr/local/bin/agent-knowledge gateway --config /etc/agent-knowledge/gateway.yaml --client-id fictional-node-a" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFictionalKeyMaterialOnly
 ```
 
 Each key maps to one configured client ID. The Gateway overwrites or rejects
 any client-supplied identity that conflicts with the authenticated identity.
 
 The OpenSSH configuration also disables password authentication and all
-forwarding for the dedicated account. No interactive shell is available.
+forwarding for the dedicated account. No interactive shell is available. The
+deployment applies per-account process/resource limits so authenticated
+connections cannot create an unbounded number of forced-command processes.
 
 ### 13.2 Operation selection
 
@@ -621,7 +623,26 @@ akp-v1 search
 ```
 
 The Gateway parses this string itself. It never evaluates it as a shell
-command.
+command. The current implementation accepts only `akp-v1 submit`; the other
+listed operations describe the version-one namespace reserved for later
+delivery increments.
+
+The current client invokes the equivalent of:
+
+```text
+ssh -T -o BatchMode=yes -o ClearAllForwardings=yes \
+  -o ForwardAgent=no -o ForwardX11=no \
+  -o StdinNull=no -o ForkAfterAuthentication=no \
+  -- <destination> "akp-v1 submit"
+```
+
+`destination` is one opaque argument and may name an SSH configuration alias.
+The client does not accept arbitrary SSH arguments or construct a shell
+command. A positive `--timeout-seconds` value applies one absolute deadline to
+process execution and all three SSH streams; it defaults to 300 seconds and is
+bounded to 3,600 seconds. The client starts SSH in a dedicated process group.
+If the deadline or a stream-size limit is reached, it terminates and reaps the
+group so proxy or jump-host descendants cannot retain a pipe past the deadline.
 
 ### 13.3 Encoding
 
@@ -637,8 +658,23 @@ payload/<regular-files>
 
 Archive entries must have normalized relative paths. Only regular files and
 directories are accepted. Duplicate names, sparse files, links, devices,
-unexpected top-level entries, excessive counts, and limit violations are
-rejected.
+PAX extensions, unexpected top-level entries, nonzero trailing data, excessive
+counts, and limit violations are rejected. The official client produces
+deterministic GNU headers and streams only `request.json`, the `payload/`
+directory, and validated payload files. Before starting SSH, it pins the
+package directory and opens each payload beneath that descriptor without
+resolving any symbolic-link component. It verifies each byte length and SHA-256
+revision and retains a bounded immutable byte snapshot. A successful response
+is accepted only when its request ID and digest match that snapshot. Linux uses
+`openat2` for this resolution when available and otherwise walks each component
+from pinned directory descriptors with `openat` and `O_NOFOLLOW`.
+
+Gateway configuration supplies a positive `transport.submit_timeout_seconds`,
+bounded to 3,600 seconds. On Linux the forced-command process polls standard
+input against that absolute deadline, so an authenticated client cannot retain
+a staging package indefinitely by withholding or trickling archive bytes. The
+OpenSSH supervisor and operating-system account enforce a matching connection
+and process-capacity policy.
 
 `export` returns an uncompressed tar stream for a selected document bundle.
 Other read operations return JSON. Protocol errors are emitted as structured
@@ -724,10 +760,11 @@ pending/
 ```
 
 `request.json`, `digest`, `acceptance.json`, and `payload/` are immutable.
-`acceptance.json` contains the central acceptance timestamp and a queue-local
-monotonic sequence allocated under the queue lock. Gaps are allowed after an
-interrupted acceptance, but accepted packages never share a sequence. Worker
-state and results use only the optional `phase.json` and `result.json`
+`acceptance.json` contains the authenticated client ID, central acceptance
+timestamp, and a queue-local monotonic sequence allocated under the queue lock.
+Local administrative intake may omit the client ID for compatibility. Gaps are
+allowed after an interrupted acceptance, but accepted packages never share a
+sequence. Worker state and results use only the optional `phase.json` and `result.json`
 sidecars next to that immutable data. The Gateway never creates these
 sidecars. The Worker writes them through temporary files and atomic rename;
 package revalidation excludes Gateway and Worker metadata bytes from the
@@ -1353,6 +1390,7 @@ Configuration, rather than architecture, controls:
 - maximum directory and total package-entry counts;
 - maximum payload path components;
 - maximum front-matter bytes;
+- Gateway submit and client transfer timeouts;
 - incoming quarantine and reap age thresholds;
 - allowed attachment extensions;
 - project identifiers;

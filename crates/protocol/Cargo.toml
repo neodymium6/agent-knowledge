@@ -1,5 +1,5 @@
 [package]
-name = "agent-knowledge-core"
+name = "agent-knowledge-protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,11 +9,6 @@ publish = false
 workspace = true
 
 [dependencies]
+agent-knowledge-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
-serde-saphyr.workspace = true
-time.workspace = true
-ulid.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.30.1", features = ["fs"] }

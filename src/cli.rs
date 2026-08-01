@@ -3,17 +3,24 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use agent_knowledge_queue::{
     EnqueueOutcome, FileQueue, PackagePolicy, PackageValidationError, QueueError, validate_package,
 };
 use serde::Serialize;
 
+use crate::client::{self, ClientCommandError};
+use crate::gateway::{self, GatewayCommandError};
 use crate::worker::{self, WorkerCommandError};
 
 const USAGE: &str = "usage:\n\
     agent-knowledge admin submit --queue-root <path> --package-root <path>\n\
+    agent-knowledge client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
+    agent-knowledge gateway --config <path> --client-id <id>\n\
     agent-knowledge worker run --config <path>";
+const DEFAULT_CLIENT_TIMEOUT_SECONDS: u64 = 300;
+const MAXIMUM_CLIENT_TIMEOUT_SECONDS: u64 = 3_600;
 
 pub fn run<I, W>(arguments: I, output: W) -> Result<(), CliError>
 where
@@ -26,6 +33,18 @@ where
             package_root,
         } => submit_directory(&queue_root, &package_root, output),
         Command::RunWorker { config } => worker::run(&config, output).map_err(CliError::Worker),
+        Command::RunGateway { config, client_id } => gateway::run_stdio(
+            &config,
+            &client_id,
+            std::env::var_os("SSH_ORIGINAL_COMMAND"),
+            output,
+        )
+        .map_err(CliError::Gateway),
+        Command::ClientSubmit {
+            destination,
+            package_root,
+            timeout,
+        } => client::submit(&destination, &package_root, timeout, output).map_err(CliError::Client),
     }
 }
 
@@ -37,6 +56,15 @@ enum Command {
     RunWorker {
         config: PathBuf,
     },
+    RunGateway {
+        config: PathBuf,
+        client_id: OsString,
+    },
+    ClientSubmit {
+        destination: OsString,
+        package_root: PathBuf,
+        timeout: Duration,
+    },
 }
 
 fn parse_arguments<I>(arguments: I) -> Result<Command, CliError>
@@ -47,7 +75,16 @@ where
     let _program = arguments.next();
     let namespace = arguments.next();
     let action = arguments.next();
+    if namespace.as_deref() == Some(std::ffi::OsStr::new("gateway")) {
+        return parse_gateway_arguments(action.into_iter().chain(arguments));
+    }
     match (namespace.as_deref(), action.as_deref()) {
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("client")
+                && action == std::ffi::OsStr::new("submit") =>
+        {
+            parse_client_submit_arguments(arguments)
+        }
         (Some(namespace), Some(action))
             if namespace == std::ffi::OsStr::new("admin")
                 && action == std::ffi::OsStr::new("submit") =>
@@ -62,6 +99,58 @@ where
         }
         _ => Err(CliError::Usage),
     }
+}
+
+fn parse_client_submit_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut destination = None;
+    let mut package_root = None;
+    let mut timeout_seconds = None;
+    while let Some(flag) = arguments.next() {
+        let value = arguments.next().ok_or(CliError::Usage)?;
+        match flag.to_str() {
+            Some("--destination") if destination.is_none() => destination = Some(value),
+            Some("--package-root") if package_root.is_none() => {
+                package_root = Some(PathBuf::from(value));
+            }
+            Some("--timeout-seconds") if timeout_seconds.is_none() => {
+                let seconds = value
+                    .to_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|seconds| (1..=MAXIMUM_CLIENT_TIMEOUT_SECONDS).contains(seconds))
+                    .ok_or(CliError::Usage)?;
+                timeout_seconds = Some(seconds);
+            }
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(Command::ClientSubmit {
+        destination: destination.ok_or(CliError::Usage)?,
+        package_root: package_root.ok_or(CliError::Usage)?,
+        timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECONDS)),
+    })
+}
+
+fn parse_gateway_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut config = None;
+    let mut client_id = None;
+    while let Some(flag) = arguments.next() {
+        let value = arguments.next().ok_or(CliError::Usage)?;
+        match flag.to_str() {
+            Some("--config") if config.is_none() => config = Some(PathBuf::from(value)),
+            Some("--client-id") if client_id.is_none() => client_id = Some(value),
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(Command::RunGateway {
+        config: config.ok_or(CliError::Usage)?,
+        client_id: client_id.ok_or(CliError::Usage)?,
+    })
 }
 
 fn parse_submit_arguments<I>(mut arguments: I) -> Result<Command, CliError>
@@ -175,7 +264,19 @@ pub enum CliError {
     PackageValidation(PackageValidationError),
     Queue(QueueError),
     Worker(WorkerCommandError),
+    Gateway(GatewayCommandError),
+    Client(ClientCommandError),
     Json(serde_json::Error),
+}
+
+impl CliError {
+    pub fn write_diagnostic(&self, mut output: impl Write) -> io::Result<()> {
+        match self {
+            Self::Gateway(error) => error.write_protocol_error(output),
+            Self::Client(error) => error.write_diagnostic(output),
+            _ => writeln!(output, "{self}"),
+        }
+    }
 }
 
 impl fmt::Display for CliError {
@@ -188,6 +289,8 @@ impl fmt::Display for CliError {
             }
             Self::Queue(error) => write!(formatter, "durable queue submission failed: {error}"),
             Self::Worker(error) => error.fmt(formatter),
+            Self::Gateway(error) => error.fmt(formatter),
+            Self::Client(error) => error.fmt(formatter),
             Self::Json(error) => write!(formatter, "JSON output encoding failed: {error}"),
         }
     }
@@ -200,6 +303,8 @@ impl std::error::Error for CliError {
             Self::PackageValidation(error) => Some(error),
             Self::Queue(error) => Some(error),
             Self::Worker(error) => Some(error),
+            Self::Gateway(error) => Some(error),
+            Self::Client(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Usage => None,
         }

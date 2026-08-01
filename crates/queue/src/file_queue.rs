@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 use agent_knowledge_core::{
     ErrorCode, PathAttestation, PathAttestationError, PayloadPath, RequestId, Revision,
 };
+use agent_knowledge_protocol::ClientId;
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
@@ -166,6 +167,12 @@ struct PinnedDirectory {
 }
 
 impl FileQueue {
+    /// Returns the immutable package validation policy for this queue handle.
+    #[must_use]
+    pub const fn policy(&self) -> &PackagePolicy {
+        &self.policy
+    }
+
     /// Attests the queue root selected and pinned during initialization.
     ///
     /// # Errors
@@ -688,7 +695,20 @@ impl IncomingPackage {
     /// Returns an error when validation, synchronization, idempotency checks,
     /// locking, or the atomic state transition fails.
     pub fn accept(self) -> Result<EnqueueOutcome, QueueError> {
-        self.accept_with_hook(&mut NoopAcceptanceHook)
+        self.accept_with_hook(None, &mut NoopAcceptanceHook)
+    }
+
+    /// Validates and durably accepts this package with an authenticated client ID.
+    ///
+    /// The client ID is Gateway-owned immutable audit metadata and is not part
+    /// of the client-controlled package digest. An idempotent retry preserves
+    /// the identity recorded by the first successful acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::accept`].
+    pub fn accept_for(self, client_id: ClientId) -> Result<EnqueueOutcome, QueueError> {
+        self.accept_with_hook(Some(client_id), &mut NoopAcceptanceHook)
     }
 
     fn write_file(
@@ -800,6 +820,7 @@ impl IncomingPackage {
 
     fn accept_with_hook(
         mut self,
+        client_id: Option<ClientId>,
         hook: &mut dyn AcceptanceHook,
     ) -> Result<EnqueueOutcome, QueueError> {
         let validated = validate_package(&self.staging_path, &self.queue.policy)
@@ -856,6 +877,7 @@ impl IncomingPackage {
         let acceptance = AcceptanceMetadata {
             sequence: NonZeroU64::new(sequence).ok_or(QueueError::InvalidSequenceState)?,
             accepted_at: time::OffsetDateTime::now_utc(),
+            client_id,
         };
         write_acceptance_file(&self.staging_path, acceptance)?;
         sync_file(&self.staging_path.join(ACCEPTANCE_FILE_NAME))?;
