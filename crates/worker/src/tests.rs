@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Cursor;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,11 +19,16 @@ use agent_knowledge_repository::{
 };
 use time::OffsetDateTime;
 
-use super::{BatchProcessor, StartupOutcome, WorkerRunOutcome, WorkerRuntime};
+use super::{
+    BatchProcessor, StartupOutcome, WorkerRunError, WorkerRunLimits, WorkerRunOutcome,
+    WorkerRuntime,
+};
 
 const REQUEST_ID: &str = "01K00000000000000000000001";
 const DOCUMENT_ID: &str = "01K00000000000000000000002";
 const BATCH_ID: &str = "01K00000000000000000000003";
+const SECOND_REQUEST_ID: &str = "01K00000000000000000000004";
+const SECOND_DOCUMENT_ID: &str = "01K00000000000000000000005";
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory(PathBuf);
@@ -224,17 +230,21 @@ fn enqueue_and_claim(queue: &FileQueue, worker: &mut WorkerSession) -> ClaimedPa
 }
 
 fn enqueue_create(queue: &FileQueue) {
+    enqueue_create_with_ids(queue, REQUEST_ID, DOCUMENT_ID);
+}
+
+fn enqueue_create_with_ids(queue: &FileQueue, request_id: &str, document_id: &str) {
     let request = format!(
         "{{\n\
          \"protocol_version\": 1,\n\
-         \"request_id\": \"{REQUEST_ID}\",\n\
+         \"request_id\": \"{request_id}\",\n\
          \"title\": \"Create a fictional experiment\",\n\
          \"project\": \"fictional-project\",\n\
          \"document_type\": \"experiment\",\n\
          \"created_at\": \"2026-07-31T04:00:00Z\",\n\
          \"operations\": [{{\n\
            \"type\": \"create_document\",\n\
-           \"document_id\": \"{DOCUMENT_ID}\",\n\
+         \"document_id\": \"{document_id}\",\n\
            \"content\": \"index.md\"\n\
          }}]\n\
          }}\n"
@@ -242,10 +252,10 @@ fn enqueue_create(queue: &FileQueue) {
     let markdown = format!(
         "---\n\
          schema_version: 1\n\
-         document_id: {DOCUMENT_ID}\n\
+         document_id: {document_id}\n\
          title: Fictional experiment\n\
          created: 2026-07-31T03:50:00Z\n\
-         request_id: {REQUEST_ID}\n\
+         request_id: {request_id}\n\
          status: active\n\
          ---\n\
          Fictional transaction body.\n"
@@ -738,4 +748,83 @@ fn runtime_replays_a_preparing_repository_transaction() {
             .join(format!("queue/{}/{REQUEST_ID}", QueueState::Completed))
             .is_dir()
     );
+}
+
+#[test]
+fn runtime_requires_restart_after_a_failed_cycle() {
+    let fixture = Fixture::create_with_quartz_script(b"exit 1\n");
+    let repository = fixture.repository();
+    let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
+    enqueue_create(&queue);
+    let (mut runtime, startup) = WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("runtime must start: {error}"));
+    assert_eq!(startup, StartupOutcome::Clean);
+
+    assert!(runtime.run_once(created_at()).is_err());
+    assert!(matches!(
+        runtime.run_once(created_at()),
+        Err(WorkerRunError::RecoveryRequired)
+    ));
+}
+
+#[test]
+fn recovery_limit_cannot_be_smaller_than_a_new_batch() {
+    let limits = WorkerRunLimits::new(
+        NonZeroUsize::new(8).unwrap_or(NonZeroUsize::MIN),
+        NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN),
+        NonZeroUsize::new(50).unwrap_or(NonZeroUsize::MIN),
+    );
+
+    assert_eq!(limits.maximum_scan_entries().get(), 8);
+    assert_eq!(limits.maximum_requests().get(), 100);
+    assert_eq!(limits.maximum_recovery_requests().get(), 100);
+}
+
+#[test]
+fn separate_recovery_limit_allows_an_older_larger_batch() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let (queue, mut worker) = fixture.queue_and_worker();
+    let _first = enqueue_and_claim(&queue, &mut worker);
+    enqueue_create_with_ids(&queue, SECOND_REQUEST_ID, SECOND_DOCUMENT_ID);
+    let second_request_id = SECOND_REQUEST_ID
+        .parse()
+        .unwrap_or_else(|error| panic!("second request ID must parse: {error}"));
+    worker
+        .claim(second_request_id, batch_id())
+        .unwrap_or_else(|error| panic!("second package must be claimed: {error}"));
+    drop(worker);
+
+    let one = NonZeroUsize::MIN;
+    let scan = NonZeroUsize::new(16).unwrap_or(NonZeroUsize::MIN);
+    let too_small = WorkerRunLimits::new(scan, one, one);
+    assert!(matches!(
+        WorkerRuntime::start(
+            &queue,
+            fixture.processor(repository.clone()),
+            too_small,
+            created_at(),
+        ),
+        Err(WorkerRunError::TooManyProcessingClaims { maximum: 1 })
+    ));
+
+    let two = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+    let recoverable = WorkerRunLimits::new(scan, one, two);
+    let (_runtime, startup) = WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        recoverable,
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("larger recovery bound must accept old claims: {error}"));
+    assert!(matches!(
+        startup,
+        StartupOutcome::Requeued { requests: 2, .. }
+    ));
 }

@@ -16,15 +16,30 @@ use crate::{BatchProcessor, BatchProcessorError};
 pub struct WorkerRunLimits {
     maximum_scan_entries: NonZeroUsize,
     maximum_requests: NonZeroUsize,
+    maximum_recovery_requests: NonZeroUsize,
 }
 
 impl WorkerRunLimits {
     /// Creates limits for incremental directory scans and in-memory claims.
+    ///
+    /// A recovery bound below the new-batch bound is raised to the new-batch
+    /// bound so every batch created by this configuration remains recoverable.
     #[must_use]
-    pub const fn new(maximum_scan_entries: NonZeroUsize, maximum_requests: NonZeroUsize) -> Self {
+    pub const fn new(
+        maximum_scan_entries: NonZeroUsize,
+        maximum_requests: NonZeroUsize,
+        maximum_recovery_requests: NonZeroUsize,
+    ) -> Self {
+        let maximum_recovery_requests = if maximum_recovery_requests.get() < maximum_requests.get()
+        {
+            maximum_requests
+        } else {
+            maximum_recovery_requests
+        };
         Self {
             maximum_scan_entries,
             maximum_requests,
+            maximum_recovery_requests,
         }
     }
 
@@ -39,6 +54,15 @@ impl WorkerRunLimits {
     pub const fn maximum_requests(self) -> NonZeroUsize {
         self.maximum_requests
     }
+
+    /// Returns the stable safety bound for claims retained during startup.
+    ///
+    /// This bound is independent of the size selected for new batches, so a
+    /// deployment can reduce new batch sizes without stranding older work.
+    #[must_use]
+    pub const fn maximum_recovery_requests(self) -> NonZeroUsize {
+        self.maximum_recovery_requests
+    }
 }
 
 impl Default for WorkerRunLimits {
@@ -46,6 +70,7 @@ impl Default for WorkerRunLimits {
         Self::new(
             NonZeroUsize::new(1_024).unwrap_or(NonZeroUsize::MIN),
             NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN),
+            NonZeroUsize::new(10_000).unwrap_or(NonZeroUsize::MIN),
         )
     }
 }
@@ -91,6 +116,7 @@ pub struct WorkerRuntime {
     session: WorkerSession,
     processor: BatchProcessor,
     limits: WorkerRunLimits,
+    ready: bool,
 }
 
 impl WorkerRuntime {
@@ -147,6 +173,7 @@ impl WorkerRuntime {
                 session,
                 processor,
                 limits,
+                ready: true,
             },
             startup,
         ))
@@ -162,6 +189,21 @@ impl WorkerRuntime {
     /// Returns an error when selection, claiming, repository application, or
     /// publication fails. Durable state is retained for the next startup.
     pub fn run_once(
+        &mut self,
+        created_at: OffsetDateTime,
+    ) -> Result<WorkerRunOutcome, WorkerRunError> {
+        if !self.ready {
+            return Err(WorkerRunError::RecoveryRequired);
+        }
+        self.ready = false;
+        let outcome = self.run_once_inner(created_at);
+        if outcome.is_ok() {
+            self.ready = true;
+        }
+        outcome
+    }
+
+    fn run_once_inner(
         &mut self,
         created_at: OffsetDateTime,
     ) -> Result<WorkerRunOutcome, WorkerRunError> {
@@ -193,17 +235,26 @@ fn recover_processing(
 ) -> Result<Vec<ClaimedPackage>, WorkerRunError> {
     let mut recovered = Vec::new();
     loop {
+        let remaining_with_sentinel = limits
+            .maximum_recovery_requests
+            .get()
+            .saturating_sub(recovered.len())
+            .saturating_add(1);
+        let scan_entries = limits
+            .maximum_scan_entries
+            .get()
+            .min(remaining_with_sentinel);
         let (claims, complete) = match session
-            .scan_processing(limits.maximum_scan_entries.get())
+            .scan_processing(scan_entries)
             .map_err(WorkerRunError::queue)?
         {
             ProcessingScanOutcome::Scanning { claims, .. } => (claims, false),
             ProcessingScanOutcome::Complete { claims, .. } => (claims, true),
         };
         recovered.extend(claims);
-        if recovered.len() > limits.maximum_requests.get() {
+        if recovered.len() > limits.maximum_recovery_requests.get() {
             return Err(WorkerRunError::TooManyProcessingClaims {
-                maximum: limits.maximum_requests.get(),
+                maximum: limits.maximum_recovery_requests.get(),
             });
         }
         if complete {
@@ -263,6 +314,8 @@ pub enum WorkerRunError {
         /// Batch named by the repository journal.
         batch_id: BatchId,
     },
+    /// A previous cycle failed and startup recovery is required before reuse.
+    RecoveryRequired,
 }
 
 impl WorkerRunError {
@@ -301,6 +354,9 @@ impl fmt::Display for WorkerRunError {
                 formatter,
                 "preparing repository batch `{batch_id}` has no processing claims"
             ),
+            Self::RecoveryRequired => formatter.write_str(
+                "Worker runtime requires startup recovery after a failed processing cycle",
+            ),
         }
     }
 }
@@ -313,7 +369,8 @@ impl std::error::Error for WorkerRunError {
             Self::TooManyProcessingClaims { .. }
             | Self::MultipleProcessingBatches { .. }
             | Self::TransactionBatchMismatch { .. }
-            | Self::MissingProcessingClaims { .. } => None,
+            | Self::MissingProcessingClaims { .. }
+            | Self::RecoveryRequired => None,
         }
     }
 }
