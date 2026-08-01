@@ -6,8 +6,9 @@ mod package;
 pub use file_queue::{
     BatchClaimOutcome, BatchReconciliation, CURRENT_WORKER_PHASE_SCHEMA_VERSION,
     CURRENT_WORKER_RESULT_SCHEMA_VERSION, ClaimToken, ClaimedPackage, EnqueueOutcome, FileQueue,
-    IncomingPackage, ProcessingScanOutcome, QueueError, QueueLimit, QueueState, WorkerPhase,
-    WorkerPhaseRecord, WorkerQueueError, WorkerResultRecord, WorkerResultStatus, WorkerSession,
+    IncomingPackage, PendingScanOutcome, PendingSnapshot, ProcessingScanOutcome, QueueError,
+    QueueLimit, QueueState, WorkerPhase, WorkerPhaseRecord, WorkerQueueError, WorkerResultRecord,
+    WorkerResultStatus, WorkerSession,
 };
 pub use package::{
     AcceptanceMetadata, MarkdownValidationError, PackageDigest, PackageLimit, PackageLimits,

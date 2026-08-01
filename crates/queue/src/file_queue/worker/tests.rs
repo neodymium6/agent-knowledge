@@ -8,8 +8,9 @@ use std::thread;
 use agent_knowledge_core::{BatchId, ErrorCode, PayloadPath, RequestId};
 
 use super::{
-    BatchClaimOutcome, ClaimHook, ClaimPhase, ProcessingScanOutcome, WorkerPhase, WorkerQueueError,
-    WorkerResultRecord, WorkerResultStatus, WorkerSession, read_required_phase_record,
+    BatchClaimOutcome, ClaimHook, ClaimPhase, PendingScanOutcome, ProcessingScanOutcome,
+    WorkerPhase, WorkerQueueError, WorkerResultRecord, WorkerResultStatus, WorkerSession,
+    read_required_phase_record,
 };
 use crate::{EnqueueOutcome, FileQueue, PackagePolicy, QueueState};
 
@@ -634,6 +635,108 @@ fn batch_snapshot_excludes_requests_accepted_during_its_scan() {
             .join(format!("queue/pending/{LATER_ACCEPTED}"))
             .is_dir()
     );
+}
+
+#[test]
+fn observed_snapshot_boundary_excludes_later_arrivals_from_claiming() {
+    const SECOND_INITIAL: &str = "01K00000000000000000000020";
+    const LATER_ACCEPTED: &str = "01K00000000000000000000021";
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    accept_fixture_with_id(&queue, SECOND_INITIAL);
+    let mut worker = open_worker(&queue);
+    match worker.scan_pending(1) {
+        Ok(PendingScanOutcome::Scanning {
+            scanned_entries,
+            observed_requests,
+        }) => {
+            assert_eq!(scanned_entries, 1);
+            assert_eq!(observed_requests, 1);
+        }
+        Ok(PendingScanOutcome::Complete(_)) => {
+            panic!("one-entry observation must remain resumable")
+        }
+        Err(error) => panic!("first observation step must succeed: {error}"),
+    }
+
+    accept_fixture_with_id(&queue, LATER_ACCEPTED);
+    let snapshot = loop {
+        match worker.scan_pending(1) {
+            Ok(PendingScanOutcome::Scanning { .. }) => {}
+            Ok(PendingScanOutcome::Complete(snapshot)) => break snapshot,
+            Err(error) => panic!("pending observation must finish: {error}"),
+        }
+    };
+    assert_eq!(snapshot.requests(), 2);
+    assert_eq!(snapshot.maximum_sequence(), 2);
+    assert!(!snapshot.has_invalid_acceptance());
+    assert!(snapshot.oldest_accepted_at() <= snapshot.newest_accepted_at());
+
+    let batch_id = parse_batch_id(FIRST_BATCH_ID);
+    let claimed = loop {
+        match worker.claim_batch_through(batch_id, snapshot.maximum_sequence(), 1, 10) {
+            Ok(BatchClaimOutcome::Scanning { .. }) => {}
+            Ok(BatchClaimOutcome::Claimed(claimed)) => break claimed,
+            Err(error) => panic!("observed snapshot must be claimable: {error}"),
+        }
+    };
+    assert_eq!(claimed.len(), 2);
+    assert!(
+        root.path()
+            .join(format!("queue/pending/{LATER_ACCEPTED}"))
+            .is_dir()
+    );
+}
+
+#[test]
+fn pending_observation_is_bounded_and_exclusive() {
+    const SECOND_REQUEST_ID: &str = "01K00000000000000000000020";
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    accept_fixture_with_id(&queue, SECOND_REQUEST_ID);
+    let mut worker = open_worker(&queue);
+    assert!(matches!(
+        worker.scan_pending(1),
+        Ok(PendingScanOutcome::Scanning {
+            scanned_entries: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        worker.claim_next_batch(parse_batch_id(FIRST_BATCH_ID), 1, 1),
+        Err(WorkerQueueError::PendingObservationScanInProgress)
+    ));
+    assert!(matches!(
+        worker.scan_processing(1),
+        Err(WorkerQueueError::PendingObservationScanInProgress)
+    ));
+
+    loop {
+        match worker.scan_pending(1) {
+            Ok(PendingScanOutcome::Scanning { .. }) => {}
+            Ok(PendingScanOutcome::Complete(snapshot)) => {
+                assert_eq!(snapshot.requests(), 2);
+                break;
+            }
+            Err(error) => panic!("pending observation must finish: {error}"),
+        }
+    }
+}
+
+#[test]
+fn claim_rejects_a_future_snapshot_boundary() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    let mut worker = open_worker(&queue);
+
+    assert!(matches!(
+        worker.claim_batch_through(parse_batch_id(FIRST_BATCH_ID), 1, 1, 1),
+        Err(WorkerQueueError::InvalidBatchSnapshot)
+    ));
 }
 
 #[test]

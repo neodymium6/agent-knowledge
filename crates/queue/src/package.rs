@@ -431,7 +431,9 @@ fn validate_package_root(
     Ok(())
 }
 
-fn read_acceptance_file(path: &Path) -> Result<AcceptanceMetadata, PackageValidationError> {
+pub(crate) fn read_acceptance_file(
+    path: &Path,
+) -> Result<AcceptanceMetadata, PackageValidationError> {
     let bytes = read_limited_file(path, MAXIMUM_ACCEPTANCE_FILE_BYTES)?;
     serde_json::from_slice(&bytes).map_err(PackageValidationError::InvalidAcceptanceMetadata)
 }

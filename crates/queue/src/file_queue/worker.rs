@@ -15,6 +15,9 @@ use crate::{PackageValidationError, ValidatedPackage, validate_accepted_package}
 
 mod batch;
 pub use batch::{BatchClaimOutcome, WorkerSession};
+mod pending;
+use pending::PendingObservationScan;
+pub use pending::{PendingScanOutcome, PendingSnapshot};
 mod result;
 pub use result::{
     BatchReconciliation, CURRENT_WORKER_RESULT_SCHEMA_VERSION, WorkerResultRecord,
@@ -575,6 +578,10 @@ pub enum WorkerQueueError {
         /// Batch identifier that owns the active scan.
         active_batch_id: BatchId,
     },
+    /// A pending observation scan was active during another transition.
+    PendingObservationScanInProgress,
+    /// A claim boundary named an acceptance sequence not yet allocated.
+    InvalidBatchSnapshot,
     /// A processing recovery scan was active during another transition.
     ProcessingScanInProgress,
     /// A new Worker session has not completed processing recovery.
@@ -654,6 +661,8 @@ impl WorkerQueueError {
             | Self::InvalidBatchLimits
             | Self::BatchScanChanged { .. }
             | Self::BatchScanInProgress { .. }
+            | Self::PendingObservationScanInProgress
+            | Self::InvalidBatchSnapshot
             | Self::ProcessingScanInProgress
             | Self::ProcessingRecoveryRequired
             | Self::InvalidProcessingScanLimit
@@ -702,6 +711,11 @@ impl fmt::Display for WorkerQueueError {
                 formatter,
                 "batch scan for `{active_batch_id}` must finish before another Worker transition"
             ),
+            Self::PendingObservationScanInProgress => formatter
+                .write_str("pending observation must finish before another Worker transition"),
+            Self::InvalidBatchSnapshot => {
+                formatter.write_str("pending snapshot exceeds the current acceptance sequence")
+            }
             Self::ProcessingScanInProgress => formatter
                 .write_str("processing recovery scan must finish before another transition"),
             Self::ProcessingRecoveryRequired => {

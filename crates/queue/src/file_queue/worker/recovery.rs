@@ -52,6 +52,9 @@ impl WorkerSession {
         if let Some(active_batch_id) = self.active_batch_id() {
             return Err(WorkerQueueError::BatchScanInProgress { active_batch_id });
         }
+        if self.pending_observation.is_active() {
+            return Err(WorkerQueueError::PendingObservationScanInProgress);
+        }
         if self.processing_scan.is_none() {
             self.processing_recovery_complete = false;
             self.processing_scan = Some(
