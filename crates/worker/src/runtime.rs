@@ -6,7 +6,10 @@ use agent_knowledge_queue::{
     BatchClaimOutcome, ClaimedPackage, FileQueue, PendingScanOutcome, ProcessingScanOutcome,
     WorkerQueueError, WorkerSession,
 };
-use agent_knowledge_repository::{BatchCommitOutcome, RepositoryTransaction};
+use agent_knowledge_repository::{
+    BatchCommitOutcome, RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicator,
+    RepositoryTransaction,
+};
 use time::OffsetDateTime;
 
 use crate::{BatchCloseReason, BatchProcessor, BatchProcessorError, BatchReadiness, BatchSchedule};
@@ -192,6 +195,7 @@ pub struct WorkerRuntime {
     session: WorkerSession,
     processor: BatchProcessor,
     limits: WorkerRunLimits,
+    replication: Option<RemoteReplicator>,
     ready: bool,
 }
 
@@ -227,6 +231,24 @@ impl WorkerRuntime {
     pub fn start_interruptible(
         queue: &FileQueue,
         processor: BatchProcessor,
+        limits: WorkerRunLimits,
+        created_at: OffsetDateTime,
+        should_stop: &impl Fn() -> bool,
+    ) -> Result<InterruptibleStart<(Self, StartupOutcome)>, WorkerRunError> {
+        Self::start_interruptible_with_replication(
+            queue,
+            processor,
+            None,
+            limits,
+            created_at,
+            should_stop,
+        )
+    }
+
+    pub(crate) fn start_interruptible_with_replication(
+        queue: &FileQueue,
+        processor: BatchProcessor,
+        replication: Option<RemoteReplicator>,
         limits: WorkerRunLimits,
         created_at: OffsetDateTime,
         should_stop: &impl Fn() -> bool,
@@ -332,10 +354,29 @@ impl WorkerRuntime {
                 session,
                 processor,
                 limits,
+                replication,
                 ready: true,
             },
             startup,
         )))
+    }
+
+    /// Runs at most one asynchronous Git remote replication attempt.
+    ///
+    /// The result is `None` when replication is not configured. A failure does
+    /// not change local request, commit, or release state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when local repository or durable retry state validation fails.
+    pub fn replicate_once(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<Option<RemoteReplicationOutcome>, RemoteReplicationError> {
+        self.replication
+            .as_ref()
+            .map(|replication| replication.replicate(now))
+            .transpose()
     }
 
     /// Selects the earliest bounded pending snapshot and processes one batch.

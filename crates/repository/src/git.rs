@@ -1105,7 +1105,7 @@ impl GitRepository {
         self.validate_live_storage()
     }
 
-    fn lock_writer(&self) -> Result<RepositoryWriter, GitTransactionError> {
+    pub(crate) fn lock_writer(&self) -> Result<RepositoryWriter, GitTransactionError> {
         let writer = lock_root_paths(
             &self.git_directory,
             &self.configured_git_directory,
@@ -1386,7 +1386,7 @@ impl GitRepository {
         }
     }
 
-    fn resolve_commit(&self, revision: &str) -> Result<String, GitTransactionError> {
+    pub(crate) fn resolve_commit(&self, revision: &str) -> Result<String, GitTransactionError> {
         let expression = format!("{revision}^{{commit}}");
         let output = run_git(
             None,
@@ -1601,7 +1601,7 @@ pub(crate) fn ensure_canonical_worktree_clean_until(
     }
 }
 
-struct RepositoryWriter {
+pub(crate) struct RepositoryWriter {
     _repository: File,
     _work_root: File,
 }
@@ -2063,7 +2063,10 @@ fn lock_root_paths(
     }
 }
 
-fn validate_pinned_directory(configured: &Path, pinned: &File) -> Result<(), GitTransactionError> {
+pub(crate) fn validate_pinned_directory(
+    configured: &Path,
+    pinned: &File,
+) -> Result<(), GitTransactionError> {
     let configured_metadata = fs::symlink_metadata(configured).map_err(GitTransactionError::Io)?;
     let pinned_metadata = pinned.metadata().map_err(GitTransactionError::Io)?;
     if !configured_metadata.file_type().is_dir()
@@ -2694,6 +2697,8 @@ fn git_command() -> Command {
     command
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
         .args([
             "-c",
             "core.fsync=all",
@@ -2711,6 +2716,20 @@ fn git_command() -> Command {
             "tag.gpgSign=false",
         ]);
     command
+}
+
+impl GitRepository {
+    pub(crate) fn git_directory(&self) -> &Path {
+        &self.git_directory
+    }
+
+    pub(crate) fn official_ref(&self) -> &str {
+        &self.official_ref
+    }
+
+    pub(crate) fn repository_state_directory(&self) -> PathBuf {
+        self.git_directory.join("agent-knowledge")
+    }
 }
 
 pub(crate) fn validate_local_git_config(git_directory: &Path) -> Result<(), GitTransactionError> {

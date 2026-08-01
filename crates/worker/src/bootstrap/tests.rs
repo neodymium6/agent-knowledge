@@ -72,6 +72,25 @@ fn invalid_repository_fails_before_queue_initialization() {
     assert!(!root.path().join("queue").exists());
 }
 
+#[test]
+fn configured_replication_requires_an_existing_repository_remote() {
+    let root = TestDirectory::create();
+    initialize_repository(root.path());
+    initialize_quartz(root.path());
+    let yaml = valid_yaml(root.path()).replace(
+        "  author_email: worker@example.invalid\n",
+        "  author_email: worker@example.invalid\n  replication:\n    remote: fictional-backup\n    branch: main\n    timeout_seconds: 5\n    initial_backoff_seconds: 10\n    maximum_backoff_seconds: 40\n",
+    );
+    let settings = WorkerSettings::decode(&yaml)
+        .unwrap_or_else(|error| panic!("fixture settings must decode: {error}"));
+
+    assert!(matches!(
+        WorkerBootstrap::open(settings),
+        Err(WorkerOpenError::Replication(_))
+    ));
+    assert!(!root.path().join("queue").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_resolved_storage_aliases_before_initialization() {

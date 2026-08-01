@@ -10,7 +10,9 @@ use agent_knowledge_release::{
     ActiveRelease, BuiltDirectory, PreparedRelease, QuartzBuildError, QuartzBuilder, ReleaseError,
     ReleaseStore,
 };
-pub use agent_knowledge_repository::BatchCommitOutcome;
+pub use agent_knowledge_repository::{
+    BatchCommitOutcome, RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicationPolicy,
+};
 use agent_knowledge_repository::{
     BatchPublication, ClaimedBatch, ContentPolicy, GitRepository, GitTransactionError,
     PublicationError, RepositoryTransaction, RequestFailure,
