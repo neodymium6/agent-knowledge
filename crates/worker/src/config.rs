@@ -1,11 +1,11 @@
 use std::fmt;
-use std::fs::{File, Metadata, OpenOptions};
-use std::io::{self, Read};
+use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration as StandardDuration;
 use std::time::Instant;
 
+use agent_knowledge_core::{BoundedFileError, read_bounded_regular_file};
 use agent_knowledge_repository::GitIdentity;
 use serde::Deserialize;
 use time::Duration;
@@ -33,48 +33,6 @@ pub struct WorkerSettings {
     limits: WorkerRunLimits,
 }
 
-#[cfg(target_os = "linux")]
-fn open_linux_config_file(path: &Path) -> Result<(File, Metadata, File), WorkerConfigError> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-    let anchor = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC)
-        .open(path)
-        .map_err(WorkerConfigError::Io)?;
-    let metadata = anchor.metadata().map_err(WorkerConfigError::Io)?;
-    if !metadata.file_type().is_file() {
-        return Err(WorkerConfigError::InvalidFileType);
-    }
-    let stable_path = PathBuf::from(format!("/proc/self/fd/{}", anchor.as_raw_fd()));
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_CLOEXEC)
-        .open(stable_path)
-        .map_err(WorkerConfigError::Io)?;
-    let read_metadata = file.metadata().map_err(WorkerConfigError::Io)?;
-    if metadata.dev() != read_metadata.dev() || metadata.ino() != read_metadata.ino() {
-        return Err(WorkerConfigError::InvalidFileType);
-    }
-    Ok((file, metadata, anchor))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn open_config_file(path: &Path) -> Result<(File, Metadata), WorkerConfigError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
-    }
-    let file = options.open(path).map_err(WorkerConfigError::Io)?;
-    let metadata = file.metadata().map_err(WorkerConfigError::Io)?;
-    Ok((file, metadata))
-}
-
 impl WorkerSettings {
     /// Loads and validates one bounded YAML configuration file.
     ///
@@ -88,28 +46,8 @@ impl WorkerSettings {
     /// Returns an error for I/O failures, non-regular files, oversized input,
     /// invalid YAML, unsupported versions, or invalid operational values.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, WorkerConfigError> {
-        let path = path.as_ref();
-        #[cfg(target_os = "linux")]
-        let (file, metadata, _anchor) = open_linux_config_file(path)?;
-        #[cfg(not(target_os = "linux"))]
-        let (file, metadata) = open_config_file(path)?;
-        if !metadata.file_type().is_file() {
-            return Err(WorkerConfigError::InvalidFileType);
-        }
-        if metadata.len() > MAXIMUM_WORKER_CONFIG_BYTES {
-            return Err(WorkerConfigError::FileTooLarge {
-                maximum: MAXIMUM_WORKER_CONFIG_BYTES,
-            });
-        }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAXIMUM_WORKER_CONFIG_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(WorkerConfigError::Io)?;
-        if bytes.len() as u64 > MAXIMUM_WORKER_CONFIG_BYTES {
-            return Err(WorkerConfigError::FileTooLarge {
-                maximum: MAXIMUM_WORKER_CONFIG_BYTES,
-            });
-        }
+        let bytes = read_bounded_regular_file(path, MAXIMUM_WORKER_CONFIG_BYTES)
+            .map_err(WorkerConfigError::bounded_file)?;
         let yaml = std::str::from_utf8(&bytes).map_err(|_| WorkerConfigError::InvalidUtf8)?;
         Self::decode(yaml)
     }
@@ -466,6 +404,16 @@ pub enum WorkerConfigError {
         /// Invalid configuration field.
         field: &'static str,
     },
+}
+
+impl WorkerConfigError {
+    fn bounded_file(error: BoundedFileError) -> Self {
+        match error {
+            BoundedFileError::Io(error) => Self::Io(error),
+            BoundedFileError::InvalidFileType => Self::InvalidFileType,
+            BoundedFileError::FileTooLarge { maximum } => Self::FileTooLarge { maximum },
+        }
+    }
 }
 
 impl fmt::Display for WorkerConfigError {

@@ -15,5 +15,5 @@ serde-saphyr.workspace = true
 time.workspace = true
 ulid.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 nix = { version = "0.30.1", features = ["fs"] }
