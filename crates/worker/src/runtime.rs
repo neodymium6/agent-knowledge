@@ -98,6 +98,28 @@ pub enum StartupOutcome {
     },
 }
 
+/// Result of interruptible Worker startup.
+#[derive(Debug)]
+pub enum InterruptibleStart<T> {
+    /// Startup recovery completed and produced a ready value.
+    Started(T),
+    /// Shutdown was observed before startup recovery could complete.
+    Stopped {
+        /// Requests rejected before shutdown was observed.
+        failed_requests: usize,
+    },
+}
+
+impl<T> InterruptibleStart<T> {
+    /// Maps the ready startup value without changing a stopped result.
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> InterruptibleStart<U> {
+        match self {
+            Self::Started(value) => InterruptibleStart::Started(map(value)),
+            Self::Stopped { failed_requests } => InterruptibleStart::Stopped { failed_requests },
+        }
+    }
+}
+
 /// Result of selecting and processing at most one new batch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerRunOutcome {
@@ -187,8 +209,8 @@ impl WorkerRuntime {
         created_at: OffsetDateTime,
     ) -> Result<(Self, StartupOutcome), WorkerRunError> {
         match Self::start_interruptible(queue, processor, limits, created_at, &|| false)? {
-            Some(started) => Ok(started),
-            None => {
+            InterruptibleStart::Started(started) => Ok(started),
+            InterruptibleStart::Stopped { .. } => {
                 unreachable!("an always-running startup control cannot request shutdown")
             }
         }
@@ -200,23 +222,26 @@ impl WorkerRuntime {
     ///
     /// Returns an error when queue recovery, repository discovery, transaction
     /// resumption, or safe pre-transaction requeueing fails.
-    /// Returns `Ok(None)` when shutdown is requested; any durable partial
-    /// claims remain safe for the next startup recovery.
+    /// Returns [`InterruptibleStart::Stopped`] when shutdown is requested; any
+    /// durable partial claims remain safe for the next startup recovery.
     pub fn start_interruptible(
         queue: &FileQueue,
         processor: BatchProcessor,
         limits: WorkerRunLimits,
         created_at: OffsetDateTime,
         should_stop: &impl Fn() -> bool,
-    ) -> Result<Option<(Self, StartupOutcome)>, WorkerRunError> {
+    ) -> Result<InterruptibleStart<(Self, StartupOutcome)>, WorkerRunError> {
         let mut session = queue.try_worker_session().map_err(WorkerRunError::queue)?;
         let Some(claims) = recover_processing(&mut session, limits, should_stop)? else {
-            return Ok(None);
+            return Ok(InterruptibleStart::Stopped { failed_requests: 0 });
         };
         let processing_batch = single_processing_batch(&claims)?;
         let transaction = processor.unfinished_transaction(&session)?;
+        let journal_failures = transaction.map_or(0, RepositoryTransaction::claim_failures);
         if should_stop() {
-            return Ok(None);
+            return Ok(InterruptibleStart::Stopped {
+                failed_requests: journal_failures,
+            });
         }
         if let (Some(processing), Some(repository)) = (processing_batch, transaction)
             && processing != repository.batch_id()
@@ -224,6 +249,7 @@ impl WorkerRuntime {
             return Err(WorkerRunError::TransactionBatchMismatch {
                 processing,
                 repository: repository.batch_id(),
+                failed_requests: repository.claim_failures(),
             });
         }
 
@@ -233,7 +259,7 @@ impl WorkerRuntime {
                 let requests = claims.len();
                 for claim in claims {
                     if should_stop() {
-                        return Ok(None);
+                        return Ok(InterruptibleStart::Stopped { failed_requests: 0 });
                     }
                     session
                         .requeue_claimed(claim.token())
@@ -249,7 +275,9 @@ impl WorkerRuntime {
                 Some(_),
             ) => {
                 if should_stop() {
-                    return Ok(None);
+                    return Ok(InterruptibleStart::Stopped {
+                        failed_requests: claim_failures,
+                    });
                 }
                 let outcome = processor
                     .process(&mut session, batch_id, &claims, claim_failures, created_at)
@@ -261,7 +289,10 @@ impl WorkerRuntime {
                 }
             }
             (Some(RepositoryTransaction::Preparing { batch_id, .. }), None) => {
-                return Err(WorkerRunError::MissingProcessingClaims { batch_id });
+                return Err(WorkerRunError::MissingProcessingClaims {
+                    batch_id,
+                    failed_requests: journal_failures,
+                });
             }
             (
                 Some(RepositoryTransaction::Recoverable {
@@ -271,7 +302,9 @@ impl WorkerRuntime {
                 _,
             ) => {
                 if should_stop() {
-                    return Ok(None);
+                    return Ok(InterruptibleStart::Stopped {
+                        failed_requests: claim_failures,
+                    });
                 }
                 let outcome = processor
                     .recover(&mut session, batch_id, created_at)
@@ -283,7 +316,7 @@ impl WorkerRuntime {
                 }
             }
         };
-        Ok(Some((
+        Ok(InterruptibleStart::Started((
             Self {
                 session,
                 processor,
@@ -594,11 +627,15 @@ pub enum WorkerRunError {
         processing: BatchId,
         /// Batch found in the repository journal.
         repository: BatchId,
+        /// Requests rejected before the repository transaction began.
+        failed_requests: usize,
     },
     /// A preparing repository transaction had no live claims to replay.
     MissingProcessingClaims {
         /// Batch named by the repository journal.
         batch_id: BatchId,
+        /// Requests rejected before the repository transaction began.
+        failed_requests: usize,
     },
     /// A previous cycle failed and startup recovery is required before reuse.
     RecoveryRequired,
@@ -622,6 +659,12 @@ impl WorkerRunError {
         match self {
             Self::Queue(error) => error.failed_requests(),
             Self::Processor {
+                failed_requests, ..
+            } => *failed_requests,
+            Self::TransactionBatchMismatch {
+                failed_requests, ..
+            }
+            | Self::MissingProcessingClaims {
                 failed_requests, ..
             } => *failed_requests,
             _ => 0,
@@ -653,11 +696,12 @@ impl fmt::Display for WorkerRunError {
             Self::TransactionBatchMismatch {
                 processing,
                 repository,
+                ..
             } => write!(
                 formatter,
                 "processing batch `{processing}` does not match repository batch `{repository}`"
             ),
-            Self::MissingProcessingClaims { batch_id } => write!(
+            Self::MissingProcessingClaims { batch_id, .. } => write!(
                 formatter,
                 "preparing repository batch `{batch_id}` has no processing claims"
             ),

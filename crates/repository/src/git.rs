@@ -24,6 +24,7 @@ use crate::{ApplyError, ContentPolicy};
 const MAXIMUM_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const MAXIMUM_JOURNAL_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_BINDING_BYTES: usize = 64 * 1024;
+const PREVIOUS_JOURNAL_SCHEMA_VERSION: u16 = 2;
 const JOURNAL_SCHEMA_VERSION: u16 = 3;
 
 /// Fixed author identity for mechanically generated knowledge commits.
@@ -239,6 +240,24 @@ struct TransactionJournal {
     base_commit: String,
     claims: Vec<JournalClaim>,
     claim_failures: u64,
+    state: JournalState,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StoredTransactionJournal {
+    Current(TransactionJournal),
+    Previous(PreviousTransactionJournal),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviousTransactionJournal {
+    schema_version: u16,
+    batch_id: BatchId,
+    queue_identity: Revision,
+    base_commit: String,
+    claims: Vec<JournalClaim>,
     state: JournalState,
 }
 
@@ -1754,9 +1773,33 @@ fn read_journal(path: &Path) -> Result<Option<TransactionJournal>, GitTransactio
     if bytes.len() as u64 > MAXIMUM_JOURNAL_BYTES {
         return Err(GitTransactionError::InvalidJournal);
     }
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|_| GitTransactionError::InvalidJournal)
+    decode_journal(&bytes).map(Some)
+}
+
+fn decode_journal(bytes: &[u8]) -> Result<TransactionJournal, GitTransactionError> {
+    let stored: StoredTransactionJournal =
+        serde_json::from_slice(bytes).map_err(|_| GitTransactionError::InvalidJournal)?;
+    match stored {
+        StoredTransactionJournal::Current(journal)
+            if journal.schema_version == JOURNAL_SCHEMA_VERSION =>
+        {
+            Ok(journal)
+        }
+        StoredTransactionJournal::Previous(journal)
+            if journal.schema_version == PREVIOUS_JOURNAL_SCHEMA_VERSION =>
+        {
+            Ok(TransactionJournal {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                batch_id: journal.batch_id,
+                queue_identity: journal.queue_identity,
+                base_commit: journal.base_commit,
+                claims: journal.claims,
+                claim_failures: 0,
+                state: journal.state,
+            })
+        }
+        _ => Err(GitTransactionError::InvalidJournal),
+    }
 }
 
 fn write_journal(path: &Path, journal: &TransactionJournal) -> Result<(), GitTransactionError> {

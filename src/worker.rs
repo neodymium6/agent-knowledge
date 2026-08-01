@@ -7,8 +7,8 @@ use std::thread;
 use std::time::{Duration as StandardDuration, Instant};
 
 use agent_knowledge_worker::{
-    BatchCloseReason, BatchCommitOutcome, StartupOutcome, WorkerBootstrap, WorkerConfigError,
-    WorkerOpenError, WorkerPollOutcome, WorkerRunError, WorkerSettings,
+    BatchCloseReason, BatchCommitOutcome, InterruptibleStart, StartupOutcome, WorkerBootstrap,
+    WorkerConfigError, WorkerOpenError, WorkerPollOutcome, WorkerRunError, WorkerSettings,
 };
 use serde::Serialize;
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -67,20 +67,17 @@ where
     let settings = WorkerSettings::load(config).map_err(WorkerCommandError::Config)?;
     let bootstrap = WorkerBootstrap::open(settings).map_err(WorkerCommandError::Open)?;
     if should_stop() {
-        return write_worker_log(
-            output,
-            WorkerLogRecord::new(OffsetDateTime::now_utc(), "worker_stopped"),
-        );
+        return write_stopped_log(output, 0);
     }
     let started_at = OffsetDateTime::now_utc();
-    let Some((mut runtime, startup, schedule)) = bootstrap
+    let started = bootstrap
         .start_interruptible(started_at, &should_stop)
-        .map_err(WorkerCommandError::Run)?
-    else {
-        return write_worker_log(
-            output,
-            WorkerLogRecord::new(OffsetDateTime::now_utc(), "worker_stopped"),
-        );
+        .map_err(WorkerCommandError::Run)?;
+    let (mut runtime, startup, schedule) = match started {
+        InterruptibleStart::Started(started) => started,
+        InterruptibleStart::Stopped { failed_requests } => {
+            return write_stopped_log(output, failed_requests);
+        }
     };
     write_startup_log(output, OffsetDateTime::now_utc(), &startup)?;
 
@@ -100,10 +97,17 @@ where
             let _ = wait_for_termination(&stopping, duration);
         }
     }
+    write_stopped_log(output, stopped_failures)
+}
+
+fn write_stopped_log<W>(output: &mut W, failed_requests: usize) -> Result<(), WorkerCommandError>
+where
+    W: Write,
+{
     let mut record = WorkerLogRecord::new(OffsetDateTime::now_utc(), "worker_stopped");
-    if stopped_failures > 0 {
+    if failed_requests > 0 {
         record.severity = "warning";
-        record.failed_requests = Some(stopped_failures);
+        record.failed_requests = Some(failed_requests);
     }
     write_worker_log(output, record)
 }

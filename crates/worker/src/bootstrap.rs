@@ -10,8 +10,8 @@ use agent_knowledge_repository::{ContentPolicy, GitRepository, GitTransactionErr
 use time::OffsetDateTime;
 
 use crate::{
-    BatchProcessor, BatchSchedule, StartupOutcome, WorkerRunError, WorkerRunLimits, WorkerRuntime,
-    WorkerSettings,
+    BatchProcessor, BatchSchedule, InterruptibleStart, StartupOutcome, WorkerRunError,
+    WorkerRunLimits, WorkerRuntime, WorkerSettings,
 };
 
 /// Lifetime-pinned Worker dependencies ready for startup recovery.
@@ -90,8 +90,10 @@ impl WorkerBootstrap {
         created_at: OffsetDateTime,
     ) -> Result<(WorkerRuntime, StartupOutcome, BatchSchedule), WorkerRunError> {
         match self.start_interruptible(created_at, &|| false)? {
-            Some(started) => Ok(started),
-            None => unreachable!("an always-running startup control cannot request shutdown"),
+            InterruptibleStart::Started(started) => Ok(started),
+            InterruptibleStart::Stopped { .. } => {
+                unreachable!("an always-running startup control cannot request shutdown")
+            }
         }
     }
 
@@ -100,13 +102,14 @@ impl WorkerBootstrap {
     /// # Errors
     ///
     /// Returns an error when interrupted durable work cannot be recovered.
-    /// Returns `Ok(None)` when shutdown is requested before recovery starts a
-    /// repository transaction.
+    /// Returns [`InterruptibleStart::Stopped`] when shutdown is requested
+    /// before recovery starts a repository transaction.
     pub fn start_interruptible(
         self,
         created_at: OffsetDateTime,
         should_stop: &impl Fn() -> bool,
-    ) -> Result<Option<(WorkerRuntime, StartupOutcome, BatchSchedule)>, WorkerRunError> {
+    ) -> Result<InterruptibleStart<(WorkerRuntime, StartupOutcome, BatchSchedule)>, WorkerRunError>
+    {
         let started = WorkerRuntime::start_interruptible(
             &self.queue,
             self.processor,

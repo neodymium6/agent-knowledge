@@ -941,12 +941,17 @@ stops publication and requires recovery; it is never overwritten.
 The Worker keeps one durable transaction journal at a time. A `preparing`
 journal includes the bounded count of requests rejected during claim
 validation and is synchronized before disposable Git work begins. After the
-commit object and internal recovery ref exist, a `committed` journal containing the
-exact claim tokens and per-request outcomes is synchronized before the
-official branch can advance. A later batch cannot begin until this journal is
-reconciled and finalized. Each journal is bound to the canonical queue
+commit object and internal recovery ref exist, a `committed` journal
+containing the exact claim tokens and per-request outcomes is synchronized
+before the official branch can advance. A later batch cannot begin until this
+journal is reconciled and finalized. Each journal is bound to the canonical queue
 instance ID held by the live Worker session. Replacing a queue at the same path
 creates a different ID and invalidates sessions opened against the old queue.
+The reader accepts schema-version-2 journals written before claim-failure
+accounting was added, assigns them a zero count, and normalizes them to the
+current schema in memory. Any subsequent journal write uses the current
+schema; terminal recovery may instead remove the migrated journal after it is
+fully reconciled.
 
 Git 2.36 or newer is required. Git subprocesses discard inherited `GIT_*`
 overrides, disable system/global configuration, hooks, signing, fsmonitor, and

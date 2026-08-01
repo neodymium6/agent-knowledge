@@ -22,8 +22,8 @@ use agent_knowledge_repository::{
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
-    BatchCloseReason, BatchProcessor, BatchSchedule, StartupOutcome, WorkerPollOutcome,
-    WorkerRunError, WorkerRunLimits, WorkerRunOutcome, WorkerRuntime,
+    BatchCloseReason, BatchProcessor, BatchSchedule, InterruptibleStart, StartupOutcome,
+    WorkerPollOutcome, WorkerRunError, WorkerRunLimits, WorkerRunOutcome, WorkerRuntime,
 };
 
 const REQUEST_ID: &str = "01K00000000000000000000001";
@@ -237,6 +237,55 @@ fn enqueue_and_claim(queue: &FileQueue, worker: &mut WorkerSession) -> ClaimedPa
     worker
         .claim(request_id(), batch_id())
         .unwrap_or_else(|error| panic!("package must be claimed: {error}"))
+}
+
+fn write_preparing_journal(
+    fixture: &Fixture,
+    worker: &WorkerSession,
+    claim: &ClaimedPackage,
+    journal_batch_id: BatchId,
+    claim_failures: usize,
+) {
+    let queue_identity = worker
+        .queue_identity()
+        .unwrap_or_else(|error| panic!("queue identity must remain available: {error}"));
+    let output = Command::new("git")
+        .arg(format!("--git-dir={}", fixture.repository_path.display()))
+        .args(["rev-parse", "main"])
+        .output()
+        .unwrap_or_else(|error| panic!("base commit command must run: {error}"));
+    assert!(output.status.success());
+    let base_commit = String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| panic!("base commit must be UTF-8: {error}"));
+    let acceptance_sequence = claim
+        .package()
+        .acceptance()
+        .unwrap_or_else(|| panic!("claimed package must retain acceptance metadata"))
+        .sequence;
+    let journal = format!(
+        "{{\n\
+         \"schema_version\": 3,\n\
+         \"batch_id\": \"{journal_batch_id}\",\n\
+         \"queue_identity\": \"{queue_identity}\",\n\
+         \"base_commit\": \"{}\",\n\
+         \"claim_failures\": {claim_failures},\n\
+         \"claims\": [{{\n\
+           \"request_id\": \"{REQUEST_ID}\",\n\
+           \"attempt\": {},\n\
+           \"acceptance_sequence\": {acceptance_sequence}\n\
+         }}],\n\
+         \"state\": {{\"phase\": \"preparing\"}}\n\
+         }}\n",
+        base_commit.trim(),
+        claim.token().attempt()
+    );
+    fs::write(
+        fixture
+            .work_path
+            .join(format!("transactions/{journal_batch_id}.json")),
+        journal,
+    )
+    .unwrap_or_else(|error| panic!("preparing journal fixture must be written: {error}"));
 }
 
 fn enqueue_create(queue: &FileQueue) {
@@ -669,6 +718,23 @@ fn runtime_resumes_a_terminal_repository_transaction() {
     assert!(matches!(result, Err(GitTransactionError::TrialBuildFailed)));
     drop(worker);
 
+    let stop_checks = Cell::new(0_u8);
+    let stop_after_discovery = || {
+        let current = stop_checks.get();
+        stop_checks.set(current.saturating_add(1));
+        current >= 1
+    };
+    assert!(matches!(
+        WorkerRuntime::start_interruptible(
+            &queue,
+            fixture.processor(repository.clone()),
+            Default::default(),
+            created_at(),
+            &stop_after_discovery,
+        ),
+        Ok(InterruptibleStart::Stopped { failed_requests: 2 })
+    ));
+
     let (_runtime, startup) = WorkerRuntime::start(
         &queue,
         fixture.processor(repository),
@@ -699,47 +765,25 @@ fn runtime_replays_a_preparing_repository_transaction() {
     let repository = fixture.repository();
     let (queue, mut worker) = fixture.queue_and_worker();
     let claim = enqueue_and_claim(&queue, &mut worker);
-    let queue_identity = worker
-        .queue_identity()
-        .unwrap_or_else(|error| panic!("queue identity must remain available: {error}"));
-    let output = Command::new("git")
-        .arg(format!("--git-dir={}", fixture.repository_path.display()))
-        .args(["rev-parse", "main"])
-        .output()
-        .unwrap_or_else(|error| panic!("base commit command must run: {error}"));
-    assert!(output.status.success());
-    let base_commit = String::from_utf8(output.stdout)
-        .unwrap_or_else(|error| panic!("base commit must be UTF-8: {error}"));
-    let acceptance_sequence = claim
-        .package()
-        .acceptance()
-        .unwrap_or_else(|| panic!("claimed package must retain acceptance metadata"))
-        .sequence;
-    let journal = format!(
-        "{{\n\
-         \"schema_version\": 3,\n\
-         \"batch_id\": \"{BATCH_ID}\",\n\
-         \"queue_identity\": \"{queue_identity}\",\n\
-         \"base_commit\": \"{}\",\n\
-         \"claim_failures\": 4,\n\
-         \"claims\": [{{\n\
-           \"request_id\": \"{REQUEST_ID}\",\n\
-           \"attempt\": {},\n\
-           \"acceptance_sequence\": {acceptance_sequence}\n\
-         }}],\n\
-         \"state\": {{\"phase\": \"preparing\"}}\n\
-         }}\n",
-        base_commit.trim(),
-        claim.token().attempt()
-    );
-    fs::write(
-        fixture
-            .work_path
-            .join(format!("transactions/{BATCH_ID}.json")),
-        journal,
-    )
-    .unwrap_or_else(|error| panic!("preparing journal fixture must be written: {error}"));
+    write_preparing_journal(&fixture, &worker, &claim, batch_id(), 4);
     drop(worker);
+
+    let stop_checks = Cell::new(0_u8);
+    let stop_after_discovery = || {
+        let current = stop_checks.get();
+        stop_checks.set(current.saturating_add(1));
+        current >= 1
+    };
+    assert!(matches!(
+        WorkerRuntime::start_interruptible(
+            &queue,
+            fixture.processor(repository.clone()),
+            Default::default(),
+            created_at(),
+            &stop_after_discovery,
+        ),
+        Ok(InterruptibleStart::Stopped { failed_requests: 4 })
+    ));
 
     let (_runtime, startup) = WorkerRuntime::start(
         &queue,
@@ -763,6 +807,69 @@ fn runtime_replays_a_preparing_repository_transaction() {
             .join(format!("queue/{}/{REQUEST_ID}", QueueState::Completed))
             .is_dir()
     );
+}
+
+#[test]
+fn recovery_batch_mismatch_retains_journaled_claim_failures() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let (queue, mut worker) = fixture.queue_and_worker();
+    let claim = enqueue_and_claim(&queue, &mut worker);
+    let journal_batch_id: BatchId = "01K00000000000000000000009"
+        .parse()
+        .unwrap_or_else(|error| panic!("journal batch ID must parse: {error}"));
+    write_preparing_journal(&fixture, &worker, &claim, journal_batch_id, 6);
+    drop(worker);
+
+    let error = match WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    ) {
+        Ok(_) => panic!("mismatched recovery batches must fail"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        WorkerRunError::TransactionBatchMismatch {
+            processing,
+            repository,
+            failed_requests: 6,
+        } if processing == batch_id() && repository == journal_batch_id
+    ));
+}
+
+#[test]
+fn missing_processing_claims_retain_journaled_claim_failures() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let (queue, mut worker) = fixture.queue_and_worker();
+    let claim = enqueue_and_claim(&queue, &mut worker);
+    worker
+        .requeue_claimed(claim.token())
+        .unwrap_or_else(|error| panic!("claim fixture must return to pending: {error}"));
+    write_preparing_journal(&fixture, &worker, &claim, batch_id(), 7);
+    drop(worker);
+
+    let error = match WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    ) {
+        Ok(_) => panic!("missing processing claims must fail"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        WorkerRunError::MissingProcessingClaims {
+            batch_id: missing,
+            failed_requests: 7,
+        } if missing == batch_id()
+    ));
 }
 
 #[test]
@@ -941,7 +1048,7 @@ fn shutdown_between_claim_scans_prevents_a_new_transaction() {
             created_at(),
             &stop_during_recovery,
         ),
-        Ok(None)
+        Ok(InterruptibleStart::Stopped { failed_requests: 0 })
     ));
 }
 

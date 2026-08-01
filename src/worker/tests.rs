@@ -9,7 +9,8 @@ use time::{Duration, OffsetDateTime};
 
 use super::{
     MAXIMUM_SIGNAL_WAIT, WorkerCommandError, WorkerLogRecord, add_commit_outcome, wait_after_poll,
-    wait_for_termination, write_failure_log, write_poll_log, write_startup_log, write_worker_log,
+    wait_for_termination, write_failure_log, write_poll_log, write_startup_log, write_stopped_log,
+    write_worker_log,
 };
 
 #[test]
@@ -196,4 +197,30 @@ fn cycle_failures_report_requests_rejected_before_the_error() {
 
     assert_eq!(value["event"], "worker_failed");
     assert_eq!(value["failed_requests"], 3);
+}
+
+#[test]
+fn recovery_failures_and_stops_report_journaled_request_failures() {
+    let batch_id = "01K00000000000000000000003"
+        .parse()
+        .unwrap_or_else(|error| panic!("fixture batch ID must parse: {error}"));
+    let error = WorkerCommandError::Run(WorkerRunError::MissingProcessingClaims {
+        batch_id,
+        failed_requests: 4,
+    });
+    let mut output = Vec::new();
+    write_failure_log(&mut output, &error)
+        .unwrap_or_else(|reporting| panic!("failure log must serialize: {reporting}"));
+    let failed: serde_json::Value = serde_json::from_slice(&output)
+        .unwrap_or_else(|decode| panic!("failure log must be JSON: {decode}"));
+    assert_eq!(failed["failed_requests"], 4);
+
+    output.clear();
+    write_stopped_log(&mut output, 5)
+        .unwrap_or_else(|reporting| panic!("stop log must serialize: {reporting}"));
+    let stopped: serde_json::Value = serde_json::from_slice(&output)
+        .unwrap_or_else(|decode| panic!("stop log must be JSON: {decode}"));
+    assert_eq!(stopped["event"], "worker_stopped");
+    assert_eq!(stopped["severity"], "warning");
+    assert_eq!(stopped["failed_requests"], 5);
 }
