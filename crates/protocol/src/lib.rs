@@ -1,6 +1,7 @@
 //! Versioned SSH command and JSON wire types shared by Gateway and client.
 
 mod read;
+mod status;
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -13,6 +14,7 @@ pub use read::{
     DocumentContent, DocumentSummary, GetRequest, GetResponse, ListRequest, ListResponse,
     ReadFilterRequest, SearchRequest,
 };
+pub use status::{RequestStatus, StatusRequest, StatusResponse};
 
 /// The protocol version encoded in Gateway commands and JSON responses.
 pub const CURRENT_GATEWAY_PROTOCOL_VERSION: u16 = 1;
@@ -26,6 +28,8 @@ pub const RECENT_COMMAND: &str = "akp-v1 recent";
 pub const GET_COMMAND: &str = "akp-v1 get";
 /// The exact remote command used to search committed documents.
 pub const SEARCH_COMMAND: &str = "akp-v1 search";
+/// The exact remote command used to inspect one durable request state.
+pub const STATUS_COMMAND: &str = "akp-v1 status";
 const MAXIMUM_CLIENT_ID_BYTES: usize = 63;
 
 /// One operation selected by an authenticated SSH session.
@@ -41,6 +45,8 @@ pub enum GatewayCommand {
     Get,
     /// Searches committed Markdown and permitted metadata.
     Search,
+    /// Retrieves one durable change-request status.
+    Status,
 }
 
 impl GatewayCommand {
@@ -57,6 +63,7 @@ impl GatewayCommand {
             value if value == OsStr::new(RECENT_COMMAND) => Ok(Self::Recent),
             value if value == OsStr::new(GET_COMMAND) => Ok(Self::Get),
             value if value == OsStr::new(SEARCH_COMMAND) => Ok(Self::Search),
+            value if value == OsStr::new(STATUS_COMMAND) => Ok(Self::Status),
             _ => Err(GatewayCommandError),
         }
     }
@@ -70,6 +77,7 @@ impl GatewayCommand {
             Self::Recent => RECENT_COMMAND,
             Self::Get => GET_COMMAND,
             Self::Search => SEARCH_COMMAND,
+            Self::Status => STATUS_COMMAND,
         }
     }
 }
@@ -263,7 +271,7 @@ mod tests {
 
     use super::{
         CURRENT_GATEWAY_PROTOCOL_VERSION, ClientId, GET_COMMAND, GatewayCommand, LIST_COMMAND,
-        ProtocolErrorResponse, RECENT_COMMAND, SEARCH_COMMAND, SUBMIT_COMMAND,
+        ProtocolErrorResponse, RECENT_COMMAND, SEARCH_COMMAND, STATUS_COMMAND, SUBMIT_COMMAND,
     };
 
     #[test]
@@ -277,6 +285,7 @@ mod tests {
             (RECENT_COMMAND, GatewayCommand::Recent),
             (GET_COMMAND, GatewayCommand::Get),
             (SEARCH_COMMAND, GatewayCommand::Search),
+            (STATUS_COMMAND, GatewayCommand::Status),
         ] {
             assert_eq!(GatewayCommand::parse(OsStr::new(command)), Ok(expected));
             assert_eq!(expected.as_str(), command);
@@ -288,7 +297,7 @@ mod tests {
             "akp-v1 submit ",
             " akp-v1 submit",
             "akp-v2 submit",
-            "akp-v1 status",
+            "akp-v1 statuses",
             "akp-v1 submit; id",
         ] {
             assert!(GatewayCommand::parse(OsStr::new(rejected)).is_err());
