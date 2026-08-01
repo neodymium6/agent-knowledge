@@ -8,8 +8,8 @@ use std::time::{Duration as StandardDuration, Instant};
 
 use agent_knowledge_worker::{
     BatchCloseReason, BatchCommitOutcome, InterruptibleStart, RemoteReplicationOutcome,
-    StartupOutcome, WorkerBootstrap, WorkerConfigError, WorkerOpenError, WorkerPollOutcome,
-    WorkerRunError, WorkerSettings,
+    ReplicationEventError, StartupOutcome, WorkerBootstrap, WorkerConfigError, WorkerOpenError,
+    WorkerPollOutcome, WorkerRunError, WorkerSettings,
 };
 use serde::Serialize;
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -97,7 +97,7 @@ where
         if let Some(replication) = runtime.take_replication_event() {
             match replication {
                 Ok(outcome) => write_replication_log(output, completed_at, Some(&outcome))?,
-                Err(_) => write_replication_error_log(output, completed_at)?,
+                Err(error) => write_replication_error_log(output, completed_at, &error)?,
             }
         }
         if let Some(duration) = wait_after_poll(&outcome, completed_at) {
@@ -151,13 +151,18 @@ where
 fn write_replication_error_log<W>(
     output: &mut W,
     timestamp: OffsetDateTime,
+    error: &ReplicationEventError,
 ) -> Result<(), WorkerCommandError>
 where
     W: Write,
 {
-    let mut record = WorkerLogRecord::new(timestamp, "remote_replication_state_error");
+    let event = match error {
+        ReplicationEventError::Attempt(_) => "remote_replication_state_error",
+        ReplicationEventError::ThreadStopped => "remote_replication_thread_stopped",
+    };
+    let mut record = WorkerLogRecord::new(timestamp, event);
     record.severity = "error";
-    record.error_code = Some("remote_replication_state_error");
+    record.error_code = Some(event);
     write_worker_log(output, record)
 }
 

@@ -318,8 +318,8 @@ impl BatchProcessor {
 
 mod runtime;
 pub use runtime::{
-    InterruptibleStart, StartupOutcome, WorkerPollOutcome, WorkerRunError, WorkerRunLimits,
-    WorkerRunOutcome, WorkerRuntime,
+    InterruptibleStart, ReplicationEventError, StartupOutcome, WorkerPollOutcome, WorkerRunError,
+    WorkerRunLimits, WorkerRunOutcome, WorkerRuntime,
 };
 mod schedule;
 pub use schedule::{BatchCloseReason, BatchReadiness, BatchSchedule, BatchScheduleError};

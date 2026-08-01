@@ -3,8 +3,8 @@ use std::time::Duration as StandardDuration;
 
 use agent_knowledge_queue::WorkerQueueError;
 use agent_knowledge_worker::{
-    BatchCommitOutcome, RemoteReplicationOutcome, StartupOutcome, WorkerPollOutcome,
-    WorkerRunError, WorkerSettings,
+    BatchCommitOutcome, RemoteReplicationError, RemoteReplicationOutcome, ReplicationEventError,
+    StartupOutcome, WorkerPollOutcome, WorkerRunError, WorkerSettings,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -113,13 +113,33 @@ fn remote_replication_attempts_have_stable_structured_events() {
     assert_eq!(succeeded["commit"], commit);
 
     output.clear();
-    write_replication_error_log(&mut output, timestamp)
-        .unwrap_or_else(|error| panic!("state error event must serialize: {error}"));
+    write_replication_error_log(
+        &mut output,
+        timestamp,
+        &ReplicationEventError::Attempt(RemoteReplicationError::InvalidState),
+    )
+    .unwrap_or_else(|error| panic!("state error event must serialize: {error}"));
     let state_error: serde_json::Value = serde_json::from_slice(&output)
         .unwrap_or_else(|error| panic!("state error event must be JSON: {error}"));
     assert_eq!(state_error["event"], "remote_replication_state_error");
     assert_eq!(state_error["severity"], "error");
     assert_eq!(state_error["error_code"], "remote_replication_state_error");
+
+    output.clear();
+    write_replication_error_log(
+        &mut output,
+        timestamp,
+        &ReplicationEventError::ThreadStopped,
+    )
+    .unwrap_or_else(|error| panic!("thread failure event must serialize: {error}"));
+    let thread_error: serde_json::Value = serde_json::from_slice(&output)
+        .unwrap_or_else(|error| panic!("thread failure event must be JSON: {error}"));
+    assert_eq!(thread_error["event"], "remote_replication_thread_stopped");
+    assert_eq!(thread_error["severity"], "error");
+    assert_eq!(
+        thread_error["error_code"],
+        "remote_replication_thread_stopped"
+    );
 }
 
 #[test]

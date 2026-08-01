@@ -324,7 +324,10 @@ local repository writer lock. A fingerprint of the configured push URL is part
 of the durable destination identity, so repointing a named remote invalidates
 its previous success record without persisting sensitive URL text. Reportable
 events are retained in a bounded queue; replication pauses when it is full
-rather than overwriting an unread event.
+rather than overwriting an unread event. Each attempt revalidates the pinned
+repository identity and local Git configuration without taking writer
+ownership. An unexpected replication-thread exit is a distinct operational
+error rather than an idle state.
 
 ## 8. Storage layout
 

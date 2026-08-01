@@ -2,7 +2,7 @@ use std::fmt;
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration as StandardDuration;
@@ -24,7 +24,36 @@ const REPLICATION_VERIFICATION_INTERVAL: StandardDuration = StandardDuration::fr
 const REPLICATION_EVENT_RETRY_INTERVAL: StandardDuration = StandardDuration::from_millis(100);
 const REPLICATION_EVENT_CAPACITY: usize = 64;
 
-type ReplicationEvent = Result<RemoteReplicationOutcome, RemoteReplicationError>;
+type ReplicationEvent = Result<RemoteReplicationOutcome, ReplicationEventError>;
+
+/// An asynchronous replication event that could not produce an outcome.
+#[derive(Debug)]
+pub enum ReplicationEventError {
+    /// One replication attempt failed local validation or durable state I/O.
+    Attempt(RemoteReplicationError),
+    /// The background replication thread exited unexpectedly.
+    ThreadStopped,
+}
+
+impl fmt::Display for ReplicationEventError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Attempt(error) => write!(formatter, "Git replication attempt failed: {error}"),
+            Self::ThreadStopped => {
+                formatter.write_str("Git replication thread stopped unexpectedly")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplicationEventError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Attempt(error) => Some(error),
+            Self::ThreadStopped => None,
+        }
+    }
+}
 
 /// Bounded queue scan and batch-size limits for one Worker process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,6 +234,7 @@ pub enum WorkerPollOutcome {
 struct ReplicationBackground {
     control: Arc<ReplicationControl>,
     events: Receiver<ReplicationEvent>,
+    terminal_reported: AtomicBool,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -230,6 +260,7 @@ impl ReplicationBackground {
         Ok(Self {
             control,
             events,
+            terminal_reported: AtomicBool::new(false),
             thread: Some(thread),
         })
     }
@@ -239,7 +270,16 @@ impl ReplicationBackground {
     }
 
     fn take_event(&self) -> Option<ReplicationEvent> {
-        self.events.try_recv().ok()
+        match self.events.try_recv() {
+            Ok(event) => Some(event),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected)
+                if !self.terminal_reported.swap(true, Ordering::AcqRel) =>
+            {
+                Some(Err(ReplicationEventError::ThreadStopped))
+            }
+            Err(TryRecvError::Disconnected) => None,
+        }
     }
 }
 
@@ -334,7 +374,8 @@ fn replication_loop(
             }
             Err(error) if !error_reported => {
                 error_reported = true;
-                pending_event = try_send_replication_event(events, Err(error));
+                pending_event =
+                    try_send_replication_event(events, Err(ReplicationEventError::Attempt(error)));
             }
             Err(_) => {}
         }
@@ -555,14 +596,14 @@ impl WorkerRuntime {
         )))
     }
 
-    /// Takes the latest asynchronous Git remote replication event.
+    /// Takes the next asynchronous Git remote replication event.
     ///
     /// The result is `None` when replication is not configured or no new
     /// reportable outcome is available. Background failures never change local
     /// request, commit, release, or queue processing state.
     pub fn take_replication_event(
         &self,
-    ) -> Option<Result<RemoteReplicationOutcome, RemoteReplicationError>> {
+    ) -> Option<Result<RemoteReplicationOutcome, ReplicationEventError>> {
         self.replication
             .as_ref()
             .and_then(ReplicationBackground::take_event)
@@ -998,5 +1039,43 @@ impl std::error::Error for WorkerRunError {
             | Self::MissingProcessingClaims { .. }
             | Self::RecoveryRequired => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod replication_background_tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn reports_an_unexpected_background_thread_exit_once() {
+        let control = Arc::new(ReplicationControl {
+            stopping: AtomicBool::new(false),
+            generation: Mutex::new(0),
+            wake: Condvar::new(),
+        });
+        let (sender, events) = sync_channel(REPLICATION_EVENT_CAPACITY);
+        let thread = thread::spawn(move || {
+            drop(sender);
+            panic!("fictional replication thread failure");
+        });
+        let background = ReplicationBackground {
+            control,
+            events,
+            terminal_reported: AtomicBool::new(false),
+            thread: Some(thread),
+        };
+        let deadline = Instant::now() + StandardDuration::from_secs(5);
+
+        loop {
+            match background.take_event() {
+                Some(Err(ReplicationEventError::ThreadStopped)) => break,
+                Some(event) => panic!("unexpected replication event: {event:?}"),
+                None if Instant::now() < deadline => thread::yield_now(),
+                None => panic!("background thread exit must be reported"),
+            }
+        }
+        assert!(background.take_event().is_none());
     }
 }

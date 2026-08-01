@@ -96,7 +96,8 @@ it sleeps until a retry is due, with a bounded low-frequency verification poll.
 It persists the last confirmed commit, a fingerprint of the configured push
 URL, and an exponential retry deadline under the bare repository. It caps delay
 at `maximum_backoff_seconds`, disables interactive Git and SSH credential
-prompts, and applies `timeout_seconds` to every attempt.
+prompts, revalidates the pinned repository and local Git configuration before
+each push, and applies `timeout_seconds` to every attempt.
 
 Submit a validated request package through an SSH host alias:
 
@@ -198,6 +199,8 @@ validation failures emit `remote_replication_state_error` once until the state
 becomes readable again. Up-to-date and deferred polls are intentionally quiet.
 Reportable events use a bounded in-process queue; when that queue is full,
 replication pauses instead of overwriting an unread event.
+An unexpected background-thread exit emits
+`remote_replication_thread_stopped` instead of appearing as an idle poll.
 
 `SIGINT` and `SIGTERM` request graceful shutdown before a new durable
 transaction or after the current transaction completes. An in-flight remote

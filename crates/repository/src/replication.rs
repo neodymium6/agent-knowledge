@@ -278,6 +278,9 @@ impl RemoteReplicator {
         let deadline = Instant::now()
             .checked_add(self.policy.timeout)
             .ok_or(RemoteReplicationError::InvalidPolicy("timeout"))?;
+        self.repository
+            .validate_replication_read()
+            .map_err(RemoteReplicationError::repository)?;
         let refspec = format!("{target}:refs/heads/{}", self.policy.branch);
         let push = run_git_until_controlled(
             None,
@@ -395,6 +398,9 @@ fn configured_remote_fingerprint(
     repository: &GitRepository,
     policy: &RemoteReplicationPolicy,
 ) -> Result<Revision, RemoteReplicationError> {
+    repository
+        .validate_replication_read()
+        .map_err(RemoteReplicationError::repository)?;
     let mirror_key = format!("remote.{}.mirror", policy.remote());
     let mirror = run_git_for_read(
         None,
@@ -802,6 +808,31 @@ mod tests {
         assert!(matches!(
             replicator.replicate(OffsetDateTime::UNIX_EPOCH),
             Err(RemoteReplicationError::InvalidPolicy("remote.mirror"))
+        ));
+    }
+
+    #[test]
+    fn rejects_unsafe_local_git_configuration_added_after_open() {
+        let fixture = Fixture::create();
+        let repository = fixture.repository();
+        let replicator = RemoteReplicator::open(repository, fixture.policy())
+            .unwrap_or_else(|error| panic!("replicator must open: {error}"));
+        let git_directory = format!("--git-dir={}", fixture.repository.display());
+        git(
+            None,
+            [
+                git_directory.as_str(),
+                "config",
+                "credential.helper",
+                "fictional-helper",
+            ],
+            None,
+        );
+
+        assert!(matches!(
+            replicator.replicate(OffsetDateTime::UNIX_EPOCH),
+            Err(RemoteReplicationError::Repository(error))
+                if matches!(*error, crate::GitTransactionError::UnsafeGitConfig)
         ));
     }
 

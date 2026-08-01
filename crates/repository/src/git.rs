@@ -1116,6 +1116,11 @@ impl GitRepository {
         Ok(writer)
     }
 
+    pub(crate) fn validate_replication_read(&self) -> Result<(), GitTransactionError> {
+        validate_pinned_directory(&self.configured_git_directory, &self.git_root_handle)?;
+        validate_local_git_config(&self.git_directory)
+    }
+
     fn validate_live_storage(&self) -> Result<(), GitTransactionError> {
         validate_pinned_directory(&self.configured_git_directory, &self.git_root_handle)?;
         validate_pinned_directory(
@@ -2515,12 +2520,31 @@ where
     };
     let (capture_sender, capture_receiver) = mpsc::channel();
     let stdout_sender = capture_sender.clone();
-    let stdout_reader = thread::spawn(move || {
-        let _ = stdout_sender.send((0_usize, capture_bounded_output(stdout)));
-    });
-    let stderr_reader = thread::spawn(move || {
-        let _ = capture_sender.send((1_usize, capture_bounded_output(stderr)));
-    });
+    let stdout_reader = match thread::Builder::new()
+        .name("knowledge-git-stdout".into())
+        .spawn(move || {
+            let _ = stdout_sender.send((0_usize, capture_bounded_output(stdout)));
+        }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            kill_timed_git_process(&mut child);
+            let _ = child.wait();
+            return Err(GitTransactionError::Io(error));
+        }
+    };
+    let stderr_reader = match thread::Builder::new()
+        .name("knowledge-git-stderr".into())
+        .spawn(move || {
+            let _ = capture_sender.send((1_usize, capture_bounded_output(stderr)));
+        }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            kill_timed_git_process(&mut child);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            return Err(GitTransactionError::Io(error));
+        }
+    };
 
     let mut status = None;
     let mut captured = [None, None];
