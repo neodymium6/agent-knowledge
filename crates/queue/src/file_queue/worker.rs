@@ -10,11 +10,16 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use super::{FileQueue, QueueError, QueueState, sync_directory};
+use super::{
+    FileQueue, NEXT_SEQUENCE_FILE_NAME, QueueError, QueueState, read_next_sequence, sync_directory,
+};
 use crate::{PackageValidationError, ValidatedPackage, validate_accepted_package};
 
 mod batch;
 pub use batch::{BatchClaimOutcome, WorkerSession};
+mod pending;
+use pending::PendingObservationScan;
+pub use pending::{PendingScanOutcome, PendingSnapshot};
 mod result;
 pub use result::{
     BatchReconciliation, CURRENT_WORKER_RESULT_SCHEMA_VERSION, WorkerResultRecord,
@@ -575,6 +580,10 @@ pub enum WorkerQueueError {
         /// Batch identifier that owns the active scan.
         active_batch_id: BatchId,
     },
+    /// A pending observation scan was active during another transition.
+    PendingObservationScanInProgress,
+    /// A claim boundary named an acceptance sequence not yet allocated.
+    InvalidBatchSnapshot,
     /// A processing recovery scan was active during another transition.
     ProcessingScanInProgress,
     /// A new Worker session has not completed processing recovery.
@@ -654,6 +663,8 @@ impl WorkerQueueError {
             | Self::InvalidBatchLimits
             | Self::BatchScanChanged { .. }
             | Self::BatchScanInProgress { .. }
+            | Self::PendingObservationScanInProgress
+            | Self::InvalidBatchSnapshot
             | Self::ProcessingScanInProgress
             | Self::ProcessingRecoveryRequired
             | Self::InvalidProcessingScanLimit
@@ -702,6 +713,11 @@ impl fmt::Display for WorkerQueueError {
                 formatter,
                 "batch scan for `{active_batch_id}` must finish before another Worker transition"
             ),
+            Self::PendingObservationScanInProgress => formatter
+                .write_str("pending observation must finish before another Worker transition"),
+            Self::InvalidBatchSnapshot => {
+                formatter.write_str("pending snapshot exceeds the current acceptance sequence")
+            }
             Self::ProcessingScanInProgress => formatter
                 .write_str("processing recovery scan must finish before another transition"),
             Self::ProcessingRecoveryRequired => {
@@ -782,3 +798,14 @@ impl std::error::Error for WorkerQueueError {
 
 #[cfg(test)]
 mod tests;
+
+pub(super) fn current_maximum_sequence(queue: &FileQueue) -> Result<u64, WorkerQueueError> {
+    let queue_lock = queue.open_queue_lock().map_err(WorkerQueueError::Queue)?;
+    queue_lock.lock().map_err(WorkerQueueError::Io)?;
+    queue
+        .current_identity_locked()
+        .map_err(WorkerQueueError::Queue)?;
+    let next_sequence = read_next_sequence(&queue.queue_root.join(NEXT_SEQUENCE_FILE_NAME))
+        .map_err(WorkerQueueError::Queue)?;
+    Ok(next_sequence - 1)
+}

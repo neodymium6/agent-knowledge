@@ -291,8 +291,11 @@ impl BatchProcessor {
 
 mod runtime;
 pub use runtime::{
-    StartupOutcome, WorkerRunError, WorkerRunLimits, WorkerRunOutcome, WorkerRuntime,
+    StartupOutcome, WorkerPollOutcome, WorkerRunError, WorkerRunLimits, WorkerRunOutcome,
+    WorkerRuntime,
 };
+mod schedule;
+pub use schedule::{BatchCloseReason, BatchReadiness, BatchSchedule, BatchScheduleError};
 
 fn outcome_tokens(outcome: &BatchCommitOutcome) -> (&[ClaimToken], Vec<(ClaimToken, ErrorCode)>) {
     match outcome {

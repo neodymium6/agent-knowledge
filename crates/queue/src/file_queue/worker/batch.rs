@@ -5,7 +5,10 @@ use std::path::Path;
 
 use agent_knowledge_core::{BatchId, RequestId, Revision};
 
-use super::{ClaimedPackage, WorkerQueueError, next_attempt, revalidate_accepted};
+use super::{
+    ClaimedPackage, PendingObservationScan, WorkerQueueError, current_maximum_sequence,
+    next_attempt, revalidate_accepted,
+};
 use crate::file_queue::{FileQueue, NEXT_SEQUENCE_FILE_NAME, QueueState, read_next_sequence};
 
 /// Progress made while selecting and claiming one bounded Worker batch.
@@ -28,6 +31,7 @@ pub struct WorkerSession {
     pub(super) queue: FileQueue,
     _writer_lock: File,
     pending_scan: PendingBatchScan,
+    pub(super) pending_observation: PendingObservationScan,
     pub(super) processing_scan: Option<fs::ReadDir>,
     pub(super) processing_recovery_complete: bool,
 }
@@ -98,6 +102,7 @@ impl FileQueue {
             queue: self.clone(),
             _writer_lock: writer_lock,
             pending_scan: PendingBatchScan::default(),
+            pending_observation: PendingObservationScan::default(),
             processing_scan: None,
             processing_recovery_complete: false,
         })
@@ -203,6 +208,41 @@ impl WorkerSession {
         maximum_scan_entries: usize,
         maximum_requests: usize,
     ) -> Result<BatchClaimOutcome, WorkerQueueError> {
+        self.claim_batch(batch_id, maximum_scan_entries, maximum_requests, None)
+    }
+
+    /// Claims pending requests no newer than one observed acceptance snapshot.
+    ///
+    /// Calls must continue with the same batch, limits, and sequence boundary
+    /// while [`BatchClaimOutcome::Scanning`] is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::claim_next_batch`], or
+    /// [`WorkerQueueError::InvalidBatchSnapshot`] when the supplied boundary
+    /// has not been allocated by this queue.
+    pub fn claim_batch_through(
+        &mut self,
+        batch_id: BatchId,
+        maximum_sequence: u64,
+        maximum_scan_entries: usize,
+        maximum_requests: usize,
+    ) -> Result<BatchClaimOutcome, WorkerQueueError> {
+        self.claim_batch(
+            batch_id,
+            maximum_scan_entries,
+            maximum_requests,
+            Some(maximum_sequence),
+        )
+    }
+
+    fn claim_batch(
+        &mut self,
+        batch_id: BatchId,
+        maximum_scan_entries: usize,
+        maximum_requests: usize,
+        requested_maximum_sequence: Option<u64>,
+    ) -> Result<BatchClaimOutcome, WorkerQueueError> {
         self.queue_identity()?;
         if maximum_scan_entries == 0 || maximum_requests == 0 {
             return Err(WorkerQueueError::InvalidBatchLimits);
@@ -211,9 +251,14 @@ impl WorkerSession {
         if self.processing_scan.is_some() {
             return Err(WorkerQueueError::ProcessingScanInProgress);
         }
+        if self.pending_observation.is_active() {
+            return Err(WorkerQueueError::PendingObservationScanInProgress);
+        }
         if let Some(active_batch_id) = self.pending_scan.batch_id
             && (active_batch_id != batch_id
-                || self.pending_scan.maximum_requests != maximum_requests)
+                || self.pending_scan.maximum_requests != maximum_requests
+                || requested_maximum_sequence
+                    .is_some_and(|sequence| sequence != self.pending_scan.maximum_sequence))
         {
             return Err(WorkerQueueError::BatchScanChanged { active_batch_id });
         }
@@ -230,13 +275,18 @@ impl WorkerSession {
             let next_sequence =
                 read_next_sequence(&self.queue.queue_root.join(NEXT_SEQUENCE_FILE_NAME))
                     .map_err(WorkerQueueError::Queue)?;
+            let current_maximum_sequence = next_sequence - 1;
+            let maximum_sequence = requested_maximum_sequence.unwrap_or(current_maximum_sequence);
+            if maximum_sequence > current_maximum_sequence {
+                return Err(WorkerQueueError::InvalidBatchSnapshot);
+            }
             self.pending_scan.entries = Some(
                 fs::read_dir(self.queue.state_root(QueueState::Pending))
                     .map_err(WorkerQueueError::Io)?,
             );
             self.pending_scan.batch_id = Some(batch_id);
             self.pending_scan.maximum_requests = maximum_requests;
-            self.pending_scan.maximum_sequence = next_sequence - 1;
+            self.pending_scan.maximum_sequence = maximum_sequence;
         }
 
         let mut scanned_entries = 0_usize;
@@ -299,6 +349,9 @@ impl WorkerSession {
         self.ensure_recovery_complete()?;
         match self.pending_scan.batch_id {
             Some(active_batch_id) => Err(WorkerQueueError::BatchScanInProgress { active_batch_id }),
+            None if self.pending_observation.is_active() => {
+                Err(WorkerQueueError::PendingObservationScanInProgress)
+            }
             None if self.processing_scan.is_some() => {
                 Err(WorkerQueueError::ProcessingScanInProgress)
             }
@@ -405,6 +458,13 @@ fn inspect_pending_candidate(
     })?;
     let sequence = acceptance.sequence.get();
     if sequence > scan.maximum_sequence {
+        if sequence > current_maximum_sequence(queue)? {
+            return Err(WorkerQueueError::CorruptState {
+                request_id,
+                state: QueueState::Pending,
+                detail: "acceptance sequence exceeds the queue allocation state",
+            });
+        }
         return Ok(None);
     }
     let _ = next_attempt(path, request_id, QueueState::Pending)?;
