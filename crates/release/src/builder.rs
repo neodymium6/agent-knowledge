@@ -402,11 +402,22 @@ fn canonical_regular_file(path: &Path) -> Result<PathBuf, QuartzBuildError> {
     }
     let path = fs::canonicalize(path).map_err(QuartzBuildError::Io)?;
     let metadata = fs::symlink_metadata(&path).map_err(QuartzBuildError::Io)?;
-    if metadata.file_type().is_file() {
-        Ok(path)
-    } else {
-        Err(QuartzBuildError::InvalidProgram)
+    if !metadata.file_type().is_file() {
+        return Err(QuartzBuildError::InvalidProgram);
     }
+    #[cfg(unix)]
+    {
+        use nix::fcntl::{AT_FDCWD, AtFlags};
+        use nix::unistd::{AccessFlags, faccessat};
+
+        if let Err(error) = faccessat(AT_FDCWD, &path, AccessFlags::X_OK, AtFlags::AT_EACCESS) {
+            return match error {
+                Errno::EACCES | Errno::EPERM => Err(QuartzBuildError::InvalidProgram),
+                error => Err(process_error(error as i32)),
+            };
+        }
+    }
+    Ok(path)
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, QuartzBuildError> {
@@ -693,7 +704,9 @@ impl fmt::Display for QuartzBuildError {
             Self::ProgramMustBeAbsolute => {
                 formatter.write_str("Quartz program path must be absolute")
             }
-            Self::InvalidProgram => formatter.write_str("Quartz program is not a regular file"),
+            Self::InvalidProgram => {
+                formatter.write_str("Quartz program is not an executable regular file")
+            }
             Self::InvalidDirectory => formatter.write_str("Quartz path is not a real directory"),
             Self::BuildPathsMustBeAbsolute => {
                 formatter.write_str("Quartz content and output paths must be absolute")

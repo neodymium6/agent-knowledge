@@ -599,6 +599,23 @@ fn rejects_a_deadline_that_cannot_be_represented() {
 
 #[cfg(unix)]
 #[test]
+fn rejects_a_non_executable_launcher_during_initialization() {
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    fs::create_dir(&integration)
+        .unwrap_or_else(|error| panic!("integration directory must be created: {error}"));
+    let program = root.0.join("non-executable-quartz");
+    fs::write(&program, b"#!/bin/sh\nexit 0\n")
+        .unwrap_or_else(|error| panic!("launcher fixture must be written: {error}"));
+
+    assert!(matches!(
+        QuartzBuilder::new(&program, &integration, Duration::from_secs(2)),
+        Err(QuartzBuildError::InvalidProgram)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn rejects_replaced_command_configuration() {
     let root = TestDirectory::new();
     let integration = root.0.join("integration");
