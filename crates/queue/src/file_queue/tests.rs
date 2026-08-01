@@ -8,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use agent_knowledge_core::{ErrorCode, PayloadPath};
+use agent_knowledge_protocol::ClientId;
 
 use super::{
     AcceptanceHook, AcceptancePhase, DirectoryScanner, EnqueueOutcome, FileQueue, IncomingPackage,
@@ -415,6 +416,43 @@ fn accepts_new_package_and_returns_existing_for_an_identical_retry() {
         }
     );
     assert!(incoming_is_empty(root.path()));
+}
+
+#[test]
+fn authenticated_acceptance_preserves_the_original_client_identity() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let first_client = "fictional-node-a"
+        .parse::<ClientId>()
+        .unwrap_or_else(|error| panic!("first client ID must parse: {error}"));
+    let retrying_client = "fictional-node-b"
+        .parse::<ClientId>()
+        .unwrap_or_else(|error| panic!("retrying client ID must parse: {error}"));
+
+    let accepted = stage_package(&queue, RESULTS)
+        .accept_for(first_client.clone())
+        .unwrap_or_else(|error| panic!("authenticated package must be accepted: {error}"));
+    let request_id = match accepted {
+        EnqueueOutcome::Accepted { request_id, .. } => request_id,
+        EnqueueOutcome::Existing { .. } => panic!("first request must be newly accepted"),
+    };
+    assert!(matches!(
+        stage_package(&queue, RESULTS).accept_for(retrying_client),
+        Ok(EnqueueOutcome::Existing { .. })
+    ));
+
+    let accepted_root = root
+        .path()
+        .join("queue/pending")
+        .join(request_id.to_string());
+    let validated = validate_accepted_package(&accepted_root, &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("accepted package must revalidate: {error}"));
+    assert_eq!(
+        validated
+            .acceptance()
+            .and_then(|metadata| metadata.client_id.clone()),
+        Some(first_client)
+    );
 }
 
 #[test]
@@ -847,7 +885,7 @@ fn queue_replacement_before_acceptance_response_prevents_acknowledgement() {
     };
 
     assert!(matches!(
-        stage_package(&queue, RESULTS).accept_with_hook(&mut hook),
+        stage_package(&queue, RESULTS).accept_with_hook(None, &mut hook),
         Err(QueueError::InvalidQueueIdentity)
     ));
     assert!(
@@ -861,14 +899,14 @@ fn queue_replacement_before_acceptance_response_prevents_acknowledgement() {
 fn retry_recovers_after_interruption_following_atomic_rename() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path(), PackagePolicy::default());
-    let error = match stage_package(&queue, RESULTS).accept_with_hook(&mut FailAfterRename) {
+    let error = match stage_package(&queue, RESULTS).accept_with_hook(None, &mut FailAfterRename) {
         Ok(_) => panic!("injected interruption must fail the first response"),
         Err(error) => error,
     };
     assert!(matches!(error, QueueError::Io(_)));
 
     let error = match stage_package(&queue, RESULTS)
-        .accept_with_hook(&mut FailAfterExistingDirectoriesSynchronized)
+        .accept_with_hook(None, &mut FailAfterExistingDirectoriesSynchronized)
     {
         Ok(_) => panic!("injected interruption must fail the second response"),
         Err(error) => error,
