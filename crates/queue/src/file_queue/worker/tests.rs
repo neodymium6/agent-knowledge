@@ -289,6 +289,81 @@ fn live_worker_validation_rejects_a_requeued_claim() {
 }
 
 #[test]
+fn batch_reconciliation_is_exact_and_idempotent() {
+    const FAILED_REQUEST_ID: &str = "01K00000000000000000000020";
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    accept_fixture_with_id(&queue, FAILED_REQUEST_ID);
+    let batch_id = parse_batch_id(FIRST_BATCH_ID);
+    let failed_request_id = FAILED_REQUEST_ID
+        .parse()
+        .unwrap_or_else(|error| panic!("failed request ID must parse: {error}"));
+    let mut worker = open_worker(&queue);
+    let successful = worker
+        .claim(parse_request_id(), batch_id)
+        .unwrap_or_else(|error| panic!("successful request must be claimed: {error}"))
+        .token();
+    let failed = worker
+        .claim(failed_request_id, batch_id)
+        .unwrap_or_else(|error| panic!("failed request must be claimed: {error}"))
+        .token();
+    let failures = [(failed, ErrorCode::RevisionConflict)];
+
+    let proof = worker
+        .reconcile_batch(batch_id, &[successful], &failures)
+        .unwrap_or_else(|error| panic!("batch must reconcile: {error}"));
+    let queue_identity = worker
+        .queue_identity()
+        .unwrap_or_else(|error| panic!("queue identity must remain valid: {error}"));
+    assert!(proof.validates(queue_identity, batch_id, &[successful], &failures));
+    assert!(!proof.validates(queue_identity, batch_id, &[successful], &[]));
+    assert!(
+        root.path()
+            .join(format!("queue/completed/{}", successful.request_id()))
+            .is_dir()
+    );
+    assert!(
+        root.path()
+            .join(format!("queue/failed/{}", failed.request_id()))
+            .is_dir()
+    );
+
+    let retried = worker
+        .reconcile_batch(batch_id, &[successful], &failures)
+        .unwrap_or_else(|error| panic!("terminal reconciliation retry must succeed: {error}"));
+    assert!(retried.validates(queue_identity, batch_id, &[successful], &failures));
+}
+
+#[test]
+fn batch_reconciliation_rejects_duplicate_or_cross_batch_outcomes() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    let first_batch = parse_batch_id(FIRST_BATCH_ID);
+    let mut worker = open_worker(&queue);
+    let token = worker
+        .claim(parse_request_id(), first_batch)
+        .unwrap_or_else(|error| panic!("request must be claimed: {error}"))
+        .token();
+
+    assert!(matches!(
+        worker.reconcile_batch(first_batch, &[token], &[(token, ErrorCode::InvalidRequest)]),
+        Err(WorkerQueueError::InvalidReconciliation)
+    ));
+    assert!(matches!(
+        worker.reconcile_batch(parse_batch_id(SECOND_BATCH_ID), &[token], &[]),
+        Err(WorkerQueueError::InvalidReconciliation)
+    ));
+    assert!(
+        root.path()
+            .join(format!("queue/processing/{}", token.request_id()))
+            .is_dir()
+    );
+}
+
+#[test]
 fn claim_rejects_corrupt_stored_phase_metadata() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path());

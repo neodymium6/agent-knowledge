@@ -16,7 +16,10 @@ use crate::{PackageValidationError, ValidatedPackage, validate_accepted_package}
 mod batch;
 pub use batch::{BatchClaimOutcome, WorkerSession};
 mod result;
-pub use result::{CURRENT_WORKER_RESULT_SCHEMA_VERSION, WorkerResultRecord, WorkerResultStatus};
+pub use result::{
+    BatchReconciliation, CURRENT_WORKER_RESULT_SCHEMA_VERSION, WorkerResultRecord,
+    WorkerResultStatus,
+};
 mod recovery;
 pub use recovery::ProcessingScanOutcome;
 
@@ -556,6 +559,8 @@ pub enum WorkerQueueError {
     ResultEncoding(serde_json::Error),
     /// Stored Worker phase JSON was malformed.
     InvalidPhaseMetadata(serde_json::Error),
+    /// Stored Worker result JSON was malformed.
+    InvalidResultMetadata(serde_json::Error),
     /// Another process currently owns the Repository Worker lock.
     WorkerAlreadyRunning,
     /// A batch scan limit was zero.
@@ -632,6 +637,8 @@ pub enum WorkerQueueError {
         /// Affected request identifier.
         request_id: RequestId,
     },
+    /// Terminal outcomes were empty, duplicated, or belonged to another batch.
+    InvalidReconciliation,
 }
 
 impl WorkerQueueError {
@@ -649,12 +656,14 @@ impl WorkerQueueError {
             | Self::BatchScanInProgress { .. }
             | Self::ProcessingScanInProgress
             | Self::ProcessingRecoveryRequired
-            | Self::InvalidProcessingScanLimit => ErrorCode::InvalidRequest,
+            | Self::InvalidProcessingScanLimit
+            | Self::InvalidReconciliation => ErrorCode::InvalidRequest,
             Self::CorruptPackage { .. }
             | Self::CorruptState { .. }
             | Self::InvalidPendingEntry { .. }
             | Self::InvalidProcessingEntry { .. }
-            | Self::InvalidPhaseMetadata(_) => ErrorCode::ContentValidationFailed,
+            | Self::InvalidPhaseMetadata(_)
+            | Self::InvalidResultMetadata(_) => ErrorCode::ContentValidationFailed,
             Self::PhaseEncoding(_) | Self::ResultEncoding(_) | Self::AttemptExhausted { .. } => {
                 ErrorCode::InternalError
             }
@@ -675,6 +684,9 @@ impl fmt::Display for WorkerQueueError {
             }
             Self::InvalidPhaseMetadata(error) => {
                 write!(formatter, "stored phase metadata JSON is invalid: {error}")
+            }
+            Self::InvalidResultMetadata(error) => {
+                write!(formatter, "stored result metadata JSON is invalid: {error}")
             }
             Self::WorkerAlreadyRunning => {
                 formatter.write_str("another Repository Worker owns the writer lock")
@@ -698,6 +710,8 @@ impl fmt::Display for WorkerQueueError {
             Self::InvalidProcessingScanLimit => {
                 formatter.write_str("processing recovery scan limit must be greater than zero")
             }
+            Self::InvalidReconciliation => formatter
+                .write_str("terminal outcomes must be non-empty, unique, and belong to one batch"),
             Self::InvalidPendingEntry { path, detail } => write!(
                 formatter,
                 "pending queue entry `{}` is invalid: {detail}",
@@ -758,7 +772,8 @@ impl std::error::Error for WorkerQueueError {
             Self::Io(error) => Some(error),
             Self::PhaseEncoding(error)
             | Self::ResultEncoding(error)
-            | Self::InvalidPhaseMetadata(error) => Some(error),
+            | Self::InvalidPhaseMetadata(error)
+            | Self::InvalidResultMetadata(error) => Some(error),
             Self::CorruptPackage { source, .. } => Some(source),
             _ => None,
         }

@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use agent_knowledge_core::{BatchId, ErrorCode, RequestId, Revision};
 use agent_knowledge_queue::{
-    ClaimToken, ClaimedPackage, PackagePolicy, WorkerQueueError, WorkerSession,
+    BatchReconciliation, ClaimToken, ClaimedPackage, PackagePolicy, WorkerQueueError, WorkerSession,
 };
+use agent_knowledge_release::{ReleaseError, ReleaseStore};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -89,6 +90,49 @@ pub enum BatchCommitOutcome {
         /// Isolated request failures.
         failures: Vec<RequestFailure>,
     },
+}
+
+/// Callbacks that build and durably prepare derived output around one commit.
+pub struct BatchPublication<F, H> {
+    trial_build: F,
+    before_publish: H,
+}
+
+/// Bounded signal returned when a derived-publication callback fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublicationError;
+
+impl PublicationError {
+    /// Creates a callback failure after the caller retained its detailed error.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for PublicationError {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for PublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("derived publication callback failed")
+    }
+}
+
+impl std::error::Error for PublicationError {}
+
+impl<F, H> BatchPublication<F, H> {
+    /// Groups the trial build and pre-publication preparation callbacks.
+    #[must_use]
+    pub const fn new(trial_build: F, before_publish: H) -> Self {
+        Self {
+            trial_build,
+            before_publish,
+        }
+    }
 }
 
 /// Central bare repository and its canonical linked worktree.
@@ -301,6 +345,51 @@ impl GitRepository {
             TransactionHooks {
                 trial_build,
                 before_publish: continue_publication,
+            },
+        )
+    }
+
+    /// Applies a batch and invokes a durable publication callback after the
+    /// commit journal exists but before the official branch can advance.
+    ///
+    /// The callback receives the exact prepared content worktree and commit.
+    /// It is intended for preparing derived output that recovery must be able
+    /// to resume before repository publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::apply_batch`] or a callback error.
+    pub fn apply_batch_with_publication<F, H>(
+        &self,
+        worker: &mut WorkerSession,
+        batch_id: BatchId,
+        claims: &[ClaimedPackage],
+        policy: ContentPolicy,
+        package_policy: &PackagePolicy,
+        publication: BatchPublication<F, H>,
+    ) -> Result<BatchCommitOutcome, GitTransactionError>
+    where
+        F: FnOnce(&Path) -> Result<(), PublicationError>,
+        H: FnOnce(&Path, &str) -> Result<(), PublicationError>,
+    {
+        let BatchPublication {
+            trial_build,
+            before_publish,
+        } = publication;
+        self.apply_batch_with_hook(
+            worker,
+            batch_id,
+            claims,
+            policy,
+            package_policy,
+            TransactionHooks {
+                trial_build: |content: &Path| {
+                    trial_build(content).map_err(|_| GitTransactionError::TrialBuildFailed)
+                },
+                before_publish: |_: &str, commit: &str| {
+                    before_publish(&self.worktree_path(batch_id), commit)
+                        .map_err(|_| GitTransactionError::TrialBuildFailed)
+                },
             },
         )
     }
@@ -579,14 +668,65 @@ impl GitRepository {
         self.validate_live_storage()
     }
 
-    /// Removes a terminal transaction journal after the caller has durably
-    /// recorded every queue transition and activated the corresponding release.
+    /// Removes a terminal transaction journal after exact queue reconciliation
+    /// and, for a committed batch, activation of its immutable release.
     ///
     /// # Errors
     ///
-    /// Returns an error if the journal does not match the published outcome.
+    /// Returns an error if the journal, queue proof, outcome, or active release
+    /// do not describe exactly the same terminal batch.
+    pub fn finalize_batch(
+        &self,
+        worker: &WorkerSession,
+        batch_id: BatchId,
+        outcome: &BatchCommitOutcome,
+        reconciliation: &BatchReconciliation,
+        release_store: Option<&ReleaseStore>,
+    ) -> Result<(), GitTransactionError> {
+        let _writer = self.lock_writer()?;
+        worker
+            .ensure_transaction_ready()
+            .map_err(GitTransactionError::Queue)?;
+        let journal_path = self.journal_path(batch_id);
+        let journal = read_journal(&journal_path)?.ok_or(GitTransactionError::JournalMissing)?;
+        validate_journal_structure(&journal, batch_id)?;
+        validate_worker_identity(&journal, worker)?;
+        if matches!(&journal.state, JournalState::Committed { .. }) {
+            self.validate_committed_journal(&journal)?;
+        }
+        let journal_outcome = outcome_from_journal(&journal)?;
+        if journal_outcome != *outcome {
+            return Err(GitTransactionError::JournalMismatch);
+        }
+        let (commit, successful, failures) = outcome_parts(outcome);
+        let queue_identity = worker
+            .queue_identity()
+            .map_err(GitTransactionError::Queue)?;
+        if !reconciliation.validates(queue_identity, batch_id, successful, &failures) {
+            return Err(GitTransactionError::JournalMismatch);
+        }
+        match (commit, release_store) {
+            (Some(commit), Some(releases))
+                if releases
+                    .active_release()
+                    .map_err(|error| GitTransactionError::Release(Box::new(error)))?
+                    .is_some_and(|active| active.commit() == commit)
+                    && self.resolve_commit(&self.official_ref)? == commit => {}
+            (None, None) if self.resolve_commit(&self.official_ref)? == journal.base_commit => {}
+            _ => return Err(GitTransactionError::PublicationIncomplete),
+        }
+        if path_exists(&self.worktree_path(batch_id))?
+            || self
+                .resolve_optional_commit(&transaction_ref(batch_id))?
+                .is_some()
+        {
+            return Err(GitTransactionError::JournalState);
+        }
+        remove_journal(&journal_path)
+    }
+
     #[cfg(test)]
-    fn finalize_batch(
+    fn finalize_batch_without_publication_proofs(
         &self,
         worker: &WorkerSession,
         batch_id: BatchId,
@@ -624,21 +764,34 @@ impl GitRepository {
         remove_journal(&journal_path)
     }
 
-    /// Recovers a terminal transaction without requiring its requests to
-    /// remain in `processing/`.
-    ///
-    /// The returned durable tokens let the caller idempotently reconcile queue
-    /// entries after a crash partway through terminal transitions.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the journal is absent or malformed, publication
-    /// cannot be resumed, or disposable cleanup fails.
-    pub fn recover_batch(
+    #[cfg(test)]
+    fn recover_batch(
         &self,
         worker: &WorkerSession,
         batch_id: BatchId,
     ) -> Result<BatchCommitOutcome, GitTransactionError> {
+        self.recover_batch_with_publication(worker, batch_id, |_, _| Ok(()))
+    }
+
+    /// Recovers a terminal transaction while ensuring its durable derived
+    /// publication is prepared before the official branch can advance.
+    ///
+    /// The callback runs only when publication had not durably started. It
+    /// receives the retained prepared worktree and exact journaled commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the journal is absent or malformed, publication
+    /// cannot be resumed, disposable cleanup fails, or the callback fails.
+    pub fn recover_batch_with_publication<F>(
+        &self,
+        worker: &WorkerSession,
+        batch_id: BatchId,
+        before_publish: F,
+    ) -> Result<BatchCommitOutcome, GitTransactionError>
+    where
+        F: FnOnce(&Path, &str) -> Result<(), PublicationError>,
+    {
         let _writer = self.lock_writer()?;
         worker
             .ensure_transaction_ready()
@@ -667,6 +820,8 @@ impl GitRepository {
                         actual,
                     });
                 }
+                before_publish(&self.worktree_path(batch_id), &commit)
+                    .map_err(|_| GitTransactionError::TrialBuildFailed)?;
                 let JournalState::Committed {
                     publication_started,
                     ..
@@ -1400,6 +1555,33 @@ fn outcome_from_journal(
         }),
         None if successful.is_empty() => Ok(BatchCommitOutcome::NoChanges { failures }),
         None => Err(GitTransactionError::JournalMismatch),
+    }
+}
+
+fn outcome_parts(
+    outcome: &BatchCommitOutcome,
+) -> (Option<&str>, &[ClaimToken], Vec<(ClaimToken, ErrorCode)>) {
+    match outcome {
+        BatchCommitOutcome::NoChanges { failures } => (
+            None,
+            &[],
+            failures
+                .iter()
+                .map(|failure| (failure.token(), failure.error_code()))
+                .collect(),
+        ),
+        BatchCommitOutcome::Committed {
+            commit,
+            successful,
+            failures,
+        } => (
+            Some(commit),
+            successful,
+            failures
+                .iter()
+                .map(|failure| (failure.token(), failure.error_code()))
+                .collect(),
+        ),
     }
 }
 
@@ -2381,6 +2563,8 @@ pub enum GitTransactionError {
     JournalMissing,
     /// A transaction journal was not in the committed state.
     JournalState,
+    /// Queue reconciliation or release activation has not completed.
+    PublicationIncomplete,
     /// A committed transaction must be recovered before it can be reconciled.
     TransactionRequiresRecovery {
         /// Batch whose durable result must be recovered.
@@ -2397,6 +2581,8 @@ pub enum GitTransactionError {
     },
     /// Live queue ownership validation failed.
     Queue(WorkerQueueError),
+    /// Active release validation failed.
+    Release(Box<ReleaseError>),
     /// The official branch changed after the transaction pinned its base.
     OfficialBranchChanged {
         /// Pinned base commit.
@@ -2492,6 +2678,9 @@ impl fmt::Display for GitTransactionError {
             Self::JournalState => {
                 formatter.write_str("transaction journal is not ready for finalization")
             }
+            Self::PublicationIncomplete => formatter.write_str(
+                "queue reconciliation and active release do not complete this transaction",
+            ),
             Self::TransactionRequiresRecovery { batch_id } => {
                 write!(
                     formatter,
@@ -2508,6 +2697,7 @@ impl fmt::Display for GitTransactionError {
                 )
             }
             Self::Queue(error) => write!(formatter, "claim ownership validation failed: {error}"),
+            Self::Release(error) => write!(formatter, "active release validation failed: {error}"),
             Self::OfficialBranchChanged { expected, actual } => write!(
                 formatter,
                 "official branch changed after pinning `{expected}`; found `{actual}`"
@@ -2537,6 +2727,7 @@ impl std::error::Error for GitTransactionError {
         match self {
             Self::Apply { source, .. } => Some(source),
             Self::Queue(error) => Some(error),
+            Self::Release(error) => Some(error),
             Self::CanonicalWorktreeSync { source, .. } | Self::PostCommitCleanup { source, .. } => {
                 Some(source)
             }
