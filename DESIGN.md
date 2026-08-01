@@ -147,8 +147,8 @@ requires:
   descriptors;
 - normal POSIX file and directory semantics; and
 - a mounted `/proc` file system exposing `/proc/self/fd` and
-  `/proc/self/mountinfo`, and allowing same-UID Git descendants to resolve
-  `/proc/<worker-pid>/fd`.
+  `/proc/self/mountinfo`, and allowing same-UID Git and Quartz descendants to
+  resolve `/proc/<worker-pid>/fd`.
 
 All durable paths are configurable. Processes handle termination signals and
 shut down at transaction boundaries. The configured queue root may be created
@@ -280,11 +280,14 @@ requires constructing a new Worker. The launcher is the complete executable
 boundary: deployments that require `npx quartz` provide an immutable wrapper
 instead of adding free-form command-prefix arguments to Worker configuration.
 
-The Rust builder resolves a canonical absolute launcher and integration
-directory at startup, preserves the executable's original path semantics, and
-invokes `<launcher> build -d <content> -o <output>` without a shell. Standard
-input and process output are disconnected from request data and logs, and
-every invocation has a positive execution deadline. Each invocation runs in
+The Rust builder pins the launcher and integration directory at startup and
+invokes the launcher through its descriptor-backed `/proc/<worker-pid>/fd`
+path as `<launcher> build -d <content> -o <output>` without a shell. The pinned
+integration directory is the process working directory. Launchers must resolve
+plugins and other resources from that working directory; they must not depend
+on `$0`, `/proc/self/exe`, or ELF `$ORIGIN` naming the configured launcher path.
+Standard input and process output are disconnected from request data and logs,
+and every invocation has a positive execution deadline. Each invocation runs in
 an isolated process
 group; the builder kills that group on timeout and after the command wrapper
 exits. The service supervisor remains responsible for terminating any process

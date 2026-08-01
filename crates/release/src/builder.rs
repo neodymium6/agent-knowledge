@@ -47,8 +47,11 @@ impl QuartzBuilder {
     /// Validates operator-controlled, trusted Quartz command configuration.
     ///
     /// The builder invokes the configured launcher as `program build -d
-    /// <content> -o <output>` without a shell. The program and integration
-    /// tree must be deployed immutably for the lifetime of this builder.
+    /// <content> -o <output>` without a shell, through a descriptor-backed path
+    /// with the integration root as its working directory. The launcher must
+    /// resolve resources from that directory rather than its executable path.
+    /// The program and integration tree must be deployed immutably for the
+    /// lifetime of this builder.
     pub fn new(
         program: impl AsRef<Path>,
         integration_directory: impl AsRef<Path>,
@@ -78,16 +81,10 @@ impl QuartzBuilder {
         let output_policy = output_policy
             .validate()
             .map_err(|_| QuartzBuildError::InvalidOutputLimits)?;
-        let configured_program = canonical_regular_file(program.as_ref())?;
-        let program_handle =
-            Arc::new(File::open(&configured_program).map_err(QuartzBuildError::Io)?);
-        validate_executable_program(&configured_program, &program_handle)?;
-        let program = stable_file_path(&program_handle, &configured_program)?;
-        let configured_integration_directory = canonical_directory(integration_directory.as_ref())?;
-        let integration_handle =
-            Arc::new(File::open(&configured_integration_directory).map_err(QuartzBuildError::Io)?);
-        let integration_directory =
-            stable_file_path(&integration_handle, &configured_integration_directory)?;
+        let (configured_program, program, program_handle) =
+            pin_executable_program(program.as_ref(), || {})?;
+        let (configured_integration_directory, integration_directory, integration_handle) =
+            pin_integration_directory(integration_directory.as_ref())?;
         Ok(Self {
             configured_program,
             program,
@@ -410,42 +407,77 @@ fn process_error(error: i32) -> QuartzBuildError {
     QuartzBuildError::Io(io::Error::from_raw_os_error(error))
 }
 
-fn canonical_regular_file(path: &Path) -> Result<PathBuf, QuartzBuildError> {
+fn pin_executable_program(
+    path: &Path,
+    after_open: impl FnOnce(),
+) -> Result<(PathBuf, PathBuf, Arc<File>), QuartzBuildError> {
     if !path.is_absolute() {
         return Err(QuartzBuildError::ProgramMustBeAbsolute);
     }
-    let path = fs::canonicalize(path).map_err(QuartzBuildError::Io)?;
-    let metadata = fs::symlink_metadata(&path).map_err(QuartzBuildError::Io)?;
+    let handle = Arc::new(open_path_handle(path).map_err(QuartzBuildError::Io)?);
+    let metadata = handle.metadata().map_err(QuartzBuildError::Io)?;
     if !metadata.file_type().is_file() {
         return Err(QuartzBuildError::InvalidProgram);
     }
-    Ok(path)
+    after_open();
+    let configured = fs::canonicalize(path).map_err(QuartzBuildError::Io)?;
+    let stable = stable_file_path(&handle, &configured)?;
+    validate_executable_program(&configured, &stable, &handle)?;
+    Ok((configured, stable, handle))
 }
 
-fn validate_executable_program(path: &Path, pinned: &File) -> Result<(), QuartzBuildError> {
+fn validate_executable_program(
+    configured: &Path,
+    executable: &Path,
+    pinned: &File,
+) -> Result<(), QuartzBuildError> {
     #[cfg(unix)]
     {
         use nix::fcntl::{AT_FDCWD, AtFlags};
         use nix::unistd::{AccessFlags, faccessat};
 
-        if let Err(error) = faccessat(AT_FDCWD, path, AccessFlags::X_OK, AtFlags::AT_EACCESS) {
+        if let Err(error) = faccessat(AT_FDCWD, executable, AccessFlags::X_OK, AtFlags::AT_EACCESS)
+        {
             return match error {
                 Errno::EACCES | Errno::EPERM => Err(QuartzBuildError::InvalidProgram),
                 error => Err(process_error(error as i32)),
             };
         }
     }
-    validate_pinned_file(path, pinned)
+    validate_pinned_file(configured, pinned)
 }
 
-fn canonical_directory(path: &Path) -> Result<PathBuf, QuartzBuildError> {
-    let path = fs::canonicalize(path).map_err(QuartzBuildError::Io)?;
-    let metadata = fs::symlink_metadata(&path).map_err(QuartzBuildError::Io)?;
-    if metadata.file_type().is_dir() {
-        Ok(path)
-    } else {
-        Err(QuartzBuildError::InvalidDirectory)
+fn pin_integration_directory(
+    path: &Path,
+) -> Result<(PathBuf, PathBuf, Arc<File>), QuartzBuildError> {
+    let handle = Arc::new(open_path_handle(path).map_err(QuartzBuildError::Io)?);
+    if !handle
+        .metadata()
+        .map_err(QuartzBuildError::Io)?
+        .file_type()
+        .is_dir()
+    {
+        return Err(QuartzBuildError::InvalidDirectory);
     }
+    let configured = fs::canonicalize(path).map_err(QuartzBuildError::Io)?;
+    validate_pinned_directory(&configured, &handle)?;
+    let stable = stable_file_path(&handle, &configured)?;
+    Ok((configured, stable, handle))
+}
+
+#[cfg(target_os = "linux")]
+fn open_path_handle(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_path_handle(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 fn stable_file_path(handle: &File, configured: &Path) -> Result<PathBuf, QuartzBuildError> {
@@ -489,7 +521,7 @@ fn validate_pinned_directory(path: &Path, pinned: &File) -> Result<(), QuartzBui
 
 #[cfg(target_os = "linux")]
 fn validate_live_mount(path: &Path, pinned: &File) -> Result<(), QuartzBuildError> {
-    let live = File::open(path).map_err(|_| QuartzBuildError::CommandIdentityChanged)?;
+    let live = open_path_handle(path).map_err(|_| QuartzBuildError::CommandIdentityChanged)?;
     if !same_metadata(
         &live.metadata().map_err(QuartzBuildError::Io)?,
         &pinned.metadata().map_err(QuartzBuildError::Io)?,

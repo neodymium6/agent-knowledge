@@ -12,12 +12,12 @@ use std::os::unix::fs::PermissionsExt;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-#[cfg(unix)]
-use super::validate_executable_program;
 use super::{
     BUILD_PROCESS_LEASE, BuildProcessLease, ChildGuard, QuartzBuildError, QuartzBuilder,
     enforce_output_limits, spawn_quartz,
 };
+#[cfg(unix)]
+use super::{pin_executable_program, validate_executable_program};
 use crate::ReleasePolicy;
 #[cfg(unix)]
 use crate::ReleaseStore;
@@ -79,6 +79,11 @@ fn invokes_quartz_with_fixed_content_and_output_arguments() {
     let output = root.0.join("output");
     fs::create_dir(&integration)
         .unwrap_or_else(|error| panic!("integration directory must be created: {error}"));
+    fs::write(
+        integration.join("fictional-resource.txt"),
+        "integration resource\n",
+    )
+    .unwrap_or_else(|error| panic!("integration resource must be written: {error}"));
     fs::create_dir(&content)
         .unwrap_or_else(|error| panic!("content directory must be created: {error}"));
     fs::create_dir(&output)
@@ -91,6 +96,7 @@ fn invokes_quartz_with_fixed_content_and_output_arguments() {
          test \"$2\" = \"-d\" || exit 12\n\
          test \"$4\" = \"-o\" || exit 14\n\
          printf '%s\\n' \"$0\" > \"$5/program-path.txt\"\n\
+         cp fictional-resource.txt \"$5/integration-resource.txt\"\n\
          printf '%s\\n' '<p>fictional release</p>' > \"$5/index.html\"\n",
     );
     let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
@@ -108,6 +114,12 @@ fn invokes_quartz_with_fixed_content_and_output_arguments() {
         fs::read_to_string(output.join("program-path.txt"))
             .unwrap_or_else(|error| panic!("program path must be readable: {error}")),
         format!("{}\n", builder.program.display())
+    );
+    assert_eq!(
+        fs::read_to_string(output.join("integration-resource.txt")).unwrap_or_else(|error| panic!(
+            "integration resource output must be readable: {error}"
+        )),
+        "integration resource\n"
     );
 }
 
@@ -630,7 +642,31 @@ fn executable_validation_rejects_a_launcher_replaced_after_open() {
     executable(&program, "#!/bin/sh\nexit 0\n");
 
     assert!(matches!(
-        validate_executable_program(&program, &pinned),
+        validate_executable_program(&program, &program, &pinned),
+        Err(QuartzBuildError::CommandIdentityChanged)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn program_pinning_rejects_a_fifo_replacement_without_opening_it() {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    let root = TestDirectory::new();
+    let program = root.0.join("quartz-launcher");
+    let detached = root.0.join("pinned-quartz-launcher");
+    executable(&program, "#!/bin/sh\nexit 0\n");
+
+    let result = pin_executable_program(&program, || {
+        fs::rename(&program, &detached)
+            .unwrap_or_else(|error| panic!("pinned launcher must be moved: {error}"));
+        mkfifo(&program, Mode::S_IRUSR | Mode::S_IWUSR)
+            .unwrap_or_else(|error| panic!("replacement FIFO must be created: {error}"));
+    });
+
+    assert!(matches!(
+        result,
         Err(QuartzBuildError::CommandIdentityChanged)
     ));
 }
