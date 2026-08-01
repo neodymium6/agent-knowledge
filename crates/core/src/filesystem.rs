@@ -1,5 +1,7 @@
 use std::fmt;
 use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
@@ -13,6 +15,8 @@ use std::fs;
 use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 
@@ -73,7 +77,8 @@ impl PathAttestation {
             loop {
                 match fs::canonicalize(existing) {
                     Ok(resolved) => {
-                        let pinned = File::open(&resolved).map_err(PathAttestationError::Io)?;
+                        let pinned =
+                            open_path_handle(&resolved).map_err(PathAttestationError::Io)?;
                         let metadata = pinned.metadata().map_err(PathAttestationError::Io)?;
                         if !metadata.is_dir() && !metadata.is_file() {
                             return Err(PathAttestationError::BindingMismatch);
@@ -123,6 +128,10 @@ impl PathAttestation {
     }
 
     /// Returns a descriptor-backed path that retains the resolved destination.
+    ///
+    /// The path is valid only in this process and while this attestation remains
+    /// alive. Callers must not persist it, pass it to a child process, or use a
+    /// copied path after dropping the attestation.
     #[must_use]
     pub fn stable_path(&self) -> &Path {
         #[cfg(target_os = "linux")]
@@ -157,7 +166,7 @@ impl PathAttestation {
     #[cfg(target_os = "linux")]
     fn capture_linux(path: &Path, pinned: &File) -> Result<Self, PathAttestationError> {
         let canonical_path = fs::canonicalize(path).map_err(PathAttestationError::Io)?;
-        let live_handle = File::open(&canonical_path).map_err(PathAttestationError::Io)?;
+        let live_handle = open_path_handle(&canonical_path).map_err(PathAttestationError::Io)?;
         let (object, pinned_mount_id, is_directory) = validate_linux_binding(&live_handle, pinned)?;
         let object = Some(object);
         let stable_path = linux_stable_path(&live_handle, is_directory);
@@ -207,6 +216,14 @@ fn validate_linux_binding(
 fn linux_stable_path(file: &File, is_directory: bool) -> PathBuf {
     let path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
     if is_directory { path.join(".") } else { path }
+}
+
+#[cfg(target_os = "linux")]
+fn open_path_handle(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC)
+        .open(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -413,10 +430,37 @@ mod tests {
     use std::path::Path;
 
     #[cfg(target_os = "linux")]
+    use nix::sys::stat::Mode;
+    #[cfg(target_os = "linux")]
+    use nix::unistd::mkfifo;
+
+    #[cfg(target_os = "linux")]
     use super::{
-        PathAttestationError, linux_backing_location_from, parse_linux_device,
+        PathAttestation, PathAttestationError, linux_backing_location_from, parse_linux_device,
         validate_linux_binding,
     };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn destination_rejects_a_fifo_without_blocking() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-knowledge-core-attestation-test-{}",
+            ulid::Ulid::generate()
+        ));
+        std::fs::create_dir(&root)
+            .unwrap_or_else(|error| panic!("test root must be created: {error}"));
+        let fifo = root.join("fictional-fifo");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR)
+            .unwrap_or_else(|error| panic!("FIFO fixture must be created: {error}"));
+
+        assert!(matches!(
+            PathAttestation::resolve_destination(&fifo),
+            Err(PathAttestationError::BindingMismatch)
+        ));
+
+        std::fs::remove_dir_all(&root)
+            .unwrap_or_else(|error| panic!("test root must be removed: {error}"));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

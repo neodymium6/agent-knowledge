@@ -15,6 +15,7 @@ dependencies = [
 name = "agent-knowledge-core"
 version = "0.1.0"
 dependencies = [
+ "nix",
  "serde",
  "serde-saphyr",
  "serde_json",
