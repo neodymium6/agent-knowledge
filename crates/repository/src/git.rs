@@ -159,6 +159,31 @@ pub struct GitRepository {
     identity: GitIdentity,
 }
 
+/// Durable repository work that must be resumed before a new batch starts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositoryTransaction {
+    /// Claims were recorded, but no terminal repository outcome exists yet.
+    Preparing {
+        /// Batch that owns the transaction.
+        batch_id: BatchId,
+    },
+    /// A terminal outcome exists and publication or reconciliation must resume.
+    Recoverable {
+        /// Batch that owns the transaction.
+        batch_id: BatchId,
+    },
+}
+
+impl RepositoryTransaction {
+    /// Returns the batch that owns this durable transaction.
+    #[must_use]
+    pub const fn batch_id(self) -> BatchId {
+        match self {
+            Self::Preparing { batch_id } | Self::Recoverable { batch_id } => batch_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TransactionJournal {
@@ -308,6 +333,53 @@ impl GitRepository {
             official_ref,
             identity,
         })
+    }
+
+    /// Discovers the single durable transaction that startup must resume.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queue recovery is incomplete, more than one
+    /// transaction exists, or the journal does not match this queue and
+    /// repository.
+    pub fn unfinished_transaction(
+        &self,
+        worker: &WorkerSession,
+    ) -> Result<Option<RepositoryTransaction>, GitTransactionError> {
+        let _writer = self.lock_writer()?;
+        worker
+            .ensure_transaction_ready()
+            .map_err(GitTransactionError::Queue)?;
+        self.validate_live_storage()?;
+
+        let mut transaction = None;
+        for entry in fs::read_dir(&self.journal_root).map_err(GitTransactionError::Io)? {
+            let entry = entry.map_err(GitTransactionError::Io)?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| GitTransactionError::InvalidJournal)?;
+            let Some(batch_text) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let batch_id = batch_text
+                .parse::<BatchId>()
+                .map_err(|_| GitTransactionError::InvalidJournal)?;
+            if batch_id.to_string() != batch_text || transaction.is_some() {
+                return Err(GitTransactionError::UnfinishedTransaction);
+            }
+            let journal =
+                read_journal(&entry.path())?.ok_or(GitTransactionError::JournalMissing)?;
+            validate_journal_structure(&journal, batch_id)?;
+            validate_worker_identity(&journal, worker)?;
+            transaction = Some(match journal.state {
+                JournalState::Preparing => RepositoryTransaction::Preparing { batch_id },
+                JournalState::NoChanges { .. } | JournalState::Committed { .. } => {
+                    RepositoryTransaction::Recoverable { batch_id }
+                }
+            });
+        }
+        Ok(transaction)
     }
 
     /// Applies a bounded ordered claim batch, requires a successful trial build
