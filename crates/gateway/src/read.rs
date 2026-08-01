@@ -20,11 +20,11 @@ pub(super) fn list(
     store: &CommittedStore,
     request: &ListRequest,
     recent: bool,
-) -> Result<ListResponse, GatewayError> {
+    deadline: Instant,
+) -> Result<PreparedResponse<ListResponse>, GatewayError> {
     validate_version(request.protocol_version)?;
     validate_filter(&request.filter)?;
     validate_result_limit(settings, request.maximum_results)?;
-    let deadline = read_deadline(settings)?;
     let snapshot = snapshot(settings, store, deadline)?;
     let filter = repository_filter(&request.filter);
     let records = if recent {
@@ -39,17 +39,24 @@ pub(super) fn list(
         .collect::<Result<Vec<_>, _>>()?;
     let response = ListResponse::new(snapshot.commit().to_owned(), documents);
     drop(snapshot);
-    ensure_response_size(settings, &response, Some(deadline))?;
-    Ok(response)
+    prepare_response(settings, response, deadline)
 }
 
 pub(super) fn get(
     settings: &GatewaySettings,
     store: &CommittedStore,
     request: GetRequest,
-) -> Result<GetResponse, GatewayError> {
+) -> Result<PreparedResponse<GetResponse>, GatewayError> {
+    get_until(settings, store, request, read_deadline(settings)?)
+}
+
+pub(super) fn get_until(
+    settings: &GatewaySettings,
+    store: &CommittedStore,
+    request: GetRequest,
+    deadline: Instant,
+) -> Result<PreparedResponse<GetResponse>, GatewayError> {
     validate_version(request.protocol_version)?;
-    let deadline = read_deadline(settings)?;
     let snapshot = snapshot(settings, store, deadline)?;
     let committed_document = snapshot.get(request.document_id).map_err(committed)?;
     let summary = document_summary(committed_document.record())?;
@@ -65,19 +72,26 @@ pub(super) fn get(
         DocumentContent { summary, markdown },
     );
     drop(snapshot);
-    ensure_response_size(settings, &response, Some(deadline))?;
-    Ok(response)
+    prepare_response(settings, response, deadline)
 }
 
 pub(super) fn search(
     settings: &GatewaySettings,
     store: &CommittedStore,
     request: &SearchRequest,
-) -> Result<ListResponse, GatewayError> {
+) -> Result<PreparedResponse<ListResponse>, GatewayError> {
+    search_until(settings, store, request, read_deadline(settings)?)
+}
+
+pub(super) fn search_until(
+    settings: &GatewaySettings,
+    store: &CommittedStore,
+    request: &SearchRequest,
+    deadline: Instant,
+) -> Result<PreparedResponse<ListResponse>, GatewayError> {
     validate_version(request.protocol_version)?;
     validate_filter(&request.filter)?;
     validate_result_limit(settings, request.maximum_results)?;
-    let deadline = read_deadline(settings)?;
     let snapshot = snapshot(settings, store, deadline)?;
     let fields = settings.search_metadata_fields();
     let search = LinearSearch::new(SearchMetadataFields::new(
@@ -103,8 +117,7 @@ pub(super) fn search(
         .collect::<Result<Vec<_>, _>>()?;
     let response = ListResponse::new(snapshot.commit().to_owned(), documents);
     drop(snapshot);
-    ensure_response_size(settings, &response, Some(deadline))?;
-    Ok(response)
+    prepare_response(settings, response, deadline)
 }
 
 fn snapshot(
@@ -123,49 +136,67 @@ fn snapshot(
         .map_err(committed)
 }
 
-fn read_deadline(settings: &GatewaySettings) -> Result<Instant, GatewayError> {
+pub(super) fn read_deadline(settings: &GatewaySettings) -> Result<Instant, GatewayError> {
     Instant::now()
         .checked_add(settings.read_operation_timeout())
         .ok_or(GatewayError::ReadRequest(ReadRequestError::InvalidDeadline))
 }
 
-fn ensure_response_size(
+fn prepare_response<T>(
     settings: &GatewaySettings,
-    response: &impl serde::Serialize,
-    deadline: Option<Instant>,
-) -> Result<(), GatewayError> {
-    let mut counter = ResponseCounter {
-        // Successful control responses are newline-delimited JSON. Reserve the
-        // framing byte so server and client enforce the same wire-byte limit.
-        written: 1,
+    response: T,
+    deadline: Instant,
+) -> Result<PreparedResponse<T>, GatewayError>
+where
+    T: serde::Serialize,
+{
+    let mut buffer = ResponseBuffer {
+        bytes: Vec::new(),
         maximum: settings.maximum_response_bytes(),
-        deadline,
+        deadline: Some(deadline),
         deadline_exceeded: false,
+        limit_exceeded: false,
     };
-    if serde_json::to_writer(&mut counter, response).is_err() {
-        if counter.deadline_exceeded {
+    let encoded = serde_json::to_writer(&mut buffer, &response)
+        .and_then(|()| buffer.write_all(b"\n").map_err(serde_json::Error::io));
+    if encoded.is_err() {
+        if buffer.deadline_exceeded {
             return Err(committed(CommittedReadError::OperationDeadlineExceeded));
         }
+        if buffer.limit_exceeded {
+            return Err(GatewayError::ReadRequest(
+                ReadRequestError::ResponseTooLarge {
+                    maximum: settings.maximum_response_bytes(),
+                },
+            ));
+        }
         return Err(GatewayError::ReadRequest(
-            ReadRequestError::ResponseTooLarge {
-                maximum: settings.maximum_response_bytes(),
-            },
+            ReadRequestError::ResponseEncoding,
         ));
     }
-    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+    if Instant::now() >= deadline {
         return Err(committed(CommittedReadError::OperationDeadlineExceeded));
     }
-    Ok(())
+    Ok(PreparedResponse {
+        response,
+        encoded: buffer.bytes,
+    })
 }
 
-struct ResponseCounter {
-    written: u64,
+pub(super) struct PreparedResponse<T> {
+    pub(super) response: T,
+    pub(super) encoded: Vec<u8>,
+}
+
+struct ResponseBuffer {
+    bytes: Vec<u8>,
     maximum: u64,
     deadline: Option<Instant>,
     deadline_exceeded: bool,
+    limit_exceeded: bool,
 }
 
-impl Write for ResponseCounter {
+impl Write for ResponseBuffer {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         if self
             .deadline
@@ -174,14 +205,14 @@ impl Write for ResponseCounter {
             self.deadline_exceeded = true;
             return Err(io::Error::other("response deadline exceeded"));
         }
-        let next = self
-            .written
+        let next = (self.bytes.len() as u64)
             .checked_add(buffer.len() as u64)
             .ok_or_else(|| io::Error::other("response byte limit exceeded"))?;
         if next > self.maximum {
+            self.limit_exceeded = true;
             return Err(io::Error::other("response byte limit exceeded"));
         }
-        self.written = next;
+        self.bytes.extend_from_slice(buffer);
         Ok(buffer.len())
     }
 
@@ -334,6 +365,8 @@ pub enum ReadRequestError {
         /// Maximum encoded response bytes.
         maximum: u64,
     },
+    /// A typed successful response unexpectedly failed JSON encoding.
+    ResponseEncoding,
 }
 
 impl ReadRequestError {
@@ -346,6 +379,7 @@ impl ReadRequestError {
             Self::InvalidCommittedPath => ErrorCode::ContentValidationFailed,
             Self::InvalidDeadline => ErrorCode::InternalError,
             Self::ResponseTooLarge { .. } => ErrorCode::LimitExceeded,
+            Self::ResponseEncoding => ErrorCode::InternalError,
         }
     }
 }
@@ -374,6 +408,7 @@ impl fmt::Display for ReadRequestError {
             Self::ResponseTooLarge { maximum } => {
                 write!(formatter, "encoded response exceeds {maximum} bytes")
             }
+            Self::ResponseEncoding => formatter.write_str("successful response encoding failed"),
         }
     }
 }
@@ -386,7 +421,7 @@ mod tests {
 
     use agent_knowledge_protocol::ListResponse;
 
-    use super::{ReadRequestError, ResponseCounter, ensure_response_size};
+    use super::{ReadRequestError, ResponseBuffer, prepare_response};
     use crate::{GatewayError, GatewaySettings};
 
     #[test]
@@ -400,7 +435,11 @@ mod tests {
             Vec::new(),
         );
         assert!(matches!(
-            ensure_response_size(&settings, &response, None),
+            prepare_response(
+                &settings,
+                response,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ),
             Err(GatewayError::ReadRequest(
                 ReadRequestError::ResponseTooLarge { maximum: 8 }
             ))
@@ -409,11 +448,12 @@ mod tests {
 
     #[test]
     fn response_counter_reserves_the_newline_framing_byte() {
-        let mut counter = ResponseCounter {
-            written: 1,
+        let mut counter = ResponseBuffer {
+            bytes: vec![b'1'],
             maximum: 8,
             deadline: None,
             deadline_exceeded: false,
+            limit_exceeded: false,
         };
         counter
             .write_all(b"1234567")

@@ -47,7 +47,6 @@ where
             &config,
             &client_id,
             std::env::var_os("SSH_ORIGINAL_COMMAND"),
-            output,
         )
         .map_err(CliError::Gateway),
         Command::ClientSubmit {

@@ -73,9 +73,10 @@ The `list`, `recent`, `get`, and `search` commands return strict versioned JSON.
 Every successful response identifies the exact official Git commit used for
 the operation. List and search operations support exact project, tag, and
 session filters; archived documents are excluded unless `--include-archived`
-is supplied. The read-operation deadline covers repository validation,
-content indexing, query work, and response encoding. The response-byte limit
-includes the JSON Lines framing newline.
+is supplied. After a complete control request is received, one read-operation
+deadline covers Gateway repository initialization, content indexing, query
+work, response encoding, and delivery to the SSH channel. The response-byte
+limit includes the JSON Lines framing newline.
 
 The client validates and snapshots at most 64 MiB of package data before
 network output. It then invokes the system `ssh` executable directly, uses

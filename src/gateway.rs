@@ -3,7 +3,8 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::Path;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use agent_knowledge_core::ErrorCode;
 use agent_knowledge_gateway::{Gateway, GatewayConfigError, GatewayError, GatewaySettings};
@@ -13,15 +14,11 @@ use serde::de::DeserializeOwned;
 const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
 
 #[cfg(target_os = "linux")]
-pub fn run_stdio<W>(
+pub fn run_stdio(
     config: &Path,
     client_id: &OsStr,
     original_command: Option<OsString>,
-    output: W,
-) -> Result<(), GatewayCommandError>
-where
-    W: Write,
-{
+) -> Result<(), GatewayCommandError> {
     let settings = GatewaySettings::load(config)
         .map_err(|error| GatewayCommandError::Config(Box::new(error)))?;
     let timeout = settings.submit_timeout();
@@ -30,19 +27,15 @@ where
         GatewayCommandError::InputSetup(io::Error::from_raw_os_error(error as i32))
     })?);
     let input = DeadlineReader::new(input, timeout);
-    run_with_settings(settings, client_id, original_command, input, output)
+    run_with_settings(settings, client_id, original_command, input, io::stdout())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn run_stdio<W>(
+pub fn run_stdio(
     config: &Path,
     client_id: &OsStr,
     original_command: Option<OsString>,
-    output: W,
-) -> Result<(), GatewayCommandError>
-where
-    W: Write,
-{
+) -> Result<(), GatewayCommandError> {
     let settings = GatewaySettings::load(config)
         .map_err(|error| GatewayCommandError::Config(Box::new(error)))?;
     run_with_settings(
@@ -50,7 +43,7 @@ where
         client_id,
         original_command,
         io::stdin().lock(),
-        output,
+        io::stdout(),
     )
 }
 
@@ -63,7 +56,7 @@ fn run_with_settings<R, W>(
 ) -> Result<(), GatewayCommandError>
 where
     R: Read,
-    W: Write,
+    W: Write + Send + 'static,
 {
     let client_id = client_id
         .to_str()
@@ -73,10 +66,10 @@ where
     let original_command = original_command.ok_or(GatewayCommandError::MissingCommand)?;
     let command = GatewayCommand::parse(&original_command)
         .map_err(|_| GatewayCommandError::InvalidCommand)?;
-    let gateway =
-        Gateway::open(&settings).map_err(|error| GatewayCommandError::Gateway(Box::new(error)))?;
     match command {
         GatewayCommand::Submit => {
+            let gateway = Gateway::open(&settings)
+                .map_err(|error| GatewayCommandError::Gateway(Box::new(error)))?;
             let response = gateway
                 .submit(client_id, input)
                 .map_err(|error| GatewayCommandError::Gateway(Box::new(error)))?;
@@ -85,27 +78,45 @@ where
         }
         GatewayCommand::List => {
             let request = decode_control_request(input)?;
-            write_json_response(&mut output, &gateway.list(&request).map_err(gateway_error)?)
+            let deadline = read_deadline(&settings);
+            let gateway = Gateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
+            let encoded = gateway
+                .list_encoded_until(&request, false, deadline)
+                .map_err(gateway_error)?;
+            write_encoded_response_until(output, encoded, deadline)
         }
         GatewayCommand::Recent => {
             let request = decode_control_request(input)?;
-            write_json_response(
-                &mut output,
-                &gateway.recent(&request).map_err(gateway_error)?,
-            )
+            let deadline = read_deadline(&settings);
+            let gateway = Gateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
+            let encoded = gateway
+                .list_encoded_until(&request, true, deadline)
+                .map_err(gateway_error)?;
+            write_encoded_response_until(output, encoded, deadline)
         }
         GatewayCommand::Get => {
             let request = decode_control_request(input)?;
-            write_json_response(&mut output, &gateway.get(request).map_err(gateway_error)?)
+            let deadline = read_deadline(&settings);
+            let gateway = Gateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
+            let encoded = gateway
+                .get_encoded_until(request, deadline)
+                .map_err(gateway_error)?;
+            write_encoded_response_until(output, encoded, deadline)
         }
         GatewayCommand::Search => {
             let request = decode_control_request(input)?;
-            write_json_response(
-                &mut output,
-                &gateway.search(&request).map_err(gateway_error)?,
-            )
+            let deadline = read_deadline(&settings);
+            let gateway = Gateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
+            let encoded = gateway
+                .search_encoded_until(&request, deadline)
+                .map_err(gateway_error)?;
+            write_encoded_response_until(output, encoded, deadline)
         }
     }
+}
+
+fn read_deadline(settings: &GatewaySettings) -> Instant {
+    Instant::now() + settings.read_operation_timeout()
 }
 
 fn decode_control_request<T: DeserializeOwned>(
@@ -123,12 +134,39 @@ fn decode_control_request<T: DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(GatewayCommandError::ControlJson)
 }
 
-fn write_json_response(
-    mut output: impl Write,
-    response: &impl serde::Serialize,
-) -> Result<(), GatewayCommandError> {
-    serde_json::to_writer(&mut output, response).map_err(GatewayCommandError::Json)?;
-    output.write_all(b"\n").map_err(GatewayCommandError::Io)
+fn write_encoded_response_until<W>(
+    mut output: W,
+    response: Vec<u8>,
+    deadline: Instant,
+) -> Result<(), GatewayCommandError>
+where
+    W: Write + Send + 'static,
+{
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(GatewayCommandError::OutputDeadline)?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        let result = output.write_all(&response);
+        let _ = sender.send(result);
+    });
+    match receiver.recv_timeout(remaining) {
+        Ok(result) => {
+            if writer.join().is_err() {
+                return Err(GatewayCommandError::Io(io::Error::other(
+                    "Gateway response writer panicked",
+                )));
+            }
+            result.map_err(GatewayCommandError::Io)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(GatewayCommandError::OutputDeadline),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = writer.join();
+            Err(GatewayCommandError::Io(io::Error::other(
+                "Gateway response writer stopped",
+            )))
+        }
+    }
 }
 
 fn gateway_error(error: GatewayError) -> GatewayCommandError {
@@ -203,6 +241,7 @@ pub enum GatewayCommandError {
     ControlJson(serde_json::Error),
     Json(serde_json::Error),
     Io(io::Error),
+    OutputDeadline,
 }
 
 impl GatewayCommandError {
@@ -216,6 +255,7 @@ impl GatewayCommandError {
             Self::ControlInput(error) if error.kind() == io::ErrorKind::TimedOut => {
                 ErrorCode::TemporaryFailure
             }
+            Self::OutputDeadline => ErrorCode::TemporaryFailure,
             Self::Gateway(error) => error.error_code(),
             Self::InvalidClientIdEncoding
             | Self::ClientId(_)
@@ -256,6 +296,7 @@ impl fmt::Display for GatewayCommandError {
             Self::ControlJson(error) => write!(formatter, "invalid Gateway control JSON: {error}"),
             Self::Json(error) => write!(formatter, "Gateway JSON encoding failed: {error}"),
             Self::Io(error) => write!(formatter, "Gateway response output failed: {error}"),
+            Self::OutputDeadline => formatter.write_str("Gateway response deadline expired"),
         }
     }
 }
@@ -274,7 +315,8 @@ impl std::error::Error for GatewayCommandError {
             Self::MissingCommand
             | Self::InvalidCommand
             | Self::InvalidClientIdEncoding
-            | Self::ControlRequestTooLarge => None,
+            | Self::ControlRequestTooLarge
+            | Self::OutputDeadline => None,
         }
     }
 }
@@ -283,17 +325,17 @@ impl std::error::Error for GatewayCommandError {
 mod tests {
     use std::ffi::OsStr;
     #[cfg(target_os = "linux")]
-    use std::io::Read;
+    use std::io::{self, Read, Write};
     #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixStream;
     #[cfg(target_os = "linux")]
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use agent_knowledge_core::ErrorCode;
 
-    #[cfg(target_os = "linux")]
-    use super::DeadlineReader;
     use super::GatewayCommandError;
+    #[cfg(target_os = "linux")]
+    use super::{DeadlineReader, write_encoded_response_until};
 
     #[test]
     fn command_selection_failures_emit_only_a_versioned_protocol_error() {
@@ -335,5 +377,33 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn committed_response_write_stops_waiting_at_the_operation_deadline() {
+        struct SlowWriter;
+
+        impl Write for SlowWriter {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_secs(1));
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let started = Instant::now();
+        assert!(matches!(
+            write_encoded_response_until(
+                SlowWriter,
+                b"{\"fictional\":true}\n".to_vec(),
+                started + Duration::from_millis(25),
+            ),
+            Err(GatewayCommandError::OutputDeadline)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }

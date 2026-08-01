@@ -14,9 +14,9 @@ use agent_knowledge_queue::PackagePolicy;
 use sha2::{Digest, Sha256};
 
 use crate::git::{
-    ensure_canonical_worktree_clean_until, ensure_real_directory, ensure_supported_git,
-    open_stable_directory, parse_object_id, run_git, run_git_for_read, validate_local_git_config,
-    validate_local_git_config_until, validate_repository_layout, validate_repository_layout_until,
+    ensure_canonical_worktree_clean_until, ensure_real_directory, ensure_supported_git_until,
+    open_stable_directory, parse_object_id, run_git_for_read, validate_local_git_config_until,
+    validate_repository_layout_until,
 };
 use crate::{ContentIndex, ContentIndexError, ContentPolicy, DocumentRecord, GitTransactionError};
 
@@ -57,7 +57,19 @@ impl CommittedStore {
         content_root: &Path,
         official_branch: &str,
     ) -> Result<Self, CommittedReadError> {
-        ensure_supported_git().map_err(CommittedReadError::repository)?;
+        Self::open_until(git_directory, content_root, official_branch, None)
+    }
+
+    /// Opens the committed store while bounding read-only Git inspection by
+    /// an optional absolute deadline.
+    pub fn open_until(
+        git_directory: &Path,
+        content_root: &Path,
+        official_branch: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Self, CommittedReadError> {
+        check_operation_deadline(deadline)?;
+        ensure_supported_git_until(deadline).map_err(CommittedReadError::repository)?;
         ensure_real_directory(git_directory).map_err(CommittedReadError::repository)?;
         ensure_real_directory(content_root).map_err(CommittedReadError::repository)?;
         let configured_git_directory =
@@ -73,30 +85,33 @@ impl CommittedStore {
             return Err(CommittedReadError::InvalidOfficialBranch);
         }
         let official_ref = format!("refs/heads/{official_branch}");
-        run_git(
+        let (git_root_handle, stable_git_directory) =
+            open_stable_directory(git_directory).map_err(CommittedReadError::repository)?;
+        let (content_root_handle, stable_content_root) =
+            open_stable_directory(content_root).map_err(CommittedReadError::repository)?;
+        run_git_for_read(
             None,
-            Some(&configured_git_directory),
+            None,
             [OsStr::new("check-ref-format"), OsStr::new(&official_ref)],
+            deadline,
         )
         .map_err(CommittedReadError::repository)?;
-        validate_local_git_config(&configured_git_directory)
+        validate_local_git_config_until(&stable_git_directory, deadline)
             .map_err(CommittedReadError::repository)?;
-        validate_repository_layout(
-            &configured_git_directory,
-            &configured_content_root,
+        validate_repository_layout_until(
+            &stable_git_directory,
+            &stable_content_root,
             &official_ref,
+            deadline,
         )
         .map_err(CommittedReadError::repository)?;
-        let (git_root_handle, git_directory) = open_stable_directory(&configured_git_directory)
-            .map_err(CommittedReadError::repository)?;
-        let (content_root_handle, content_root) = open_stable_directory(&configured_content_root)
-            .map_err(CommittedReadError::repository)?;
+        check_operation_deadline(deadline)?;
 
         Ok(Self {
-            git_directory,
+            git_directory: stable_git_directory,
             configured_git_directory,
             git_root_handle,
-            content_root,
+            content_root: stable_content_root,
             configured_content_root,
             content_root_handle,
             official_ref,

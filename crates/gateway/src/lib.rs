@@ -33,6 +33,15 @@ impl Gateway {
     ///
     /// Returns an error when the queue cannot be initialized or pinned.
     pub fn open(settings: &GatewaySettings) -> Result<Self, GatewayError> {
+        Self::open_until(settings, None)
+    }
+
+    /// Opens Gateway dependencies while applying an optional read deadline to
+    /// repository inspection and initialization boundaries.
+    pub fn open_until(
+        settings: &GatewaySettings,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self, GatewayError> {
         let resolved = [
             PathAttestation::resolve_destination(settings.queue_root())
                 .map_err(GatewayError::Attestation)?,
@@ -42,21 +51,34 @@ impl Gateway {
                 .map_err(GatewayError::Attestation)?,
         ];
         validate_disjoint_storage(&resolved)?;
-        let committed = CommittedStore::open(
+        let committed = CommittedStore::open_until(
             resolved[1].stable_path(),
             resolved[2].stable_path(),
             settings.official_branch(),
+            deadline,
         )
         .map_err(|error| GatewayError::CommittedRead(Box::new(error)))?;
+        ensure_deadline(deadline)?;
         let queue = FileQueue::initialize(resolved[0].stable_path(), PackagePolicy::default())
             .map_err(|error| GatewayError::Queue(Box::new(error)))?;
+        ensure_deadline(deadline)?;
         let [repository, content] = committed
             .storage_attestations()
             .map_err(GatewayError::Attestation)?;
         let queue_storage = queue
             .storage_attestation()
             .map_err(GatewayError::Attestation)?;
-        validate_disjoint_storage(&[queue_storage, repository, content])?;
+        let opened = [queue_storage, repository, content];
+        validate_disjoint_storage(&opened)?;
+        if resolved
+            .iter()
+            .zip(opened.iter())
+            .any(|(expected, actual)| !expected.matches_destination(actual))
+        {
+            return Err(GatewayError::Attestation(
+                PathAttestationError::BindingMismatch,
+            ));
+        }
         Ok(Self {
             queue,
             committed,
@@ -80,22 +102,67 @@ impl Gateway {
 
     /// Lists matching committed documents in canonical path order.
     pub fn list(&self, request: &ListRequest) -> Result<ListResponse, GatewayError> {
-        read::list(&self.settings, &self.committed, request, false)
+        let deadline = read::read_deadline(&self.settings)?;
+        read::list(&self.settings, &self.committed, request, false, deadline)
+            .map(|prepared| prepared.response)
     }
 
     /// Lists matching committed documents from most recently changed.
     pub fn recent(&self, request: &ListRequest) -> Result<ListResponse, GatewayError> {
-        read::list(&self.settings, &self.committed, request, true)
+        let deadline = read::read_deadline(&self.settings)?;
+        read::list(&self.settings, &self.committed, request, true, deadline)
+            .map(|prepared| prepared.response)
     }
 
     /// Retrieves one exact committed Markdown document.
     pub fn get(&self, request: GetRequest) -> Result<GetResponse, GatewayError> {
-        read::get(&self.settings, &self.committed, request)
+        read::get(&self.settings, &self.committed, request).map(|prepared| prepared.response)
     }
 
     /// Searches committed Markdown and configured metadata fields.
     pub fn search(&self, request: &SearchRequest) -> Result<ListResponse, GatewayError> {
-        read::search(&self.settings, &self.committed, request)
+        read::search(&self.settings, &self.committed, request).map(|prepared| prepared.response)
+    }
+
+    /// Encodes one list response exactly once under the supplied deadline.
+    pub fn list_encoded_until(
+        &self,
+        request: &ListRequest,
+        recent: bool,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, GatewayError> {
+        read::list(&self.settings, &self.committed, request, recent, deadline)
+            .map(|prepared| prepared.encoded)
+    }
+
+    /// Encodes one exact-document response once under the supplied deadline.
+    pub fn get_encoded_until(
+        &self,
+        request: GetRequest,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, GatewayError> {
+        read::get_until(&self.settings, &self.committed, request, deadline)
+            .map(|prepared| prepared.encoded)
+    }
+
+    /// Encodes one search response exactly once under the supplied deadline.
+    pub fn search_encoded_until(
+        &self,
+        request: &SearchRequest,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, GatewayError> {
+        read::search_until(&self.settings, &self.committed, request, deadline)
+            .map(|prepared| prepared.encoded)
+    }
+}
+
+fn ensure_deadline(deadline: Option<std::time::Instant>) -> Result<(), GatewayError> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        Err(GatewayError::CommittedRead(Box::new(
+            CommittedReadError::OperationDeadlineExceeded,
+        )))
+    } else {
+        Ok(())
     }
 }
 

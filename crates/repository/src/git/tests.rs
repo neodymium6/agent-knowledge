@@ -55,6 +55,28 @@ fn terminates_a_read_only_git_process_group_at_the_deadline() {
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn terminates_descendants_that_retain_git_output_after_the_parent_exits() {
+    let started = Instant::now();
+    let result = run_git_until(
+        None,
+        None,
+        [
+            OsStr::new("-c"),
+            OsStr::new("alias.fictional-leak=!sh -c 'sleep 5 &'"),
+            OsStr::new("fictional-leak"),
+        ],
+        started + Duration::from_millis(50),
+    );
+
+    assert!(matches!(
+        result,
+        Err(GitTransactionError::GitDeadlineExceeded)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
 #[test]
 fn migrates_schema_two_journals_for_every_recovery_phase() {
     let base = "0123456789abcdef0123456789abcdef01234567";

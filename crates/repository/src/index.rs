@@ -260,27 +260,39 @@ impl ContentIndex {
                         actual: metadata.len(),
                     });
                 }
-                markdown_bytes = markdown_bytes.checked_add(metadata.len()).ok_or(
-                    ContentIndexError::MarkdownByteLimitExceeded {
-                        maximum: policy.maximum_total_markdown_bytes,
-                    },
-                )?;
-                if markdown_bytes > policy.maximum_total_markdown_bytes {
+                let remaining_total = policy
+                    .maximum_total_markdown_bytes
+                    .saturating_sub(markdown_bytes);
+                if metadata.len() > remaining_total {
                     return Err(ContentIndexError::MarkdownByteLimitExceeded {
                         maximum: policy.maximum_total_markdown_bytes,
                     });
                 }
 
-                let bytes =
-                    read_bounded_file(&path, policy.maximum_markdown_bytes, policy.scan_deadline)?;
+                let read_limit = policy.maximum_markdown_bytes.min(remaining_total);
+                let bytes = read_bounded_file(&path, read_limit, policy.scan_deadline)?;
                 check_scan_deadline(policy.scan_deadline)?;
-                if bytes.len() as u64 > policy.maximum_markdown_bytes {
-                    return Err(ContentIndexError::MarkdownTooLarge {
-                        path: relative_path,
-                        maximum: policy.maximum_markdown_bytes,
-                        actual: bytes.len() as u64,
+                if bytes.len() as u64 > read_limit {
+                    return Err(if read_limit == remaining_total {
+                        ContentIndexError::MarkdownByteLimitExceeded {
+                            maximum: policy.maximum_total_markdown_bytes,
+                        }
+                    } else {
+                        ContentIndexError::MarkdownTooLarge {
+                            path: relative_path,
+                            maximum: policy.maximum_markdown_bytes,
+                            actual: bytes.len() as u64,
+                        }
                     });
                 }
+                if bytes.len() as u64 != metadata.len() {
+                    return Err(ContentIndexError::FileChangedDuringScan(relative_path));
+                }
+                markdown_bytes = markdown_bytes.checked_add(bytes.len() as u64).ok_or(
+                    ContentIndexError::MarkdownByteLimitExceeded {
+                        maximum: policy.maximum_total_markdown_bytes,
+                    },
+                )?;
                 let document = decode_document_metadata(&bytes, policy.maximum_front_matter_bytes)
                     .map_err(|source| ContentIndexError::InvalidDocument {
                         path: relative_path.clone(),
@@ -304,7 +316,7 @@ impl ContentIndex {
                     location,
                     metadata: document,
                     revision,
-                    byte_length: metadata.len(),
+                    byte_length: bytes.len() as u64,
                 };
                 if let Some(existing) = documents.insert(document_id, record) {
                     return Err(ContentIndexError::DuplicateDocumentId {
@@ -735,6 +747,8 @@ pub enum ContentIndexError {
     },
     /// The configured absolute index-scan deadline expired.
     ScanDeadlineExceeded,
+    /// A Markdown file changed length while the index was reading it.
+    FileChangedDuringScan(PathBuf),
     /// Markdown front matter could not be decoded safely.
     InvalidDocument {
         /// Document path relative to the content root.
@@ -835,6 +849,11 @@ impl fmt::Display for ContentIndexError {
             Self::ScanDeadlineExceeded => {
                 formatter.write_str("content index scan deadline expired")
             }
+            Self::FileChangedDuringScan(path) => write!(
+                formatter,
+                "Markdown `{}` changed while the index was reading it",
+                path.display()
+            ),
             Self::InvalidDocument { path, source } => {
                 write!(
                     formatter,

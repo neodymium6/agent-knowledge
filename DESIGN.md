@@ -1298,10 +1298,12 @@ state boundaries respectively.
 
 Each content read pins the official commit at operation start. Pending and
 processing data is visible only through status operations, never through
-normal content reads. One absolute deadline bounds read-only Git validation,
-content indexing, query work, and successful-response encoding. Deadline-aware
-Git inspection runs in an isolated process group that is terminated and reaped
-on expiry. The encoded-response budget includes the JSON Lines framing newline.
+normal content reads. After a complete control request is received, one
+absolute deadline bounds Gateway repository initialization, read-only Git
+validation, content indexing, query work, successful-response encoding, and
+delivery to the SSH channel. Deadline-aware Git inspection runs in an isolated
+process group that is terminated and reaped on expiry. The encoded-response
+budget includes the JSON Lines framing newline.
 
 ## 24. Search
 

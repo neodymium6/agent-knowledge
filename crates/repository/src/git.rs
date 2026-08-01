@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -2493,37 +2493,72 @@ where
     #[cfg(target_os = "linux")]
     command.process_group(0);
     let mut child = command.spawn().map_err(GitTransactionError::Io)?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or(GitTransactionError::InvalidGitOutput)?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or(GitTransactionError::InvalidGitOutput)?;
-    let stdout_reader = thread::spawn(move || capture_bounded_output(stdout));
-    let stderr_reader = thread::spawn(move || capture_bounded_output(stderr));
+    let Some(stdout) = child.stdout.take() else {
+        kill_timed_git_process(&mut child);
+        let _ = child.wait();
+        return Err(GitTransactionError::InvalidGitOutput);
+    };
+    let Some(stderr) = child.stderr.take() else {
+        kill_timed_git_process(&mut child);
+        let _ = child.wait();
+        return Err(GitTransactionError::InvalidGitOutput);
+    };
+    let (capture_sender, capture_receiver) = mpsc::channel();
+    let stdout_sender = capture_sender.clone();
+    let stdout_reader = thread::spawn(move || {
+        let _ = stdout_sender.send((0_usize, capture_bounded_output(stdout)));
+    });
+    let stderr_reader = thread::spawn(move || {
+        let _ = capture_sender.send((1_usize, capture_bounded_output(stderr)));
+    });
 
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(GitTransactionError::Io)? {
-            break status;
-        }
+    let mut status = None;
+    let mut captured = [None, None];
+    while status.is_none() || captured.iter().any(Option::is_none) {
         let now = Instant::now();
         if now >= deadline {
-            kill_timed_git_process(&mut child);
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+            terminate_timed_git(&mut child, stdout_reader, stderr_reader);
             return Err(GitTransactionError::GitDeadlineExceeded);
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(found) => status = found,
+                Err(error) => {
+                    terminate_timed_git(&mut child, stdout_reader, stderr_reader);
+                    return Err(GitTransactionError::Io(error));
+                }
+            }
+        }
+        loop {
+            match capture_receiver.try_recv() {
+                Ok((stream, result)) => captured[stream] = Some(result),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if captured.iter().any(Option::is_none) {
+                        terminate_timed_git(&mut child, stdout_reader, stderr_reader);
+                        return Err(GitTransactionError::InvalidGitOutput);
+                    }
+                    break;
+                }
+            }
+        }
+        if status.is_some() && captured.iter().all(Option::is_some) {
+            break;
         }
         thread::sleep(
             deadline
                 .saturating_duration_since(now)
-                .min(Duration::from_millis(10)),
+                .min(Duration::from_millis(2)),
         );
-    };
-    let stdout = join_captured_output(stdout_reader)?;
-    let stderr = join_captured_output(stderr_reader)?;
+    }
+    let stdout_join = stdout_reader.join();
+    let stderr_join = stderr_reader.join();
+    if stdout_join.is_err() || stderr_join.is_err() {
+        return Err(GitTransactionError::InvalidGitOutput);
+    }
+    let stdout = finish_captured_output(captured[0].take())?;
+    let stderr = finish_captured_output(captured[1].take())?;
+    let status = status.ok_or(GitTransactionError::InvalidGitOutput)?;
     if status.success() {
         Ok(Output {
             status,
@@ -2536,6 +2571,17 @@ where
             stderr: diagnostic(&stderr),
         })
     }
+}
+
+fn terminate_timed_git(
+    child: &mut std::process::Child,
+    stdout_reader: thread::JoinHandle<()>,
+    stderr_reader: thread::JoinHandle<()>,
+) {
+    kill_timed_git_process(child);
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
 }
 
 fn kill_timed_git_process(child: &mut std::process::Child) {
@@ -2570,12 +2616,11 @@ fn capture_bounded_output(mut reader: impl Read) -> io::Result<(Vec<u8>, bool)> 
     Ok((captured, exceeded))
 }
 
-fn join_captured_output(
-    reader: thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
+fn finish_captured_output(
+    captured: Option<io::Result<(Vec<u8>, bool)>>,
 ) -> Result<Vec<u8>, GitTransactionError> {
-    let (captured, exceeded) = reader
-        .join()
-        .map_err(|_| GitTransactionError::InvalidGitOutput)?
+    let (captured, exceeded) = captured
+        .ok_or(GitTransactionError::InvalidGitOutput)?
         .map_err(GitTransactionError::Io)?;
     if exceeded {
         Err(GitTransactionError::InvalidGitOutput)
@@ -2842,16 +2887,13 @@ fn hash_worktree_file(worktree: &Path, path: &Path) -> Result<String, GitTransac
 }
 
 pub(crate) fn ensure_supported_git() -> Result<(), GitTransactionError> {
-    let output = git_command()
-        .arg("--version")
-        .output()
-        .map_err(GitTransactionError::Io)?;
-    if !output.status.success() {
-        return Err(GitTransactionError::GitCommand {
-            arguments: vec![OsString::from("--version")],
-            stderr: diagnostic(&output.stderr),
-        });
-    }
+    ensure_supported_git_until(None)
+}
+
+pub(crate) fn ensure_supported_git_until(
+    deadline: Option<Instant>,
+) -> Result<(), GitTransactionError> {
+    let output = run_git_for_read(None, None, [OsStr::new("--version")], deadline)?;
     let version = parse_git_version(&output.stdout)?;
     if version.0 > 2 || (version.0 == 2 && version.1 >= 36) {
         Ok(())
