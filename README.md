@@ -54,14 +54,18 @@ Submit a validated request package through an SSH host alias:
 ```sh
 agent-knowledge client submit \
   --destination fictional-knowledge \
-  --package-root ./fictional-request
+  --package-root ./fictional-request \
+  --timeout-seconds 300
 ```
 
-The client invokes the system `ssh` executable directly, uses non-interactive
-authentication, disables TTY allocation and forwarding, and streams an
-uncompressed tar archive to the exact remote command `akp-v1 submit`. SSH
-identity, host-key, proxy, and destination settings belong in the user's SSH
-configuration.
+The client validates and snapshots at most 64 MiB of package data before
+network output. It then invokes the system `ssh` executable directly, uses
+non-interactive authentication, disables TTY allocation, forwarding, and SSH
+backgrounding/stdin overrides, and streams an uncompressed tar archive to the
+exact remote command `akp-v1 submit`. SSH identity, host-key, proxy, and
+destination settings belong in the user's SSH configuration. The timeout is an
+absolute transfer deadline; it defaults to 300 seconds and is bounded to 3,600
+seconds.
 
 The forced command requires a strict Gateway configuration such as:
 
@@ -69,6 +73,8 @@ The forced command requires a strict Gateway configuration such as:
 schema_version: 1
 storage:
   queue_root: /srv/fictional-knowledge/queue
+transport:
+  submit_timeout_seconds: 300
 ```
 
 ```text

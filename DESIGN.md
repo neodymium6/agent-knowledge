@@ -602,7 +602,9 @@ Each key maps to one configured client ID. The Gateway overwrites or rejects
 any client-supplied identity that conflicts with the authenticated identity.
 
 The OpenSSH configuration also disables password authentication and all
-forwarding for the dedicated account. No interactive shell is available.
+forwarding for the dedicated account. No interactive shell is available. The
+deployment applies per-account process/resource limits so authenticated
+connections cannot create an unbounded number of forced-command processes.
 
 ### 13.2 Operation selection
 
@@ -628,11 +630,17 @@ delivery increments.
 The current client invokes the equivalent of:
 
 ```text
-ssh -T -o BatchMode=yes -o ClearAllForwardings=yes -- <destination> "akp-v1 submit"
+ssh -T -o BatchMode=yes -o ClearAllForwardings=yes \
+  -o ForwardAgent=no -o ForwardX11=no \
+  -o StdinNull=no -o ForkAfterAuthentication=no \
+  -- <destination> "akp-v1 submit"
 ```
 
 `destination` is one opaque argument and may name an SSH configuration alias.
-The client does not accept arbitrary SSH arguments or construct a shell command.
+The client does not accept arbitrary SSH arguments or construct a shell
+command. A positive `--timeout-seconds` value applies one absolute deadline to
+process execution and all three SSH streams; it defaults to 300 seconds and is
+bounded to 3,600 seconds.
 
 ### 13.3 Encoding
 
@@ -651,8 +659,17 @@ directories are accepted. Duplicate names, sparse files, links, devices,
 PAX extensions, unexpected top-level entries, nonzero trailing data, excessive
 counts, and limit violations are rejected. The official client produces
 deterministic GNU headers and streams only `request.json`, the `payload/`
-directory, and validated payload files. It pins each selected payload file and
-verifies its byte length and SHA-256 revision while sending it.
+directory, and validated payload files. Before starting SSH, it opens each
+payload without following a final symbolic link, verifies its byte length and
+SHA-256 revision, and retains a bounded immutable byte snapshot. A successful
+response is accepted only when its request ID and digest match that snapshot.
+
+Gateway configuration supplies a positive `transport.submit_timeout_seconds`,
+bounded to 3,600 seconds. On Linux the forced-command process polls standard
+input against that absolute deadline, so an authenticated client cannot retain
+a staging package indefinitely by withholding or trickling archive bytes. The
+OpenSSH supervisor and operating-system account enforce a matching connection
+and process-capacity policy.
 
 `export` returns an uncompressed tar stream for a selected document bundle.
 Other read operations return JSON. Protocol errors are emitted as structured
