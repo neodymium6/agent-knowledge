@@ -10,10 +10,11 @@ use std::time::Duration;
 use agent_knowledge_core::{BatchId, ErrorCode, PayloadPath, RequestId};
 use agent_knowledge_protocol::ClientId;
 
+use super::status::StatusObservationHook;
 use super::{
-    AcceptanceHook, AcceptancePhase, DirectoryScanner, EnqueueOutcome, FileQueue, IncomingPackage,
-    ProcessingScanOutcome, QueueError, QueueLimit, QueueReader, QueueRequestStatus, QueueState,
-    StaleAgeSource, WorkerQueueError, inactive_stale_directories,
+    AcceptanceHook, AcceptancePhase, ClaimToken, DirectoryScanner, EnqueueOutcome, FileQueue,
+    IncomingPackage, ProcessingScanOutcome, QueueError, QueueLimit, QueueReader,
+    QueueRequestStatus, QueueState, StaleAgeSource, WorkerQueueError, inactive_stale_directories,
 };
 use crate::{PackageLimits, PackagePolicy, validate_accepted_package};
 
@@ -317,6 +318,58 @@ fn read_only_status_rejects_queue_replacement() {
         reader.status_until(request_id("01K00000000000000000000000"), None),
         Err(QueueError::InvalidQueueIdentity)
     ));
+}
+
+#[test]
+fn read_only_status_retries_an_empty_observation_during_requeue() {
+    const BATCH_ID: &str = "01K00000000000000000000020";
+
+    struct RequeueAfterPending<'a> {
+        worker: &'a mut super::WorkerSession,
+        token: Option<ClaimToken>,
+    }
+
+    impl StatusObservationHook for RequeueAfterPending<'_> {
+        fn after_state(&mut self, state: QueueState) {
+            if state == QueueState::Pending
+                && let Some(token) = self.token.take()
+            {
+                self.worker.requeue_claimed(token).unwrap_or_else(|error| {
+                    panic!("processing request must be requeued during observation: {error}")
+                });
+            }
+        }
+    }
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    let request_id = request_id("01K00000000000000000000000");
+    let mut worker = queue
+        .try_worker_session()
+        .unwrap_or_else(|error| panic!("Worker fixture must open: {error}"));
+    assert!(matches!(
+        worker.scan_processing(16),
+        Ok(ProcessingScanOutcome::Complete { ref claims, .. }) if claims.is_empty()
+    ));
+    let token = worker
+        .claim(request_id, batch_id(BATCH_ID))
+        .unwrap_or_else(|error| panic!("request must be claimed: {error}"))
+        .token();
+    let reader = QueueReader::open_until(root.path().join("queue"), None)
+        .unwrap_or_else(|error| panic!("read-only queue fixture must open: {error}"));
+    let mut hook = RequeueAfterPending {
+        worker: &mut worker,
+        token: Some(token),
+    };
+
+    assert_eq!(
+        reader
+            .status_until_with_hook(request_id, None, &mut hook)
+            .unwrap_or_else(|error| panic!("requeued status must be retried: {error}")),
+        Some(QueueRequestStatus::Pending)
+    );
+    assert!(hook.token.is_none());
 }
 
 #[test]

@@ -22,6 +22,16 @@ const RESULT_FILE_NAME: &str = "result.json";
 const MAXIMUM_RESULT_FILE_BYTES: u64 = 1_024;
 const MAXIMUM_STATE_OBSERVATION_ATTEMPTS: usize = 3;
 
+pub(super) trait StatusObservationHook {
+    fn after_state(&mut self, state: QueueState);
+}
+
+struct NoopStatusObservationHook;
+
+impl StatusObservationHook for NoopStatusObservationHook {
+    fn after_state(&mut self, _state: QueueState) {}
+}
+
 /// A request state observed without changing or locking the durable queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueueRequestStatus {
@@ -142,12 +152,21 @@ impl QueueReader {
         request_id: RequestId,
         deadline: Option<Instant>,
     ) -> Result<Option<QueueRequestStatus>, QueueError> {
+        self.status_until_with_hook(request_id, deadline, &mut NoopStatusObservationHook)
+    }
+
+    pub(super) fn status_until_with_hook(
+        &self,
+        request_id: RequestId,
+        deadline: Option<Instant>,
+        hook: &mut dyn StatusObservationHook,
+    ) -> Result<Option<QueueRequestStatus>, QueueError> {
         ensure_deadline(deadline)?;
         self.current_identity()?;
-        for _ in 0..MAXIMUM_STATE_OBSERVATION_ATTEMPTS {
-            let observed = self.observe_states(request_id, deadline)?;
+        for attempt in 0..MAXIMUM_STATE_OBSERVATION_ATTEMPTS {
+            let observed = self.observe_states(request_id, deadline, hook)?;
             match observed.as_slice() {
-                [] => {
+                [] if attempt + 1 == MAXIMUM_STATE_OBSERVATION_ATTEMPTS => {
                     self.current_identity()?;
                     ensure_deadline(deadline)?;
                     return Ok(None);
@@ -163,7 +182,7 @@ impl QueueReader {
                     ensure_deadline(deadline)?;
                     return Ok(Some(status));
                 }
-                _ => ensure_deadline(deadline)?,
+                [] | [_, _, ..] => ensure_deadline(deadline)?,
             }
         }
         Err(QueueError::RequestInMultipleStates { request_id })
@@ -173,6 +192,7 @@ impl QueueReader {
         &self,
         request_id: RequestId,
         deadline: Option<Instant>,
+        hook: &mut dyn StatusObservationHook,
     ) -> Result<Vec<(QueueState, SafeDirectory)>, QueueError> {
         let mut observed = Vec::with_capacity(2);
         for state in QueueState::ALL {
@@ -195,6 +215,7 @@ impl QueueReader {
                 Err(PinnedPathError::Io(error)) => return Err(QueueError::Io(error)),
                 Err(_) => return Err(QueueError::InvalidStoragePath(path)),
             }
+            hook.after_state(state);
         }
         Ok(observed)
     }
