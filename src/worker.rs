@@ -7,8 +7,8 @@ use std::thread;
 use std::time::{Duration as StandardDuration, Instant};
 
 use agent_knowledge_worker::{
-    BatchCloseReason, StartupOutcome, WorkerBootstrap, WorkerConfigError, WorkerOpenError,
-    WorkerPollOutcome, WorkerRunError, WorkerSettings,
+    BatchCloseReason, BatchCommitOutcome, StartupOutcome, WorkerBootstrap, WorkerConfigError,
+    WorkerOpenError, WorkerPollOutcome, WorkerRunError, WorkerSettings,
 };
 use serde::Serialize;
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -21,35 +21,73 @@ pub(crate) fn run<W>(config: &Path, mut output: W) -> Result<(), WorkerCommandEr
 where
     W: Write,
 {
+    match run_inner(config, &mut output) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let Some(error_code) = error.stable_code() else {
+                return Err(error);
+            };
+            let mut record = WorkerLogRecord::new(OffsetDateTime::now_utc(), "worker_failed");
+            record.severity = "error";
+            record.error_code = Some(error_code);
+            match write_worker_log(&mut output, record) {
+                Ok(()) => Err(error),
+                Err(reporting) => Err(WorkerCommandError::FailureReporting {
+                    operation: Box::new(error),
+                    reporting: Box::new(reporting),
+                }),
+            }
+        }
+    }
+}
+
+fn run_inner<W>(config: &Path, output: &mut W) -> Result<(), WorkerCommandError>
+where
+    W: Write,
+{
     let stopping = Arc::new(AtomicBool::new(false));
     let _sigint = signal_hook::flag::register(SIGINT, Arc::clone(&stopping))
         .map_err(WorkerCommandError::SignalRegistration)?;
     let _sigterm = signal_hook::flag::register(SIGTERM, Arc::clone(&stopping))
         .map_err(WorkerCommandError::SignalRegistration)?;
 
+    let should_stop = || stopping.load(Ordering::Relaxed);
     let settings = WorkerSettings::load(config).map_err(WorkerCommandError::Config)?;
     let bootstrap = WorkerBootstrap::open(settings).map_err(WorkerCommandError::Open)?;
-    if stopping.load(Ordering::Relaxed) {
-        return Ok(());
+    if should_stop() {
+        return write_worker_log(
+            output,
+            WorkerLogRecord::new(OffsetDateTime::now_utc(), "worker_stopped"),
+        );
     }
     let started_at = OffsetDateTime::now_utc();
-    let (mut runtime, startup, schedule) = bootstrap
-        .start(started_at)
-        .map_err(WorkerCommandError::Run)?;
-    write_startup_log(&mut output, started_at, &startup)?;
+    let Some((mut runtime, startup, schedule)) = bootstrap
+        .start_interruptible(started_at, &should_stop)
+        .map_err(WorkerCommandError::Run)?
+    else {
+        return write_worker_log(
+            output,
+            WorkerLogRecord::new(OffsetDateTime::now_utc(), "worker_stopped"),
+        );
+    };
+    write_startup_log(output, OffsetDateTime::now_utc(), &startup)?;
 
-    while !stopping.load(Ordering::Relaxed) {
-        let now = OffsetDateTime::now_utc();
+    while !should_stop() {
+        let operation_at = OffsetDateTime::now_utc();
         let outcome = runtime
-            .poll_once(schedule, now)
+            .poll_once_interruptible(schedule, operation_at, &should_stop)
             .map_err(WorkerCommandError::Run)?;
-        write_poll_log(&mut output, now, &outcome)?;
-        if let Some(duration) = wait_after_poll(&outcome, now) {
+        let completed_at = OffsetDateTime::now_utc();
+        if matches!(outcome, WorkerPollOutcome::Stopped) {
+            break;
+        }
+        write_poll_log(output, completed_at, &outcome)?;
+        if let Some(duration) = wait_after_poll(&outcome, completed_at) {
             wait_for_termination(&stopping, duration);
         }
     }
     write_worker_log(
-        &mut output,
+        output,
         WorkerLogRecord::new(OffsetDateTime::now_utc(), "worker_stopped"),
     )
 }
@@ -60,12 +98,17 @@ fn wait_after_poll(outcome: &WorkerPollOutcome, now: OffsetDateTime) -> Option<S
         WorkerPollOutcome::Waiting { ready_at } => {
             let remaining = *ready_at - now;
             if remaining.is_positive() {
-                Some(StandardDuration::try_from(remaining).unwrap_or(MAXIMUM_SIGNAL_WAIT))
+                Some(
+                    StandardDuration::try_from(remaining)
+                        .unwrap_or(MAXIMUM_SIGNAL_WAIT)
+                        .min(MAXIMUM_SIGNAL_WAIT),
+                )
             } else {
                 None
             }
         }
-        WorkerPollOutcome::Scanning { .. }
+        WorkerPollOutcome::Stopped
+        | WorkerPollOutcome::Scanning { .. }
         | WorkerPollOutcome::ClosedWithoutCommit { .. }
         | WorkerPollOutcome::Processed { .. } => None,
     }
@@ -98,9 +141,10 @@ where
             record.requests = Some(*requests);
             record
         }
-        StartupOutcome::Resumed { batch_id, .. } => {
+        StartupOutcome::Resumed { batch_id, outcome } => {
             let mut record = WorkerLogRecord::new(timestamp, "worker_resumed_batch");
             record.batch_id = Some(batch_id.to_string());
+            add_commit_outcome(&mut record, outcome);
             record
         }
     };
@@ -116,26 +160,58 @@ where
     W: Write,
 {
     let record = match outcome {
-        WorkerPollOutcome::ClosedWithoutCommit { reason } => {
+        WorkerPollOutcome::ClosedWithoutCommit { reason, requests } => {
             let mut record = WorkerLogRecord::new(timestamp, "batch_closed_without_commit");
+            record.severity = "warning";
             record.close_reason = Some(close_reason_name(*reason));
+            record.outcome = Some("no_claimable_requests");
+            record.successful_requests = Some(0);
+            record.failed_requests = Some(*requests);
             Some(record)
         }
         WorkerPollOutcome::Processed {
-            reason, batch_id, ..
+            reason,
+            batch_id,
+            outcome,
         } => {
             let mut record = WorkerLogRecord::new(timestamp, "batch_processed");
             record.batch_id = Some(batch_id.to_string());
             record.close_reason = Some(close_reason_name(*reason));
+            add_commit_outcome(&mut record, outcome);
             Some(record)
         }
-        WorkerPollOutcome::Scanning { .. }
+        WorkerPollOutcome::Stopped
+        | WorkerPollOutcome::Scanning { .. }
         | WorkerPollOutcome::Idle
         | WorkerPollOutcome::Waiting { .. } => None,
     };
     match record {
         Some(record) => write_worker_log(output, record),
         None => Ok(()),
+    }
+}
+
+fn add_commit_outcome(record: &mut WorkerLogRecord, outcome: &BatchCommitOutcome) {
+    match outcome {
+        BatchCommitOutcome::NoChanges { failures } => {
+            record.severity = "warning";
+            record.outcome = Some("no_changes");
+            record.successful_requests = Some(0);
+            record.failed_requests = Some(failures.len());
+        }
+        BatchCommitOutcome::Committed {
+            commit,
+            successful,
+            failures,
+        } => {
+            if !failures.is_empty() {
+                record.severity = "warning";
+            }
+            record.outcome = Some("committed");
+            record.commit = Some(commit.clone());
+            record.successful_requests = Some(successful.len());
+            record.failed_requests = Some(failures.len());
+        }
     }
 }
 
@@ -178,6 +254,16 @@ struct WorkerLogRecord {
     requests: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     close_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    successful_requests: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed_requests: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<&'static str>,
 }
 
 impl WorkerLogRecord {
@@ -191,6 +277,11 @@ impl WorkerLogRecord {
             batch_id: None,
             requests: None,
             close_reason: None,
+            outcome: None,
+            commit: None,
+            successful_requests: None,
+            failed_requests: None,
+            error_code: None,
         }
     }
 }
@@ -204,6 +295,24 @@ pub(crate) enum WorkerCommandError {
     Timestamp(time::error::Format),
     Json(serde_json::Error),
     Io(io::Error),
+    FailureReporting {
+        operation: Box<WorkerCommandError>,
+        reporting: Box<WorkerCommandError>,
+    },
+}
+
+impl WorkerCommandError {
+    fn stable_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Config(_) => Some("worker_config_invalid"),
+            Self::Open(_) => Some("worker_startup_failed"),
+            Self::Run(_) => Some("worker_cycle_failed"),
+            Self::SignalRegistration(_) => Some("worker_signal_registration_failed"),
+            Self::Timestamp(_) | Self::Json(_) | Self::Io(_) | Self::FailureReporting { .. } => {
+                None
+            }
+        }
+    }
 }
 
 impl fmt::Display for WorkerCommandError {
@@ -221,6 +330,13 @@ impl fmt::Display for WorkerCommandError {
             Self::Timestamp(error) => write!(formatter, "could not format log timestamp: {error}"),
             Self::Json(error) => write!(formatter, "JSON log encoding failed: {error}"),
             Self::Io(error) => write!(formatter, "Worker log output failed: {error}"),
+            Self::FailureReporting {
+                operation,
+                reporting,
+            } => write!(
+                formatter,
+                "{operation}; structured failure reporting also failed: {reporting}"
+            ),
         }
     }
 }
@@ -235,6 +351,7 @@ impl std::error::Error for WorkerCommandError {
             Self::Timestamp(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Io(error) => Some(error),
+            Self::FailureReporting { operation, .. } => Some(operation),
         }
     }
 }

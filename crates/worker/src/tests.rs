@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
@@ -875,6 +875,68 @@ fn scheduler_waits_for_debounce_before_processing() {
 }
 
 #[test]
+fn shutdown_between_claim_scans_prevents_a_new_transaction() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
+    enqueue_create(&queue);
+    enqueue_create_with_ids(&queue, SECOND_REQUEST_ID, SECOND_DOCUMENT_ID);
+    let two = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+    let one_hundred = NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN);
+    let limits = WorkerRunLimits::new(two, one_hundred, one_hundred);
+    let (mut runtime, startup) =
+        WorkerRuntime::start(&queue, fixture.processor(repository), limits, created_at())
+            .unwrap_or_else(|error| panic!("runtime must start: {error}"));
+    assert_eq!(startup, StartupOutcome::Clean);
+    let ready_time = OffsetDateTime::now_utc() + TimeDuration::minutes(10);
+    assert!(matches!(
+        runtime.poll_once(BatchSchedule::default(), ready_time),
+        Ok(WorkerPollOutcome::Scanning {
+            scanned_entries: 2,
+            ..
+        })
+    ));
+
+    let checks = Cell::new(0_u8);
+    let should_stop = || {
+        let current = checks.get();
+        checks.set(current.saturating_add(1));
+        current >= 2
+    };
+    assert_eq!(
+        runtime
+            .poll_once_interruptible(BatchSchedule::default(), ready_time, &should_stop)
+            .unwrap_or_else(|error| panic!("interruptible poll must remain valid: {error}")),
+        WorkerPollOutcome::Stopped
+    );
+    assert_eq!(
+        fs::read_dir(fixture.work_path.join("transactions"))
+            .unwrap_or_else(|error| panic!("transactions must be readable: {error}"))
+            .count(),
+        0
+    );
+
+    drop(runtime);
+    let startup_checks = Cell::new(0_u8);
+    let stop_during_recovery = || {
+        let current = startup_checks.get();
+        startup_checks.set(current.saturating_add(1));
+        current >= 1
+    };
+    assert!(matches!(
+        WorkerRuntime::start_interruptible(
+            &queue,
+            fixture.processor(fixture.repository()),
+            WorkerRunLimits::new(NonZeroUsize::MIN, one_hundred, one_hundred),
+            created_at(),
+            &stop_during_recovery,
+        ),
+        Ok(None)
+    ));
+}
+
+#[test]
 fn scheduler_leaves_arrivals_after_observation_for_the_next_batch() {
     let fixture = Fixture::create();
     let repository = fixture.repository();
@@ -952,6 +1014,7 @@ fn scheduler_reports_invalid_only_snapshots_without_a_commit() {
             .unwrap_or_else(|error| panic!("invalid snapshot must close: {error}")),
         WorkerPollOutcome::ClosedWithoutCommit {
             reason: BatchCloseReason::InvalidAcceptance,
+            requests: 1,
         }
     );
     assert!(

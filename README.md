@@ -46,5 +46,12 @@ Run the Repository Worker with a validated deployment configuration:
 agent-knowledge worker run --config /srv/agent-knowledge/worker.yaml
 ```
 
-The Worker emits JSON Lines operational events. `SIGINT` and `SIGTERM` request
-graceful shutdown after the current durable transaction boundary.
+The Worker emits JSON Lines operational events. Every record includes
+`timestamp`, `severity`, `component`, and `event`. Terminal batch records also
+include `outcome`, `successful_requests`, and `failed_requests`; committed
+batches include `commit`. Terminal process failures use a stable `error_code`.
+
+`SIGINT` and `SIGTERM` request graceful shutdown before a new durable
+transaction or after the current transaction completes. A supervisor must
+signal only the main Worker process initially and reserve group-wide `SIGKILL`
+for its hard-stop timeout.

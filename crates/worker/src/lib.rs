@@ -10,9 +10,10 @@ use agent_knowledge_release::{
     ActiveRelease, BuiltDirectory, PreparedRelease, QuartzBuildError, QuartzBuilder, ReleaseError,
     ReleaseStore,
 };
+pub use agent_knowledge_repository::BatchCommitOutcome;
 use agent_knowledge_repository::{
-    BatchCommitOutcome, BatchPublication, ContentPolicy, GitRepository, GitTransactionError,
-    PublicationError, RepositoryTransaction, RequestFailure,
+    BatchPublication, ContentPolicy, GitRepository, GitTransactionError, PublicationError,
+    RepositoryTransaction, RequestFailure,
 };
 use time::OffsetDateTime;
 

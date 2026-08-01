@@ -161,6 +161,12 @@ checks that flag between bounded queue scans, during bounded waits, and after a
 batch transaction completes. A signal never abandons a transaction halfway;
 the service supervisor may enforce a separate hard-stop timeout.
 
+For a systemd deployment, the service must use `KillMode=mixed` so the initial
+`SIGTERM` reaches only the Worker while a later hard stop reaches its whole
+control group. `TimeoutStopSec` must exceed the deployment's maximum expected
+Git and Quartz transaction duration. The supervisor must not start a
+replacement Worker until the previous service control group is empty.
+
 Before creating any storage root, the Worker pins each existing root or its
 nearest existing ancestor and compares canonical paths, device and inode
 identities, and Linux mount roots. This rejects equal, nested, symlink-aliased,
@@ -1392,6 +1398,13 @@ Processes emit structured logs with:
 - batch or release ID;
 - stable event or error code; and
 - retry attempt.
+
+Worker JSON Lines records always contain `timestamp`, `severity`, `component`,
+and a stable `event`. Completed and resumed batch records contain an
+`outcome`, `successful_requests`, and `failed_requests`; committed outcomes
+also contain the Git `commit`. Terminal process failures contain a stable
+`error_code`. The Worker resamples time after recovery or batch processing, so
+completion events record completion rather than operation-start time.
 
 Logs must not contain document bodies, attachment contents, private keys,
 tokens, or Git credentials.

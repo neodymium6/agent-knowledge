@@ -89,9 +89,30 @@ impl WorkerBootstrap {
         self,
         created_at: OffsetDateTime,
     ) -> Result<(WorkerRuntime, StartupOutcome, BatchSchedule), WorkerRunError> {
-        let (runtime, startup) =
-            WorkerRuntime::start(&self.queue, self.processor, self.limits, created_at)?;
-        Ok((runtime, startup, self.schedule))
+        match self.start_interruptible(created_at, &|| false)? {
+            Some(started) => Ok(started),
+            None => unreachable!("an always-running startup control cannot request shutdown"),
+        }
+    }
+
+    /// Runs startup recovery with shutdown checks between bounded steps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when interrupted durable work cannot be recovered.
+    pub fn start_interruptible(
+        self,
+        created_at: OffsetDateTime,
+        should_stop: &impl Fn() -> bool,
+    ) -> Result<Option<(WorkerRuntime, StartupOutcome, BatchSchedule)>, WorkerRunError> {
+        let started = WorkerRuntime::start_interruptible(
+            &self.queue,
+            self.processor,
+            self.limits,
+            created_at,
+            should_stop,
+        )?;
+        Ok(started.map(|(runtime, startup)| (runtime, startup, self.schedule)))
     }
 }
 

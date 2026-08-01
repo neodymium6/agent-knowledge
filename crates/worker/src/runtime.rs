@@ -113,6 +113,8 @@ pub enum WorkerRunOutcome {
 /// Progress made by one nonblocking scheduler poll.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerPollOutcome {
+    /// Shutdown was requested before a repository transaction began.
+    Stopped,
     /// One bounded portion of the pending directory was observed.
     Scanning {
         /// Directory entries inspected by this poll.
@@ -131,6 +133,8 @@ pub enum WorkerPollOutcome {
     ClosedWithoutCommit {
         /// Threshold responsible for closing the snapshot.
         reason: BatchCloseReason,
+        /// Requests rejected while the snapshot was claimed.
+        requests: usize,
     },
     /// A ready snapshot was claimed and processed.
     Processed {
@@ -165,10 +169,36 @@ impl WorkerRuntime {
         limits: WorkerRunLimits,
         created_at: OffsetDateTime,
     ) -> Result<(Self, StartupOutcome), WorkerRunError> {
+        match Self::start_interruptible(queue, processor, limits, created_at, &|| false)? {
+            Some(started) => Ok(started),
+            None => {
+                unreachable!("an always-running startup control cannot request shutdown")
+            }
+        }
+    }
+
+    /// Acquires exclusive ownership and allows shutdown between recovery steps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queue recovery, repository discovery, transaction
+    /// resumption, or safe pre-transaction requeueing fails.
+    pub fn start_interruptible(
+        queue: &FileQueue,
+        processor: BatchProcessor,
+        limits: WorkerRunLimits,
+        created_at: OffsetDateTime,
+        should_stop: &impl Fn() -> bool,
+    ) -> Result<Option<(Self, StartupOutcome)>, WorkerRunError> {
         let mut session = queue.try_worker_session().map_err(WorkerRunError::queue)?;
-        let claims = recover_processing(&mut session, limits)?;
+        let Some(claims) = recover_processing(&mut session, limits, should_stop)? else {
+            return Ok(None);
+        };
         let processing_batch = single_processing_batch(&claims)?;
         let transaction = processor.unfinished_transaction(&session)?;
+        if should_stop() {
+            return Ok(None);
+        }
         if let (Some(processing), Some(repository)) = (processing_batch, transaction)
             && processing != repository.batch_id()
         {
@@ -183,6 +213,9 @@ impl WorkerRuntime {
             (None, Some(batch_id)) => {
                 let requests = claims.len();
                 for claim in claims {
+                    if should_stop() {
+                        return Ok(None);
+                    }
                     session
                         .requeue_claimed(claim.token())
                         .map_err(WorkerRunError::queue)?;
@@ -190,6 +223,9 @@ impl WorkerRuntime {
                 StartupOutcome::Requeued { batch_id, requests }
             }
             (Some(RepositoryTransaction::Preparing { batch_id }), Some(_)) => {
+                if should_stop() {
+                    return Ok(None);
+                }
                 let outcome = processor.process(&mut session, batch_id, &claims, created_at)?;
                 StartupOutcome::Resumed { batch_id, outcome }
             }
@@ -197,11 +233,14 @@ impl WorkerRuntime {
                 return Err(WorkerRunError::MissingProcessingClaims { batch_id });
             }
             (Some(RepositoryTransaction::Recoverable { batch_id }), _) => {
+                if should_stop() {
+                    return Ok(None);
+                }
                 let outcome = processor.recover(&mut session, batch_id, created_at)?;
                 StartupOutcome::Resumed { batch_id, outcome }
             }
         };
-        Ok((
+        Ok(Some((
             Self {
                 session,
                 processor,
@@ -209,7 +248,7 @@ impl WorkerRuntime {
                 ready: true,
             },
             startup,
-        ))
+        )))
     }
 
     /// Selects the earliest bounded pending snapshot and processes one batch.
@@ -230,11 +269,16 @@ impl WorkerRuntime {
         }
         self.session.discard_pending_observation();
         self.ready = false;
-        let outcome = self.run_once_inner(created_at, None);
+        let outcome = self.run_once_inner(created_at, None, &|| false);
         if outcome.is_ok() {
             self.ready = true;
         }
-        outcome
+        match outcome? {
+            WorkerRunProgress::Stopped => {
+                unreachable!("an always-running cycle control cannot request shutdown")
+            }
+            WorkerRunProgress::Complete(outcome) => Ok(outcome),
+        }
     }
 
     /// Observes pending work once and processes it only when a threshold closes.
@@ -252,8 +296,31 @@ impl WorkerRuntime {
         schedule: BatchSchedule,
         now: OffsetDateTime,
     ) -> Result<WorkerPollOutcome, WorkerRunError> {
+        match self.poll_once_interruptible(schedule, now, &|| false)? {
+            WorkerPollOutcome::Stopped => {
+                unreachable!("an always-running poll control cannot request shutdown")
+            }
+            outcome => Ok(outcome),
+        }
+    }
+
+    /// Polls one bounded scheduler step and observes pre-transaction shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when observation, claiming, repository application, or
+    /// publication fails. A failed processing cycle requires startup recovery.
+    pub fn poll_once_interruptible(
+        &mut self,
+        schedule: BatchSchedule,
+        now: OffsetDateTime,
+        should_stop: &impl Fn() -> bool,
+    ) -> Result<WorkerPollOutcome, WorkerRunError> {
         if !self.ready {
             return Err(WorkerRunError::RecoveryRequired);
+        }
+        if should_stop() {
+            return Ok(WorkerPollOutcome::Stopped);
         }
         let snapshot = match self
             .session
@@ -264,6 +331,9 @@ impl WorkerRuntime {
                 scanned_entries,
                 observed_requests,
             } => {
+                if should_stop() {
+                    return Ok(WorkerPollOutcome::Stopped);
+                }
                 return Ok(WorkerPollOutcome::Scanning {
                     scanned_entries,
                     observed_requests,
@@ -271,24 +341,36 @@ impl WorkerRuntime {
             }
             PendingScanOutcome::Complete(snapshot) => snapshot,
         };
+        if should_stop() {
+            return Ok(WorkerPollOutcome::Stopped);
+        }
         match schedule.readiness(snapshot, self.limits.maximum_requests, now) {
             BatchReadiness::Empty => Ok(WorkerPollOutcome::Idle),
             BatchReadiness::Waiting { ready_at } => Ok(WorkerPollOutcome::Waiting { ready_at }),
             BatchReadiness::Ready { reason } => {
+                let requests = snapshot.requests();
                 self.ready = false;
-                let outcome = self.run_once_inner(now, Some(snapshot.maximum_sequence()));
+                let outcome =
+                    self.run_once_inner(now, Some(snapshot.maximum_sequence()), should_stop);
                 if outcome.is_ok() {
                     self.ready = true;
                 }
                 match outcome? {
-                    WorkerRunOutcome::Idle => Ok(WorkerPollOutcome::ClosedWithoutCommit { reason }),
-                    WorkerRunOutcome::Processed { batch_id, outcome } => {
-                        Ok(WorkerPollOutcome::Processed {
-                            reason,
-                            batch_id,
-                            outcome,
-                        })
+                    WorkerRunProgress::Stopped => {
+                        self.ready = false;
+                        Ok(WorkerPollOutcome::Stopped)
                     }
+                    WorkerRunProgress::Complete(WorkerRunOutcome::Idle) => {
+                        Ok(WorkerPollOutcome::ClosedWithoutCommit { reason, requests })
+                    }
+                    WorkerRunProgress::Complete(WorkerRunOutcome::Processed {
+                        batch_id,
+                        outcome,
+                    }) => Ok(WorkerPollOutcome::Processed {
+                        reason,
+                        batch_id,
+                        outcome,
+                    }),
                 }
             }
         }
@@ -298,7 +380,8 @@ impl WorkerRuntime {
         &mut self,
         created_at: OffsetDateTime,
         maximum_sequence: Option<u64>,
-    ) -> Result<WorkerRunOutcome, WorkerRunError> {
+        should_stop: &impl Fn() -> bool,
+    ) -> Result<WorkerRunProgress, WorkerRunError> {
         let batch_id = BatchId::generate();
         let claims = loop {
             let outcome = match maximum_sequence {
@@ -315,25 +398,41 @@ impl WorkerRuntime {
                 ),
             };
             match outcome {
-                Ok(BatchClaimOutcome::Scanning { .. }) => {}
+                Ok(BatchClaimOutcome::Scanning { .. }) => {
+                    if should_stop() {
+                        return Ok(WorkerRunProgress::Stopped);
+                    }
+                }
                 Ok(BatchClaimOutcome::Claimed(claims)) => break claims,
                 Err(error) => return Err(WorkerRunError::queue(error)),
             }
         };
+        if should_stop() {
+            return Ok(WorkerRunProgress::Stopped);
+        }
         if claims.is_empty() {
-            return Ok(WorkerRunOutcome::Idle);
+            return Ok(WorkerRunProgress::Complete(WorkerRunOutcome::Idle));
         }
         let outcome = self
             .processor
             .process(&mut self.session, batch_id, &claims, created_at)?;
-        Ok(WorkerRunOutcome::Processed { batch_id, outcome })
+        Ok(WorkerRunProgress::Complete(WorkerRunOutcome::Processed {
+            batch_id,
+            outcome,
+        }))
     }
+}
+
+enum WorkerRunProgress {
+    Stopped,
+    Complete(WorkerRunOutcome),
 }
 
 fn recover_processing(
     session: &mut WorkerSession,
     limits: WorkerRunLimits,
-) -> Result<Vec<ClaimedPackage>, WorkerRunError> {
+    should_stop: &impl Fn() -> bool,
+) -> Result<Option<Vec<ClaimedPackage>>, WorkerRunError> {
     let mut recovered = Vec::new();
     loop {
         let remaining_with_sentinel = limits
@@ -358,6 +457,9 @@ fn recover_processing(
                 maximum: limits.maximum_recovery_requests.get(),
             });
         }
+        if should_stop() {
+            return Ok(None);
+        }
         if complete {
             recovered.sort_by_key(|claim| {
                 claim
@@ -365,7 +467,7 @@ fn recover_processing(
                     .acceptance()
                     .map(|acceptance| acceptance.sequence)
             });
-            return Ok(recovered);
+            return Ok(Some(recovered));
         }
     }
 }

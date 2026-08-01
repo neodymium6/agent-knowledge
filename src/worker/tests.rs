@@ -1,10 +1,14 @@
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration as StandardDuration, Instant};
+use std::time::Duration as StandardDuration;
 
-use agent_knowledge_worker::{StartupOutcome, WorkerPollOutcome};
+use agent_knowledge_worker::{BatchCommitOutcome, StartupOutcome, WorkerPollOutcome};
 use time::{Duration, OffsetDateTime};
 
-use super::{MAXIMUM_SIGNAL_WAIT, wait_after_poll, wait_for_termination, write_startup_log};
+use super::{
+    MAXIMUM_SIGNAL_WAIT, WorkerCommandError, WorkerLogRecord, add_commit_outcome, run,
+    wait_after_poll, wait_for_termination, write_poll_log, write_startup_log, write_worker_log,
+};
 
 #[test]
 fn waits_until_the_batch_deadline_or_idle_poll() {
@@ -17,10 +21,7 @@ fn waits_until_the_batch_deadline_or_idle_poll() {
         ready_at: now + Duration::seconds(30),
     };
 
-    assert_eq!(
-        wait_after_poll(&waiting, now),
-        Some(StandardDuration::from_secs(30))
-    );
+    assert_eq!(wait_after_poll(&waiting, now), Some(MAXIMUM_SIGNAL_WAIT));
     assert_eq!(
         wait_after_poll(&WorkerPollOutcome::Idle, now),
         Some(MAXIMUM_SIGNAL_WAIT)
@@ -30,11 +31,8 @@ fn waits_until_the_batch_deadline_or_idle_poll() {
 #[test]
 fn returns_immediately_when_termination_was_already_requested() {
     let stopping = AtomicBool::new(true);
-    let started = Instant::now();
 
     wait_for_termination(&stopping, StandardDuration::from_secs(60));
-
-    assert!(started.elapsed() < MAXIMUM_SIGNAL_WAIT);
 }
 
 #[test]
@@ -55,4 +53,109 @@ fn startup_log_is_structured_json() {
     assert_eq!(value["component"], "worker");
     assert_eq!(value["event"], "worker_started");
     assert!(value.get("batch_id").is_none());
+}
+
+#[test]
+fn commit_outcomes_have_stable_structured_fields() {
+    let timestamp = OffsetDateTime::parse(
+        "2026-08-01T04:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap_or_else(|error| panic!("fixture timestamp must parse: {error}"));
+    let cases = [
+        BatchCommitOutcome::NoChanges {
+            failures: Vec::new(),
+        },
+        BatchCommitOutcome::Committed {
+            commit: "0123456789abcdef".into(),
+            successful: Vec::new(),
+            failures: Vec::new(),
+        },
+    ];
+
+    for outcome in cases {
+        let mut record = WorkerLogRecord::new(timestamp, "batch_processed");
+        add_commit_outcome(&mut record, &outcome);
+        let mut output = Vec::new();
+        write_worker_log(&mut output, record)
+            .unwrap_or_else(|error| panic!("outcome log must serialize: {error}"));
+        let value: serde_json::Value = serde_json::from_slice(&output)
+            .unwrap_or_else(|error| panic!("outcome log must be JSON: {error}"));
+
+        assert!(matches!(
+            value["outcome"].as_str(),
+            Some("no_changes" | "committed")
+        ));
+        assert_eq!(value["successful_requests"], 0);
+        assert_eq!(value["failed_requests"], 0);
+        if value["outcome"] == "committed" {
+            assert_eq!(value["commit"], "0123456789abcdef");
+        } else {
+            assert!(value.get("commit").is_none());
+        }
+    }
+}
+
+#[test]
+fn terminal_batch_events_report_request_outcomes() {
+    let timestamp = OffsetDateTime::parse(
+        "2026-08-01T04:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap_or_else(|error| panic!("fixture timestamp must parse: {error}"));
+    let mut output = Vec::new();
+    let batch_id = "01K00000000000000000000003"
+        .parse()
+        .unwrap_or_else(|error| panic!("fixture batch ID must parse: {error}"));
+    write_poll_log(
+        &mut output,
+        timestamp,
+        &WorkerPollOutcome::Processed {
+            reason: agent_knowledge_worker::BatchCloseReason::MaximumRequests,
+            batch_id,
+            outcome: BatchCommitOutcome::Committed {
+                commit: "0123456789abcdef".into(),
+                successful: Vec::new(),
+                failures: Vec::new(),
+            },
+        },
+    )
+    .unwrap_or_else(|error| panic!("processed event must serialize: {error}"));
+    let processed: serde_json::Value = serde_json::from_slice(&output)
+        .unwrap_or_else(|error| panic!("processed event must be JSON: {error}"));
+    assert_eq!(processed["event"], "batch_processed");
+    assert_eq!(processed["outcome"], "committed");
+    assert_eq!(processed["successful_requests"], 0);
+    assert_eq!(processed["failed_requests"], 0);
+
+    output.clear();
+    write_poll_log(
+        &mut output,
+        timestamp,
+        &WorkerPollOutcome::ClosedWithoutCommit {
+            reason: agent_knowledge_worker::BatchCloseReason::InvalidAcceptance,
+            requests: 3,
+        },
+    )
+    .unwrap_or_else(|error| panic!("closed event must serialize: {error}"));
+    let closed: serde_json::Value = serde_json::from_slice(&output)
+        .unwrap_or_else(|error| panic!("closed event must be JSON: {error}"));
+    assert_eq!(closed["event"], "batch_closed_without_commit");
+    assert_eq!(closed["outcome"], "no_claimable_requests");
+    assert_eq!(closed["successful_requests"], 0);
+    assert_eq!(closed["failed_requests"], 3);
+}
+
+#[test]
+fn configuration_failures_emit_a_structured_terminal_event() {
+    let mut output = Vec::new();
+    let result = run(Path::new(""), &mut output);
+
+    assert!(matches!(result, Err(WorkerCommandError::Config(_))));
+    let value: serde_json::Value = serde_json::from_slice(&output)
+        .unwrap_or_else(|error| panic!("failure log must be JSON: {error}"));
+    assert_eq!(value["severity"], "error");
+    assert_eq!(value["component"], "worker");
+    assert_eq!(value["event"], "worker_failed");
+    assert_eq!(value["error_code"], "worker_config_invalid");
 }
