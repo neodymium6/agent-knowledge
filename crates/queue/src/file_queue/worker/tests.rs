@@ -808,6 +808,44 @@ fn impossible_acceptance_sequence_is_failed_instead_of_deferred() {
 }
 
 #[test]
+fn missing_acceptance_metadata_is_failed_instead_of_retried() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path());
+    accept_fixture(&queue);
+    fs::remove_file(
+        root.path()
+            .join(format!("queue/pending/{REQUEST_ID}/acceptance.json")),
+    )
+    .unwrap_or_else(|error| panic!("acceptance fixture must be removed: {error}"));
+    let mut worker = open_worker(&queue);
+
+    let snapshot = match worker.scan_pending(10) {
+        Ok(PendingScanOutcome::Complete(snapshot)) => snapshot,
+        Ok(PendingScanOutcome::Scanning { .. }) => panic!("single entry scan must complete"),
+        Err(error) => panic!("missing acceptance must remain observable: {error}"),
+    };
+    assert_eq!(snapshot.requests(), 1);
+    assert!(snapshot.has_invalid_acceptance());
+
+    let claimed = match worker.claim_batch_through(
+        parse_batch_id(FIRST_BATCH_ID),
+        snapshot.maximum_sequence(),
+        10,
+        10,
+    ) {
+        Ok(BatchClaimOutcome::Claimed(claimed)) => claimed,
+        Ok(BatchClaimOutcome::Scanning { .. }) => panic!("single entry claim must complete"),
+        Err(error) => panic!("missing acceptance must be failed durably: {error}"),
+    };
+    assert!(claimed.is_empty());
+    assert!(
+        root.path()
+            .join(format!("queue/failed/{REQUEST_ID}"))
+            .is_dir()
+    );
+}
+
+#[test]
 fn corrupt_pending_request_is_failed_without_blocking_valid_candidates() {
     const VALID_REQUEST_ID: &str = "01K00000000000000000000020";
 

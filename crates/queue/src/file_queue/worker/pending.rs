@@ -1,4 +1,5 @@
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 
 use agent_knowledge_core::RequestId;
@@ -195,7 +196,9 @@ fn inspect_pending(
     let (path, _request_id) = pending_request_entry(entry)?;
     let acceptance = match read_acceptance_file(&path.join(ACCEPTANCE_FILE_NAME)) {
         Ok(acceptance) => acceptance,
-        Err(PackageValidationError::Io(error)) => return Err(WorkerQueueError::Io(error)),
+        Err(PackageValidationError::Io(error)) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(WorkerQueueError::Io(error));
+        }
         Err(_) => {
             scan.requests = scan.requests.saturating_add(1);
             scan.has_invalid_acceptance = true;
