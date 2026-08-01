@@ -156,6 +156,11 @@ by the application, but its parent directory must already exist so the
 application can durably synchronize the new root entry without recursively
 creating unsynchronized ancestors.
 
+The Worker process converts `SIGINT` and `SIGTERM` into a shutdown flag. It
+checks that flag between bounded queue scans, during bounded waits, and after a
+batch transaction completes. A signal never abandons a transaction halfway;
+the service supervisor may enforce a separate hard-stop timeout.
+
 Before creating any storage root, the Worker pins each existing root or its
 nearest existing ancestor and compares canonical paths, device and inode
 identities, and Linux mount roots. This rejects equal, nested, symlink-aliased,

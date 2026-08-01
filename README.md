@@ -39,3 +39,12 @@ Initialize the local Git hooks and run the repository checks:
 just init
 just check
 ```
+
+Run the Repository Worker with a validated deployment configuration:
+
+```sh
+agent-knowledge worker run --config /srv/agent-knowledge/worker.yaml
+```
+
+The Worker emits JSON Lines operational events. `SIGINT` and `SIGTERM` request
+graceful shutdown after the current durable transaction boundary.
