@@ -18,10 +18,10 @@ use agent_knowledge_queue::{
 use ulid::Ulid;
 
 #[cfg(target_os = "linux")]
-use super::run_git_until;
+use super::run_git_until_controlled;
 use super::{
     BatchCommitOutcome, ClaimedBatch, GitIdentity, GitRepository, GitTransactionError,
-    RepositoryTransaction, TransactionHooks, accept_trial_build, decode_journal,
+    RepositoryTransaction, TransactionHooks, accept_trial_build, decode_journal, git_command,
     interrupt_publication, parse_git_version, parse_text, staged_stats, validate_journal_structure,
 };
 use crate::ContentPolicy;
@@ -37,7 +37,7 @@ const SECOND_BATCH_ID: &str = "01K00000000000000000000005";
 #[test]
 fn terminates_a_read_only_git_process_group_at_the_deadline() {
     let started = Instant::now();
-    let result = run_git_until(
+    let result = run_git_until_controlled(
         None,
         None,
         [
@@ -46,6 +46,7 @@ fn terminates_a_read_only_git_process_group_at_the_deadline() {
             OsStr::new("fictional-delay"),
         ],
         started + Duration::from_millis(50),
+        &|| false,
     );
 
     assert!(matches!(
@@ -59,7 +60,7 @@ fn terminates_a_read_only_git_process_group_at_the_deadline() {
 #[test]
 fn terminates_descendants_that_retain_git_output_after_the_parent_exits() {
     let started = Instant::now();
-    let result = run_git_until(
+    let result = run_git_until_controlled(
         None,
         None,
         [
@@ -68,6 +69,7 @@ fn terminates_descendants_that_retain_git_output_after_the_parent_exits() {
             OsStr::new("fictional-leak"),
         ],
         started + Duration::from_millis(50),
+        &|| false,
     );
 
     assert!(matches!(
@@ -75,6 +77,40 @@ fn terminates_descendants_that_retain_git_output_after_the_parent_exits() {
         Err(GitTransactionError::GitDeadlineExceeded)
     ));
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cancels_a_controlled_git_process_group() {
+    let started = Instant::now();
+    let result = run_git_until_controlled(
+        None,
+        None,
+        [
+            OsStr::new("-c"),
+            OsStr::new("alias.fictional-delay=!sleep 5"),
+            OsStr::new("fictional-delay"),
+        ],
+        started + Duration::from_secs(5),
+        &|| true,
+    );
+
+    assert!(matches!(result, Err(GitTransactionError::GitCancelled)));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn git_ssh_transport_is_noninteractive_and_disables_forwarding() {
+    let command = git_command();
+    let ssh = command
+        .get_envs()
+        .find(|(name, _)| *name == OsStr::new("GIT_SSH_COMMAND"))
+        .and_then(|(_, value)| value);
+
+    assert_eq!(
+        ssh,
+        Some(OsStr::new("ssh -oBatchMode=yes -oClearAllForwardings=yes"))
+    );
 }
 
 #[test]

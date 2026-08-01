@@ -5,19 +5,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, TryLockError as MutexTryLockError};
 use std::time::{Duration, Instant};
 
+use agent_knowledge_core::Revision;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
-use ulid::Ulid;
 
 use crate::git::{
     GitRepository, GitTransactionError, open_stable_directory, run_git_for_read,
-    validate_pinned_directory,
+    run_git_until_controlled, same_metadata, validate_pinned_directory,
 };
 
 const REPLICATION_STATE_VERSION: u16 = 1;
 const MAXIMUM_STATE_BYTES: u64 = 64 * 1024;
 const STATE_FILE_NAME: &str = "remote-replication-v1.json";
 const LOCK_FILE_NAME: &str = "remote-replication.lock";
+const TEMPORARY_STATE_FILE_NAME: &str = ".remote-replication.tmp";
 
 /// Validated retry and destination settings for asynchronous Git replication.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,6 +55,13 @@ impl RemoteReplicationPolicy {
             || maximum_backoff < initial_backoff
             || Instant::now().checked_add(timeout).is_none()
             || Instant::now().checked_add(maximum_backoff).is_none()
+            || time::Duration::try_from(maximum_backoff).is_err()
+            || OffsetDateTime::now_utc()
+                .checked_add(
+                    time::Duration::try_from(maximum_backoff)
+                        .map_err(|_| RemoteReplicationError::InvalidPolicy("timing"))?,
+                )
+                .is_none()
         {
             return Err(RemoteReplicationError::InvalidPolicy("timing"));
         }
@@ -97,6 +106,8 @@ pub enum RemoteReplicationOutcome {
         consecutive_failures: u32,
         retry_at: OffsetDateTime,
     },
+    /// Shutdown cancelled an in-flight push before it changed durable state.
+    Cancelled,
 }
 
 /// Replicates the latest official local commit without participating in publication.
@@ -108,6 +119,7 @@ pub struct RemoteReplicator {
     configured_state_directory: PathBuf,
     state_directory: PathBuf,
     state_directory_handle: Arc<File>,
+    configured_lock_path: PathBuf,
     lock: File,
     in_process_lock: Mutex<()>,
 }
@@ -133,13 +145,14 @@ impl RemoteReplicator {
             None,
         )
         .map_err(|_| RemoteReplicationError::InvalidPolicy("branch"))?;
-        run_git_for_read(
+        let remote_urls = run_git_for_read(
             None,
             Some(repository.git_directory()),
             ["remote", "get-url", "--push", "--all", policy.remote()],
             None,
         )
         .map_err(|_| RemoteReplicationError::RemoteUnavailable)?;
+        fingerprint_remote_urls(&remote_urls.stdout)?;
         let configured_state_directory = fs::canonicalize(repository.repository_state_directory())
             .map_err(RemoteReplicationError::Io)?;
         let (state_directory_handle, state_directory) =
@@ -148,6 +161,8 @@ impl RemoteReplicator {
         let state_path = state_directory.join(STATE_FILE_NAME);
         let lock_path = state_directory.join(LOCK_FILE_NAME);
         let lock = open_lock_file(&lock_path).map_err(RemoteReplicationError::Io)?;
+        let configured_lock_path = configured_state_directory.join(LOCK_FILE_NAME);
+        validate_lock_file(&configured_lock_path, &lock)?;
         lock.sync_all().map_err(RemoteReplicationError::Io)?;
         Ok(Self {
             repository,
@@ -156,6 +171,7 @@ impl RemoteReplicator {
             configured_state_directory,
             state_directory,
             state_directory_handle,
+            configured_lock_path,
             lock,
             in_process_lock: Mutex::new(()),
         })
@@ -174,6 +190,28 @@ impl RemoteReplicator {
         &self,
         now: OffsetDateTime,
     ) -> Result<RemoteReplicationOutcome, RemoteReplicationError> {
+        self.replicate_controlled(now, &OffsetDateTime::now_utc, &|| false)
+    }
+
+    /// Runs one replication step that may cancel an in-flight Git subprocess.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when local repository or durable state validation fails.
+    pub fn replicate_interruptible(
+        &self,
+        now: OffsetDateTime,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<RemoteReplicationOutcome, RemoteReplicationError> {
+        self.replicate_controlled(now, &OffsetDateTime::now_utc, cancelled)
+    }
+
+    fn replicate_controlled(
+        &self,
+        now: OffsetDateTime,
+        completed_at: &impl Fn() -> OffsetDateTime,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<RemoteReplicationOutcome, RemoteReplicationError> {
         let _in_process = match self.in_process_lock.try_lock() {
             Ok(guard) => guard,
             Err(MutexTryLockError::WouldBlock) => return Err(RemoteReplicationError::Busy),
@@ -181,12 +219,14 @@ impl RemoteReplicator {
                 return Err(RemoteReplicationError::LockPoisoned);
             }
         };
+        validate_lock_file(&self.configured_lock_path, &self.lock)?;
         match self.lock.try_lock() {
             Ok(()) => {}
             Err(FileTryLockError::WouldBlock) => return Err(RemoteReplicationError::Busy),
             Err(FileTryLockError::Error(error)) => return Err(RemoteReplicationError::Io(error)),
         }
-        let result = self.replicate_locked(now);
+        let result = validate_lock_file(&self.configured_lock_path, &self.lock)
+            .and_then(|()| self.replicate_locked(now, completed_at, cancelled));
         let unlock = self.lock.unlock().map_err(RemoteReplicationError::Io);
         match (result, unlock) {
             (Ok(outcome), Ok(())) => Ok(outcome),
@@ -198,27 +238,50 @@ impl RemoteReplicator {
     fn replicate_locked(
         &self,
         now: OffsetDateTime,
+        completed_at: &impl Fn() -> OffsetDateTime,
+        cancelled: &impl Fn() -> bool,
     ) -> Result<RemoteReplicationOutcome, RemoteReplicationError> {
         validate_pinned_directory(
             &self.configured_state_directory,
             &self.state_directory_handle,
         )
         .map_err(RemoteReplicationError::repository)?;
-        let target = {
+        let (target, remote_fingerprint) = {
             let _writer = self
                 .repository
                 .lock_writer()
                 .map_err(RemoteReplicationError::repository)?;
-            self.repository
+            let target = self
+                .repository
                 .resolve_commit(self.repository.official_ref())
-                .map_err(RemoteReplicationError::repository)?
+                .map_err(RemoteReplicationError::repository)?;
+            let urls = run_git_for_read(
+                None,
+                Some(self.repository.git_directory()),
+                ["remote", "get-url", "--push", "--all", self.policy.remote()],
+                None,
+            )
+            .map_err(|_| RemoteReplicationError::RemoteUnavailable)?;
+            (target, fingerprint_remote_urls(&urls.stdout)?)
         };
-        let mut state = read_state(&self.state_path)?
-            .unwrap_or_else(|| ReplicationState::new(self.policy.remote(), self.policy.branch()));
-        if state.remote != self.policy.remote || state.branch != self.policy.branch {
-            state = ReplicationState::new(self.policy.remote(), self.policy.branch());
-        }
+        let mut state = read_state(&self.state_path)?.unwrap_or_else(|| {
+            ReplicationState::new(
+                self.policy.remote(),
+                self.policy.branch(),
+                remote_fingerprint,
+            )
+        });
         validate_state(&state)?;
+        if state.remote != self.policy.remote
+            || state.branch != self.policy.branch
+            || state.remote_fingerprint != remote_fingerprint
+        {
+            state = ReplicationState::new(
+                self.policy.remote(),
+                self.policy.branch(),
+                remote_fingerprint,
+            );
+        }
         if state.replicated_commit.as_deref() == Some(target.as_str()) {
             return Ok(RemoteReplicationOutcome::UpToDate { commit: target });
         }
@@ -236,11 +299,12 @@ impl RemoteReplicator {
             .checked_add(self.policy.timeout)
             .ok_or(RemoteReplicationError::InvalidPolicy("timeout"))?;
         let refspec = format!("{target}:refs/heads/{}", self.policy.branch);
-        let push = run_git_for_read(
+        let push = run_git_until_controlled(
             None,
             Some(self.repository.git_directory()),
             ["push", "--porcelain", "--", self.policy.remote(), &refspec],
-            Some(deadline),
+            deadline,
+            cancelled,
         );
         match push {
             Ok(_) => {
@@ -250,12 +314,16 @@ impl RemoteReplicator {
                 write_state(&self.state_directory, &self.state_path, &state)?;
                 Ok(RemoteReplicationOutcome::Pushed { commit: target })
             }
-            Err(_) => {
+            Err(
+                GitTransactionError::GitCommand { .. } | GitTransactionError::GitDeadlineExceeded,
+            ) => {
                 state.consecutive_failures = state.consecutive_failures.saturating_add(1);
                 let delay = retry_delay(&self.policy, state.consecutive_failures);
-                let retry_at = now
-                    + time::Duration::try_from(delay)
-                        .map_err(|_| RemoteReplicationError::InvalidPolicy("backoff"))?;
+                let delay = time::Duration::try_from(delay)
+                    .map_err(|_| RemoteReplicationError::InvalidPolicy("backoff"))?;
+                let retry_at = completed_at()
+                    .checked_add(delay)
+                    .ok_or(RemoteReplicationError::InvalidPolicy("backoff"))?;
                 state.retry_at = Some(retry_at);
                 write_state(&self.state_directory, &self.state_path, &state)?;
                 Ok(RemoteReplicationOutcome::Failed {
@@ -264,6 +332,8 @@ impl RemoteReplicator {
                     retry_at,
                 })
             }
+            Err(GitTransactionError::GitCancelled) => Ok(RemoteReplicationOutcome::Cancelled),
+            Err(error) => Err(RemoteReplicationError::repository(error)),
         }
     }
 }
@@ -274,6 +344,7 @@ struct ReplicationState {
     schema_version: u16,
     remote: String,
     branch: String,
+    remote_fingerprint: Revision,
     replicated_commit: Option<String>,
     consecutive_failures: u32,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -281,11 +352,12 @@ struct ReplicationState {
 }
 
 impl ReplicationState {
-    fn new(remote: &str, branch: &str) -> Self {
+    fn new(remote: &str, branch: &str, remote_fingerprint: Revision) -> Self {
         Self {
             schema_version: REPLICATION_STATE_VERSION,
             remote: remote.into(),
             branch: branch.into(),
+            remote_fingerprint,
             replicated_commit: None,
             consecutive_failures: 0,
             retry_at: None,
@@ -330,6 +402,13 @@ fn valid_object_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn fingerprint_remote_urls(urls: &[u8]) -> Result<Revision, RemoteReplicationError> {
+    if urls.is_empty() {
+        return Err(RemoteReplicationError::RemoteUnavailable);
+    }
+    Ok(Revision::from_bytes(Sha256::digest(urls).into()))
 }
 
 fn validate_state(state: &ReplicationState) -> Result<(), RemoteReplicationError> {
@@ -385,6 +464,15 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+fn validate_lock_file(path: &Path, pinned: &File) -> Result<(), RemoteReplicationError> {
+    let configured = fs::symlink_metadata(path).map_err(RemoteReplicationError::Io)?;
+    let pinned = pinned.metadata().map_err(RemoteReplicationError::Io)?;
+    if !configured.file_type().is_file() || !same_metadata(&configured, &pinned) {
+        return Err(RemoteReplicationError::LockReplaced);
+    }
+    Ok(())
+}
+
 fn open_read_only_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -416,7 +504,8 @@ fn write_state(
     if bytes.len() as u64 > MAXIMUM_STATE_BYTES {
         return Err(RemoteReplicationError::InvalidState);
     }
-    let temporary = directory.join(format!(".remote-replication-{}.tmp", Ulid::generate()));
+    let temporary = directory.join(TEMPORARY_STATE_FILE_NAME);
+    remove_temporary_state(&temporary)?;
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -433,6 +522,15 @@ fn write_state(
     result.map_err(RemoteReplicationError::Io)
 }
 
+fn remove_temporary_state(path: &Path) -> Result<(), RemoteReplicationError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Err(RemoteReplicationError::InvalidState),
+        Ok(_) => fs::remove_file(path).map_err(RemoteReplicationError::Io),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(RemoteReplicationError::Io(error)),
+    }
+}
+
 /// Failure to validate or persist one remote-replication step.
 #[derive(Debug)]
 pub enum RemoteReplicationError {
@@ -444,6 +542,8 @@ pub enum RemoteReplicationError {
     Busy,
     /// An earlier in-process replication attempt panicked while holding its lock.
     LockPoisoned,
+    /// The fixed cross-process lock entry no longer names the pinned file.
+    LockReplaced,
     /// Durable replication state was malformed or unsafe.
     InvalidState,
     /// Local repository inspection failed.
@@ -467,6 +567,7 @@ impl fmt::Display for RemoteReplicationError {
             Self::RemoteUnavailable => formatter.write_str("configured Git remote is unavailable"),
             Self::Busy => formatter.write_str("another remote replication attempt is active"),
             Self::LockPoisoned => formatter.write_str("remote replication lock is poisoned"),
+            Self::LockReplaced => formatter.write_str("remote replication lock was replaced"),
             Self::InvalidState => {
                 formatter.write_str("durable remote replication state is invalid")
             }
@@ -499,7 +600,7 @@ mod tests {
     use ulid::Ulid;
 
     use super::{
-        RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicationPolicy,
+        LOCK_FILE_NAME, RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicationPolicy,
         RemoteReplicator, STATE_FILE_NAME,
     };
     use crate::{GitIdentity, GitRepository};
@@ -681,6 +782,46 @@ mod tests {
     }
 
     #[test]
+    fn repointed_remote_invalidates_the_confirmed_commit_cache() {
+        let fixture = Fixture::create();
+        let repository = fixture.repository();
+        let replicator = RemoteReplicator::open(repository, fixture.policy())
+            .unwrap_or_else(|error| panic!("replicator must open: {error}"));
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let commit = fixture.local_commit();
+        assert!(matches!(
+            replicate(&replicator, now),
+            RemoteReplicationOutcome::Pushed { .. }
+        ));
+
+        let replacement = fixture.root.join("replacement-remote");
+        git(
+            None,
+            ["init", "--bare", "--initial-branch=main"],
+            Some(&replacement),
+        );
+        let git_directory = format!("--git-dir={}", fixture.repository.display());
+        git(
+            None,
+            [
+                git_directory.as_str(),
+                "remote",
+                "set-url",
+                "fictional-backup",
+            ],
+            Some(&replacement),
+        );
+
+        assert_eq!(
+            replicate(&replicator, now),
+            RemoteReplicationOutcome::Pushed {
+                commit: commit.clone()
+            }
+        );
+        assert_eq!(git_output(&replacement, "refs/heads/main"), commit);
+    }
+
+    #[test]
     fn persists_backoff_across_restart_and_recovers_after_remote_returns() {
         let fixture = Fixture::create();
         let repository = fixture.repository();
@@ -693,19 +834,19 @@ mod tests {
         let commit = fixture.local_commit();
 
         assert_eq!(
-            replicate(&replicator, now),
+            replicate_completed_at(&replicator, now, now + time::Duration::seconds(30)),
             RemoteReplicationOutcome::Failed {
                 commit: commit.clone(),
                 consecutive_failures: 1,
-                retry_at: now + time::Duration::seconds(10),
+                retry_at: now + time::Duration::seconds(40),
             }
         );
         assert_eq!(
-            replicate(&replicator, now + time::Duration::seconds(10)),
+            replicate(&replicator, now + time::Duration::seconds(40)),
             RemoteReplicationOutcome::Failed {
                 commit: commit.clone(),
                 consecutive_failures: 2,
-                retry_at: now + time::Duration::seconds(30),
+                retry_at: now + time::Duration::seconds(60),
             }
         );
         drop(replicator);
@@ -717,15 +858,15 @@ mod tests {
         let restarted = RemoteReplicator::open(repository, policy)
             .unwrap_or_else(|error| panic!("restarted replicator must open: {error}"));
         assert_eq!(
-            replicate(&restarted, now + time::Duration::seconds(29)),
+            replicate(&restarted, now + time::Duration::seconds(59)),
             RemoteReplicationOutcome::Deferred {
                 commit: commit.clone(),
                 consecutive_failures: 2,
-                retry_at: now + time::Duration::seconds(30),
+                retry_at: now + time::Duration::seconds(60),
             }
         );
         assert_eq!(
-            replicate(&restarted, now + time::Duration::seconds(30)),
+            replicate(&restarted, now + time::Duration::seconds(60)),
             RemoteReplicationOutcome::Pushed {
                 commit: commit.clone()
             }
@@ -752,6 +893,92 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn validates_corrupted_state_before_resetting_a_changed_destination() {
+        let fixture = Fixture::create();
+        let repository = fixture.repository();
+        let replicator = RemoteReplicator::open(repository, fixture.policy())
+            .unwrap_or_else(|error| panic!("replicator must open: {error}"));
+        let state = fixture
+            .repository
+            .join("agent-knowledge")
+            .join(STATE_FILE_NAME);
+        let invalid = format!(
+            "{{\"schema_version\":1,\"remote\":\"other\",\"branch\":\"main\",\"remote_fingerprint\":\"sha256:{}\",\"replicated_commit\":\"invalid\",\"consecutive_failures\":0,\"retry_at\":null}}\n",
+            "00".repeat(32)
+        );
+        fs::write(state, invalid)
+            .unwrap_or_else(|error| panic!("invalid fixture state must be written: {error}"));
+
+        assert!(matches!(
+            replicator.replicate(OffsetDateTime::UNIX_EPOCH),
+            Err(RemoteReplicationError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_replaced_cross_process_lock() {
+        let fixture = Fixture::create();
+        let repository = fixture.repository();
+        let replicator = RemoteReplicator::open(repository, fixture.policy())
+            .unwrap_or_else(|error| panic!("replicator must open: {error}"));
+        let lock = fixture
+            .repository
+            .join("agent-knowledge")
+            .join(LOCK_FILE_NAME);
+        fs::rename(&lock, lock.with_extension("replaced"))
+            .unwrap_or_else(|error| panic!("fixture lock must be moved: {error}"));
+        fs::write(&lock, b"")
+            .unwrap_or_else(|error| panic!("replacement lock must be written: {error}"));
+
+        assert!(matches!(
+            replicator.replicate(OffsetDateTime::UNIX_EPOCH),
+            Err(RemoteReplicationError::LockReplaced)
+        ));
+    }
+
+    #[test]
+    fn cancellation_does_not_create_retry_state() {
+        let fixture = Fixture::create();
+        let repository = fixture.repository();
+        let replicator = RemoteReplicator::open(repository, fixture.policy())
+            .unwrap_or_else(|error| panic!("replicator must open: {error}"));
+        let outcome = replicator.replicate_controlled(
+            OffsetDateTime::UNIX_EPOCH,
+            &|| OffsetDateTime::UNIX_EPOCH,
+            &|| true,
+        );
+
+        assert!(matches!(outcome, Ok(RemoteReplicationOutcome::Cancelled)));
+        assert!(
+            !fixture
+                .repository
+                .join("agent-knowledge")
+                .join(STATE_FILE_NAME)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn retry_deadline_overflow_is_reported_without_panicking() {
+        let fixture = Fixture::create();
+        let repository = fixture.repository();
+        let replicator = RemoteReplicator::open(repository, fixture.policy())
+            .unwrap_or_else(|error| panic!("replicator must open: {error}"));
+        fs::remove_dir_all(&fixture.remote)
+            .unwrap_or_else(|error| panic!("fixture remote must be removed: {error}"));
+        let maximum = OffsetDateTime::parse(
+            "9999-12-31T23:59:59Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap_or_else(|error| panic!("maximum fixture timestamp must parse: {error}"));
+
+        assert!(matches!(
+            replicator.replicate_controlled(maximum, &|| maximum, &|| false),
+            Err(RemoteReplicationError::InvalidPolicy("backoff"))
+        ));
+    }
+
     fn git<const N: usize>(
         working_directory: Option<&Path>,
         arguments: [&str; N],
@@ -772,8 +999,16 @@ mod tests {
     }
 
     fn replicate(replicator: &RemoteReplicator, now: OffsetDateTime) -> RemoteReplicationOutcome {
+        replicate_completed_at(replicator, now, now)
+    }
+
+    fn replicate_completed_at(
+        replicator: &RemoteReplicator,
+        now: OffsetDateTime,
+        completed_at: OffsetDateTime,
+    ) -> RemoteReplicationOutcome {
         replicator
-            .replicate(now)
+            .replicate_controlled(now, &|| completed_at, &|| false)
             .unwrap_or_else(|error| panic!("replication step must complete: {error}"))
     }
 

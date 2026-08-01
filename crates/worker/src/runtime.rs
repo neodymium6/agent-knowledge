@@ -1,5 +1,10 @@
 use std::fmt;
+use std::io;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration as StandardDuration;
 
 use agent_knowledge_core::BatchId;
 use agent_knowledge_queue::{
@@ -13,6 +18,8 @@ use agent_knowledge_repository::{
 use time::OffsetDateTime;
 
 use crate::{BatchCloseReason, BatchProcessor, BatchProcessorError, BatchReadiness, BatchSchedule};
+
+const REPLICATION_POLL_INTERVAL: StandardDuration = StandardDuration::from_millis(250);
 
 /// Bounded queue scan and batch-size limits for one Worker process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,13 +196,113 @@ pub enum WorkerPollOutcome {
     },
 }
 
+#[derive(Debug)]
+struct ReplicationBackground {
+    control: Arc<ReplicationControl>,
+    event: Arc<Mutex<Option<Result<RemoteReplicationOutcome, RemoteReplicationError>>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct ReplicationControl {
+    stopping: AtomicBool,
+    wait: Mutex<()>,
+    wake: Condvar,
+}
+
+impl ReplicationBackground {
+    fn start(replication: RemoteReplicator) -> Result<Self, io::Error> {
+        let control = Arc::new(ReplicationControl {
+            stopping: AtomicBool::new(false),
+            wait: Mutex::new(()),
+            wake: Condvar::new(),
+        });
+        let event = Arc::new(Mutex::new(None));
+        let thread_control = Arc::clone(&control);
+        let thread_event = Arc::clone(&event);
+        let thread = thread::Builder::new()
+            .name("knowledge-git-replication".into())
+            .spawn(move || replication_loop(replication, &thread_control, &thread_event))?;
+        Ok(Self {
+            control,
+            event,
+            thread: Some(thread),
+        })
+    }
+
+    fn take_event(&self) -> Option<Result<RemoteReplicationOutcome, RemoteReplicationError>> {
+        match self.event.lock() {
+            Ok(mut event) => event.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
+    }
+}
+
+impl Drop for ReplicationBackground {
+    fn drop(&mut self) {
+        self.control.stopping.store(true, Ordering::Release);
+        self.control.wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn replication_loop(
+    replication: RemoteReplicator,
+    control: &ReplicationControl,
+    event: &Mutex<Option<Result<RemoteReplicationOutcome, RemoteReplicationError>>>,
+) {
+    let mut error_reported = false;
+    while !control.stopping.load(Ordering::Acquire) {
+        let outcome = replication.replicate_interruptible(OffsetDateTime::now_utc(), &|| {
+            control.stopping.load(Ordering::Acquire)
+        });
+        match outcome {
+            Ok(RemoteReplicationOutcome::Cancelled) => break,
+            Ok(outcome @ RemoteReplicationOutcome::Pushed { .. })
+            | Ok(outcome @ RemoteReplicationOutcome::Failed { .. }) => {
+                error_reported = false;
+                replace_replication_event(event, Ok(outcome));
+            }
+            Ok(RemoteReplicationOutcome::UpToDate { .. })
+            | Ok(RemoteReplicationOutcome::Deferred { .. }) => {
+                error_reported = false;
+            }
+            Err(error) if !error_reported => {
+                error_reported = true;
+                replace_replication_event(event, Err(error));
+            }
+            Err(_) => {}
+        }
+        let guard = match control.wait.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if control.stopping.load(Ordering::Acquire) {
+            break;
+        }
+        drop(control.wake.wait_timeout(guard, REPLICATION_POLL_INTERVAL));
+    }
+}
+
+fn replace_replication_event(
+    event: &Mutex<Option<Result<RemoteReplicationOutcome, RemoteReplicationError>>>,
+    outcome: Result<RemoteReplicationOutcome, RemoteReplicationError>,
+) {
+    match event.lock() {
+        Ok(mut event) => *event = Some(outcome),
+        Err(poisoned) => *poisoned.into_inner() = Some(outcome),
+    }
+}
+
 /// Exclusive, recovered Worker state ready to process new batches.
 #[derive(Debug)]
 pub struct WorkerRuntime {
     session: WorkerSession,
     processor: BatchProcessor,
     limits: WorkerRunLimits,
-    replication: Option<RemoteReplicator>,
+    replication: Option<ReplicationBackground>,
     ready: bool,
 }
 
@@ -349,6 +456,10 @@ impl WorkerRuntime {
                 }
             }
         };
+        let replication = replication
+            .map(ReplicationBackground::start)
+            .transpose()
+            .map_err(WorkerRunError::ReplicationThread)?;
         Ok(InterruptibleStart::Started((
             Self {
                 session,
@@ -361,22 +472,17 @@ impl WorkerRuntime {
         )))
     }
 
-    /// Runs at most one asynchronous Git remote replication attempt.
+    /// Takes the latest asynchronous Git remote replication event.
     ///
-    /// The result is `None` when replication is not configured. A failure does
-    /// not change local request, commit, or release state.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when local repository or durable retry state validation fails.
-    pub fn replicate_once(
+    /// The result is `None` when replication is not configured or no new
+    /// reportable outcome is available. Background failures never change local
+    /// request, commit, release, or queue processing state.
+    pub fn take_replication_event(
         &self,
-        now: OffsetDateTime,
-    ) -> Result<Option<RemoteReplicationOutcome>, RemoteReplicationError> {
+    ) -> Option<Result<RemoteReplicationOutcome, RemoteReplicationError>> {
         self.replication
             .as_ref()
-            .map(|replication| replication.replicate(now))
-            .transpose()
+            .and_then(ReplicationBackground::take_event)
     }
 
     /// Selects the earliest bounded pending snapshot and processes one batch.
@@ -668,6 +774,8 @@ pub enum WorkerRunError {
         /// Requests rejected before startup recovery began.
         failed_requests: usize,
     },
+    /// The independent Git replication thread could not be started.
+    ReplicationThread(io::Error),
     /// Interrupted processing exceeded the configured in-memory batch bound.
     TooManyProcessingClaims {
         /// Configured maximum number of claims.
@@ -761,6 +869,9 @@ impl fmt::Display for WorkerRunError {
             Self::StartupRecovery { source, .. } => {
                 write!(formatter, "Worker startup recovery failed: {source}")
             }
+            Self::ReplicationThread(error) => {
+                write!(formatter, "Git replication thread could not start: {error}")
+            }
             Self::TooManyProcessingClaims { maximum } => write!(
                 formatter,
                 "interrupted processing exceeds the configured {maximum}-request bound"
@@ -794,6 +905,7 @@ impl std::error::Error for WorkerRunError {
             Self::Queue(error) => Some(error),
             Self::Processor { source, .. } => Some(source),
             Self::StartupRecovery { source, .. } => Some(source),
+            Self::ReplicationThread(error) => Some(error),
             Self::TooManyProcessingClaims { .. }
             | Self::MultipleProcessingBatches { .. }
             | Self::TransactionBatchMismatch { .. }

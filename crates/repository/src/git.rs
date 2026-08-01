@@ -2078,13 +2078,13 @@ pub(crate) fn validate_pinned_directory(
 }
 
 #[cfg(unix)]
-fn same_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+pub(crate) fn same_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 #[cfg(not(unix))]
-fn same_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+pub(crate) fn same_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.file_type() == right.file_type()
         && left.len() == right.len()
         && left.modified().ok() == right.modified().ok()
@@ -2462,16 +2462,23 @@ where
     S: AsRef<OsStr>,
 {
     match deadline {
-        Some(deadline) => run_git_until(working_directory, git_directory, arguments, deadline),
+        Some(deadline) => run_git_until_controlled(
+            working_directory,
+            git_directory,
+            arguments,
+            deadline,
+            &|| false,
+        ),
         None => run_git(working_directory, git_directory, arguments),
     }
 }
 
-fn run_git_until<I, S>(
+pub(crate) fn run_git_until_controlled<I, S>(
     working_directory: Option<&Path>,
     git_directory: Option<&Path>,
     arguments: I,
     deadline: Instant,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<Output, GitTransactionError>
 where
     I: IntoIterator<Item = S>,
@@ -2518,6 +2525,10 @@ where
     let mut status = None;
     let mut captured = [None, None];
     while status.is_none() || captured.iter().any(Option::is_none) {
+        if cancelled() {
+            terminate_timed_git(&mut child, stdout_reader, stderr_reader);
+            return Err(GitTransactionError::GitCancelled);
+        }
         let now = Instant::now();
         if now >= deadline {
             terminate_timed_git(&mut child, stdout_reader, stderr_reader);
@@ -2699,6 +2710,10 @@ fn git_command() -> Command {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -oBatchMode=yes -oClearAllForwardings=yes",
+        )
         .args([
             "-c",
             "core.fsync=all",
@@ -3082,8 +3097,10 @@ pub enum GitTransactionError {
     },
     /// Git returned malformed machine-readable output.
     InvalidGitOutput,
-    /// A read-only Git inspection exceeded its absolute operation deadline.
+    /// A Git operation exceeded its absolute deadline.
     GitDeadlineExceeded,
+    /// A controlled Git subprocess was cancelled before its deadline.
+    GitCancelled,
     /// A transaction attempted a physical content deletion.
     PhysicalDeletion,
     /// A Git subprocess failed.
@@ -3189,9 +3206,8 @@ impl fmt::Display for GitTransactionError {
                 "official commit `{commit}` advanced but transaction cleanup failed: {source}"
             ),
             Self::InvalidGitOutput => formatter.write_str("Git returned invalid output"),
-            Self::GitDeadlineExceeded => {
-                formatter.write_str("read-only Git inspection exceeded its deadline")
-            }
+            Self::GitDeadlineExceeded => formatter.write_str("Git operation exceeded its deadline"),
+            Self::GitCancelled => formatter.write_str("Git operation was cancelled"),
             Self::PhysicalDeletion => {
                 formatter.write_str("Git transaction attempted a physical content deletion")
             }

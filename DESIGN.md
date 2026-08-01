@@ -314,10 +314,13 @@ remote is behind and retries the push. The current official commit is the
 authoritative synchronization target, so a crash between local publication and
 retry-state persistence cannot lose a push. The Worker durably records the last
 confirmed remote commit, consecutive failures, and the next retry time. Pushes
-use an exact commit-to-branch refspec, a non-interactive credential mode, a
-per-attempt timeout, and capped exponential backoff. They never force-update the
-remote branch and do not hold the local repository writer lock while waiting on
-the network.
+run on an independent background thread and use an exact commit-to-branch
+refspec, non-interactive Git and SSH credential modes, a per-attempt timeout,
+shutdown cancellation, and capped exponential backoff. They never force-update
+the remote branch and do not hold the local repository writer lock while
+waiting on the network. A fingerprint of the configured push URL is part of
+the durable destination identity, so repointing a named remote invalidates its
+previous success record without persisting sensitive URL text.
 
 ## 8. Storage layout
 

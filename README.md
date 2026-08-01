@@ -90,9 +90,11 @@ already exist in the bare repository. Authentication belongs in the service
 account's Git/SSH deployment configuration; credentials are not accepted in
 the Worker configuration. A push failure never rolls back the local commit,
 canonical content, active Quartz release, or completed request. The Worker
-persists the last confirmed commit and an exponential retry deadline under the
-bare repository, caps delay at `maximum_backoff_seconds`, disables interactive
-credential prompts, and applies `timeout_seconds` to every attempt.
+performs pushes on an independent background thread, so a slow remote does not
+delay queue processing. It persists the last confirmed commit, a fingerprint
+of the configured push URL, and an exponential retry deadline under the bare
+repository. It caps delay at `maximum_backoff_seconds`, disables interactive
+Git and SSH credential prompts, and applies `timeout_seconds` to every attempt.
 
 Submit a validated request package through an SSH host alias:
 
@@ -194,6 +196,7 @@ validation failures emit `remote_replication_state_error` once until the state
 becomes readable again. Up-to-date and deferred polls are intentionally quiet.
 
 `SIGINT` and `SIGTERM` request graceful shutdown before a new durable
-transaction or after the current transaction completes. A supervisor must
-signal only the main Worker process initially and reserve group-wide `SIGKILL`
-for its hard-stop timeout.
+transaction or after the current transaction completes. An in-flight remote
+push is cancelled when the Worker runtime shuts down. A supervisor must signal
+only the main Worker process initially and reserve group-wide `SIGKILL` for its
+hard-stop timeout.

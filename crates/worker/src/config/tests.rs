@@ -219,6 +219,17 @@ fn rejects_unsafe_paths_and_invalid_operational_bounds() {
             field: "repository.replication"
         })
     ));
+
+    let excessive_backoff = valid_yaml(root).replace(
+        "  author_email: worker@example.invalid\n",
+        "  author_email: worker@example.invalid\n  replication:\n    remote: fictional-backup\n    branch: main\n    timeout_seconds: 30\n    initial_backoff_seconds: 10\n    maximum_backoff_seconds: 9223372036854775807\n",
+    );
+    assert!(matches!(
+        WorkerSettings::decode(&excessive_backoff),
+        Err(WorkerConfigError::InvalidValue {
+            field: "repository.replication.maximum_backoff_seconds"
+        })
+    ));
 }
 
 #[test]

@@ -2,6 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration as StandardDuration, Instant};
 
 use time::{Duration, OffsetDateTime};
 
@@ -9,7 +11,7 @@ use time::{Duration, OffsetDateTime};
 use std::os::unix::fs::PermissionsExt;
 
 use super::{WorkerBootstrap, WorkerOpenError};
-use crate::{StartupOutcome, WorkerSettings};
+use crate::{RemoteReplicationOutcome, StartupOutcome, WorkerSettings};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -89,6 +91,52 @@ fn configured_replication_requires_an_existing_repository_remote() {
         Err(WorkerOpenError::Replication(_))
     ));
     assert!(!root.path().join("queue").exists());
+}
+
+#[test]
+fn configured_replication_runs_in_the_background_after_startup() {
+    let root = TestDirectory::create();
+    initialize_repository(root.path());
+    initialize_quartz(root.path());
+    let backup = root.path().join("fictional-backup");
+    run_git(
+        None,
+        ["init", "--bare", "--initial-branch=main"],
+        Some(&backup),
+    );
+    run_git(
+        Some(&root.path().join("repository")),
+        ["remote", "add", "fictional-backup"],
+        Some(&backup),
+    );
+    let yaml = valid_yaml(root.path()).replace(
+        "  author_email: worker@example.invalid\n",
+        "  author_email: worker@example.invalid\n  replication:\n    remote: fictional-backup\n    branch: main\n    timeout_seconds: 5\n    initial_backoff_seconds: 1\n    maximum_backoff_seconds: 4\n",
+    );
+    let settings = WorkerSettings::decode(&yaml)
+        .unwrap_or_else(|error| panic!("fixture settings must decode: {error}"));
+    let bootstrap = WorkerBootstrap::open(settings)
+        .unwrap_or_else(|error| panic!("configured components must open: {error}"));
+    let (runtime, startup, _) = bootstrap
+        .start(created_at())
+        .unwrap_or_else(|error| panic!("configured Worker must start: {error}"));
+
+    assert_eq!(startup, StartupOutcome::Clean);
+    let deadline = Instant::now() + StandardDuration::from_secs(5);
+    let outcome = loop {
+        if let Some(outcome) = runtime.take_replication_event() {
+            break outcome;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background replication must report its initial push"
+        );
+        thread::sleep(StandardDuration::from_millis(10));
+    };
+    assert!(matches!(
+        outcome,
+        Ok(RemoteReplicationOutcome::Pushed { .. })
+    ));
 }
 
 #[cfg(unix)]

@@ -83,7 +83,6 @@ where
     write_startup_log(output, OffsetDateTime::now_utc(), &startup)?;
 
     let mut stopped_failures = 0;
-    let mut replication_error_reported = false;
     while !should_stop() {
         let operation_at = OffsetDateTime::now_utc();
         let outcome = runtime
@@ -95,16 +94,11 @@ where
             break;
         }
         write_poll_log(output, completed_at, &outcome)?;
-        match runtime.replicate_once(completed_at) {
-            Ok(replication) => {
-                replication_error_reported = false;
-                write_replication_log(output, completed_at, replication.as_ref())?;
+        if let Some(replication) = runtime.take_replication_event() {
+            match replication {
+                Ok(outcome) => write_replication_log(output, completed_at, Some(&outcome))?,
+                Err(_) => write_replication_error_log(output, completed_at)?,
             }
-            Err(_) if !replication_error_reported => {
-                write_replication_error_log(output, completed_at)?;
-                replication_error_reported = true;
-            }
-            Err(_) => {}
         }
         if let Some(duration) = wait_after_poll(&outcome, completed_at) {
             let _ = wait_for_termination(&stopping, duration);
@@ -144,6 +138,7 @@ where
             Some(record)
         }
         None
+        | Some(RemoteReplicationOutcome::Cancelled)
         | Some(RemoteReplicationOutcome::UpToDate { .. })
         | Some(RemoteReplicationOutcome::Deferred { .. }) => None,
     };
