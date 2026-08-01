@@ -310,7 +310,14 @@ that escapes the group before restarting recovery.
 
 The remote is an asynchronous backup target. A remote push failure does not
 roll back a locally committed and published change. The Worker records that the
-remote is behind and retries the push.
+remote is behind and retries the push. The current official commit is the
+authoritative synchronization target, so a crash between local publication and
+retry-state persistence cannot lose a push. The Worker durably records the last
+confirmed remote commit, consecutive failures, and the next retry time. Pushes
+use an exact commit-to-branch refspec, a non-interactive credential mode, a
+per-attempt timeout, and capped exponential backoff. They never force-update the
+remote branch and do not hold the local repository writer lock while waiting on
+the network.
 
 ## 8. Storage layout
 
@@ -1420,7 +1427,7 @@ Configuration, rather than architecture, controls:
 - Git remote name and branch;
 - Quartz command and configuration;
 - release retention;
-- retry limits and backoff;
+- retry timeouts and backoff;
 - title length;
 - search backend; and
 - CLI output format.
@@ -1522,7 +1529,7 @@ Implementation proceeds in these increments:
 5. Quartz trial builds and atomic releases.
 6. OpenSSH forced-command Gateway and client SSH transport.
 7. Committed reads and initial full-text search.
-8. Request status (implemented), remote push retry, operational status, and
+8. Request status and remote push retry (implemented), operational status, and
    retention.
 9. Optional container and single-replica Kubernetes packaging.
 
