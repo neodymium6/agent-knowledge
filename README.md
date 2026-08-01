@@ -9,12 +9,14 @@ restricted gateway; they do not synchronize the repository with Git.
 
 ## Status
 
-The architecture is defined, and delivery increments 1 through 7 are
-implemented. The current executable can accept requests locally or through an
+The architecture is defined, delivery increments 1 through 7 are implemented,
+and the request-status portion of increment 8 is complete. The current
+executable can accept requests locally or through an
 OpenSSH forced command, process them through the single Writer, and publish
 immutable Quartz releases. Coding agents can list, retrieve, and search an
-exact committed content snapshot through the same Gateway. Bundle export,
-request status, remote-push retry, retention, and packaging remain future work.
+exact committed content snapshot and inspect durable request state through the
+same Gateway. Bundle export, remote-push retry, retention, and packaging remain
+future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -59,6 +61,14 @@ agent-knowledge client submit \
   --timeout-seconds 300
 ```
 
+Inspect the durable state of an accepted request:
+
+```sh
+agent-knowledge client status \
+  --destination fictional-knowledge \
+  --request-id 01K00000000000000000000000
+```
+
 Search committed Markdown and configured metadata through that alias:
 
 ```sh
@@ -69,17 +79,19 @@ agent-knowledge client search \
   --maximum-results 25
 ```
 
-The `list`, `recent`, `get`, and `search` commands return strict versioned JSON.
-Every successful response identifies the exact official Git commit used for
-the operation. List and search operations support exact project, tag, and
-session filters; archived documents are excluded unless `--include-archived`
-is supplied. After a complete control request is received, one read-operation
-deadline covers Gateway repository initialization, content indexing, query
-work, response encoding, and delivery to the SSH channel. The response-byte
-limit includes the JSON Lines framing newline. Read processes open only the
-committed repository and content checkout; submit processes open only the
-durable queue after preflighting all configured storage destinations for
-overlap.
+The `list`, `recent`, `get`, `search`, and `status` commands return strict
+versioned JSON. Every successful committed-content response identifies the
+exact official Git commit used for the operation. List and search operations
+support exact project, tag, and session filters; archived documents are
+excluded unless `--include-archived` is supplied. Status returns `pending`,
+`processing`, `completed`, or `failed`; failed responses include the durable
+error code and failure time. An unknown request ID returns
+`REQUEST_NOT_FOUND`. After a complete control request is received, one
+read-operation deadline covers initialization, lookup or query work, response
+encoding, and delivery to the SSH channel. The response-byte limit includes
+the JSON Lines framing newline. Committed-content read processes open only the
+repository and content checkout. Status and submit processes open the durable
+queue, while status takes no queue locks and does not run maintenance.
 
 The client validates and snapshots at most 64 MiB of package data before
 network output. It then invokes the system `ssh` executable directly, uses

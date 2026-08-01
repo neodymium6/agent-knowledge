@@ -260,6 +260,50 @@ fn parses_committed_read_and_search_commands() {
 }
 
 #[test]
+fn parses_request_status_command() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "client".into(),
+        "status".into(),
+        "--destination".into(),
+        "fictional-knowledge".into(),
+        "--request-id".into(),
+        "01K00000000000000000000000".into(),
+        "--timeout-seconds".into(),
+        "42".into(),
+    ])
+    .unwrap_or_else(|error| panic!("client status command must parse: {error}"));
+    assert!(matches!(
+        command,
+        Command::ClientStatus { destination, request, timeout }
+            if destination == "fictional-knowledge"
+                && request.request_id.to_string() == "01K00000000000000000000000"
+                && timeout == std::time::Duration::from_secs(42)
+    ));
+
+    for arguments in [
+        vec![
+            "agent-knowledge".into(),
+            "client".into(),
+            "status".into(),
+            "--destination".into(),
+            "fictional-knowledge".into(),
+        ],
+        vec![
+            "agent-knowledge".into(),
+            "client".into(),
+            "status".into(),
+            "--destination".into(),
+            "fictional-knowledge".into(),
+            "--request-id".into(),
+            "invalid".into(),
+        ],
+    ] {
+        assert!(matches!(parse_arguments(arguments), Err(CliError::Usage)));
+    }
+}
+
+#[test]
 fn rejects_invalid_committed_read_arguments() {
     for arguments in [
         vec![

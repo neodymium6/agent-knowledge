@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use agent_knowledge_protocol::{
     GetRequest, LIST_COMMAND, ListRequest, ListResponse, RECENT_COMMAND, ReadFilterRequest,
-    SEARCH_COMMAND, SearchRequest,
+    SEARCH_COMMAND, SearchRequest, StatusRequest,
 };
 use agent_knowledge_queue::{
     EnqueueOutcome, FileQueue, PackagePolicy, PackageValidationError, QueueError, validate_package,
@@ -24,6 +24,7 @@ const USAGE: &str = "usage:\n\
     agent-knowledge client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge client recent --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge client get --destination <ssh-destination> --document-id <id> [--timeout-seconds <seconds>]\n\
+    agent-knowledge client status --destination <ssh-destination> --request-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge client search --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge gateway --config <path> --client-id <id>\n\
     agent-knowledge worker run --config <path>";
@@ -84,6 +85,11 @@ where
             output,
         )
         .map_err(CliError::Client),
+        Command::ClientStatus {
+            destination,
+            request,
+            timeout,
+        } => client::status(&destination, &request, timeout, output).map_err(CliError::Client),
     }
 }
 
@@ -118,6 +124,11 @@ enum Command {
     ClientSearch {
         destination: OsString,
         request: SearchRequest,
+        timeout: Duration,
+    },
+    ClientStatus {
+        destination: OsString,
+        request: StatusRequest,
         timeout: Duration,
     },
 }
@@ -158,6 +169,12 @@ where
                 && action == std::ffi::OsStr::new("search") =>
         {
             parse_client_search_arguments(arguments)
+        }
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("client")
+                && action == std::ffi::OsStr::new("status") =>
+        {
+            parse_client_status_arguments(arguments)
         }
         (Some(namespace), Some(action))
             if namespace == std::ffi::OsStr::new("admin")
@@ -346,6 +363,38 @@ where
     Ok(Command::ClientGet {
         destination: destination.ok_or(CliError::Usage)?,
         request: GetRequest::new(document_id.ok_or(CliError::Usage)?),
+        timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECONDS)),
+    })
+}
+
+fn parse_client_status_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut destination = None;
+    let mut request_id = None;
+    let mut timeout_seconds = None;
+    while let Some(flag) = arguments.next() {
+        let value = arguments.next().ok_or(CliError::Usage)?;
+        match flag.to_str() {
+            Some("--destination") if destination.is_none() => destination = Some(value),
+            Some("--request-id") if request_id.is_none() => {
+                request_id = Some(
+                    value
+                        .to_str()
+                        .and_then(|value| value.parse().ok())
+                        .ok_or(CliError::Usage)?,
+                );
+            }
+            Some("--timeout-seconds") if timeout_seconds.is_none() => {
+                timeout_seconds = Some(parse_bounded_u64(&value, MAXIMUM_CLIENT_TIMEOUT_SECONDS)?);
+            }
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(Command::ClientStatus {
+        destination: destination.ok_or(CliError::Usage)?,
+        request: StatusRequest::new(request_id.ok_or(CliError::Usage)?),
         timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECONDS)),
     })
 }
