@@ -1,5 +1,5 @@
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
@@ -33,12 +33,55 @@ pub struct WorkerSettings {
     limits: WorkerRunLimits,
 }
 
+#[cfg(target_os = "linux")]
+fn open_linux_config_file(path: &Path) -> Result<(File, Metadata, File), WorkerConfigError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let anchor = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC)
+        .open(path)
+        .map_err(WorkerConfigError::Io)?;
+    let metadata = anchor.metadata().map_err(WorkerConfigError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(WorkerConfigError::InvalidFileType);
+    }
+    let stable_path = PathBuf::from(format!("/proc/self/fd/{}", anchor.as_raw_fd()));
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC)
+        .open(stable_path)
+        .map_err(WorkerConfigError::Io)?;
+    let read_metadata = file.metadata().map_err(WorkerConfigError::Io)?;
+    if metadata.dev() != read_metadata.dev() || metadata.ino() != read_metadata.ino() {
+        return Err(WorkerConfigError::InvalidFileType);
+    }
+    Ok((file, metadata, anchor))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_config_file(path: &Path) -> Result<(File, Metadata), WorkerConfigError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(WorkerConfigError::Io)?;
+    let metadata = file.metadata().map_err(WorkerConfigError::Io)?;
+    Ok((file, metadata))
+}
+
 impl WorkerSettings {
     /// Loads and validates one bounded YAML configuration file.
     ///
     /// Symbolic links to regular files are supported for Kubernetes projected
-    /// configuration. The selected target is opened once, validated through
-    /// that descriptor, and retained through the complete bounded read.
+    /// configuration. On Linux, the selected target is pinned without opening
+    /// it for I/O, validated through that descriptor, and read only through the
+    /// descriptor-backed path while the pin remains alive.
     ///
     /// # Errors
     ///
@@ -46,16 +89,10 @@ impl WorkerSettings {
     /// invalid YAML, unsupported versions, or invalid operational values.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, WorkerConfigError> {
         let path = path.as_ref();
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-
-            options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
-        }
-        let file = options.open(path).map_err(WorkerConfigError::Io)?;
-        let metadata = file.metadata().map_err(WorkerConfigError::Io)?;
+        #[cfg(target_os = "linux")]
+        let (file, metadata, _anchor) = open_linux_config_file(path)?;
+        #[cfg(not(target_os = "linux"))]
+        let (file, metadata) = open_config_file(path)?;
         if !metadata.file_type().is_file() {
             return Err(WorkerConfigError::InvalidFileType);
         }

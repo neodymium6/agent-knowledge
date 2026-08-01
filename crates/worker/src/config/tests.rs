@@ -228,3 +228,12 @@ fn load_rejects_a_fifo_without_blocking() {
         Err(WorkerConfigError::InvalidFileType)
     ));
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn load_rejects_a_device_without_reading_it() {
+    assert!(matches!(
+        WorkerSettings::load("/dev/null"),
+        Err(WorkerConfigError::InvalidFileType)
+    ));
+}
