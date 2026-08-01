@@ -80,6 +80,7 @@ impl QuartzBuilder {
         let configured_program = canonical_regular_file(program.as_ref())?;
         let program_handle =
             Arc::new(File::open(&configured_program).map_err(QuartzBuildError::Io)?);
+        validate_executable_program(&configured_program, &program_handle)?;
         let configured_integration_directory = canonical_directory(integration_directory.as_ref())?;
         let integration_handle =
             Arc::new(File::open(&configured_integration_directory).map_err(QuartzBuildError::Io)?);
@@ -405,19 +406,23 @@ fn canonical_regular_file(path: &Path) -> Result<PathBuf, QuartzBuildError> {
     if !metadata.file_type().is_file() {
         return Err(QuartzBuildError::InvalidProgram);
     }
+    Ok(path)
+}
+
+fn validate_executable_program(path: &Path, pinned: &File) -> Result<(), QuartzBuildError> {
     #[cfg(unix)]
     {
         use nix::fcntl::{AT_FDCWD, AtFlags};
         use nix::unistd::{AccessFlags, faccessat};
 
-        if let Err(error) = faccessat(AT_FDCWD, &path, AccessFlags::X_OK, AtFlags::AT_EACCESS) {
+        if let Err(error) = faccessat(AT_FDCWD, path, AccessFlags::X_OK, AtFlags::AT_EACCESS) {
             return match error {
                 Errno::EACCES | Errno::EPERM => Err(QuartzBuildError::InvalidProgram),
                 error => Err(process_error(error as i32)),
             };
         }
     }
-    Ok(path)
+    validate_pinned_file(path, pinned)
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, QuartzBuildError> {

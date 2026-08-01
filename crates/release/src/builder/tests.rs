@@ -12,6 +12,8 @@ use std::os::unix::fs::PermissionsExt;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
+#[cfg(unix)]
+use super::validate_executable_program;
 use super::{
     BUILD_PROCESS_LEASE, BuildProcessLease, ChildGuard, QuartzBuildError, QuartzBuilder,
     enforce_output_limits, spawn_quartz,
@@ -611,6 +613,25 @@ fn rejects_a_non_executable_launcher_during_initialization() {
     assert!(matches!(
         QuartzBuilder::new(&program, &integration, Duration::from_secs(2)),
         Err(QuartzBuildError::InvalidProgram)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn executable_validation_rejects_a_launcher_replaced_after_open() {
+    let root = TestDirectory::new();
+    let program = root.0.join("quartz-launcher");
+    fs::write(&program, b"#!/bin/sh\nexit 0\n")
+        .unwrap_or_else(|error| panic!("non-executable launcher must be written: {error}"));
+    let pinned =
+        fs::File::open(&program).unwrap_or_else(|error| panic!("launcher must be pinned: {error}"));
+    fs::rename(&program, root.0.join("pinned-non-executable"))
+        .unwrap_or_else(|error| panic!("pinned launcher must be moved: {error}"));
+    executable(&program, "#!/bin/sh\nexit 0\n");
+
+    assert!(matches!(
+        validate_executable_program(&program, &pinned),
+        Err(QuartzBuildError::CommandIdentityChanged)
     ));
 }
 
