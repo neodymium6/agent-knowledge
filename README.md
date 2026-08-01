@@ -97,10 +97,12 @@ it sleeps until a retry is due, with a bounded low-frequency verification poll.
 It persists the last confirmed commit, a fingerprint of the configured push
 URL, and an exponential retry deadline under the bare repository. It caps delay
 at `maximum_backoff_seconds`, disables interactive Git and SSH credential
-prompts, and applies `timeout_seconds` to the complete attempt, including local
-Git inspection. Each push uses an isolated temporary Git directory and the
-exact validated URL snapshot, so later changes to the main repository's local
-Git configuration cannot change that attempt's destination or behavior.
+prompts, and applies one `timeout_seconds` deadline to every Git subprocess in
+an attempt, including local Git inspection. Local replication-state filesystem
+I/O is outside that subprocess deadline. Each push uses an isolated temporary
+Git directory and the exact validated URL snapshot, so later changes to the
+main repository's local Git configuration cannot change that attempt's
+destination or behavior.
 
 Submit a validated request package through an SSH host alias:
 
