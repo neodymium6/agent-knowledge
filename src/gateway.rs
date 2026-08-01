@@ -9,7 +9,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use agent_knowledge_core::ErrorCode;
-use agent_knowledge_gateway::{Gateway, GatewayConfigError, GatewayError, GatewaySettings};
+use agent_knowledge_gateway::{
+    GatewayConfigError, GatewayError, GatewaySettings, ReadGateway, SubmitGateway,
+};
 use agent_knowledge_protocol::{ClientId, ClientIdError, GatewayCommand, ProtocolErrorResponse};
 use serde::de::DeserializeOwned;
 
@@ -74,7 +76,7 @@ where
         .map_err(|_| GatewayCommandError::InvalidCommand)?;
     match command {
         GatewayCommand::Submit => {
-            let gateway = Gateway::open_for_submit(&settings)
+            let gateway = SubmitGateway::open(&settings)
                 .map_err(|error| GatewayCommandError::Gateway(Box::new(error)))?;
             let response = gateway
                 .submit(client_id, input)
@@ -86,7 +88,7 @@ where
             let request = decode_control_request(input)?;
             let deadline = read_deadline(&settings);
             let gateway =
-                Gateway::open_for_read_until(&settings, Some(deadline)).map_err(gateway_error)?;
+                ReadGateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
             let encoded = gateway
                 .list_encoded_until(&request, false, deadline)
                 .map_err(gateway_error)?;
@@ -96,7 +98,7 @@ where
             let request = decode_control_request(input)?;
             let deadline = read_deadline(&settings);
             let gateway =
-                Gateway::open_for_read_until(&settings, Some(deadline)).map_err(gateway_error)?;
+                ReadGateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
             let encoded = gateway
                 .list_encoded_until(&request, true, deadline)
                 .map_err(gateway_error)?;
@@ -106,7 +108,7 @@ where
             let request = decode_control_request(input)?;
             let deadline = read_deadline(&settings);
             let gateway =
-                Gateway::open_for_read_until(&settings, Some(deadline)).map_err(gateway_error)?;
+                ReadGateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
             let encoded = gateway
                 .get_encoded_until(request, deadline)
                 .map_err(gateway_error)?;
@@ -116,7 +118,7 @@ where
             let request = decode_control_request(input)?;
             let deadline = read_deadline(&settings);
             let gateway =
-                Gateway::open_for_read_until(&settings, Some(deadline)).map_err(gateway_error)?;
+                ReadGateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
             let encoded = gateway
                 .search_encoded_until(&request, deadline)
                 .map_err(gateway_error)?;

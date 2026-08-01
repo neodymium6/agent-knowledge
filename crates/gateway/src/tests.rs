@@ -11,7 +11,7 @@ use agent_knowledge_protocol::{
 use agent_knowledge_queue::{PackagePolicy, validate_accepted_package};
 use tar::{Builder, EntryType, Header};
 
-use super::{ArchiveError, Gateway, GatewayError, GatewaySettings};
+use super::{ArchiveError, GatewayError, GatewaySettings, ReadGateway, SubmitGateway};
 
 const REQUEST_ID: &str = "01K00000000000000000000000";
 const REQUEST_JSON: &[u8] = br#"{
@@ -68,16 +68,16 @@ impl Drop for TestDirectory {
     }
 }
 
-fn gateway(root: &TestDirectory) -> Gateway {
+fn gateway(root: &TestDirectory) -> SubmitGateway {
     let settings = settings(root);
-    Gateway::open_for_submit(&settings)
+    SubmitGateway::open(&settings)
         .unwrap_or_else(|error| panic!("submit Gateway must open: {error}"))
 }
 
-fn read_gateway(root: &TestDirectory) -> Gateway {
+fn read_gateway(root: &TestDirectory) -> ReadGateway {
     initialize_committed_content(root);
     let settings = settings(root);
-    Gateway::open_for_read_until(&settings, None)
+    ReadGateway::open_until(&settings, None)
         .unwrap_or_else(|error| panic!("read Gateway must open: {error}"))
 }
 
@@ -225,7 +225,7 @@ fn committed_reads_do_not_open_the_queue_path() {
     let queue_socket = UnixListener::bind(root.path().join("queue"))
         .unwrap_or_else(|error| panic!("fictional queue socket must bind: {error}"));
     let settings = settings(&root);
-    let gateway = Gateway::open_for_read_until(&settings, None)
+    let gateway = ReadGateway::open_until(&settings, None)
         .unwrap_or_else(|error| panic!("read Gateway must ignore the queue path: {error}"));
     let response = gateway
         .list(&ListRequest::new(ReadFilterRequest::default(), 10))
@@ -248,7 +248,7 @@ fn rejects_overlapping_storage_before_initializing_the_queue() {
     let settings = GatewaySettings::decode(&yaml)
         .unwrap_or_else(|error| panic!("overlap settings must decode: {error}"));
     assert!(matches!(
-        Gateway::open_for_submit(&settings),
+        SubmitGateway::open(&settings),
         Err(GatewayError::OverlappingStorage)
     ));
     assert!(!content.join("queue-id").exists());
