@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
@@ -16,14 +16,14 @@ use agent_knowledge_queue::{
 };
 use agent_knowledge_release::{QuartzBuilder, ReleasePolicy, ReleaseStore};
 use agent_knowledge_repository::{
-    BatchCommitOutcome, BatchPublication, ContentPolicy, GitIdentity, GitRepository,
+    BatchCommitOutcome, BatchPublication, ClaimedBatch, ContentPolicy, GitIdentity, GitRepository,
     GitTransactionError, PublicationError,
 };
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
-    BatchCloseReason, BatchProcessor, BatchSchedule, StartupOutcome, WorkerPollOutcome,
-    WorkerRunError, WorkerRunLimits, WorkerRunOutcome, WorkerRuntime,
+    BatchCloseReason, BatchProcessor, BatchSchedule, InterruptibleStart, StartupOutcome,
+    WorkerPollOutcome, WorkerRunError, WorkerRunLimits, WorkerRunOutcome, WorkerRuntime,
 };
 
 const REQUEST_ID: &str = "01K00000000000000000000001";
@@ -239,6 +239,55 @@ fn enqueue_and_claim(queue: &FileQueue, worker: &mut WorkerSession) -> ClaimedPa
         .unwrap_or_else(|error| panic!("package must be claimed: {error}"))
 }
 
+fn write_preparing_journal(
+    fixture: &Fixture,
+    worker: &WorkerSession,
+    claim: &ClaimedPackage,
+    journal_batch_id: BatchId,
+    claim_failures: usize,
+) {
+    let queue_identity = worker
+        .queue_identity()
+        .unwrap_or_else(|error| panic!("queue identity must remain available: {error}"));
+    let output = Command::new("git")
+        .arg(format!("--git-dir={}", fixture.repository_path.display()))
+        .args(["rev-parse", "main"])
+        .output()
+        .unwrap_or_else(|error| panic!("base commit command must run: {error}"));
+    assert!(output.status.success());
+    let base_commit = String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| panic!("base commit must be UTF-8: {error}"));
+    let acceptance_sequence = claim
+        .package()
+        .acceptance()
+        .unwrap_or_else(|| panic!("claimed package must retain acceptance metadata"))
+        .sequence;
+    let journal = format!(
+        "{{\n\
+         \"schema_version\": 3,\n\
+         \"batch_id\": \"{journal_batch_id}\",\n\
+         \"queue_identity\": \"{queue_identity}\",\n\
+         \"base_commit\": \"{}\",\n\
+         \"claim_failures\": {claim_failures},\n\
+         \"claims\": [{{\n\
+           \"request_id\": \"{REQUEST_ID}\",\n\
+           \"attempt\": {},\n\
+           \"acceptance_sequence\": {acceptance_sequence}\n\
+         }}],\n\
+         \"state\": {{\"phase\": \"preparing\"}}\n\
+         }}\n",
+        base_commit.trim(),
+        claim.token().attempt()
+    );
+    fs::write(
+        fixture
+            .work_path
+            .join(format!("transactions/{journal_batch_id}.json")),
+        journal,
+    )
+    .unwrap_or_else(|error| panic!("preparing journal fixture must be written: {error}"));
+}
+
 fn enqueue_create(queue: &FileQueue) {
     enqueue_create_with_ids(queue, REQUEST_ID, DOCUMENT_ID);
 }
@@ -346,7 +395,7 @@ fn publishes_release_before_completing_the_queue_and_journal() {
     let processor = fixture.processor(repository);
 
     let outcome = processor
-        .process(&mut worker, batch_id(), &[claim], created_at())
+        .process(&mut worker, batch_id(), &[claim], 0, created_at())
         .unwrap_or_else(|error| panic!("batch must publish: {error}"));
     let BatchCommitOutcome::Committed { commit, .. } = outcome else {
         panic!("create request must commit");
@@ -393,7 +442,7 @@ fn recovery_prepares_release_before_advancing_an_interrupted_commit() {
     let result = repository.apply_batch_with_publication(
         &mut worker,
         batch_id(),
-        std::slice::from_ref(&claim),
+        ClaimedBatch::new(std::slice::from_ref(&claim), 0),
         ContentPolicy::default(),
         &PackagePolicy::default(),
         BatchPublication::new(
@@ -472,6 +521,7 @@ fn trial_failure_cleans_transaction_artifacts_for_an_exact_retry() {
                 &mut worker,
                 batch_id(),
                 std::slice::from_ref(&claim),
+                0,
                 created_at(),
             )
             .is_err()
@@ -483,7 +533,7 @@ fn trial_failure_cleans_transaction_artifacts_for_an_exact_retry() {
         0
     );
     let outcome = processor
-        .process(&mut worker, batch_id(), &[claim], created_at())
+        .process(&mut worker, batch_id(), &[claim], 0, created_at())
         .unwrap_or_else(|error| panic!("exact batch retry must publish: {error}"));
     assert!(matches!(outcome, BatchCommitOutcome::Committed { .. }));
 }
@@ -504,6 +554,7 @@ fn repository_failure_after_trial_discards_unconsumed_build() {
                 &mut worker,
                 batch_id(),
                 std::slice::from_ref(&claim),
+                0,
                 created_at(),
             )
             .is_err()
@@ -532,7 +583,7 @@ fn all_failed_batch_reconciles_without_creating_a_release() {
     let processor = fixture.processor(repository);
 
     let outcome = processor
-        .process(&mut worker, batch_id(), &[claim], created_at())
+        .process(&mut worker, batch_id(), &[claim], 0, created_at())
         .unwrap_or_else(|error| panic!("failed batch must finalize: {error}"));
     assert!(matches!(
         outcome,
@@ -638,7 +689,7 @@ fn runtime_resumes_a_terminal_repository_transaction() {
     let result = repository.apply_batch_with_publication(
         &mut worker,
         batch_id(),
-        std::slice::from_ref(&claim),
+        ClaimedBatch::new(std::slice::from_ref(&claim), 2),
         ContentPolicy::default(),
         &PackagePolicy::default(),
         BatchPublication::new(
@@ -667,6 +718,34 @@ fn runtime_resumes_a_terminal_repository_transaction() {
     assert!(matches!(result, Err(GitTransactionError::TrialBuildFailed)));
     drop(worker);
 
+    assert!(matches!(
+        WorkerRuntime::start_interruptible(
+            &queue,
+            fixture.processor(repository.clone()),
+            Default::default(),
+            created_at(),
+            &|| true,
+        ),
+        Ok(InterruptibleStart::Stopped { failed_requests: 2 })
+    ));
+
+    let stop_checks = Cell::new(0_u8);
+    let stop_after_discovery = || {
+        let current = stop_checks.get();
+        stop_checks.set(current.saturating_add(1));
+        current >= 1
+    };
+    assert!(matches!(
+        WorkerRuntime::start_interruptible(
+            &queue,
+            fixture.processor(repository.clone()),
+            Default::default(),
+            created_at(),
+            &stop_after_discovery,
+        ),
+        Ok(InterruptibleStart::Stopped { failed_requests: 2 })
+    ));
+
     let (_runtime, startup) = WorkerRuntime::start(
         &queue,
         fixture.processor(repository),
@@ -679,6 +758,7 @@ fn runtime_resumes_a_terminal_repository_transaction() {
         StartupOutcome::Resumed {
             batch_id: resumed_batch,
             outcome: BatchCommitOutcome::Committed { .. },
+            claim_failures: 2,
         } if resumed_batch == batch_id()
     ));
     assert!(
@@ -696,46 +776,25 @@ fn runtime_replays_a_preparing_repository_transaction() {
     let repository = fixture.repository();
     let (queue, mut worker) = fixture.queue_and_worker();
     let claim = enqueue_and_claim(&queue, &mut worker);
-    let queue_identity = worker
-        .queue_identity()
-        .unwrap_or_else(|error| panic!("queue identity must remain available: {error}"));
-    let output = Command::new("git")
-        .arg(format!("--git-dir={}", fixture.repository_path.display()))
-        .args(["rev-parse", "main"])
-        .output()
-        .unwrap_or_else(|error| panic!("base commit command must run: {error}"));
-    assert!(output.status.success());
-    let base_commit = String::from_utf8(output.stdout)
-        .unwrap_or_else(|error| panic!("base commit must be UTF-8: {error}"));
-    let acceptance_sequence = claim
-        .package()
-        .acceptance()
-        .unwrap_or_else(|| panic!("claimed package must retain acceptance metadata"))
-        .sequence;
-    let journal = format!(
-        "{{\n\
-         \"schema_version\": 2,\n\
-         \"batch_id\": \"{BATCH_ID}\",\n\
-         \"queue_identity\": \"{queue_identity}\",\n\
-         \"base_commit\": \"{}\",\n\
-         \"claims\": [{{\n\
-           \"request_id\": \"{REQUEST_ID}\",\n\
-           \"attempt\": {},\n\
-           \"acceptance_sequence\": {acceptance_sequence}\n\
-         }}],\n\
-         \"state\": {{\"phase\": \"preparing\"}}\n\
-         }}\n",
-        base_commit.trim(),
-        claim.token().attempt()
-    );
-    fs::write(
-        fixture
-            .work_path
-            .join(format!("transactions/{BATCH_ID}.json")),
-        journal,
-    )
-    .unwrap_or_else(|error| panic!("preparing journal fixture must be written: {error}"));
+    write_preparing_journal(&fixture, &worker, &claim, batch_id(), 4);
     drop(worker);
+
+    let stop_checks = Cell::new(0_u8);
+    let stop_after_discovery = || {
+        let current = stop_checks.get();
+        stop_checks.set(current.saturating_add(1));
+        current >= 1
+    };
+    assert!(matches!(
+        WorkerRuntime::start_interruptible(
+            &queue,
+            fixture.processor(repository.clone()),
+            Default::default(),
+            created_at(),
+            &stop_after_discovery,
+        ),
+        Ok(InterruptibleStart::Stopped { failed_requests: 4 })
+    ));
 
     let (_runtime, startup) = WorkerRuntime::start(
         &queue,
@@ -749,6 +808,7 @@ fn runtime_replays_a_preparing_repository_transaction() {
         StartupOutcome::Resumed {
             batch_id: resumed_batch,
             outcome: BatchCommitOutcome::Committed { .. },
+            claim_failures: 4,
         } if resumed_batch == batch_id()
     ));
     assert!(
@@ -758,6 +818,106 @@ fn runtime_replays_a_preparing_repository_transaction() {
             .join(format!("queue/{}/{REQUEST_ID}", QueueState::Completed))
             .is_dir()
     );
+}
+
+#[test]
+fn recovery_batch_mismatch_retains_journaled_claim_failures() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let (queue, mut worker) = fixture.queue_and_worker();
+    let claim = enqueue_and_claim(&queue, &mut worker);
+    let journal_batch_id: BatchId = "01K00000000000000000000009"
+        .parse()
+        .unwrap_or_else(|error| panic!("journal batch ID must parse: {error}"));
+    write_preparing_journal(&fixture, &worker, &claim, journal_batch_id, 6);
+    drop(worker);
+
+    let error = match WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    ) {
+        Ok(_) => panic!("mismatched recovery batches must fail"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        WorkerRunError::TransactionBatchMismatch {
+            processing,
+            repository,
+            failed_requests: 6,
+        } if processing == batch_id() && repository == journal_batch_id
+    ));
+}
+
+#[test]
+fn multiple_processing_batches_retain_journaled_claim_failures() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let (queue, mut worker) = fixture.queue_and_worker();
+    let first = enqueue_and_claim(&queue, &mut worker);
+    enqueue_create_with_ids(&queue, SECOND_REQUEST_ID, SECOND_DOCUMENT_ID);
+    let second_request_id: RequestId = SECOND_REQUEST_ID
+        .parse()
+        .unwrap_or_else(|error| panic!("second request ID must parse: {error}"));
+    let second_batch_id: BatchId = "01K00000000000000000000010"
+        .parse()
+        .unwrap_or_else(|error| panic!("second batch ID must parse: {error}"));
+    worker
+        .claim(second_request_id, second_batch_id)
+        .unwrap_or_else(|error| panic!("second package must be claimed: {error}"));
+    write_preparing_journal(&fixture, &worker, &first, batch_id(), 8);
+    drop(worker);
+
+    let error = match WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    ) {
+        Ok(_) => panic!("multiple processing batches must fail recovery"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.failed_requests(), 8);
+    assert!(matches!(
+        error,
+        WorkerRunError::StartupRecovery { source, .. }
+            if matches!(*source, WorkerRunError::MultipleProcessingBatches { .. })
+    ));
+}
+
+#[test]
+fn missing_processing_claims_retain_journaled_claim_failures() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let (queue, mut worker) = fixture.queue_and_worker();
+    let claim = enqueue_and_claim(&queue, &mut worker);
+    worker
+        .requeue_claimed(claim.token())
+        .unwrap_or_else(|error| panic!("claim fixture must return to pending: {error}"));
+    write_preparing_journal(&fixture, &worker, &claim, batch_id(), 7);
+    drop(worker);
+
+    let error = match WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    ) {
+        Ok(_) => panic!("missing processing claims must fail"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        WorkerRunError::MissingProcessingClaims {
+            batch_id: missing,
+            failed_requests: 7,
+        } if missing == batch_id()
+    ));
 }
 
 #[test]
@@ -875,6 +1035,120 @@ fn scheduler_waits_for_debounce_before_processing() {
 }
 
 #[test]
+fn shutdown_between_claim_scans_prevents_a_new_transaction() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
+    enqueue_create(&queue);
+    enqueue_create_with_ids(&queue, SECOND_REQUEST_ID, SECOND_DOCUMENT_ID);
+    let two = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+    let one_hundred = NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN);
+    let limits = WorkerRunLimits::new(two, one_hundred, one_hundred);
+    let (mut runtime, startup) =
+        WorkerRuntime::start(&queue, fixture.processor(repository), limits, created_at())
+            .unwrap_or_else(|error| panic!("runtime must start: {error}"));
+    assert_eq!(startup, StartupOutcome::Clean);
+    let ready_time = OffsetDateTime::now_utc() + TimeDuration::minutes(10);
+    assert!(matches!(
+        runtime.poll_once(BatchSchedule::default(), ready_time),
+        Ok(WorkerPollOutcome::Scanning {
+            scanned_entries: 2,
+            ..
+        })
+    ));
+
+    let checks = Cell::new(0_u8);
+    let should_stop = || {
+        let current = checks.get();
+        checks.set(current.saturating_add(1));
+        current >= 2
+    };
+    assert_eq!(
+        runtime
+            .poll_once_interruptible(BatchSchedule::default(), ready_time, &should_stop)
+            .unwrap_or_else(|error| panic!("interruptible poll must remain valid: {error}")),
+        WorkerPollOutcome::Stopped { failed_requests: 0 }
+    );
+    assert_eq!(
+        fs::read_dir(fixture.work_path.join("transactions"))
+            .unwrap_or_else(|error| panic!("transactions must be readable: {error}"))
+            .count(),
+        0
+    );
+    assert!(matches!(
+        runtime.poll_once(BatchSchedule::default(), ready_time),
+        Err(WorkerRunError::RecoveryRequired)
+    ));
+
+    drop(runtime);
+    let startup_checks = Cell::new(0_u8);
+    let stop_during_recovery = || {
+        let current = startup_checks.get();
+        startup_checks.set(current.saturating_add(1));
+        current >= 1
+    };
+    assert!(matches!(
+        WorkerRuntime::start_interruptible(
+            &queue,
+            fixture.processor(fixture.repository()),
+            WorkerRunLimits::new(NonZeroUsize::MIN, one_hundred, one_hundred),
+            created_at(),
+            &stop_during_recovery,
+        ),
+        Ok(InterruptibleStart::Stopped { failed_requests: 0 })
+    ));
+}
+
+#[test]
+fn shutdown_reports_requests_failed_during_claiming() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
+    enqueue_create(&queue);
+    fs::write(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/pending/{REQUEST_ID}/digest")),
+        b"not-a-digest\n",
+    )
+    .unwrap_or_else(|error| panic!("corrupt package fixture must be written: {error}"));
+    let (mut runtime, startup) = WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("runtime must start: {error}"));
+    assert_eq!(startup, StartupOutcome::Clean);
+
+    let checks = Cell::new(0_u8);
+    let should_stop = || {
+        let current = checks.get();
+        checks.set(current.saturating_add(1));
+        current >= 2
+    };
+    let outcome = runtime
+        .poll_once_interruptible(
+            BatchSchedule::default(),
+            OffsetDateTime::now_utc() + TimeDuration::minutes(10),
+            &should_stop,
+        )
+        .unwrap_or_else(|error| panic!("interruptible poll must remain valid: {error}"));
+
+    assert_eq!(outcome, WorkerPollOutcome::Stopped { failed_requests: 1 });
+    assert!(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/{}/{REQUEST_ID}", QueueState::Failed))
+            .is_dir()
+    );
+}
+
+#[test]
 fn scheduler_leaves_arrivals_after_observation_for_the_next_batch() {
     let fixture = Fixture::create();
     let repository = fixture.repository();
@@ -952,6 +1226,7 @@ fn scheduler_reports_invalid_only_snapshots_without_a_commit() {
             .unwrap_or_else(|error| panic!("invalid snapshot must close: {error}")),
         WorkerPollOutcome::ClosedWithoutCommit {
             reason: BatchCloseReason::InvalidAcceptance,
+            failed_requests: 1,
         }
     );
     assert!(
@@ -961,6 +1236,96 @@ fn scheduler_reports_invalid_only_snapshots_without_a_commit() {
             .join(format!("queue/{}/{REQUEST_ID}", QueueState::Failed))
             .is_dir()
     );
+}
+
+#[test]
+fn scheduler_reports_claim_failures_in_a_committed_mixed_batch() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
+    enqueue_create(&queue);
+    enqueue_create_with_ids(&queue, SECOND_REQUEST_ID, SECOND_DOCUMENT_ID);
+    fs::write(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/pending/{REQUEST_ID}/digest")),
+        b"not-a-digest\n",
+    )
+    .unwrap_or_else(|error| panic!("corrupt package fixture must be written: {error}"));
+    let (mut runtime, startup) = WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("runtime must start: {error}"));
+    assert_eq!(startup, StartupOutcome::Clean);
+
+    let outcome = runtime
+        .poll_once(
+            BatchSchedule::default(),
+            OffsetDateTime::now_utc() + TimeDuration::minutes(10),
+        )
+        .unwrap_or_else(|error| panic!("mixed batch must finish: {error}"));
+    assert!(matches!(
+        outcome,
+        WorkerPollOutcome::Processed {
+            claim_failures: 1,
+            outcome: BatchCommitOutcome::Committed {
+                successful,
+                failures,
+                ..
+            },
+            ..
+        } if successful.len() == 1 && failures.is_empty()
+    ));
+    assert!(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/{}/{REQUEST_ID}", QueueState::Failed))
+            .is_dir()
+    );
+}
+
+#[test]
+fn processing_errors_retain_prior_claim_failure_counts() {
+    let fixture = Fixture::create_with_quartz_script(
+        b"content=\noutput=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-d\" ]; then content=$2; shift 2; elif [ \"$1\" = \"-o\" ]; then output=$2; shift 2; else shift; fi\ndone\nprintf '%s\\n' '<p>fictional site</p>' > \"$output/index.html\"\nprintf '%s\\n' 'unexpected mutation' > \"$content/untracked.txt\"\n",
+    );
+    let repository = fixture.repository();
+    let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
+    enqueue_create(&queue);
+    enqueue_create_with_ids(&queue, SECOND_REQUEST_ID, SECOND_DOCUMENT_ID);
+    fs::write(
+        fixture
+            .root
+            .path()
+            .join(format!("queue/pending/{REQUEST_ID}/digest")),
+        b"not-a-digest\n",
+    )
+    .unwrap_or_else(|error| panic!("corrupt package fixture must be written: {error}"));
+    let (mut runtime, startup) = WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("runtime must start: {error}"));
+    assert_eq!(startup, StartupOutcome::Clean);
+
+    let error = match runtime.poll_once(
+        BatchSchedule::default(),
+        OffsetDateTime::now_utc() + TimeDuration::minutes(10),
+    ) {
+        Ok(outcome) => panic!("mutated trial content must fail, got {outcome:?}"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.failed_requests(), 1);
 }
 
 #[test]

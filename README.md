@@ -39,3 +39,23 @@ Initialize the local Git hooks and run the repository checks:
 just init
 just check
 ```
+
+Run the Repository Worker with a validated deployment configuration:
+
+```sh
+agent-knowledge worker run --config /srv/agent-knowledge/worker.yaml
+```
+
+The Worker emits JSON Lines operational events. Every record includes
+`timestamp`, `severity`, `component`, and `event`. Terminal batch records also
+include `outcome`, `successful_requests`, and `failed_requests`; committed
+batches include `commit`. Failure counts include both queue validation and
+repository application. Queue-validation counts are retained in the durable
+repository transaction journal, so resumed batch events preserve them.
+Terminal process failures use a stable `error_code` and include any requests
+already rejected during the interrupted cycle.
+
+`SIGINT` and `SIGTERM` request graceful shutdown before a new durable
+transaction or after the current transaction completes. A supervisor must
+signal only the main Worker process initially and reserve group-wide `SIGKILL`
+for its hard-stop timeout.

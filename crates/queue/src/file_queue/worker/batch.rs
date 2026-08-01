@@ -20,9 +20,16 @@ pub enum BatchClaimOutcome {
         scanned_entries: usize,
         /// Earliest eligible requests retained for the batch.
         retained_candidates: usize,
+        /// Corrupt requests durably moved to failed so far.
+        failed_requests: usize,
     },
     /// The complete snapshot was scanned and its earliest requests were claimed.
-    Claimed(Vec<ClaimedPackage>),
+    Claimed {
+        /// Valid requests durably moved to processing.
+        claims: Vec<ClaimedPackage>,
+        /// Corrupt requests durably moved to failed while scanning.
+        failed_requests: usize,
+    },
 }
 
 /// Exclusive Repository Worker access to one file queue.
@@ -49,6 +56,7 @@ struct PendingBatchScan {
     batch_id: Option<BatchId>,
     maximum_requests: usize,
     maximum_sequence: u64,
+    failed_requests: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,8 +319,9 @@ impl WorkerSession {
                 )
             });
             if let Err(error) = result {
+                let failed_requests = self.pending_scan.failed_requests;
                 self.pending_scan = PendingBatchScan::default();
-                return Err(error);
+                return Err(with_scan_failures(error, failed_requests));
             }
         }
 
@@ -320,14 +329,19 @@ impl WorkerSession {
             return Ok(BatchClaimOutcome::Scanning {
                 scanned_entries,
                 retained_candidates: self.pending_scan.candidates.len(),
+                failed_requests: self.pending_scan.failed_requests,
             });
         }
 
         let candidates = std::mem::take(&mut self.pending_scan.candidates).into_sorted_vec();
+        let failed_requests = self.pending_scan.failed_requests;
         self.pending_scan = PendingBatchScan::default();
         let mut prepared = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let claim = self.queue.prepare_claim(candidate.request_id)?;
+            let claim = self
+                .queue
+                .prepare_claim(candidate.request_id)
+                .map_err(|error| with_scan_failures(error, failed_requests))?;
             prepared.push((candidate.request_id, claim));
         }
 
@@ -338,11 +352,14 @@ impl WorkerSession {
                 Ok(claim) => claimed.push(claim),
                 Err(error) => {
                     self.require_processing_recovery();
-                    return Err(error);
+                    return Err(with_scan_failures(error, failed_requests));
                 }
             }
         }
-        Ok(BatchClaimOutcome::Claimed(claimed))
+        Ok(BatchClaimOutcome::Claimed {
+            claims: claimed,
+            failed_requests,
+        })
     }
 
     pub(super) fn ensure_no_active_scan(&self) -> Result<(), WorkerQueueError> {
@@ -376,6 +393,17 @@ impl WorkerSession {
     pub(super) fn require_processing_recovery(&mut self) {
         self.processing_recovery_complete = false;
         self.processing_scan = None;
+    }
+}
+
+fn with_scan_failures(error: WorkerQueueError, failed_requests: usize) -> WorkerQueueError {
+    if failed_requests == 0 {
+        error
+    } else {
+        WorkerQueueError::BatchScanFailed {
+            failed_requests,
+            source: Box::new(error),
+        }
     }
 }
 
@@ -423,6 +451,7 @@ fn retain_pending_candidate(
             ) =>
         {
             queue.fail_pending(request_id, batch_id, error.error_code())?;
+            scan.failed_requests = scan.failed_requests.saturating_add(1);
             return Ok(());
         }
         Err(error) => return Err(error),

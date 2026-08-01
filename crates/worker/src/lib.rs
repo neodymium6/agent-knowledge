@@ -10,8 +10,9 @@ use agent_knowledge_release::{
     ActiveRelease, BuiltDirectory, PreparedRelease, QuartzBuildError, QuartzBuilder, ReleaseError,
     ReleaseStore,
 };
+pub use agent_knowledge_repository::BatchCommitOutcome;
 use agent_knowledge_repository::{
-    BatchCommitOutcome, BatchPublication, ContentPolicy, GitRepository, GitTransactionError,
+    BatchPublication, ClaimedBatch, ContentPolicy, GitRepository, GitTransactionError,
     PublicationError, RepositoryTransaction, RequestFailure,
 };
 use time::OffsetDateTime;
@@ -65,6 +66,24 @@ impl BatchProcessor {
             .map_err(BatchProcessorError::repository)
     }
 
+    /// Reads durable transaction metadata before queue recovery completes.
+    ///
+    /// This supports accurate interruption and failure reporting only. A
+    /// caller must still use [`Self::unfinished_transaction`] after queue
+    /// recovery before replaying repository state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the repository journal or queue binding is invalid.
+    pub fn unfinished_transaction_summary(
+        &self,
+        worker: &WorkerSession,
+    ) -> Result<Option<RepositoryTransaction>, BatchProcessorError> {
+        self.repository
+            .unfinished_transaction_summary(worker)
+            .map_err(BatchProcessorError::repository)
+    }
+
     /// Applies, publishes, reconciles, and finalizes one claimed batch.
     ///
     /// # Errors
@@ -78,6 +97,7 @@ impl BatchProcessor {
         worker: &mut WorkerSession,
         batch_id: BatchId,
         claims: &[ClaimedPackage],
+        claim_failures: usize,
         created_at: OffsetDateTime,
     ) -> Result<BatchCommitOutcome, BatchProcessorError> {
         let built = RefCell::new(None::<BuiltDirectory>);
@@ -87,7 +107,7 @@ impl BatchProcessor {
         let outcome = self.repository.apply_batch_with_publication(
             worker,
             batch_id,
-            claims,
+            ClaimedBatch::new(claims, claim_failures),
             self.content_policy,
             &self.package_policy,
             BatchPublication::new(
@@ -296,8 +316,8 @@ impl BatchProcessor {
 
 mod runtime;
 pub use runtime::{
-    StartupOutcome, WorkerPollOutcome, WorkerRunError, WorkerRunLimits, WorkerRunOutcome,
-    WorkerRuntime,
+    InterruptibleStart, StartupOutcome, WorkerPollOutcome, WorkerRunError, WorkerRunLimits,
+    WorkerRunOutcome, WorkerRuntime,
 };
 mod schedule;
 pub use schedule::{BatchCloseReason, BatchReadiness, BatchSchedule, BatchScheduleError};

@@ -156,6 +156,17 @@ by the application, but its parent directory must already exist so the
 application can durably synchronize the new root entry without recursively
 creating unsynchronized ancestors.
 
+The Worker process converts `SIGINT` and `SIGTERM` into a shutdown flag. It
+checks that flag between bounded queue scans, during bounded waits, and after a
+batch transaction completes. A signal never abandons a transaction halfway;
+the service supervisor may enforce a separate hard-stop timeout.
+
+For a systemd deployment, the service must use `KillMode=mixed` so the initial
+`SIGTERM` reaches only the Worker while a later hard stop reaches its whole
+control group. `TimeoutStopSec` must exceed the deployment's maximum expected
+Git and Quartz transaction duration. The supervisor must not start a
+replacement Worker until the previous service control group is empty.
+
 Before creating any storage root, the Worker pins each existing root or its
 nearest existing ancestor and compares canonical paths, device and inode
 identities, and Linux mount roots. This rejects equal, nested, symlink-aliased,
@@ -873,7 +884,10 @@ from validated packages and durable phase records. No other Worker transition
 is allowed until that recovery scan completes successfully; an error leaves the
 session recovery-gated. This also recovers requests for which rename succeeded
 but the previous process failed before returning a token or completing
-directory synchronization.
+directory synchronization. Before the bounded scan, the Worker performs a
+read-only validation of any repository journal and its queue binding so early
+shutdown or scan errors can report the journaled claim-failure count. It repeats
+full transaction discovery after queue recovery before any replay mutation.
 
 ## 17. Revisions and conflicts
 
@@ -907,32 +921,40 @@ The Worker performs these phases while holding the writer lock:
 1. Recover interrupted processing.
 2. Select a bounded batch of pending requests.
 3. Atomically move selected requests to `processing/`.
-4. Pin the current official commit.
-5. Create a detached temporary worktree and an internal transaction ref.
-6. Revalidate and apply each request in deterministic order.
-7. Remove permanently invalid requests from the candidate batch.
-8. Validate the resulting file hierarchy and Markdown.
-9. Build Quartz into a temporary directory.
-10. Create one Git commit for the successful requests.
-11. Atomically advance the official branch with an expected-old-commit check.
-12. Synchronize the canonical `content/` worktree.
-13. finalize and activate the new Quartz release.
-14. Mark successful requests `completed`.
-15. Mark permanent request failures `failed`.
-16. Schedule or perform the Git remote push.
-17. Remove disposable worktrees after their results are no longer needed.
+4. Record the number of requests rejected during selection in the durable
+   repository transaction journal.
+5. Pin the current official commit.
+6. Create a detached temporary worktree and an internal transaction ref.
+7. Revalidate and apply each request in deterministic order.
+8. Remove permanently invalid requests from the candidate batch.
+9. Validate the resulting file hierarchy and Markdown.
+10. Build Quartz into a temporary directory.
+11. Create one Git commit for the successful requests.
+12. Atomically advance the official branch with an expected-old-commit check.
+13. Synchronize the canonical `content/` worktree.
+14. Finalize and activate the new Quartz release.
+15. Mark successful requests `completed`.
+16. Mark permanent request failures `failed`.
+17. Schedule or perform the Git remote push.
+18. Remove disposable worktrees after their results are no longer needed.
 
 The branch update uses compare-and-swap semantics. An unexpected branch change
 stops publication and requires recovery; it is never overwritten.
 
 The Worker keeps one durable transaction journal at a time. A `preparing`
-journal is synchronized before disposable Git work begins. After the commit
-object and internal recovery ref exist, a `committed` journal containing the
-exact claim tokens and per-request outcomes is synchronized before the
-official branch can advance. A later batch cannot begin until this journal is
-reconciled and finalized. Each journal is bound to the canonical queue
+journal includes the bounded count of requests rejected during claim
+validation and is synchronized before disposable Git work begins. After the
+commit object and internal recovery ref exist, a `committed` journal
+containing the exact claim tokens and per-request outcomes is synchronized
+before the official branch can advance. A later batch cannot begin until this
+journal is reconciled and finalized. Each journal is bound to the canonical queue
 instance ID held by the live Worker session. Replacing a queue at the same path
 creates a different ID and invalidates sessions opened against the old queue.
+The reader accepts schema-version-2 journals written before claim-failure
+accounting was added, assigns them a zero count, and normalizes them to the
+current schema in memory. Any subsequent journal write uses the current
+schema; terminal recovery may instead remove the migrated journal after it is
+fully reconciled.
 
 Git 2.36 or newer is required. Git subprocesses discard inherited `GIT_*`
 overrides, disable system/global configuration, hooks, signing, fsmonitor, and
@@ -1387,6 +1409,18 @@ Processes emit structured logs with:
 - batch or release ID;
 - stable event or error code; and
 - retry attempt.
+
+Worker JSON Lines records always contain `timestamp`, `severity`, `component`,
+and a stable `event`. Completed and resumed batch records contain an
+`outcome`, `successful_requests`, and `failed_requests`; committed outcomes
+also contain the Git `commit`. Failure counts include queue validation failures
+detected while claiming and repository application failures. Terminal process
+failures contain a stable `error_code` and any claim-validation failure count
+already accumulated before the error. Graceful shutdown records the same count
+when it stops an in-progress claim scan. Repository journals retain the count
+through preparing and terminal recovery. The Worker resamples time after
+recovery or batch processing, so completion events record completion rather
+than operation-start time.
 
 Logs must not contain document bodies, attachment contents, private keys,
 tokens, or Git credentials.

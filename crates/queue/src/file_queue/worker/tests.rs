@@ -582,11 +582,12 @@ fn bounded_batch_claims_globally_earliest_acceptance_sequences() {
             Ok(BatchClaimOutcome::Scanning {
                 scanned_entries,
                 retained_candidates,
+                ..
             }) => {
                 assert_eq!(scanned_entries, 1);
                 assert!(retained_candidates <= 2);
             }
-            Ok(BatchClaimOutcome::Claimed(claimed)) => break claimed,
+            Ok(BatchClaimOutcome::Claimed { claims, .. }) => break claims,
             Err(error) => panic!("bounded batch scan must succeed: {error}"),
         }
     };
@@ -616,7 +617,7 @@ fn batch_snapshot_excludes_requests_accepted_during_its_scan() {
     let batch_id = parse_batch_id(FIRST_BATCH_ID);
     match worker.claim_next_batch(batch_id, 1, 10) {
         Ok(BatchClaimOutcome::Scanning { .. }) => {}
-        Ok(BatchClaimOutcome::Claimed(_)) => panic!("one-entry scan must remain resumable"),
+        Ok(BatchClaimOutcome::Claimed { .. }) => panic!("one-entry scan must remain resumable"),
         Err(error) => panic!("first scan step must succeed: {error}"),
     }
 
@@ -624,7 +625,7 @@ fn batch_snapshot_excludes_requests_accepted_during_its_scan() {
     let claimed = loop {
         match worker.claim_next_batch(batch_id, 1, 10) {
             Ok(BatchClaimOutcome::Scanning { .. }) => {}
-            Ok(BatchClaimOutcome::Claimed(claimed)) => break claimed,
+            Ok(BatchClaimOutcome::Claimed { claims, .. }) => break claims,
             Err(error) => panic!("snapshot scan must finish: {error}"),
         }
     };
@@ -678,7 +679,7 @@ fn observed_snapshot_boundary_excludes_later_arrivals_from_claiming() {
     let claimed = loop {
         match worker.claim_batch_through(batch_id, snapshot.maximum_sequence(), 1, 10) {
             Ok(BatchClaimOutcome::Scanning { .. }) => {}
-            Ok(BatchClaimOutcome::Claimed(claimed)) => break claimed,
+            Ok(BatchClaimOutcome::Claimed { claims, .. }) => break claims,
             Err(error) => panic!("observed snapshot must be claimable: {error}"),
         }
     };
@@ -795,7 +796,13 @@ fn impossible_acceptance_sequence_is_failed_instead_of_deferred() {
         10,
         10,
     ) {
-        Ok(BatchClaimOutcome::Claimed(claimed)) => claimed,
+        Ok(BatchClaimOutcome::Claimed {
+            claims,
+            failed_requests: 1,
+        }) => claims,
+        Ok(BatchClaimOutcome::Claimed {
+            failed_requests, ..
+        }) => panic!("one corrupt request must fail, got {failed_requests}"),
         Ok(BatchClaimOutcome::Scanning { .. }) => panic!("single entry claim must complete"),
         Err(error) => panic!("impossible sequence must be failed durably: {error}"),
     };
@@ -833,7 +840,13 @@ fn missing_acceptance_metadata_is_failed_instead_of_retried() {
         10,
         10,
     ) {
-        Ok(BatchClaimOutcome::Claimed(claimed)) => claimed,
+        Ok(BatchClaimOutcome::Claimed {
+            claims,
+            failed_requests: 1,
+        }) => claims,
+        Ok(BatchClaimOutcome::Claimed {
+            failed_requests, ..
+        }) => panic!("one corrupt request must fail, got {failed_requests}"),
         Ok(BatchClaimOutcome::Scanning { .. }) => panic!("single entry claim must complete"),
         Err(error) => panic!("missing acceptance must be failed durably: {error}"),
     };
@@ -863,15 +876,19 @@ fn corrupt_pending_request_is_failed_without_blocking_valid_candidates() {
     let mut worker = open_worker(&queue);
     let batch_id = parse_batch_id(FIRST_BATCH_ID);
 
-    let claimed = loop {
+    let (claimed, failed_requests) = loop {
         match worker.claim_next_batch(batch_id, 1, 10) {
             Ok(BatchClaimOutcome::Scanning { .. }) => {}
-            Ok(BatchClaimOutcome::Claimed(claimed)) => break claimed,
+            Ok(BatchClaimOutcome::Claimed {
+                claims,
+                failed_requests,
+            }) => break (claims, failed_requests),
             Err(error) => panic!("corrupt request must not block the valid batch: {error}"),
         }
     };
 
     assert_eq!(claimed.len(), 1);
+    assert_eq!(failed_requests, 1);
     assert_eq!(
         claimed[0].token().request_id().to_string(),
         VALID_REQUEST_ID
@@ -928,7 +945,7 @@ fn active_batch_scan_rejects_changed_identity_or_capacity() {
     let first_batch = parse_batch_id(FIRST_BATCH_ID);
     match worker.claim_next_batch(first_batch, 1, 1) {
         Ok(BatchClaimOutcome::Scanning { .. }) => {}
-        Ok(BatchClaimOutcome::Claimed(_)) => panic!("one-entry scan must remain resumable"),
+        Ok(BatchClaimOutcome::Claimed { .. }) => panic!("one-entry scan must remain resumable"),
         Err(error) => panic!("first scan step must succeed: {error}"),
     }
 

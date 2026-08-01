@@ -16,9 +16,9 @@ use agent_knowledge_queue::{
 use ulid::Ulid;
 
 use super::{
-    BatchCommitOutcome, GitIdentity, GitRepository, GitTransactionError, RepositoryTransaction,
-    TransactionHooks, accept_trial_build, interrupt_publication, parse_git_version, parse_text,
-    staged_stats,
+    BatchCommitOutcome, ClaimedBatch, GitIdentity, GitRepository, GitTransactionError,
+    RepositoryTransaction, TransactionHooks, accept_trial_build, decode_journal,
+    interrupt_publication, parse_git_version, parse_text, staged_stats, validate_journal_structure,
 };
 use crate::ContentPolicy;
 use crate::apply::AppliedMove;
@@ -28,6 +28,109 @@ const SECOND_REQUEST_ID: &str = "01K00000000000000000000002";
 const DOCUMENT_ID: &str = "01K00000000000000000000003";
 const BATCH_ID: &str = "01K00000000000000000000004";
 const SECOND_BATCH_ID: &str = "01K00000000000000000000005";
+
+#[test]
+fn migrates_schema_two_journals_for_every_recovery_phase() {
+    let base = "0123456789abcdef0123456789abcdef01234567";
+    let commit = "89abcdef0123456789abcdef0123456789abcdef";
+    let states = [
+        serde_json::json!({"phase": "preparing"}),
+        serde_json::json!({
+            "phase": "no_changes",
+            "failures": [{
+                "request_id": FIRST_REQUEST_ID,
+                "error_code": "CONTENT_VALIDATION_FAILED"
+            }]
+        }),
+        serde_json::json!({
+            "phase": "committed",
+            "commit": commit,
+            "successful": [FIRST_REQUEST_ID],
+            "failures": [],
+            "publication_started": false
+        }),
+    ];
+
+    for (index, state) in states.into_iter().enumerate() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "batch_id": BATCH_ID,
+            "queue_identity": format!("sha256:{}", "0".repeat(64)),
+            "base_commit": base,
+            "claims": [{
+                "request_id": FIRST_REQUEST_ID,
+                "attempt": 1,
+                "acceptance_sequence": 1
+            }],
+            "state": state
+        }))
+        .unwrap_or_else(|error| panic!("legacy journal fixture must encode: {error}"));
+
+        let journal = decode_journal(&bytes)
+            .unwrap_or_else(|error| panic!("schema two journal {index} must migrate: {error}"));
+        assert_eq!(journal.schema_version, 3);
+        assert_eq!(journal.claim_failures, 0);
+        validate_journal_structure(&journal, parse_batch_id())
+            .unwrap_or_else(|error| panic!("migrated journal must validate: {error}"));
+    }
+}
+
+#[test]
+fn rejects_unsupported_or_malformed_journal_schema_layouts() {
+    let base = serde_json::json!({
+        "schema_version": 3,
+        "batch_id": BATCH_ID,
+        "queue_identity": format!("sha256:{}", "0".repeat(64)),
+        "base_commit": "0123456789abcdef0123456789abcdef01234567",
+        "claims": [{
+            "request_id": FIRST_REQUEST_ID,
+            "attempt": 1,
+            "acceptance_sequence": 1
+        }],
+        "claim_failures": 2,
+        "state": {"phase": "preparing"}
+    });
+    let mut fixtures = Vec::new();
+
+    for schema_version in [1, 4] {
+        let mut fixture = base.clone();
+        fixture["schema_version"] = schema_version.into();
+        fixtures.push((format!("schema {schema_version}"), fixture));
+    }
+
+    let mut version_two_with_failure_count = base.clone();
+    version_two_with_failure_count["schema_version"] = 2.into();
+    fixtures.push((
+        "schema 2 with claim_failures".into(),
+        version_two_with_failure_count,
+    ));
+
+    let mut version_three_without_failure_count = base.clone();
+    let Some(version_three_fields) = version_three_without_failure_count.as_object_mut() else {
+        panic!("journal fixture must be an object");
+    };
+    version_three_fields.remove("claim_failures");
+    fixtures.push((
+        "schema 3 without claim_failures".into(),
+        version_three_without_failure_count,
+    ));
+
+    let mut unknown_field = base;
+    unknown_field["unexpected"] = true.into();
+    fixtures.push(("unknown field".into(), unknown_field));
+
+    for (name, fixture) in fixtures {
+        let bytes = serde_json::to_vec(&fixture)
+            .unwrap_or_else(|error| panic!("{name} fixture must encode: {error}"));
+        assert!(
+            matches!(
+                decode_journal(&bytes),
+                Err(GitTransactionError::InvalidJournal)
+            ),
+            "{name} must be rejected"
+        );
+    }
+}
 
 struct TestDirectory {
     path: PathBuf,
@@ -597,6 +700,7 @@ fn trial_build_failure_keeps_the_official_commit_unchanged() {
             .unwrap_or_else(|error| panic!("unfinished transaction must be discoverable: {error}")),
         Some(RepositoryTransaction::Preparing {
             batch_id: parse_batch_id(),
+            claim_failures: 0,
         })
     );
 }
@@ -1119,7 +1223,7 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
     let interrupted = repository.apply_batch_with_hook(
         &mut worker,
         parse_batch_id(),
-        std::slice::from_ref(&claim),
+        ClaimedBatch::new(std::slice::from_ref(&claim), 2),
         ContentPolicy::default(),
         &PackagePolicy::default(),
         TransactionHooks {
@@ -1140,6 +1244,7 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
             .unwrap_or_else(|error| panic!("unfinished transaction must be discoverable: {error}")),
         Some(RepositoryTransaction::Recoverable {
             batch_id: parse_batch_id(),
+            claim_failures: 2,
         })
     );
     let journal_path = git.work.join(format!("transactions/{BATCH_ID}.json"));
@@ -1561,7 +1666,7 @@ fn compare_and_swap_refuses_a_concurrent_official_update() {
     let result = git.open().apply_batch_with_hook(
         &mut worker,
         parse_batch_id(),
-        &[claim],
+        ClaimedBatch::new(&[claim], 0),
         ContentPolicy::default(),
         &PackagePolicy::default(),
         TransactionHooks {
@@ -1643,7 +1748,7 @@ fn publication_rejects_a_replaced_canonical_root() {
     let result = git.open().apply_batch_with_hook(
         &mut worker,
         parse_batch_id(),
-        &[claim],
+        ClaimedBatch::new(&[claim], 0),
         ContentPolicy::default(),
         &PackagePolicy::default(),
         TransactionHooks {
