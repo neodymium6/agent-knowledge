@@ -98,8 +98,8 @@ agent-knowledge worker ...
 agent-knowledge admin ...
 ```
 
-The implementation bootstrap exposes one local-only administrative intake
-command before the SSH Gateway is added:
+The executable retains a local-only administrative intake command for
+operators and tests:
 
 ```text
 agent-knowledge admin submit \
@@ -109,7 +109,7 @@ agent-knowledge admin submit \
 
 `package-root` contains extracted `request.json` and `payload/` entries. The
 command validates that directory, restreams every permitted file through the
-same `FileQueue` limits as the future Gateway, and prints one JSON acceptance
+same `FileQueue` limits as the Gateway, and prints one JSON acceptance
 result. It never copies an unchecked directory into an accepted queue state.
 
 The same executable can be used with different entry-point arguments in a
@@ -595,7 +595,7 @@ account uses OpenSSH public-key authentication and per-key forced commands.
 A fictional `authorized_keys` entry has this form:
 
 ```text
-restrict,command="/usr/local/bin/agent-knowledge gateway --client-id fictional-node-a" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFictionalKeyMaterialOnly
+restrict,command="/usr/local/bin/agent-knowledge gateway --config /etc/agent-knowledge/gateway.yaml --client-id fictional-node-a" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFictionalKeyMaterialOnly
 ```
 
 Each key maps to one configured client ID. The Gateway overwrites or rejects
@@ -621,7 +621,18 @@ akp-v1 search
 ```
 
 The Gateway parses this string itself. It never evaluates it as a shell
-command.
+command. The current implementation accepts only `akp-v1 submit`; the other
+listed operations describe the version-one namespace reserved for later
+delivery increments.
+
+The current client invokes the equivalent of:
+
+```text
+ssh -T -o BatchMode=yes -o ClearAllForwardings=yes -- <destination> "akp-v1 submit"
+```
+
+`destination` is one opaque argument and may name an SSH configuration alias.
+The client does not accept arbitrary SSH arguments or construct a shell command.
 
 ### 13.3 Encoding
 
@@ -637,8 +648,11 @@ payload/<regular-files>
 
 Archive entries must have normalized relative paths. Only regular files and
 directories are accepted. Duplicate names, sparse files, links, devices,
-unexpected top-level entries, excessive counts, and limit violations are
-rejected.
+PAX extensions, unexpected top-level entries, nonzero trailing data, excessive
+counts, and limit violations are rejected. The official client produces
+deterministic GNU headers and streams only `request.json`, the `payload/`
+directory, and validated payload files. It pins each selected payload file and
+verifies its byte length and SHA-256 revision while sending it.
 
 `export` returns an uncompressed tar stream for a selected document bundle.
 Other read operations return JSON. Protocol errors are emitted as structured
@@ -724,10 +738,11 @@ pending/
 ```
 
 `request.json`, `digest`, `acceptance.json`, and `payload/` are immutable.
-`acceptance.json` contains the central acceptance timestamp and a queue-local
-monotonic sequence allocated under the queue lock. Gaps are allowed after an
-interrupted acceptance, but accepted packages never share a sequence. Worker
-state and results use only the optional `phase.json` and `result.json`
+`acceptance.json` contains the authenticated client ID, central acceptance
+timestamp, and a queue-local monotonic sequence allocated under the queue lock.
+Local administrative intake may omit the client ID for compatibility. Gaps are
+allowed after an interrupted acceptance, but accepted packages never share a
+sequence. Worker state and results use only the optional `phase.json` and `result.json`
 sidecars next to that immutable data. The Gateway never creates these
 sidecars. The Worker writes them through temporary files and atomic rename;
 package revalidation excludes Gateway and Worker metadata bytes from the

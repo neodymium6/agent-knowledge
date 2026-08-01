@@ -9,8 +9,11 @@ restricted gateway; they do not synchronize the repository with Git.
 
 ## Status
 
-The initial architecture is defined and the Rust implementation scaffold is in
-place.
+The architecture is defined, and delivery increments 1 through 6 are
+implemented. The current executable can accept requests locally or through an
+OpenSSH forced command, process them through the single Writer, and publish
+immutable Quartz releases. Committed reads, search, remote-push retry, and
+packaging remain future increments.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -44,6 +47,32 @@ Run the Repository Worker with a validated deployment configuration:
 
 ```sh
 agent-knowledge worker run --config /srv/agent-knowledge/worker.yaml
+```
+
+Submit a validated request package through an SSH host alias:
+
+```sh
+agent-knowledge client submit \
+  --destination fictional-knowledge \
+  --package-root ./fictional-request
+```
+
+The client invokes the system `ssh` executable directly, uses non-interactive
+authentication, disables TTY allocation and forwarding, and streams an
+uncompressed tar archive to the exact remote command `akp-v1 submit`. SSH
+identity, host-key, proxy, and destination settings belong in the user's SSH
+configuration.
+
+The forced command requires a strict Gateway configuration such as:
+
+```yaml
+schema_version: 1
+storage:
+  queue_root: /srv/fictional-knowledge/queue
+```
+
+```text
+restrict,command="/usr/local/bin/agent-knowledge gateway --config /etc/agent-knowledge/gateway.yaml --client-id fictional-node-a" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFictionalKeyMaterialOnly
 ```
 
 The Worker emits JSON Lines operational events. Every record includes
