@@ -13,4 +13,6 @@ agent-knowledge-core = { path = "../core" }
 agent-knowledge-queue = { path = "../queue" }
 agent-knowledge-release = { path = "../release" }
 agent-knowledge-repository = { path = "../repository" }
+serde.workspace = true
+serde-saphyr.workspace = true
 time.workspace = true

@@ -16,6 +16,9 @@ use agent_knowledge_repository::{
 };
 use time::OffsetDateTime;
 
+mod config;
+pub use config::{CURRENT_WORKER_CONFIG_VERSION, WorkerConfigError, WorkerSettings};
+
 /// Connects one queue session, Git transaction, Quartz build, and release.
 #[derive(Clone, Debug)]
 pub struct BatchProcessor {
