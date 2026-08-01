@@ -12,8 +12,8 @@ use agent_knowledge_release::{
 };
 pub use agent_knowledge_repository::BatchCommitOutcome;
 use agent_knowledge_repository::{
-    BatchPublication, ContentPolicy, GitRepository, GitTransactionError, PublicationError,
-    RepositoryTransaction, RequestFailure,
+    BatchPublication, ClaimedBatch, ContentPolicy, GitRepository, GitTransactionError,
+    PublicationError, RepositoryTransaction, RequestFailure,
 };
 use time::OffsetDateTime;
 
@@ -79,6 +79,7 @@ impl BatchProcessor {
         worker: &mut WorkerSession,
         batch_id: BatchId,
         claims: &[ClaimedPackage],
+        claim_failures: usize,
         created_at: OffsetDateTime,
     ) -> Result<BatchCommitOutcome, BatchProcessorError> {
         let built = RefCell::new(None::<BuiltDirectory>);
@@ -88,7 +89,7 @@ impl BatchProcessor {
         let outcome = self.repository.apply_batch_with_publication(
             worker,
             batch_id,
-            claims,
+            ClaimedBatch::new(claims, claim_failures),
             self.content_policy,
             &self.package_policy,
             BatchPublication::new(

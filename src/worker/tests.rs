@@ -1,8 +1,9 @@
 use std::sync::atomic::AtomicBool;
 use std::time::Duration as StandardDuration;
 
+use agent_knowledge_queue::WorkerQueueError;
 use agent_knowledge_worker::{
-    BatchCommitOutcome, StartupOutcome, WorkerPollOutcome, WorkerSettings,
+    BatchCommitOutcome, StartupOutcome, WorkerPollOutcome, WorkerRunError, WorkerSettings,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -33,7 +34,17 @@ fn waits_until_the_batch_deadline_or_idle_poll() {
 fn returns_immediately_when_termination_was_already_requested() {
     let stopping = AtomicBool::new(true);
 
-    wait_for_termination(&stopping, StandardDuration::from_secs(60));
+    assert!(wait_for_termination(
+        &stopping,
+        StandardDuration::from_secs(60)
+    ));
+}
+
+#[test]
+fn reports_when_wait_deadline_expires_without_termination() {
+    let stopping = AtomicBool::new(false);
+
+    assert!(!wait_for_termination(&stopping, StandardDuration::ZERO));
 }
 
 #[test]
@@ -166,4 +177,23 @@ fn configuration_failures_emit_a_structured_terminal_event() {
     assert_eq!(value["component"], "worker");
     assert_eq!(value["event"], "worker_failed");
     assert_eq!(value["error_code"], "worker_config_invalid");
+}
+
+#[test]
+fn cycle_failures_report_requests_rejected_before_the_error() {
+    let error = WorkerCommandError::Run(WorkerRunError::Queue(Box::new(
+        WorkerQueueError::BatchScanFailed {
+            failed_requests: 3,
+            source: Box::new(WorkerQueueError::InvalidBatchLimits),
+        },
+    )));
+    let mut output = Vec::new();
+
+    write_failure_log(&mut output, &error)
+        .unwrap_or_else(|reporting| panic!("failure log must serialize: {reporting}"));
+    let value: serde_json::Value = serde_json::from_slice(&output)
+        .unwrap_or_else(|decode| panic!("failure log must be JSON: {decode}"));
+
+    assert_eq!(value["event"], "worker_failed");
+    assert_eq!(value["failed_requests"], 3);
 }

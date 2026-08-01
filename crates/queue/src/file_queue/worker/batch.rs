@@ -20,6 +20,8 @@ pub enum BatchClaimOutcome {
         scanned_entries: usize,
         /// Earliest eligible requests retained for the batch.
         retained_candidates: usize,
+        /// Corrupt requests durably moved to failed so far.
+        failed_requests: usize,
     },
     /// The complete snapshot was scanned and its earliest requests were claimed.
     Claimed {
@@ -317,8 +319,9 @@ impl WorkerSession {
                 )
             });
             if let Err(error) = result {
+                let failed_requests = self.pending_scan.failed_requests;
                 self.pending_scan = PendingBatchScan::default();
-                return Err(error);
+                return Err(with_scan_failures(error, failed_requests));
             }
         }
 
@@ -326,6 +329,7 @@ impl WorkerSession {
             return Ok(BatchClaimOutcome::Scanning {
                 scanned_entries,
                 retained_candidates: self.pending_scan.candidates.len(),
+                failed_requests: self.pending_scan.failed_requests,
             });
         }
 
@@ -334,7 +338,10 @@ impl WorkerSession {
         self.pending_scan = PendingBatchScan::default();
         let mut prepared = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let claim = self.queue.prepare_claim(candidate.request_id)?;
+            let claim = self
+                .queue
+                .prepare_claim(candidate.request_id)
+                .map_err(|error| with_scan_failures(error, failed_requests))?;
             prepared.push((candidate.request_id, claim));
         }
 
@@ -345,7 +352,7 @@ impl WorkerSession {
                 Ok(claim) => claimed.push(claim),
                 Err(error) => {
                     self.require_processing_recovery();
-                    return Err(error);
+                    return Err(with_scan_failures(error, failed_requests));
                 }
             }
         }
@@ -386,6 +393,17 @@ impl WorkerSession {
     pub(super) fn require_processing_recovery(&mut self) {
         self.processing_recovery_complete = false;
         self.processing_scan = None;
+    }
+}
+
+fn with_scan_failures(error: WorkerQueueError, failed_requests: usize) -> WorkerQueueError {
+    if failed_requests == 0 {
+        error
+    } else {
+        WorkerQueueError::BatchScanFailed {
+            failed_requests,
+            source: Box::new(error),
+        }
     }
 }
 

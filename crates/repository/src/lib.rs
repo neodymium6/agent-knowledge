@@ -6,8 +6,8 @@ mod index;
 
 pub use apply::ApplyError;
 pub use git::{
-    BatchCommitOutcome, BatchPublication, GitIdentity, GitRepository, GitTransactionError,
-    PublicationError, RepositoryTransaction, RequestFailure,
+    BatchCommitOutcome, BatchPublication, ClaimedBatch, GitIdentity, GitRepository,
+    GitTransactionError, PublicationError, RepositoryTransaction, RequestFailure,
 };
 pub use index::{
     ContentIndex, ContentIndexError, ContentPolicy, DocumentLocation, DocumentRecord,

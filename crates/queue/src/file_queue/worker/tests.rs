@@ -582,6 +582,7 @@ fn bounded_batch_claims_globally_earliest_acceptance_sequences() {
             Ok(BatchClaimOutcome::Scanning {
                 scanned_entries,
                 retained_candidates,
+                ..
             }) => {
                 assert_eq!(scanned_entries, 1);
                 assert!(retained_candidates <= 2);

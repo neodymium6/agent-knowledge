@@ -575,6 +575,13 @@ pub enum WorkerQueueError {
         /// Batch identifier that owns the active scan.
         active_batch_id: BatchId,
     },
+    /// A batch scan failed after rejecting one or more corrupt requests.
+    BatchScanFailed {
+        /// Requests durably moved to failed before the scan stopped.
+        failed_requests: usize,
+        /// Underlying queue failure that stopped the scan.
+        source: Box<WorkerQueueError>,
+    },
     /// Another Worker transition was requested during a pending batch scan.
     BatchScanInProgress {
         /// Batch identifier that owns the active scan.
@@ -655,6 +662,7 @@ impl WorkerQueueError {
     #[must_use]
     pub const fn error_code(&self) -> ErrorCode {
         match self {
+            Self::BatchScanFailed { source, .. } => source.error_code(),
             Self::Queue(error) => error.error_code(),
             Self::Io(_) | Self::WorkerAlreadyRunning => ErrorCode::TemporaryFailure,
             Self::RequestNotFound { .. }
@@ -678,6 +686,17 @@ impl WorkerQueueError {
             Self::PhaseEncoding(_) | Self::ResultEncoding(_) | Self::AttemptExhausted { .. } => {
                 ErrorCode::InternalError
             }
+        }
+    }
+
+    /// Returns requests durably failed before this operation stopped.
+    #[must_use]
+    pub const fn failed_requests(&self) -> usize {
+        match self {
+            Self::BatchScanFailed {
+                failed_requests, ..
+            } => *failed_requests,
+            _ => 0,
         }
     }
 }
@@ -708,6 +727,13 @@ impl fmt::Display for WorkerQueueError {
             Self::BatchScanChanged { active_batch_id } => write!(
                 formatter,
                 "batch scan for `{active_batch_id}` must finish before its parameters change"
+            ),
+            Self::BatchScanFailed {
+                failed_requests,
+                source,
+            } => write!(
+                formatter,
+                "batch scan stopped after failing {failed_requests} requests: {source}"
             ),
             Self::BatchScanInProgress { active_batch_id } => write!(
                 formatter,
@@ -791,6 +817,7 @@ impl std::error::Error for WorkerQueueError {
             | Self::InvalidPhaseMetadata(error)
             | Self::InvalidResultMetadata(error) => Some(error),
             Self::CorruptPackage { source, .. } => Some(source),
+            Self::BatchScanFailed { source, .. } => Some(source),
             _ => None,
         }
     }

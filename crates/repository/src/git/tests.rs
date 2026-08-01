@@ -16,9 +16,9 @@ use agent_knowledge_queue::{
 use ulid::Ulid;
 
 use super::{
-    BatchCommitOutcome, GitIdentity, GitRepository, GitTransactionError, RepositoryTransaction,
-    TransactionHooks, accept_trial_build, interrupt_publication, parse_git_version, parse_text,
-    staged_stats,
+    BatchCommitOutcome, ClaimedBatch, GitIdentity, GitRepository, GitTransactionError,
+    RepositoryTransaction, TransactionHooks, accept_trial_build, interrupt_publication,
+    parse_git_version, parse_text, staged_stats,
 };
 use crate::ContentPolicy;
 use crate::apply::AppliedMove;
@@ -597,6 +597,7 @@ fn trial_build_failure_keeps_the_official_commit_unchanged() {
             .unwrap_or_else(|error| panic!("unfinished transaction must be discoverable: {error}")),
         Some(RepositoryTransaction::Preparing {
             batch_id: parse_batch_id(),
+            claim_failures: 0,
         })
     );
 }
@@ -1119,7 +1120,7 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
     let interrupted = repository.apply_batch_with_hook(
         &mut worker,
         parse_batch_id(),
-        std::slice::from_ref(&claim),
+        ClaimedBatch::new(std::slice::from_ref(&claim), 2),
         ContentPolicy::default(),
         &PackagePolicy::default(),
         TransactionHooks {
@@ -1140,6 +1141,7 @@ fn resumes_publication_from_a_committed_journal_after_interruption() {
             .unwrap_or_else(|error| panic!("unfinished transaction must be discoverable: {error}")),
         Some(RepositoryTransaction::Recoverable {
             batch_id: parse_batch_id(),
+            claim_failures: 2,
         })
     );
     let journal_path = git.work.join(format!("transactions/{BATCH_ID}.json"));
@@ -1561,7 +1563,7 @@ fn compare_and_swap_refuses_a_concurrent_official_update() {
     let result = git.open().apply_batch_with_hook(
         &mut worker,
         parse_batch_id(),
-        &[claim],
+        ClaimedBatch::new(&[claim], 0),
         ContentPolicy::default(),
         &PackagePolicy::default(),
         TransactionHooks {
@@ -1643,7 +1645,7 @@ fn publication_rejects_a_replaced_canonical_root() {
     let result = git.open().apply_batch_with_hook(
         &mut worker,
         parse_batch_id(),
-        &[claim],
+        ClaimedBatch::new(&[claim], 0),
         ContentPolicy::default(),
         &PackagePolicy::default(),
         TransactionHooks {

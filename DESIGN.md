@@ -918,27 +918,30 @@ The Worker performs these phases while holding the writer lock:
 1. Recover interrupted processing.
 2. Select a bounded batch of pending requests.
 3. Atomically move selected requests to `processing/`.
-4. Pin the current official commit.
-5. Create a detached temporary worktree and an internal transaction ref.
-6. Revalidate and apply each request in deterministic order.
-7. Remove permanently invalid requests from the candidate batch.
-8. Validate the resulting file hierarchy and Markdown.
-9. Build Quartz into a temporary directory.
-10. Create one Git commit for the successful requests.
-11. Atomically advance the official branch with an expected-old-commit check.
-12. Synchronize the canonical `content/` worktree.
-13. finalize and activate the new Quartz release.
-14. Mark successful requests `completed`.
-15. Mark permanent request failures `failed`.
-16. Schedule or perform the Git remote push.
-17. Remove disposable worktrees after their results are no longer needed.
+4. Record the number of requests rejected during selection in the durable
+   repository transaction journal.
+5. Pin the current official commit.
+6. Create a detached temporary worktree and an internal transaction ref.
+7. Revalidate and apply each request in deterministic order.
+8. Remove permanently invalid requests from the candidate batch.
+9. Validate the resulting file hierarchy and Markdown.
+10. Build Quartz into a temporary directory.
+11. Create one Git commit for the successful requests.
+12. Atomically advance the official branch with an expected-old-commit check.
+13. Synchronize the canonical `content/` worktree.
+14. Finalize and activate the new Quartz release.
+15. Mark successful requests `completed`.
+16. Mark permanent request failures `failed`.
+17. Schedule or perform the Git remote push.
+18. Remove disposable worktrees after their results are no longer needed.
 
 The branch update uses compare-and-swap semantics. An unexpected branch change
 stops publication and requires recovery; it is never overwritten.
 
 The Worker keeps one durable transaction journal at a time. A `preparing`
-journal is synchronized before disposable Git work begins. After the commit
-object and internal recovery ref exist, a `committed` journal containing the
+journal includes the bounded count of requests rejected during claim
+validation and is synchronized before disposable Git work begins. After the
+commit object and internal recovery ref exist, a `committed` journal containing the
 exact claim tokens and per-request outcomes is synchronized before the
 official branch can advance. A later batch cannot begin until this journal is
 reconciled and finalized. Each journal is bound to the canonical queue
@@ -1404,7 +1407,10 @@ and a stable `event`. Completed and resumed batch records contain an
 `outcome`, `successful_requests`, and `failed_requests`; committed outcomes
 also contain the Git `commit`. Failure counts include queue validation failures
 detected while claiming and repository application failures. Terminal process
-failures contain a stable `error_code`. The Worker resamples time after
+failures contain a stable `error_code` and any claim-validation failure count
+already accumulated before the error. Graceful shutdown records the same count
+when it stops an in-progress claim scan. Repository journals retain the count
+through preparing and terminal recovery. The Worker resamples time after
 recovery or batch processing, so completion events record completion rather
 than operation-start time.
 

@@ -46,6 +46,10 @@ where
     let mut record = WorkerLogRecord::new(OffsetDateTime::now_utc(), "worker_failed");
     record.severity = "error";
     record.error_code = Some(error_code);
+    let failed_requests = error.failed_requests();
+    if failed_requests > 0 {
+        record.failed_requests = Some(failed_requests);
+    }
     write_worker_log(output, record)
 }
 
@@ -80,24 +84,28 @@ where
     };
     write_startup_log(output, OffsetDateTime::now_utc(), &startup)?;
 
+    let mut stopped_failures = 0;
     while !should_stop() {
         let operation_at = OffsetDateTime::now_utc();
         let outcome = runtime
             .poll_once_interruptible(schedule, operation_at, &should_stop)
             .map_err(WorkerCommandError::Run)?;
         let completed_at = OffsetDateTime::now_utc();
-        if matches!(outcome, WorkerPollOutcome::Stopped) {
+        if let WorkerPollOutcome::Stopped { failed_requests } = outcome {
+            stopped_failures = failed_requests;
             break;
         }
         write_poll_log(output, completed_at, &outcome)?;
         if let Some(duration) = wait_after_poll(&outcome, completed_at) {
-            wait_for_termination(&stopping, duration);
+            let _ = wait_for_termination(&stopping, duration);
         }
     }
-    write_worker_log(
-        output,
-        WorkerLogRecord::new(OffsetDateTime::now_utc(), "worker_stopped"),
-    )
+    let mut record = WorkerLogRecord::new(OffsetDateTime::now_utc(), "worker_stopped");
+    if stopped_failures > 0 {
+        record.severity = "warning";
+        record.failed_requests = Some(stopped_failures);
+    }
+    write_worker_log(output, record)
 }
 
 fn wait_after_poll(outcome: &WorkerPollOutcome, now: OffsetDateTime) -> Option<StandardDuration> {
@@ -115,22 +123,23 @@ fn wait_after_poll(outcome: &WorkerPollOutcome, now: OffsetDateTime) -> Option<S
                 None
             }
         }
-        WorkerPollOutcome::Stopped
+        WorkerPollOutcome::Stopped { .. }
         | WorkerPollOutcome::Scanning { .. }
         | WorkerPollOutcome::ClosedWithoutCommit { .. }
         | WorkerPollOutcome::Processed { .. } => None,
     }
 }
 
-fn wait_for_termination(stopping: &AtomicBool, duration: StandardDuration) {
+fn wait_for_termination(stopping: &AtomicBool, duration: StandardDuration) -> bool {
     let started = Instant::now();
     while !stopping.load(Ordering::Relaxed) {
         let remaining = duration.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            return;
+            return false;
         }
         thread::sleep(remaining.min(MAXIMUM_SIGNAL_WAIT));
     }
+    true
 }
 
 fn write_startup_log<W>(
@@ -149,10 +158,14 @@ where
             record.requests = Some(*requests);
             record
         }
-        StartupOutcome::Resumed { batch_id, outcome } => {
+        StartupOutcome::Resumed {
+            batch_id,
+            outcome,
+            claim_failures,
+        } => {
             let mut record = WorkerLogRecord::new(timestamp, "worker_resumed_batch");
             record.batch_id = Some(batch_id.to_string());
-            add_commit_outcome(&mut record, outcome, 0);
+            add_commit_outcome(&mut record, outcome, *claim_failures);
             record
         }
     };
@@ -192,7 +205,7 @@ where
             add_commit_outcome(&mut record, outcome, *claim_failures);
             Some(record)
         }
-        WorkerPollOutcome::Stopped
+        WorkerPollOutcome::Stopped { .. }
         | WorkerPollOutcome::Scanning { .. }
         | WorkerPollOutcome::Idle
         | WorkerPollOutcome::Waiting { .. } => None,
@@ -327,6 +340,14 @@ impl WorkerCommandError {
             Self::Timestamp(_) | Self::Json(_) | Self::Io(_) | Self::FailureReporting { .. } => {
                 None
             }
+        }
+    }
+
+    fn failed_requests(&self) -> usize {
+        match self {
+            Self::Run(error) => error.failed_requests(),
+            Self::FailureReporting { operation, .. } => operation.failed_requests(),
+            _ => 0,
         }
     }
 }

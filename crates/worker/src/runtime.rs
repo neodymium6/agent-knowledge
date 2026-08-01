@@ -93,6 +93,8 @@ pub enum StartupOutcome {
         batch_id: BatchId,
         /// Exact committed or no-change result.
         outcome: BatchCommitOutcome,
+        /// Requests rejected before the recovered transaction began.
+        claim_failures: usize,
     },
 }
 
@@ -100,7 +102,9 @@ pub enum StartupOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerRunOutcome {
     /// The fixed pending snapshot contained no requests.
-    Idle {
+    Idle,
+    /// The fixed snapshot contained only requests rejected during claiming.
+    ClosedWithoutProcessing {
         /// Requests rejected while the snapshot was claimed.
         failed_requests: usize,
     },
@@ -122,7 +126,10 @@ pub enum WorkerPollOutcome {
     ///
     /// This is terminal for the runtime; the caller must discard it and use
     /// startup recovery before processing more work.
-    Stopped,
+    Stopped {
+        /// Requests rejected before shutdown was observed.
+        failed_requests: usize,
+    },
     /// One bounded portion of the pending directory was observed.
     Scanning {
         /// Directory entries inspected by this poll.
@@ -234,22 +241,46 @@ impl WorkerRuntime {
                 }
                 StartupOutcome::Requeued { batch_id, requests }
             }
-            (Some(RepositoryTransaction::Preparing { batch_id }), Some(_)) => {
+            (
+                Some(RepositoryTransaction::Preparing {
+                    batch_id,
+                    claim_failures,
+                }),
+                Some(_),
+            ) => {
                 if should_stop() {
                     return Ok(None);
                 }
-                let outcome = processor.process(&mut session, batch_id, &claims, created_at)?;
-                StartupOutcome::Resumed { batch_id, outcome }
+                let outcome = processor
+                    .process(&mut session, batch_id, &claims, claim_failures, created_at)
+                    .map_err(|error| WorkerRunError::processor(error, claim_failures))?;
+                StartupOutcome::Resumed {
+                    batch_id,
+                    outcome,
+                    claim_failures,
+                }
             }
-            (Some(RepositoryTransaction::Preparing { batch_id }), None) => {
+            (Some(RepositoryTransaction::Preparing { batch_id, .. }), None) => {
                 return Err(WorkerRunError::MissingProcessingClaims { batch_id });
             }
-            (Some(RepositoryTransaction::Recoverable { batch_id }), _) => {
+            (
+                Some(RepositoryTransaction::Recoverable {
+                    batch_id,
+                    claim_failures,
+                }),
+                _,
+            ) => {
                 if should_stop() {
                     return Ok(None);
                 }
-                let outcome = processor.recover(&mut session, batch_id, created_at)?;
-                StartupOutcome::Resumed { batch_id, outcome }
+                let outcome = processor
+                    .recover(&mut session, batch_id, created_at)
+                    .map_err(|error| WorkerRunError::processor(error, claim_failures))?;
+                StartupOutcome::Resumed {
+                    batch_id,
+                    outcome,
+                    claim_failures,
+                }
             }
         };
         Ok(Some((
@@ -286,7 +317,7 @@ impl WorkerRuntime {
             self.ready = true;
         }
         match outcome? {
-            WorkerRunProgress::Stopped => {
+            WorkerRunProgress::Stopped { .. } => {
                 unreachable!("an always-running cycle control cannot request shutdown")
             }
             WorkerRunProgress::Complete(outcome) => Ok(outcome),
@@ -309,7 +340,7 @@ impl WorkerRuntime {
         now: OffsetDateTime,
     ) -> Result<WorkerPollOutcome, WorkerRunError> {
         match self.poll_once_interruptible(schedule, now, &|| false)? {
-            WorkerPollOutcome::Stopped => {
+            WorkerPollOutcome::Stopped { .. } => {
                 unreachable!("an always-running poll control cannot request shutdown")
             }
             outcome => Ok(outcome),
@@ -333,7 +364,7 @@ impl WorkerRuntime {
             return Err(WorkerRunError::RecoveryRequired);
         }
         if should_stop() {
-            return Ok(self.stop());
+            return Ok(self.stop(0));
         }
         let snapshot = match self
             .session
@@ -345,7 +376,7 @@ impl WorkerRuntime {
                 observed_requests,
             } => {
                 if should_stop() {
-                    return Ok(self.stop());
+                    return Ok(self.stop(0));
                 }
                 return Ok(WorkerPollOutcome::Scanning {
                     scanned_entries,
@@ -355,7 +386,7 @@ impl WorkerRuntime {
             PendingScanOutcome::Complete(snapshot) => snapshot,
         };
         if should_stop() {
-            return Ok(self.stop());
+            return Ok(self.stop(0));
         }
         match schedule.readiness(snapshot, self.limits.maximum_requests, now) {
             BatchReadiness::Empty => Ok(WorkerPollOutcome::Idle),
@@ -368,13 +399,19 @@ impl WorkerRuntime {
                     self.ready = true;
                 }
                 match outcome? {
-                    WorkerRunProgress::Stopped => Ok(self.stop()),
-                    WorkerRunProgress::Complete(WorkerRunOutcome::Idle { failed_requests }) => {
+                    WorkerRunProgress::Stopped { claim_failures } => Ok(self.stop(claim_failures)),
+                    WorkerRunProgress::Complete(WorkerRunOutcome::Idle) => {
                         Ok(WorkerPollOutcome::ClosedWithoutCommit {
                             reason,
-                            failed_requests,
+                            failed_requests: 0,
                         })
                     }
+                    WorkerRunProgress::Complete(WorkerRunOutcome::ClosedWithoutProcessing {
+                        failed_requests,
+                    }) => Ok(WorkerPollOutcome::ClosedWithoutCommit {
+                        reason,
+                        failed_requests,
+                    }),
                     WorkerRunProgress::Complete(WorkerRunOutcome::Processed {
                         batch_id,
                         outcome,
@@ -412,9 +449,13 @@ impl WorkerRuntime {
                 ),
             };
             match outcome {
-                Ok(BatchClaimOutcome::Scanning { .. }) => {
+                Ok(BatchClaimOutcome::Scanning {
+                    failed_requests, ..
+                }) => {
                     if should_stop() {
-                        return Ok(WorkerRunProgress::Stopped);
+                        return Ok(WorkerRunProgress::Stopped {
+                            claim_failures: failed_requests,
+                        });
                     }
                 }
                 Ok(BatchClaimOutcome::Claimed {
@@ -425,16 +466,28 @@ impl WorkerRuntime {
             }
         };
         if should_stop() {
-            return Ok(WorkerRunProgress::Stopped);
+            return Ok(WorkerRunProgress::Stopped { claim_failures });
         }
         if claims.is_empty() {
-            return Ok(WorkerRunProgress::Complete(WorkerRunOutcome::Idle {
-                failed_requests: claim_failures,
-            }));
+            let outcome = if claim_failures == 0 {
+                WorkerRunOutcome::Idle
+            } else {
+                WorkerRunOutcome::ClosedWithoutProcessing {
+                    failed_requests: claim_failures,
+                }
+            };
+            return Ok(WorkerRunProgress::Complete(outcome));
         }
         let outcome = self
             .processor
-            .process(&mut self.session, batch_id, &claims, created_at)?;
+            .process(
+                &mut self.session,
+                batch_id,
+                &claims,
+                claim_failures,
+                created_at,
+            )
+            .map_err(|error| WorkerRunError::processor(error, claim_failures))?;
         Ok(WorkerRunProgress::Complete(WorkerRunOutcome::Processed {
             batch_id,
             outcome,
@@ -442,14 +495,14 @@ impl WorkerRuntime {
         }))
     }
 
-    fn stop(&mut self) -> WorkerPollOutcome {
+    fn stop(&mut self, failed_requests: usize) -> WorkerPollOutcome {
         self.ready = false;
-        WorkerPollOutcome::Stopped
+        WorkerPollOutcome::Stopped { failed_requests }
     }
 }
 
 enum WorkerRunProgress {
-    Stopped,
+    Stopped { claim_failures: usize },
     Complete(WorkerRunOutcome),
 }
 
@@ -517,7 +570,12 @@ pub enum WorkerRunError {
     /// Durable queue discovery or transition failed.
     Queue(Box<WorkerQueueError>),
     /// Repository application or publication failed.
-    Processor(Box<BatchProcessorError>),
+    Processor {
+        /// Concrete batch-processing failure.
+        source: Box<BatchProcessorError>,
+        /// Requests rejected before repository processing began.
+        failed_requests: usize,
+    },
     /// Interrupted processing exceeded the configured in-memory batch bound.
     TooManyProcessingClaims {
         /// Configured maximum number of claims.
@@ -550,11 +608,30 @@ impl WorkerRunError {
     fn queue(error: WorkerQueueError) -> Self {
         Self::Queue(Box::new(error))
     }
+
+    fn processor(error: BatchProcessorError, failed_requests: usize) -> Self {
+        Self::Processor {
+            source: Box::new(error),
+            failed_requests,
+        }
+    }
+
+    /// Returns requests durably rejected before this cycle failed.
+    #[must_use]
+    pub const fn failed_requests(&self) -> usize {
+        match self {
+            Self::Queue(error) => error.failed_requests(),
+            Self::Processor {
+                failed_requests, ..
+            } => *failed_requests,
+            _ => 0,
+        }
+    }
 }
 
 impl From<BatchProcessorError> for WorkerRunError {
     fn from(error: BatchProcessorError) -> Self {
-        Self::Processor(Box::new(error))
+        Self::processor(error, 0)
     }
 }
 
@@ -562,7 +639,9 @@ impl fmt::Display for WorkerRunError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Queue(error) => write!(formatter, "Worker queue operation failed: {error}"),
-            Self::Processor(error) => write!(formatter, "Worker batch processing failed: {error}"),
+            Self::Processor { source, .. } => {
+                write!(formatter, "Worker batch processing failed: {source}")
+            }
             Self::TooManyProcessingClaims { maximum } => write!(
                 formatter,
                 "interrupted processing exceeds the configured {maximum}-request bound"
@@ -593,7 +672,7 @@ impl std::error::Error for WorkerRunError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Queue(error) => Some(error),
-            Self::Processor(error) => Some(error),
+            Self::Processor { source, .. } => Some(source),
             Self::TooManyProcessingClaims { .. }
             | Self::MultipleProcessingBatches { .. }
             | Self::TransactionBatchMismatch { .. }

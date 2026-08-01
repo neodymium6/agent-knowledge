@@ -24,7 +24,7 @@ use crate::{ApplyError, ContentPolicy};
 const MAXIMUM_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const MAXIMUM_JOURNAL_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_BINDING_BYTES: usize = 64 * 1024;
-const JOURNAL_SCHEMA_VERSION: u16 = 2;
+const JOURNAL_SCHEMA_VERSION: u16 = 3;
 
 /// Fixed author identity for mechanically generated knowledge commits.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,12 +168,46 @@ pub enum RepositoryTransaction {
     Preparing {
         /// Batch that owns the transaction.
         batch_id: BatchId,
+        /// Requests rejected while the batch was claimed.
+        claim_failures: usize,
     },
     /// A terminal outcome exists and publication or reconciliation must resume.
     Recoverable {
         /// Batch that owns the transaction.
         batch_id: BatchId,
+        /// Requests rejected while the batch was claimed.
+        claim_failures: usize,
     },
+}
+
+/// Ordered claims and queue-stage outcomes entering one repository transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClaimedBatch<'a> {
+    claims: &'a [ClaimedPackage],
+    claim_failures: usize,
+}
+
+impl<'a> ClaimedBatch<'a> {
+    /// Creates one batch from ordered claims and prior validation failures.
+    #[must_use]
+    pub const fn new(claims: &'a [ClaimedPackage], claim_failures: usize) -> Self {
+        Self {
+            claims,
+            claim_failures,
+        }
+    }
+
+    /// Returns the ordered, durably owned requests.
+    #[must_use]
+    pub const fn claims(self) -> &'a [ClaimedPackage] {
+        self.claims
+    }
+
+    /// Returns requests rejected before repository processing began.
+    #[must_use]
+    pub const fn claim_failures(self) -> usize {
+        self.claim_failures
+    }
 }
 
 impl RepositoryTransaction {
@@ -181,7 +215,17 @@ impl RepositoryTransaction {
     #[must_use]
     pub const fn batch_id(self) -> BatchId {
         match self {
-            Self::Preparing { batch_id } | Self::Recoverable { batch_id } => batch_id,
+            Self::Preparing { batch_id, .. } | Self::Recoverable { batch_id, .. } => batch_id,
+        }
+    }
+
+    /// Returns requests rejected before repository processing began.
+    #[must_use]
+    pub const fn claim_failures(self) -> usize {
+        match self {
+            Self::Preparing { claim_failures, .. } | Self::Recoverable { claim_failures, .. } => {
+                claim_failures
+            }
         }
     }
 }
@@ -194,6 +238,7 @@ struct TransactionJournal {
     queue_identity: Revision,
     base_commit: String,
     claims: Vec<JournalClaim>,
+    claim_failures: u64,
     state: JournalState,
 }
 
@@ -391,10 +436,18 @@ impl GitRepository {
                 read_journal(&entry.path())?.ok_or(GitTransactionError::JournalMissing)?;
             validate_journal_structure(&journal, batch_id)?;
             validate_worker_identity(&journal, worker)?;
+            let claim_failures = usize::try_from(journal.claim_failures)
+                .map_err(|_| GitTransactionError::JournalMismatch)?;
             transaction = Some(match journal.state {
-                JournalState::Preparing => RepositoryTransaction::Preparing { batch_id },
+                JournalState::Preparing => RepositoryTransaction::Preparing {
+                    batch_id,
+                    claim_failures,
+                },
                 JournalState::NoChanges { .. } | JournalState::Committed { .. } => {
-                    RepositoryTransaction::Recoverable { batch_id }
+                    RepositoryTransaction::Recoverable {
+                        batch_id,
+                        claim_failures,
+                    }
                 }
             });
         }
@@ -430,7 +483,7 @@ impl GitRepository {
         self.apply_batch_with_hook(
             worker,
             batch_id,
-            claims,
+            ClaimedBatch::new(claims, 0),
             policy,
             package_policy,
             TransactionHooks {
@@ -454,7 +507,7 @@ impl GitRepository {
         &self,
         worker: &mut WorkerSession,
         batch_id: BatchId,
-        claims: &[ClaimedPackage],
+        batch: ClaimedBatch<'_>,
         policy: ContentPolicy,
         package_policy: &PackagePolicy,
         publication: BatchPublication<F, H>,
@@ -470,7 +523,7 @@ impl GitRepository {
         self.apply_batch_with_hook(
             worker,
             batch_id,
-            claims,
+            batch,
             policy,
             package_policy,
             TransactionHooks {
@@ -489,7 +542,7 @@ impl GitRepository {
         &self,
         worker: &mut WorkerSession,
         batch_id: BatchId,
-        claims: &[ClaimedPackage],
+        batch: ClaimedBatch<'_>,
         policy: ContentPolicy,
         package_policy: &PackagePolicy,
         hooks: TransactionHooks<F, H>,
@@ -503,9 +556,12 @@ impl GitRepository {
             trial_build,
             before_publish,
         } = hooks;
+        let claims = batch.claims();
         if claims.is_empty() {
             return Err(GitTransactionError::EmptyBatch);
         }
+        let journal_claim_failures = u64::try_from(batch.claim_failures())
+            .map_err(|_| GitTransactionError::JournalMismatch)?;
         self.ensure_no_other_journal(batch_id)?;
         let journal_path = self.journal_path(batch_id);
         if let Some(journal) = read_journal(&journal_path)? {
@@ -522,6 +578,9 @@ impl GitRepository {
                     }
                     validate_batch_claims(worker, batch_id, claims)?;
                     validate_journal_claims(&journal, claims)?;
+                    if journal.claim_failures != journal_claim_failures {
+                        return Err(GitTransactionError::JournalMismatch);
+                    }
                     self.remove_worktree(&self.worktree_path(batch_id))?;
                     self.remove_preparing_ref(batch_id, &journal.base_commit)?;
                     remove_journal(&journal_path)?;
@@ -551,6 +610,7 @@ impl GitRepository {
                 .map_err(GitTransactionError::Queue)?,
             base_commit: base.clone(),
             claims: journal_claims(claims),
+            claim_failures: journal_claim_failures,
             state: JournalState::Preparing,
         };
         write_journal(&journal_path, &preparing)?;
