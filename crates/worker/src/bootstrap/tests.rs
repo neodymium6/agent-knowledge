@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use time::{Duration, OffsetDateTime};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use super::{WorkerBootstrap, WorkerOpenError};
 use crate::{StartupOutcome, WorkerSettings};
 
@@ -109,10 +112,8 @@ repository:
   author_name: Fictional Knowledge Worker
   author_email: worker@example.invalid
 quartz:
-  program: /bin/sh
+  program: {script}
   integration_root: {integration}
-  arguments:
-    - {script}
   timeout_seconds: 5
 batch:
   debounce_seconds: 30
@@ -177,11 +178,21 @@ fn initialize_quartz(root: &Path) {
     let integration = root.join("quartz-integration");
     fs::create_dir(&integration)
         .unwrap_or_else(|error| panic!("Quartz integration must be created: {error}"));
+    let script = integration.join("quartz.sh");
     fs::write(
-        integration.join("quartz.sh"),
-        b"printf '%s\\n' '<p>fictional site</p>' > \"$5/index.html\"\n",
+        &script,
+        b"#!/bin/sh\nprintf '%s\\n' '<p>fictional site</p>' > \"$5/index.html\"\n",
     )
     .unwrap_or_else(|error| panic!("Quartz fixture must be written: {error}"));
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script)
+            .unwrap_or_else(|error| panic!("Quartz fixture metadata must be read: {error}"))
+            .permissions();
+        permissions.set_mode(0o500);
+        fs::set_permissions(script, permissions)
+            .unwrap_or_else(|error| panic!("Quartz fixture must be executable: {error}"));
+    }
 }
 
 fn run_git<const N: usize>(working: Option<&Path>, arguments: [&str; N], path: Option<&Path>) {

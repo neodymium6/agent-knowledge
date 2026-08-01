@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{self, Read};
@@ -29,7 +28,6 @@ pub struct WorkerSettings {
     identity: GitIdentity,
     quartz_program: PathBuf,
     quartz_integration_root: PathBuf,
-    quartz_arguments: Vec<OsString>,
     quartz_timeout: StandardDuration,
     schedule: BatchSchedule,
     limits: WorkerRunLimits,
@@ -168,12 +166,6 @@ impl WorkerSettings {
         &self.quartz_integration_root
     }
 
-    /// Returns the fixed arguments prepended to every Quartz build.
-    #[must_use]
-    pub fn quartz_arguments(&self) -> &[OsString] {
-        &self.quartz_arguments
-    }
-
     /// Returns the maximum duration of one Quartz invocation.
     #[must_use]
     pub const fn quartz_timeout(&self) -> StandardDuration {
@@ -230,15 +222,6 @@ impl TryFrom<WireWorkerConfig> for WorkerSettings {
                     field: "repository author identity",
                 },
             )?;
-        let mut quartz_arguments = Vec::with_capacity(wire.quartz.arguments.len());
-        for argument in wire.quartz.arguments {
-            if argument.is_empty() || argument.chars().any(char::is_control) {
-                return Err(WorkerConfigError::InvalidValue {
-                    field: "quartz.arguments",
-                });
-            }
-            quartz_arguments.push(argument.into());
-        }
         let quartz_timeout =
             positive_standard_duration("quartz.timeout_seconds", wire.quartz.timeout_seconds)?;
         let debounce =
@@ -275,7 +258,6 @@ impl TryFrom<WireWorkerConfig> for WorkerSettings {
             identity,
             quartz_program: wire.quartz.program,
             quartz_integration_root: wire.quartz.integration_root,
-            quartz_arguments,
             quartz_timeout,
             schedule,
             limits: WorkerRunLimits::new(
@@ -396,8 +378,6 @@ struct WireRepository {
 struct WireQuartz {
     program: PathBuf,
     integration_root: PathBuf,
-    #[serde(default)]
-    arguments: Vec<String>,
     timeout_seconds: u64,
 }
 

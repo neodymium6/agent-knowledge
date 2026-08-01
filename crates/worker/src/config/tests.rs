@@ -50,10 +50,8 @@ repository:
   author_name: Fictional Knowledge Worker
   author_email: worker@example.invalid
 quartz:
-  program: /bin/sh
+  program: {script}
   integration_root: {integration}
-  arguments:
-    - {script}
   timeout_seconds: 5
 batch:
   debounce_seconds: 30
@@ -91,6 +89,15 @@ fn rejects_unknown_fields_aliases_and_multiple_documents() {
     unknown.push_str("unknown: true\n");
     assert!(matches!(
         WorkerSettings::decode(&unknown),
+        Err(WorkerConfigError::InvalidYaml(_))
+    ));
+
+    let free_form_arguments = valid_yaml(root).replace(
+        "  integration_root: /srv/fictional-knowledge/quartz-integration\n",
+        "  integration_root: /srv/fictional-knowledge/quartz-integration\n  arguments:\n    - quartz\n",
+    );
+    assert!(matches!(
+        WorkerSettings::decode(&free_form_arguments),
         Err(WorkerConfigError::InvalidYaml(_))
     ));
 

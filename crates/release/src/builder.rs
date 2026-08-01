@@ -1,4 +1,4 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
@@ -7,6 +7,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use agent_knowledge_core::{PathAttestation, PathAttestationError};
 
 use crate::store::{BuildDirectory, BuiltDirectory, MAXIMUM_RELEASE_TREE_DEPTH, ReleasePolicy};
 
@@ -36,7 +38,6 @@ pub struct QuartzBuilder {
     configured_integration_directory: PathBuf,
     integration_directory: PathBuf,
     integration_handle: Arc<File>,
-    prefix_arguments: Vec<OsString>,
     timeout: Duration,
     output_policy: ReleasePolicy,
 }
@@ -44,20 +45,17 @@ pub struct QuartzBuilder {
 impl QuartzBuilder {
     /// Validates operator-controlled, trusted Quartz command configuration.
     ///
-    /// `prefix_arguments` typically contains `quartz` when `program` is an
-    /// absolute `npx` path. The builder appends `build -d <content> -o
-    /// <output>` without invoking a shell. The program and integration tree
-    /// must be deployed immutably for the lifetime of this builder.
+    /// The builder invokes the configured launcher as `program build -d
+    /// <content> -o <output>` without a shell. The program and integration
+    /// tree must be deployed immutably for the lifetime of this builder.
     pub fn new(
         program: impl AsRef<Path>,
         integration_directory: impl AsRef<Path>,
-        prefix_arguments: Vec<OsString>,
         timeout: Duration,
     ) -> Result<Self, QuartzBuildError> {
         Self::new_with_policy(
             program,
             integration_directory,
-            prefix_arguments,
             timeout,
             ReleasePolicy::default(),
         )
@@ -67,7 +65,6 @@ impl QuartzBuilder {
     pub fn new_with_policy(
         program: impl AsRef<Path>,
         integration_directory: impl AsRef<Path>,
-        prefix_arguments: Vec<OsString>,
         timeout: Duration,
         output_policy: ReleasePolicy,
     ) -> Result<Self, QuartzBuildError> {
@@ -94,10 +91,25 @@ impl QuartzBuilder {
             configured_integration_directory,
             integration_directory,
             integration_handle,
-            prefix_arguments,
             timeout,
             output_policy,
         })
+    }
+
+    /// Attests the launcher and integration root selected and pinned at open.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured path no longer names its pinned
+    /// object or its ancestry cannot be inspected.
+    pub fn trusted_attestations(&self) -> Result<[PathAttestation; 2], PathAttestationError> {
+        Ok([
+            PathAttestation::capture(&self.configured_program, &self.program_handle)?,
+            PathAttestation::capture(
+                &self.configured_integration_directory,
+                &self.integration_handle,
+            )?,
+        ])
     }
 
     /// Consumes a staging directory and returns it only after a successful,
@@ -133,7 +145,6 @@ impl QuartzBuilder {
         let mut command = Command::new(&self.configured_program);
         command
             .current_dir(&self.integration_directory)
-            .args(&self.prefix_arguments)
             .arg(OsStr::new("build"))
             .arg(OsStr::new("-d"))
             .arg(content)

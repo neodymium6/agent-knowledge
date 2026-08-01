@@ -4,6 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use agent_knowledge_core::{PathAttestation, PathAttestationError};
 use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueError};
 use agent_knowledge_release::{
     QuartzBuildError, QuartzBuilder, ReleaseError, ReleasePolicy, ReleaseStore,
@@ -48,7 +49,6 @@ impl WorkerBootstrap {
         let quartz = QuartzBuilder::new_with_policy(
             settings.quartz_program(),
             settings.quartz_integration_root(),
-            settings.quartz_arguments().to_vec(),
             settings.quartz_timeout(),
             release_policy,
         )
@@ -58,7 +58,7 @@ impl WorkerBootstrap {
         let package_policy = PackagePolicy::default();
         let queue = FileQueue::initialize(settings.queue_root(), package_policy.clone())
             .map_err(|error| WorkerOpenError::Queue(Box::new(error)))?;
-        validate_resolved_topology(&settings)?;
+        validate_opened_topology(&repository, &quartz, &releases, &queue)?;
         let processor = BatchProcessor::new(
             repository,
             quartz,
@@ -106,6 +106,13 @@ pub enum WorkerOpenError {
         /// Second conflicting configuration field.
         second: &'static str,
     },
+    /// A component could not attest the filesystem object that it pinned.
+    Attestation {
+        /// Component boundary whose pinned path could not be attested.
+        component: &'static str,
+        /// Attestation failure.
+        source: PathAttestationError,
+    },
     /// The repository transaction boundary was invalid.
     Repository(Box<GitTransactionError>),
     /// The configured Quartz command could not be pinned.
@@ -129,6 +136,9 @@ impl fmt::Display for WorkerOpenError {
                 formatter,
                 "Worker paths `{first}` and `{second}` resolve to overlapping locations"
             ),
+            Self::Attestation { component, source } => {
+                write!(formatter, "could not attest {component}: {source}")
+            }
             Self::Repository(error) => write!(formatter, "could not open repository: {error}"),
             Self::Quartz(error) => write!(formatter, "could not open Quartz builder: {error}"),
             Self::Release(error) => write!(formatter, "could not open release store: {error}"),
@@ -142,12 +152,76 @@ impl std::error::Error for WorkerOpenError {
         match self {
             Self::PathResolution { source, .. } => Some(source),
             Self::OverlappingPaths { .. } => None,
+            Self::Attestation { source, .. } => Some(source),
             Self::Repository(error) => Some(error),
             Self::Quartz(error) => Some(error),
             Self::Release(error) => Some(error),
             Self::Queue(error) => Some(error),
         }
     }
+}
+
+fn validate_opened_topology(
+    repository: &GitRepository,
+    quartz: &QuartzBuilder,
+    releases: &ReleaseStore,
+    queue: &FileQueue,
+) -> Result<(), WorkerOpenError> {
+    let [repository_root, content_root, work_root] =
+        repository
+            .storage_attestations()
+            .map_err(|source| WorkerOpenError::Attestation {
+                component: "repository storage",
+                source,
+            })?;
+    let release_root =
+        releases
+            .storage_attestation()
+            .map_err(|source| WorkerOpenError::Attestation {
+                component: "release storage",
+                source,
+            })?;
+    let queue_root =
+        queue
+            .storage_attestation()
+            .map_err(|source| WorkerOpenError::Attestation {
+                component: "queue storage",
+                source,
+            })?;
+    let [quartz_program, quartz_integration] =
+        quartz
+            .trusted_attestations()
+            .map_err(|source| WorkerOpenError::Attestation {
+                component: "Quartz command",
+                source,
+            })?;
+    let storage = [
+        ("storage.queue_root", queue_root),
+        ("storage.repository_root", repository_root),
+        ("storage.content_root", content_root),
+        ("storage.work_root", work_root),
+        ("storage.release_root", release_root),
+    ];
+    for (index, (field, attestation)) in storage.iter().enumerate() {
+        for (other_field, other_attestation) in &storage[index + 1..] {
+            reject_attested_overlap(field, attestation, other_field, other_attestation)?;
+        }
+    }
+    let trusted = [
+        ("quartz.program", quartz_program),
+        ("quartz.integration_root", quartz_integration),
+    ];
+    for (storage_field, storage_attestation) in &storage {
+        for (trusted_field, trusted_attestation) in &trusted {
+            reject_attested_overlap(
+                storage_field,
+                storage_attestation,
+                trusted_field,
+                trusted_attestation,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_resolved_topology(settings: &WorkerSettings) -> Result<(), WorkerOpenError> {
@@ -233,6 +307,18 @@ fn reject_overlap(
     second_path: &Path,
 ) -> Result<(), WorkerOpenError> {
     if first_path.starts_with(second_path) || second_path.starts_with(first_path) {
+        return Err(WorkerOpenError::OverlappingPaths { first, second });
+    }
+    Ok(())
+}
+
+fn reject_attested_overlap(
+    first: &'static str,
+    first_path: &PathAttestation,
+    second: &'static str,
+    second_path: &PathAttestation,
+) -> Result<(), WorkerOpenError> {
+    if first_path.is_within(second_path) || second_path.is_within(first_path) {
         return Err(WorkerOpenError::OverlappingPaths { first, second });
     }
     Ok(())

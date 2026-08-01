@@ -263,19 +263,21 @@ The Repository Worker is the only writer to authoritative content. It:
 Quartz receives a committed content tree and produces a static site in a
 temporary release directory. It never changes authoritative content.
 
-The Quartz command, configuration path, and integration directory are
-configuration values. A trial build must finish successfully before a release
-can become current. They are trusted deployment inputs, not request data. The
-configured program and complete integration tree, including plugins and
-runtime dependencies, must be versioned and deployed immutably for the
-Worker's lifetime; changing them requires constructing a new Worker.
+The Quartz launcher and integration directory are configuration values. A
+trial build must finish successfully before a release can become current. They
+are trusted deployment inputs, not request data. The configured launcher and
+complete integration tree, including plugins and runtime dependencies, must
+be versioned and deployed immutably for the Worker's lifetime; changing them
+requires constructing a new Worker. The launcher is the complete executable
+boundary: deployments that require `npx quartz` provide an immutable wrapper
+instead of adding free-form command-prefix arguments to Worker configuration.
 
-The Rust builder resolves a canonical absolute executable and integration
-directory at startup, preserves the executable's original path semantics,
-passes arguments without a shell, and appends Quartz's
-`build -d <content> -o <output>` interface. Standard input and process output
-are disconnected from request data and logs, and every invocation has a
-positive execution deadline. Each invocation runs in an isolated process
+The Rust builder resolves a canonical absolute launcher and integration
+directory at startup, preserves the executable's original path semantics, and
+invokes `<launcher> build -d <content> -o <output>` without a shell. Standard
+input and process output are disconnected from request data and logs, and
+every invocation has a positive execution deadline. Each invocation runs in
+an isolated process
 group; the builder kills that group on timeout and after the command wrapper
 exits. The service supervisor remains responsible for terminating any process
 that escapes the group before restarting recovery.

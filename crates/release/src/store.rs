@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use agent_knowledge_core::{BatchId, Revision};
+use agent_knowledge_core::{BatchId, PathAttestation, PathAttestationError, Revision};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, UtcOffset};
@@ -163,6 +163,16 @@ struct BatchLease {
 }
 
 impl ReleaseStore {
+    /// Attests the release root selected and pinned while opening the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured root no longer names the pinned
+    /// release object or its ancestry cannot be inspected.
+    pub fn storage_attestation(&self) -> Result<PathAttestation, PathAttestationError> {
+        PathAttestation::capture(&self.configured_root, &self.root_handle)
+    }
+
     /// Creates fixed release directories and binds them to this storage root.
     pub fn open(root: impl AsRef<Path>, policy: ReleasePolicy) -> Result<Self, ReleaseError> {
         let policy = policy.validate()?;

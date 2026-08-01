@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::ffi::OsString;
 use std::fs;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
@@ -7,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use agent_knowledge_core::{BatchId, ErrorCode, PayloadPath, RequestId, Revision};
 use agent_knowledge_queue::{
@@ -130,15 +132,21 @@ impl Fixture {
         fs::create_dir(&integration)
             .unwrap_or_else(|error| panic!("Quartz integration must be created: {error}"));
         let script = integration.join("quartz.sh");
-        fs::write(&script, script_contents)
+        let mut executable_script = b"#!/bin/sh\n".to_vec();
+        executable_script.extend_from_slice(script_contents);
+        fs::write(&script, executable_script)
             .unwrap_or_else(|error| panic!("Quartz fixture must be written: {error}"));
-        let quartz = QuartzBuilder::new(
-            "/bin/sh",
-            &integration,
-            vec![OsString::from(script)],
-            Duration::from_secs(5),
-        )
-        .unwrap_or_else(|error| panic!("Quartz fixture must initialize: {error}"));
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&script)
+                .unwrap_or_else(|error| panic!("Quartz fixture metadata must be read: {error}"))
+                .permissions();
+            permissions.set_mode(0o500);
+            fs::set_permissions(&script, permissions)
+                .unwrap_or_else(|error| panic!("Quartz fixture must be executable: {error}"));
+        }
+        let quartz = QuartzBuilder::new(&script, &integration, Duration::from_secs(5))
+            .unwrap_or_else(|error| panic!("Quartz fixture must initialize: {error}"));
         let releases = ReleaseStore::open(root.path().join("releases"), ReleasePolicy::default())
             .unwrap_or_else(|error| panic!("release store must initialize: {error}"));
         Self {
