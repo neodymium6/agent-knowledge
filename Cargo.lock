@@ -11,6 +11,7 @@ dependencies = [
  "agent-knowledge-protocol",
  "agent-knowledge-queue",
  "agent-knowledge-worker",
+ "nix",
  "serde",
  "serde_json",
  "sha2",

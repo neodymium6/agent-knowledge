@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use agent_knowledge_queue::{
     EnqueueOutcome, FileQueue, PackagePolicy, PackageValidationError, QueueError, validate_package,
@@ -15,9 +16,11 @@ use crate::worker::{self, WorkerCommandError};
 
 const USAGE: &str = "usage:\n\
     agent-knowledge admin submit --queue-root <path> --package-root <path>\n\
-    agent-knowledge client submit --destination <ssh-destination> --package-root <path>\n\
+    agent-knowledge client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
     agent-knowledge gateway --config <path> --client-id <id>\n\
     agent-knowledge worker run --config <path>";
+const DEFAULT_CLIENT_TIMEOUT_SECONDS: u64 = 300;
+const MAXIMUM_CLIENT_TIMEOUT_SECONDS: u64 = 3_600;
 
 pub fn run<I, W>(arguments: I, output: W) -> Result<(), CliError>
 where
@@ -30,18 +33,18 @@ where
             package_root,
         } => submit_directory(&queue_root, &package_root, output),
         Command::RunWorker { config } => worker::run(&config, output).map_err(CliError::Worker),
-        Command::RunGateway { config, client_id } => gateway::run(
+        Command::RunGateway { config, client_id } => gateway::run_stdio(
             &config,
             &client_id,
             std::env::var_os("SSH_ORIGINAL_COMMAND"),
-            std::io::stdin().lock(),
             output,
         )
         .map_err(CliError::Gateway),
         Command::ClientSubmit {
             destination,
             package_root,
-        } => client::submit(&destination, &package_root, output).map_err(CliError::Client),
+            timeout,
+        } => client::submit(&destination, &package_root, timeout, output).map_err(CliError::Client),
     }
 }
 
@@ -60,6 +63,7 @@ enum Command {
     ClientSubmit {
         destination: OsString,
         package_root: PathBuf,
+        timeout: Duration,
     },
 }
 
@@ -103,6 +107,7 @@ where
 {
     let mut destination = None;
     let mut package_root = None;
+    let mut timeout_seconds = None;
     while let Some(flag) = arguments.next() {
         let value = arguments.next().ok_or(CliError::Usage)?;
         match flag.to_str() {
@@ -110,12 +115,21 @@ where
             Some("--package-root") if package_root.is_none() => {
                 package_root = Some(PathBuf::from(value));
             }
+            Some("--timeout-seconds") if timeout_seconds.is_none() => {
+                let seconds = value
+                    .to_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|seconds| (1..=MAXIMUM_CLIENT_TIMEOUT_SECONDS).contains(seconds))
+                    .ok_or(CliError::Usage)?;
+                timeout_seconds = Some(seconds);
+            }
             _ => return Err(CliError::Usage),
         }
     }
     Ok(Command::ClientSubmit {
         destination: destination.ok_or(CliError::Usage)?,
         package_root: package_root.ok_or(CliError::Usage)?,
+        timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECONDS)),
     })
 }
 
@@ -259,6 +273,7 @@ impl CliError {
     pub fn write_diagnostic(&self, mut output: impl Write) -> io::Result<()> {
         match self {
             Self::Gateway(error) => error.write_protocol_error(output),
+            Self::Client(error) => error.write_diagnostic(output),
             _ => writeln!(output, "{self}"),
         }
     }

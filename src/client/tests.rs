@@ -3,11 +3,15 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use agent_knowledge_protocol::{ProtocolErrorResponse, SubmitResponse};
+use agent_knowledge_queue::{PackagePolicy, validate_package};
 use tar::Archive;
 
 use super::{
-    ClientCommandError, MAXIMUM_RESPONSE_BYTES, read_bounded_response, submit_with_program,
+    ClientCommandError, MAXIMUM_RESPONSE_BYTES, PreparedPackage, open_payload,
+    read_bounded_diagnostic, read_bounded_response, submit_with_program,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -32,8 +36,6 @@ request_id: 01K00000000000000000000000\n\
 status: active\n\
 ---\n\
 Fictional client body.\n";
-const RESPONSE: &str = "{\"protocol_version\":1,\"status\":\"accepted\",\"request_id\":\"01K00000000000000000000000\",\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"}";
-
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory(PathBuf);
@@ -76,13 +78,32 @@ fn write_package(root: &Path) -> PathBuf {
     package
 }
 
+fn response(package: &Path) -> String {
+    let validated = validate_package(package, &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("response package must validate: {error}"));
+    format!(
+        "{{\"protocol_version\":1,\"status\":\"accepted\",\"request_id\":\"{}\",\"digest\":\"{}\"}}",
+        validated.request().request_id,
+        validated.digest()
+    )
+}
+
+#[cfg(unix)]
+fn write_program(path: &Path, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(path, script)
+        .unwrap_or_else(|error| panic!("fake ssh program must be written: {error}"));
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("fake ssh program must be executable: {error}"));
+}
+
 #[cfg(unix)]
 #[test]
 fn invokes_system_ssh_without_a_shell_and_streams_a_valid_archive() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = TestDirectory::create();
     let package = write_package(root.path());
+    let response = response(&package);
     let arguments = root.path().join("arguments");
     let archive = root.path().join("archive.tar");
     let program = root.path().join("fictional-ssh");
@@ -90,19 +111,19 @@ fn invokes_system_ssh_without_a_shell_and_streams_a_valid_archive() {
         "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\nprintf '%s\\n' '{}'\n",
         arguments.display(),
         archive.display(),
-        RESPONSE
+        response
     );
-    fs::write(&program, script)
-        .unwrap_or_else(|error| panic!("fake ssh program must be written: {error}"));
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o700))
-        .unwrap_or_else(|error| panic!("fake ssh program must be executable: {error}"));
+    write_program(&program, &script);
 
     let mut output = Vec::new();
+    let mut diagnostic = Vec::new();
     submit_with_program(
         program.as_os_str(),
         OsStr::new("-fictional-alias"),
         &package,
+        Duration::from_secs(5),
         &mut output,
+        &mut diagnostic,
     )
     .unwrap_or_else(|error| panic!("client submission must succeed: {error}"));
 
@@ -110,9 +131,10 @@ fn invokes_system_ssh_without_a_shell_and_streams_a_valid_archive() {
         .unwrap_or_else(|error| panic!("fake ssh arguments must be readable: {error}"));
     assert_eq!(
         invoked,
-        "-T\n-o\nBatchMode=yes\n-o\nClearAllForwardings=yes\n--\n-fictional-alias\nakp-v1 submit\n"
+        "-T\n-o\nBatchMode=yes\n-o\nClearAllForwardings=yes\n-o\nForwardAgent=no\n-o\nForwardX11=no\n-o\nStdinNull=no\n-o\nForkAfterAuthentication=no\n--\n-fictional-alias\nakp-v1 submit\n"
     );
-    assert_eq!(String::from_utf8_lossy(&output), format!("{RESPONSE}\n"));
+    assert_eq!(String::from_utf8_lossy(&output), format!("{response}\n"));
+    assert!(diagnostic.is_empty());
 
     let bytes = fs::read(archive)
         .unwrap_or_else(|error| panic!("streamed archive must be readable: {error}"));
@@ -155,4 +177,164 @@ fn bounds_gateway_responses_before_decoding() {
         read_bounded_response(&mut oversized.as_slice()),
         Err(ClientCommandError::ResponseTooLarge)
     ));
+    assert!(matches!(
+        read_bounded_diagnostic(&mut oversized.as_slice()),
+        Err(ClientCommandError::DiagnosticTooLarge)
+    ));
+}
+
+#[test]
+fn prepared_package_uses_an_immutable_payload_snapshot() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let prepared = PreparedPackage::open(&package)
+        .unwrap_or_else(|error| panic!("package snapshot must succeed: {error}"));
+    fs::write(
+        package.join("payload/run/index.md"),
+        "x".repeat(MARKDOWN.len()),
+    )
+    .unwrap_or_else(|error| panic!("payload replacement must be written: {error}"));
+
+    let mut bytes = Vec::new();
+    prepared
+        .write_archive(&mut bytes)
+        .unwrap_or_else(|error| panic!("snapshot archive must be written: {error}"));
+    let mut archive = Archive::new(bytes.as_slice());
+    for entry in archive
+        .entries()
+        .unwrap_or_else(|error| panic!("snapshot archive must decode: {error}"))
+    {
+        let mut entry = entry.unwrap_or_else(|error| panic!("snapshot entry must decode: {error}"));
+        if entry
+            .path()
+            .unwrap_or_else(|error| panic!("snapshot path must decode: {error}"))
+            == Path::new("payload/run/index.md")
+        {
+            let mut body = String::new();
+            entry
+                .read_to_string(&mut body)
+                .unwrap_or_else(|error| panic!("snapshot payload must be readable: {error}"));
+            assert_eq!(body, MARKDOWN);
+            return;
+        }
+    }
+    panic!("snapshot payload entry must exist");
+}
+
+#[test]
+fn rejects_a_same_length_change_before_network_output() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let validated = validate_package(&package, &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("package fixture must validate: {error}"));
+    fs::write(
+        package.join("payload/run/index.md"),
+        "x".repeat(MARKDOWN.len()),
+    )
+    .unwrap_or_else(|error| panic!("changed payload must be written: {error}"));
+
+    assert!(matches!(
+        open_payload(&package, &validated.payload()[0]),
+        Err(ClientCommandError::PackageChanged { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_payload_path_replaced_by_a_symbolic_link() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let validated = validate_package(&package, &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("package fixture must validate: {error}"));
+    let payload = package.join("payload/run/index.md");
+    let replacement = root.path().join("fictional-replacement.md");
+    fs::write(&replacement, MARKDOWN)
+        .unwrap_or_else(|error| panic!("replacement payload must be written: {error}"));
+    fs::remove_file(&payload)
+        .unwrap_or_else(|error| panic!("original payload must be removed: {error}"));
+    symlink(&replacement, &payload)
+        .unwrap_or_else(|error| panic!("payload symlink must be created: {error}"));
+
+    assert!(matches!(
+        open_payload(&package, &validated.payload()[0]),
+        Err(ClientCommandError::OpenPayload { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn decodes_a_bounded_gateway_rejection() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let program = root.path().join("fictional-ssh");
+    write_program(
+        &program,
+        "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{\"protocol_version\":1,\"error_code\":\"REVISION_CONFLICT\"}' >&2\nexit 2\n",
+    );
+
+    let error = match submit_with_program(
+        program.as_os_str(),
+        OsStr::new("fictional-alias"),
+        &package,
+        Duration::from_secs(5),
+        Vec::new(),
+        Vec::new(),
+    ) {
+        Ok(()) => panic!("Gateway rejection must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        ClientCommandError::GatewayRejected(ProtocolErrorResponse { .. })
+    ));
+    let mut diagnostic = Vec::new();
+    error
+        .write_diagnostic(&mut diagnostic)
+        .unwrap_or_else(|write_error| panic!("Gateway error must encode: {write_error}"));
+    assert_eq!(
+        diagnostic,
+        b"{\"protocol_version\":1,\"error_code\":\"REVISION_CONFLICT\"}\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn terminates_a_stalled_ssh_process_at_the_deadline() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let program = root.path().join("fictional-ssh");
+    write_program(&program, "#!/bin/sh\ncat > /dev/null\nexec sleep 5\n");
+
+    assert!(matches!(
+        submit_with_program(
+            program.as_os_str(),
+            OsStr::new("fictional-alias"),
+            &package,
+            Duration::from_millis(50),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(ClientCommandError::SshTimedOut { .. })
+    ));
+}
+
+#[test]
+fn rejects_success_responses_for_a_different_package() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let prepared = PreparedPackage::open(&package)
+        .unwrap_or_else(|error| panic!("package expectation must be prepared: {error}"));
+    for response in [
+        "{\"protocol_version\":1,\"status\":\"accepted\",\"request_id\":\"01K00000000000000000000009\",\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"}",
+        "{\"protocol_version\":1,\"status\":\"existing\",\"request_id\":\"01K00000000000000000000009\",\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"state\":\"pending\"}",
+    ] {
+        let response: SubmitResponse = serde_json::from_str(response)
+            .unwrap_or_else(|error| panic!("mismatched response fixture must decode: {error}"));
+        assert!(matches!(
+            prepared.expectation().verify(&response),
+            Err(ClientCommandError::ResponseMismatch)
+        ));
+    }
 }

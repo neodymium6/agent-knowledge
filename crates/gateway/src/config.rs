@@ -1,6 +1,7 @@
 use std::fmt;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use agent_knowledge_core::{BoundedFileError, read_bounded_regular_file};
 use serde::Deserialize;
@@ -8,11 +9,13 @@ use serde::Deserialize;
 /// Gateway configuration schema supported by this release.
 pub const CURRENT_GATEWAY_CONFIG_VERSION: u16 = 1;
 const MAXIMUM_GATEWAY_CONFIG_BYTES: u64 = 64 * 1024;
+const MAXIMUM_SUBMIT_TIMEOUT_SECONDS: u64 = 3_600;
 
 /// Validated settings for one forced-command Gateway process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewaySettings {
     queue_root: PathBuf,
+    submit_timeout: Duration,
 }
 
 impl GatewaySettings {
@@ -67,6 +70,12 @@ impl GatewaySettings {
     pub fn queue_root(&self) -> &Path {
         &self.queue_root
     }
+
+    /// Returns the absolute wall-clock deadline for one submit stream.
+    #[must_use]
+    pub const fn submit_timeout(&self) -> Duration {
+        self.submit_timeout
+    }
 }
 
 impl TryFrom<WireGatewayConfig> for GatewaySettings {
@@ -87,7 +96,15 @@ impl TryFrom<WireGatewayConfig> for GatewaySettings {
         {
             return Err(GatewayConfigError::InvalidQueuePath);
         }
-        Ok(Self { queue_root })
+        if wire.transport.submit_timeout_seconds == 0
+            || wire.transport.submit_timeout_seconds > MAXIMUM_SUBMIT_TIMEOUT_SECONDS
+        {
+            return Err(GatewayConfigError::InvalidSubmitTimeout);
+        }
+        Ok(Self {
+            queue_root,
+            submit_timeout: Duration::from_secs(wire.transport.submit_timeout_seconds),
+        })
     }
 }
 
@@ -96,12 +113,19 @@ impl TryFrom<WireGatewayConfig> for GatewaySettings {
 struct WireGatewayConfig {
     schema_version: u16,
     storage: WireStorage,
+    transport: WireTransport,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireStorage {
     queue_root: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireTransport {
+    submit_timeout_seconds: u64,
 }
 
 /// Invalid Gateway configuration input.
@@ -127,6 +151,8 @@ pub enum GatewayConfigError {
     },
     /// The queue root was relative, non-normalized, or a filesystem root.
     InvalidQueuePath,
+    /// The submit deadline was zero or exceeded the operational bound.
+    InvalidSubmitTimeout,
 }
 
 impl GatewayConfigError {
@@ -157,6 +183,10 @@ impl fmt::Display for GatewayConfigError {
             ),
             Self::InvalidQueuePath => formatter
                 .write_str("Gateway queue root must be an absolute normalized non-root path"),
+            Self::InvalidSubmitTimeout => write!(
+                formatter,
+                "Gateway submit timeout must be between 1 and {MAXIMUM_SUBMIT_TIMEOUT_SECONDS} seconds"
+            ),
         }
     }
 }
@@ -173,32 +203,37 @@ impl std::error::Error for GatewayConfigError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{GatewayConfigError, GatewaySettings};
 
     #[test]
     fn decodes_only_the_strict_versioned_gateway_shape() {
         let settings = GatewaySettings::decode(
-            "schema_version: 1\nstorage:\n  queue_root: /srv/fictional-knowledge/queue\n",
+            "schema_version: 1\nstorage:\n  queue_root: /srv/fictional-knowledge/queue\ntransport:\n  submit_timeout_seconds: 300\n",
         )
         .unwrap_or_else(|error| panic!("Gateway fixture must decode: {error}"));
         assert_eq!(
             settings.queue_root(),
             std::path::Path::new("/srv/fictional-knowledge/queue")
         );
+        assert_eq!(settings.submit_timeout(), Duration::from_secs(300));
 
         for invalid in [
-            "schema_version: 2\nstorage:\n  queue_root: /srv/fictional-knowledge/queue\n",
-            "schema_version: 1\nstorage:\n  queue_root: relative/queue\n",
-            "schema_version: 1\nstorage:\n  queue_root: /srv/../queue\n",
-            "schema_version: 1\nstorage:\n  queue_root: /\n",
-            "schema_version: 1\nstorage:\n  queue_root: /srv/queue\nextra: true\n",
-            "schema_version: 1\nstorage: &storage\n  queue_root: /srv/queue\ncopy: *storage\n",
+            "schema_version: 2\nstorage:\n  queue_root: /srv/fictional-knowledge/queue\ntransport:\n  submit_timeout_seconds: 300\n",
+            "schema_version: 1\nstorage:\n  queue_root: relative/queue\ntransport:\n  submit_timeout_seconds: 300\n",
+            "schema_version: 1\nstorage:\n  queue_root: /srv/../queue\ntransport:\n  submit_timeout_seconds: 300\n",
+            "schema_version: 1\nstorage:\n  queue_root: /\ntransport:\n  submit_timeout_seconds: 300\n",
+            "schema_version: 1\nstorage:\n  queue_root: /srv/queue\ntransport:\n  submit_timeout_seconds: 300\nextra: true\n",
+            "schema_version: 1\nstorage: &storage\n  queue_root: /srv/queue\ntransport:\n  submit_timeout_seconds: 300\ncopy: *storage\n",
+            "schema_version: 1\nstorage:\n  queue_root: /srv/queue\ntransport:\n  submit_timeout_seconds: 0\n",
+            "schema_version: 1\nstorage:\n  queue_root: /srv/queue\ntransport:\n  submit_timeout_seconds: 3601\n",
         ] {
             assert!(GatewaySettings::decode(invalid).is_err());
         }
         assert!(matches!(
             GatewaySettings::decode(
-                "schema_version: 2\nstorage:\n  queue_root: /srv/fictional-knowledge/queue\n"
+                "schema_version: 2\nstorage:\n  queue_root: /srv/fictional-knowledge/queue\ntransport:\n  submit_timeout_seconds: 300\n"
             ),
             Err(GatewayConfigError::UnsupportedSchemaVersion { found: 2 })
         ));

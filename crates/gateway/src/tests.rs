@@ -67,7 +67,7 @@ impl Drop for TestDirectory {
 
 fn gateway(root: &TestDirectory) -> Gateway {
     let yaml = format!(
-        "schema_version: 1\nstorage:\n  queue_root: {}\n",
+        "schema_version: 1\nstorage:\n  queue_root: {}\ntransport:\n  submit_timeout_seconds: 300\n",
         root.path().join("queue").display()
     );
     let settings = GatewaySettings::decode(&yaml)

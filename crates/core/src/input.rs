@@ -4,13 +4,21 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
-fn open_regular_file(path: &Path) -> Result<PinnedRegularFile, BoundedFileError> {
+fn open_regular_file(
+    path: &Path,
+    follow_symbolic_links: bool,
+) -> Result<PinnedRegularFile, BoundedFileError> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+    let no_follow = if follow_symbolic_links {
+        0
+    } else {
+        nix::libc::O_NOFOLLOW
+    };
     let anchor = OpenOptions::new()
         .read(true)
-        .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC | no_follow)
         .open(path)
         .map_err(BoundedFileError::Io)?;
     let metadata = anchor.metadata().map_err(BoundedFileError::Io)?;
@@ -35,14 +43,31 @@ fn open_regular_file(path: &Path) -> Result<PinnedRegularFile, BoundedFileError>
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_regular_file(path: &Path) -> Result<PinnedRegularFile, BoundedFileError> {
+fn open_regular_file(
+    path: &Path,
+    follow_symbolic_links: bool,
+) -> Result<PinnedRegularFile, BoundedFileError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
 
-        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
+        let no_follow = if follow_symbolic_links {
+            0
+        } else {
+            nix::libc::O_NOFOLLOW
+        };
+        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK | no_follow);
+    }
+    #[cfg(not(unix))]
+    if !follow_symbolic_links
+        && std::fs::symlink_metadata(path)
+            .map_err(BoundedFileError::Io)?
+            .file_type()
+            .is_symlink()
+    {
+        return Err(BoundedFileError::InvalidFileType);
     }
     let file = options.open(path).map_err(BoundedFileError::Io)?;
     let metadata = file.metadata().map_err(BoundedFileError::Io)?;
@@ -72,7 +97,18 @@ impl PinnedRegularFile {
     ///
     /// Returns an error for I/O failures or a non-regular selected target.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, BoundedFileError> {
-        open_regular_file(path.as_ref())
+        open_regular_file(path.as_ref(), true)
+    }
+
+    /// Opens a regular file while rejecting a symbolic link at the selected
+    /// path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for I/O failures, symbolic links, or non-regular
+    /// targets.
+    pub fn open_no_follow(path: impl AsRef<Path>) -> Result<Self, BoundedFileError> {
+        open_regular_file(path.as_ref(), false)
     }
 
     /// Returns the byte length observed from the pinned file descriptor.
@@ -196,5 +232,23 @@ mod tests {
 
         fs::remove_file(path)
             .unwrap_or_else(|error| panic!("replacement fixture must be removed: {error}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_follow_open_rejects_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let target = test_path();
+        let link = test_path();
+        fs::write(&target, b"fictional")
+            .unwrap_or_else(|error| panic!("symlink target must be written: {error}"));
+        symlink(&target, &link)
+            .unwrap_or_else(|error| panic!("symlink fixture must be created: {error}"));
+        assert!(PinnedRegularFile::open_no_follow(&link).is_err());
+        fs::remove_file(link)
+            .unwrap_or_else(|error| panic!("symlink fixture must be removed: {error}"));
+        fs::remove_file(target)
+            .unwrap_or_else(|error| panic!("symlink target must be removed: {error}"));
     }
 }

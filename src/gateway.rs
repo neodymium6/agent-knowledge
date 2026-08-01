@@ -2,13 +2,54 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 use agent_knowledge_core::ErrorCode;
 use agent_knowledge_gateway::{Gateway, GatewayConfigError, GatewayError, GatewaySettings};
 use agent_knowledge_protocol::{ClientId, ClientIdError, GatewayCommand, ProtocolErrorResponse};
 
-pub fn run<R, W>(
+#[cfg(target_os = "linux")]
+pub fn run_stdio<W>(
     config: &Path,
+    client_id: &OsStr,
+    original_command: Option<OsString>,
+    output: W,
+) -> Result<(), GatewayCommandError>
+where
+    W: Write,
+{
+    let settings = GatewaySettings::load(config)
+        .map_err(|error| GatewayCommandError::Config(Box::new(error)))?;
+    let timeout = settings.submit_timeout();
+    let stdin = io::stdin();
+    let input = DeadlineReader::new(stdin.lock(), timeout);
+    run_with_settings(settings, client_id, original_command, input, output)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn run_stdio<W>(
+    config: &Path,
+    client_id: &OsStr,
+    original_command: Option<OsString>,
+    output: W,
+) -> Result<(), GatewayCommandError>
+where
+    W: Write,
+{
+    let settings = GatewaySettings::load(config)
+        .map_err(|error| GatewayCommandError::Config(Box::new(error)))?;
+    run_with_settings(
+        settings,
+        client_id,
+        original_command,
+        io::stdin().lock(),
+        output,
+    )
+}
+
+fn run_with_settings<R, W>(
+    settings: GatewaySettings,
     client_id: &OsStr,
     original_command: Option<OsString>,
     input: R,
@@ -26,8 +67,6 @@ where
     let original_command = original_command.ok_or(GatewayCommandError::MissingCommand)?;
     let command = GatewayCommand::parse(&original_command)
         .map_err(|_| GatewayCommandError::InvalidCommand)?;
-    let settings = GatewaySettings::load(config)
-        .map_err(|error| GatewayCommandError::Config(Box::new(error)))?;
     let gateway =
         Gateway::open(&settings).map_err(|error| GatewayCommandError::Gateway(Box::new(error)))?;
     match command {
@@ -37,6 +76,60 @@ where
                 .map_err(|error| GatewayCommandError::Gateway(Box::new(error)))?;
             serde_json::to_writer(&mut output, &response).map_err(GatewayCommandError::Json)?;
             output.write_all(b"\n").map_err(GatewayCommandError::Io)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct DeadlineReader<R> {
+    inner: R,
+    deadline: Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl<R> DeadlineReader<R> {
+    fn new(inner: R, timeout: Duration) -> Self {
+        Self {
+            inner,
+            deadline: Instant::now() + timeout,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<R> Read for DeadlineReader<R>
+where
+    R: Read + std::os::fd::AsFd,
+{
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use nix::errno::Errno;
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let now = Instant::now();
+            if now >= self.deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Gateway submit deadline expired",
+                ));
+            }
+            let remaining = self.deadline.saturating_duration_since(now);
+            let timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX);
+            let mut descriptors = [PollFd::new(self.inner.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut descriptors, timeout) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Gateway submit deadline expired",
+                    ));
+                }
+                Ok(_) => return self.inner.read(buffer),
+                Err(Errno::EINTR) => {}
+                Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+            }
         }
     }
 }
@@ -109,9 +202,17 @@ impl std::error::Error for GatewayCommandError {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    #[cfg(target_os = "linux")]
+    use std::io::Read;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::UnixStream;
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
 
     use agent_knowledge_core::ErrorCode;
 
+    #[cfg(target_os = "linux")]
+    use super::DeadlineReader;
     use super::GatewayCommandError;
 
     #[test]
@@ -132,5 +233,19 @@ mod tests {
                 .contains("SSH_ORIGINAL_COMMAND")
         );
         assert!(OsStr::new("fictional-node-a").to_str().is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn submit_reader_enforces_an_absolute_idle_deadline() {
+        let (reader, _writer) = UnixStream::pair()
+            .unwrap_or_else(|error| panic!("deadline stream pair must open: {error}"));
+        let mut reader = DeadlineReader::new(reader, Duration::from_millis(20));
+        let mut byte = [0_u8; 1];
+        let error = match reader.read(&mut byte) {
+            Ok(_) => panic!("idle submit stream must time out"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 }

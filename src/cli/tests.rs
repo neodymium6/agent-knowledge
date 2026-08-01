@@ -195,8 +195,47 @@ fn parses_the_ssh_client_submission_command() {
 
     assert!(matches!(
         command,
-        Command::ClientSubmit { destination, package_root }
+        Command::ClientSubmit { destination, package_root, timeout }
             if destination == "fictional-knowledge"
                 && package_root == Path::new("/tmp/fictional-package")
+                && timeout == std::time::Duration::from_secs(300)
     ));
+}
+
+#[test]
+fn parses_and_bounds_the_ssh_client_timeout() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "client".into(),
+        "submit".into(),
+        "--destination".into(),
+        "fictional-knowledge".into(),
+        "--package-root".into(),
+        "/tmp/fictional-package".into(),
+        "--timeout-seconds".into(),
+        "42".into(),
+    ])
+    .unwrap_or_else(|error| panic!("client timeout must parse: {error}"));
+    assert!(matches!(
+        command,
+        Command::ClientSubmit { timeout, .. }
+            if timeout == std::time::Duration::from_secs(42)
+    ));
+
+    for timeout in ["0", "3601", "not-a-number"] {
+        assert!(matches!(
+            parse_arguments([
+                "agent-knowledge".into(),
+                "client".into(),
+                "submit".into(),
+                "--destination".into(),
+                "fictional-knowledge".into(),
+                "--package-root".into(),
+                "/tmp/fictional-package".into(),
+                "--timeout-seconds".into(),
+                timeout.into(),
+            ]),
+            Err(CliError::Usage)
+        ));
+    }
 }
