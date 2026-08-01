@@ -76,7 +76,10 @@ session filters; archived documents are excluded unless `--include-archived`
 is supplied. After a complete control request is received, one read-operation
 deadline covers Gateway repository initialization, content indexing, query
 work, response encoding, and delivery to the SSH channel. The response-byte
-limit includes the JSON Lines framing newline.
+limit includes the JSON Lines framing newline. Read processes open only the
+committed repository and content checkout; submit processes open only the
+durable queue after preflighting all configured storage destinations for
+overlap.
 
 The client validates and snapshots at most 64 MiB of package data before
 network output. It then invokes the system `ssh` executable directly, uses

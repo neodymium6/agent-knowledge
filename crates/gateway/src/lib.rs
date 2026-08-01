@@ -21,9 +21,14 @@ pub use submit::ArchiveError;
 /// Opened Gateway dependencies for one forced-command process.
 #[derive(Debug)]
 pub struct Gateway {
-    queue: Option<FileQueue>,
-    committed: CommittedStore,
+    dependency: GatewayDependency,
     settings: GatewaySettings,
+}
+
+#[derive(Debug)]
+enum GatewayDependency {
+    Submit(Box<FileQueue>),
+    Read(Box<CommittedStore>),
 }
 
 impl Gateway {
@@ -32,24 +37,7 @@ impl Gateway {
     /// # Errors
     ///
     /// Returns an error when the queue cannot be initialized or pinned.
-    pub fn open(settings: &GatewaySettings) -> Result<Self, GatewayError> {
-        Self::open_dependencies(settings, None, true)
-    }
-
-    /// Opens Gateway dependencies while applying an optional read deadline to
-    /// repository inspection and initialization boundaries.
-    pub fn open_until(
-        settings: &GatewaySettings,
-        deadline: Option<std::time::Instant>,
-    ) -> Result<Self, GatewayError> {
-        Self::open_dependencies(settings, deadline, false)
-    }
-
-    fn open_dependencies(
-        settings: &GatewaySettings,
-        deadline: Option<std::time::Instant>,
-        include_queue: bool,
-    ) -> Result<Self, GatewayError> {
+    pub fn open_for_submit(settings: &GatewaySettings) -> Result<Self, GatewayError> {
         let resolved = [
             PathAttestation::resolve_destination(settings.queue_root())
                 .map_err(GatewayError::Attestation)?,
@@ -59,9 +47,38 @@ impl Gateway {
                 .map_err(GatewayError::Attestation)?,
         ];
         validate_disjoint_storage(&resolved)?;
+        let queue = FileQueue::initialize(resolved[0].stable_path(), PackagePolicy::default())
+            .map_err(|error| GatewayError::Queue(Box::new(error)))?;
+        let queue_storage = queue
+            .storage_attestation()
+            .map_err(GatewayError::Attestation)?;
+        if !resolved[0].matches_destination(&queue_storage) {
+            return Err(GatewayError::Attestation(
+                PathAttestationError::BindingMismatch,
+            ));
+        }
+        Ok(Self {
+            dependency: GatewayDependency::Submit(Box::new(queue)),
+            settings: settings.clone(),
+        })
+    }
+
+    /// Opens the committed store while applying an optional read deadline to
+    /// repository inspection and initialization boundaries.
+    pub fn open_for_read_until(
+        settings: &GatewaySettings,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self, GatewayError> {
+        let resolved = [
+            PathAttestation::resolve_destination(settings.git_directory())
+                .map_err(GatewayError::Attestation)?,
+            PathAttestation::resolve_destination(settings.content_root())
+                .map_err(GatewayError::Attestation)?,
+        ];
+        validate_disjoint_storage(&resolved)?;
         let committed = CommittedStore::open_until(
+            resolved[0].stable_path(),
             resolved[1].stable_path(),
-            resolved[2].stable_path(),
             settings.official_branch(),
             deadline,
         )
@@ -70,37 +87,16 @@ impl Gateway {
         let [repository, content] = committed
             .storage_attestations()
             .map_err(GatewayError::Attestation)?;
-        if !resolved[1].matches_destination(&repository)
-            || !resolved[2].matches_destination(&content)
+        if !resolved[0].matches_destination(&repository)
+            || !resolved[1].matches_destination(&content)
         {
             return Err(GatewayError::Attestation(
                 PathAttestationError::BindingMismatch,
             ));
         }
-        let queue = if include_queue {
-            let queue = FileQueue::initialize(resolved[0].stable_path(), PackagePolicy::default())
-                .map_err(|error| GatewayError::Queue(Box::new(error)))?;
-            let queue_storage = queue
-                .storage_attestation()
-                .map_err(GatewayError::Attestation)?;
-            validate_disjoint_storage(&[
-                queue_storage.clone(),
-                repository.clone(),
-                content.clone(),
-            ])?;
-            if !resolved[0].matches_destination(&queue_storage) {
-                return Err(GatewayError::Attestation(
-                    PathAttestationError::BindingMismatch,
-                ));
-            }
-            Some(queue)
-        } else {
-            None
-        };
         ensure_deadline(deadline)?;
         Ok(Self {
-            queue,
-            committed,
+            dependency: GatewayDependency::Read(Box::new(committed)),
             settings: settings.clone(),
         })
     }
@@ -116,32 +112,35 @@ impl Gateway {
         client_id: ClientId,
         input: impl Read,
     ) -> Result<SubmitResponse, GatewayError> {
-        let queue = self.queue.as_ref().ok_or(GatewayError::QueueUnavailable)?;
+        let queue = match &self.dependency {
+            GatewayDependency::Submit(queue) => queue.as_ref(),
+            GatewayDependency::Read(_) => return Err(GatewayError::QueueUnavailable),
+        };
         submit::submit(queue, client_id, input)
     }
 
     /// Lists matching committed documents in canonical path order.
     pub fn list(&self, request: &ListRequest) -> Result<ListResponse, GatewayError> {
         let deadline = read::read_deadline(&self.settings)?;
-        read::list(&self.settings, &self.committed, request, false, deadline)
+        read::list(self.settings(), self.committed()?, request, false, deadline)
             .map(|prepared| prepared.response)
     }
 
     /// Lists matching committed documents from most recently changed.
     pub fn recent(&self, request: &ListRequest) -> Result<ListResponse, GatewayError> {
         let deadline = read::read_deadline(&self.settings)?;
-        read::list(&self.settings, &self.committed, request, true, deadline)
+        read::list(self.settings(), self.committed()?, request, true, deadline)
             .map(|prepared| prepared.response)
     }
 
     /// Retrieves one exact committed Markdown document.
     pub fn get(&self, request: GetRequest) -> Result<GetResponse, GatewayError> {
-        read::get(&self.settings, &self.committed, request).map(|prepared| prepared.response)
+        read::get(self.settings(), self.committed()?, request).map(|prepared| prepared.response)
     }
 
     /// Searches committed Markdown and configured metadata fields.
     pub fn search(&self, request: &SearchRequest) -> Result<ListResponse, GatewayError> {
-        read::search(&self.settings, &self.committed, request).map(|prepared| prepared.response)
+        read::search(self.settings(), self.committed()?, request).map(|prepared| prepared.response)
     }
 
     /// Encodes one list response exactly once under the supplied deadline.
@@ -151,8 +150,14 @@ impl Gateway {
         recent: bool,
         deadline: std::time::Instant,
     ) -> Result<Vec<u8>, GatewayError> {
-        read::list(&self.settings, &self.committed, request, recent, deadline)
-            .map(|prepared| prepared.encoded)
+        read::list(
+            self.settings(),
+            self.committed()?,
+            request,
+            recent,
+            deadline,
+        )
+        .map(|prepared| prepared.encoded)
     }
 
     /// Encodes one exact-document response once under the supplied deadline.
@@ -161,7 +166,7 @@ impl Gateway {
         request: GetRequest,
         deadline: std::time::Instant,
     ) -> Result<Vec<u8>, GatewayError> {
-        read::get_until(&self.settings, &self.committed, request, deadline)
+        read::get_until(self.settings(), self.committed()?, request, deadline)
             .map(|prepared| prepared.encoded)
     }
 
@@ -171,8 +176,19 @@ impl Gateway {
         request: &SearchRequest,
         deadline: std::time::Instant,
     ) -> Result<Vec<u8>, GatewayError> {
-        read::search_until(&self.settings, &self.committed, request, deadline)
+        read::search_until(self.settings(), self.committed()?, request, deadline)
             .map(|prepared| prepared.encoded)
+    }
+
+    fn settings(&self) -> &GatewaySettings {
+        &self.settings
+    }
+
+    fn committed(&self) -> Result<&CommittedStore, GatewayError> {
+        match &self.dependency {
+            GatewayDependency::Read(committed) => Ok(committed.as_ref()),
+            GatewayDependency::Submit(_) => Err(GatewayError::CommittedUnavailable),
+        }
     }
 }
 
@@ -203,6 +219,8 @@ pub enum GatewayError {
     OverlappingStorage,
     /// A submit operation was attempted through a read-only Gateway instance.
     QueueUnavailable,
+    /// A read operation was attempted through a submit-only Gateway instance.
+    CommittedUnavailable,
 }
 
 impl GatewayError {
@@ -214,9 +232,10 @@ impl GatewayError {
             Self::Archive(error) => error.error_code(),
             Self::ReadRequest(error) => error.error_code(),
             Self::CommittedRead(error) => read::committed_error_code(error),
-            Self::Attestation(_) | Self::OverlappingStorage | Self::QueueUnavailable => {
-                ErrorCode::InternalError
-            }
+            Self::Attestation(_)
+            | Self::OverlappingStorage
+            | Self::QueueUnavailable
+            | Self::CommittedUnavailable => ErrorCode::InternalError,
         }
     }
 }
@@ -237,6 +256,9 @@ impl fmt::Display for GatewayError {
             Self::QueueUnavailable => {
                 formatter.write_str("Gateway queue is unavailable for submission")
             }
+            Self::CommittedUnavailable => {
+                formatter.write_str("Gateway committed store is unavailable for reading")
+            }
         }
     }
 }
@@ -249,7 +271,7 @@ impl std::error::Error for GatewayError {
             Self::ReadRequest(error) => Some(error),
             Self::CommittedRead(error) => Some(error.as_ref()),
             Self::Attestation(error) => Some(error),
-            Self::OverlappingStorage | Self::QueueUnavailable => None,
+            Self::OverlappingStorage | Self::QueueUnavailable | Self::CommittedUnavailable => None,
         }
     }
 }

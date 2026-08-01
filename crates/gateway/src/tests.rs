@@ -69,18 +69,27 @@ impl Drop for TestDirectory {
 }
 
 fn gateway(root: &TestDirectory) -> Gateway {
-    if !root.path().join("repository").exists() {
-        initialize_committed_content(root);
-    }
+    let settings = settings(root);
+    Gateway::open_for_submit(&settings)
+        .unwrap_or_else(|error| panic!("submit Gateway must open: {error}"))
+}
+
+fn read_gateway(root: &TestDirectory) -> Gateway {
+    initialize_committed_content(root);
+    let settings = settings(root);
+    Gateway::open_for_read_until(&settings, None)
+        .unwrap_or_else(|error| panic!("read Gateway must open: {error}"))
+}
+
+fn settings(root: &TestDirectory) -> GatewaySettings {
     let yaml = format!(
         "schema_version: 2\nstorage:\n  queue_root: {}\n  git_directory: {}\n  content_root: {}\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
         root.path().join("queue").display(),
         root.path().join("repository").display(),
         root.path().join("content").display(),
     );
-    let settings = GatewaySettings::decode(&yaml)
-        .unwrap_or_else(|error| panic!("Gateway settings must decode: {error}"));
-    Gateway::open(&settings).unwrap_or_else(|error| panic!("Gateway must open: {error}"))
+    GatewaySettings::decode(&yaml)
+        .unwrap_or_else(|error| panic!("Gateway settings must decode: {error}"))
 }
 
 fn client_id() -> ClientId {
@@ -171,7 +180,7 @@ fn run_git(working_directory: Option<&Path>, arguments: &[&str]) {
 #[test]
 fn serves_list_recent_get_and_search_from_one_committed_revision() {
     let root = TestDirectory::create();
-    let gateway = gateway(&root);
+    let gateway = read_gateway(&root);
     let filter = ReadFilterRequest {
         project: Some(
             "fictional-project"
@@ -206,6 +215,25 @@ fn serves_list_recent_get_and_search_from_one_committed_revision() {
     assert_eq!(search.commit, list.commit);
 }
 
+#[cfg(target_family = "unix")]
+#[test]
+fn committed_reads_do_not_open_the_queue_path() {
+    use std::os::unix::net::UnixListener;
+
+    let root = TestDirectory::create();
+    initialize_committed_content(&root);
+    let queue_socket = UnixListener::bind(root.path().join("queue"))
+        .unwrap_or_else(|error| panic!("fictional queue socket must bind: {error}"));
+    let settings = settings(&root);
+    let gateway = Gateway::open_for_read_until(&settings, None)
+        .unwrap_or_else(|error| panic!("read Gateway must ignore the queue path: {error}"));
+    let response = gateway
+        .list(&ListRequest::new(ReadFilterRequest::default(), 10))
+        .unwrap_or_else(|error| panic!("committed list must succeed: {error}"));
+    assert_eq!(response.documents.len(), 1);
+    drop(queue_socket);
+}
+
 #[test]
 fn rejects_overlapping_storage_before_initializing_the_queue() {
     let root = TestDirectory::create();
@@ -220,7 +248,7 @@ fn rejects_overlapping_storage_before_initializing_the_queue() {
     let settings = GatewaySettings::decode(&yaml)
         .unwrap_or_else(|error| panic!("overlap settings must decode: {error}"));
     assert!(matches!(
-        Gateway::open(&settings),
+        Gateway::open_for_submit(&settings),
         Err(GatewayError::OverlappingStorage)
     ));
     assert!(!content.join("queue-id").exists());
@@ -274,7 +302,9 @@ fn valid_archive() -> Vec<u8> {
 #[test]
 fn streams_a_valid_archive_and_preserves_authenticated_identity() {
     let root = TestDirectory::create();
+    assert!(!root.path().join("repository").exists());
     let gateway = gateway(&root);
+    assert!(!root.path().join("repository").exists());
     let response = gateway
         .submit(client_id(), Cursor::new(valid_archive()))
         .unwrap_or_else(|error| panic!("valid archive must be accepted: {error}"));

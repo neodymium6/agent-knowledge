@@ -74,7 +74,7 @@ where
         .map_err(|_| GatewayCommandError::InvalidCommand)?;
     match command {
         GatewayCommand::Submit => {
-            let gateway = Gateway::open(&settings)
+            let gateway = Gateway::open_for_submit(&settings)
                 .map_err(|error| GatewayCommandError::Gateway(Box::new(error)))?;
             let response = gateway
                 .submit(client_id, input)
@@ -85,7 +85,8 @@ where
         GatewayCommand::List => {
             let request = decode_control_request(input)?;
             let deadline = read_deadline(&settings);
-            let gateway = Gateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
+            let gateway =
+                Gateway::open_for_read_until(&settings, Some(deadline)).map_err(gateway_error)?;
             let encoded = gateway
                 .list_encoded_until(&request, false, deadline)
                 .map_err(gateway_error)?;
@@ -94,7 +95,8 @@ where
         GatewayCommand::Recent => {
             let request = decode_control_request(input)?;
             let deadline = read_deadline(&settings);
-            let gateway = Gateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
+            let gateway =
+                Gateway::open_for_read_until(&settings, Some(deadline)).map_err(gateway_error)?;
             let encoded = gateway
                 .list_encoded_until(&request, true, deadline)
                 .map_err(gateway_error)?;
@@ -103,7 +105,8 @@ where
         GatewayCommand::Get => {
             let request = decode_control_request(input)?;
             let deadline = read_deadline(&settings);
-            let gateway = Gateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
+            let gateway =
+                Gateway::open_for_read_until(&settings, Some(deadline)).map_err(gateway_error)?;
             let encoded = gateway
                 .get_encoded_until(request, deadline)
                 .map_err(gateway_error)?;
@@ -112,7 +115,8 @@ where
         GatewayCommand::Search => {
             let request = decode_control_request(input)?;
             let deadline = read_deadline(&settings);
-            let gateway = Gateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
+            let gateway =
+                Gateway::open_for_read_until(&settings, Some(deadline)).map_err(gateway_error)?;
             let encoded = gateway
                 .search_encoded_until(&request, deadline)
                 .map_err(gateway_error)?;
@@ -309,6 +313,13 @@ impl GatewayCommandError {
             Self::ControlInput(error) if error.kind() == io::ErrorKind::TimedOut => {
                 ErrorCode::TemporaryFailure
             }
+            Self::ControlInput(error) if is_peer_disconnect(error.kind()) => {
+                ErrorCode::TemporaryFailure
+            }
+            Self::Json(error) if error.io_error_kind().is_some_and(is_peer_disconnect) => {
+                ErrorCode::TemporaryFailure
+            }
+            Self::Io(error) if is_peer_disconnect(error.kind()) => ErrorCode::TemporaryFailure,
             Self::OutputDeadline => ErrorCode::TemporaryFailure,
             Self::Gateway(error) => error.error_code(),
             Self::InvalidClientIdEncoding
@@ -327,6 +338,17 @@ impl GatewayCommandError {
             .map_err(io::Error::other)?;
         output.write_all(b"\n")
     }
+}
+
+fn is_peer_disconnect(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 impl fmt::Display for GatewayCommandError {
@@ -420,6 +442,55 @@ mod tests {
                 .contains("SSH_ORIGINAL_COMMAND")
         );
         assert!(OsStr::new("fictional-node-a").to_str().is_some());
+    }
+
+    #[test]
+    fn peer_disconnects_are_retryable_transport_failures() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert_eq!(
+                GatewayCommandError::Io(std::io::Error::new(kind, "fictional peer disconnect"))
+                    .error_code(),
+                ErrorCode::TemporaryFailure
+            );
+            assert_eq!(
+                GatewayCommandError::ControlInput(std::io::Error::new(
+                    kind,
+                    "fictional peer disconnect"
+                ))
+                .error_code(),
+                ErrorCode::TemporaryFailure
+            );
+        }
+
+        struct DisconnectedWriter;
+
+        impl std::io::Write for DisconnectedWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "fictional peer disconnect",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let json_error = match serde_json::to_writer(DisconnectedWriter, &"fictional response") {
+            Ok(()) => panic!("disconnected JSON output must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            GatewayCommandError::Json(json_error).error_code(),
+            ErrorCode::TemporaryFailure
+        );
     }
 
     #[cfg(target_os = "linux")]
