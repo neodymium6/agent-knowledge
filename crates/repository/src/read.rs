@@ -4,9 +4,11 @@ use std::fs::{self, File, TryLockError};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use agent_knowledge_core::{
-    DocumentId, PinnedDirectory, PinnedPathError, ProjectId, Revision, SessionId, markdown_body,
+    DocumentId, PathAttestation, PathAttestationError, PinnedDirectory, PinnedPathError, ProjectId,
+    Revision, SessionId, markdown_body,
 };
 use agent_knowledge_queue::PackagePolicy;
 use sha2::{Digest, Sha256};
@@ -31,6 +33,19 @@ pub struct CommittedStore {
 }
 
 impl CommittedStore {
+    /// Returns attested identities for the bare repository and content root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either pinned storage binding changed or Linux
+    /// mount topology cannot be inspected.
+    pub fn storage_attestations(&self) -> Result<[PathAttestation; 2], PathAttestationError> {
+        Ok([
+            PathAttestation::capture(&self.configured_git_directory, &self.git_root_handle)?,
+            PathAttestation::capture(&self.configured_content_root, &self.content_root_handle)?,
+        ])
+    }
+
     /// Opens a read boundary for one bare repository and its canonical worktree.
     ///
     /// # Errors
@@ -413,9 +428,37 @@ pub trait SearchBackend {
         snapshot: &'a CommittedSnapshot,
         query: &str,
         filter: &ReadFilter,
-        maximum_query_characters: usize,
-        maximum_results: usize,
+        policy: SearchPolicy,
     ) -> Result<Vec<&'a DocumentRecord>, CommittedReadError>;
+}
+
+/// CPU and I/O bounds for one search over a committed snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchPolicy {
+    /// Maximum Unicode scalar values in the query.
+    pub maximum_query_characters: usize,
+    /// Maximum matching documents returned.
+    pub maximum_results: usize,
+    /// Maximum filtered documents inspected.
+    pub maximum_scanned_documents: usize,
+    /// Maximum Markdown bytes read for body matching.
+    pub maximum_scanned_markdown_bytes: u64,
+    /// Optional absolute deadline shared with snapshot construction.
+    pub deadline: Option<Instant>,
+}
+
+impl SearchPolicy {
+    /// Creates a policy with bounded query/results and unrestricted scan work.
+    #[must_use]
+    pub const fn new(maximum_query_characters: usize, maximum_results: usize) -> Self {
+        Self {
+            maximum_query_characters,
+            maximum_results,
+            maximum_scanned_documents: usize::MAX,
+            maximum_scanned_markdown_bytes: u64::MAX,
+            deadline: None,
+        }
+    }
 }
 
 /// Initial bounded full-text search that scans committed Markdown directly.
@@ -444,28 +487,41 @@ impl SearchBackend for LinearSearch {
         snapshot: &'a CommittedSnapshot,
         query: &str,
         filter: &ReadFilter,
-        maximum_query_characters: usize,
-        maximum_results: usize,
+        policy: SearchPolicy,
     ) -> Result<Vec<&'a DocumentRecord>, CommittedReadError> {
-        validate_result_limit(maximum_results)?;
+        validate_result_limit(policy.maximum_results)?;
         let query = query.trim();
         if query.is_empty() {
             return Err(CommittedReadError::EmptyQuery);
         }
         let actual = query.chars().count();
-        if actual > maximum_query_characters {
+        if actual > policy.maximum_query_characters {
             return Err(CommittedReadError::QueryTooLong {
-                maximum: maximum_query_characters,
+                maximum: policy.maximum_query_characters,
                 actual,
             });
         }
         let query = query.to_lowercase();
         let mut matches = Vec::new();
+        let mut scanned_documents = 0_usize;
+        let mut scanned_markdown_bytes = 0_u64;
         for record in snapshot
             .index
             .documents()
             .filter(|record| filter.matches(record))
         {
+            if policy
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Err(CommittedReadError::SearchDeadlineExceeded);
+            }
+            scanned_documents = scanned_documents.saturating_add(1);
+            if scanned_documents > policy.maximum_scanned_documents {
+                return Err(CommittedReadError::SearchDocumentLimitExceeded {
+                    maximum: policy.maximum_scanned_documents,
+                });
+            }
             let metadata = record.metadata();
             let fixed_match = metadata.title.to_lowercase().contains(&query)
                 || record
@@ -501,6 +557,16 @@ impl SearchBackend for LinearSearch {
                 false
             } else {
                 let markdown = snapshot.read_markdown(record)?;
+                scanned_markdown_bytes = scanned_markdown_bytes
+                    .checked_add(markdown.len() as u64)
+                    .ok_or(CommittedReadError::SearchMarkdownByteLimitExceeded {
+                        maximum: policy.maximum_scanned_markdown_bytes,
+                    })?;
+                if scanned_markdown_bytes > policy.maximum_scanned_markdown_bytes {
+                    return Err(CommittedReadError::SearchMarkdownByteLimitExceeded {
+                        maximum: policy.maximum_scanned_markdown_bytes,
+                    });
+                }
                 markdown_body(&markdown)
                     .map_err(|_| CommittedReadError::InvalidMarkdownEncoding {
                         document_id: metadata.document_id,
@@ -513,7 +579,7 @@ impl SearchBackend for LinearSearch {
             }
         }
         matches.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
-        matches.truncate(maximum_results);
+        matches.truncate(policy.maximum_results);
         Ok(matches)
     }
 }
@@ -570,6 +636,18 @@ pub enum CommittedReadError {
     },
     /// A list or search operation requested no possible results.
     InvalidResultLimit,
+    /// Search inspected more documents than deployment policy permits.
+    SearchDocumentLimitExceeded {
+        /// Configured maximum inspected documents.
+        maximum: usize,
+    },
+    /// Search read more Markdown body bytes than deployment policy permits.
+    SearchMarkdownByteLimitExceeded {
+        /// Configured maximum inspected Markdown bytes.
+        maximum: u64,
+    },
+    /// The configured absolute search deadline expired.
+    SearchDeadlineExceeded,
 }
 
 impl fmt::Display for CommittedReadError {
@@ -616,6 +694,16 @@ impl fmt::Display for CommittedReadError {
                 )
             }
             Self::InvalidResultLimit => formatter.write_str("maximum results must be positive"),
+            Self::SearchDocumentLimitExceeded { maximum } => {
+                write!(formatter, "search exceeds {maximum} inspected documents")
+            }
+            Self::SearchMarkdownByteLimitExceeded { maximum } => {
+                write!(
+                    formatter,
+                    "search exceeds {maximum} inspected Markdown bytes"
+                )
+            }
+            Self::SearchDeadlineExceeded => formatter.write_str("search deadline expired"),
         }
     }
 }

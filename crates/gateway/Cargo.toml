@@ -14,5 +14,6 @@ agent-knowledge-protocol = { path = "../protocol" }
 agent-knowledge-queue = { path = "../queue" }
 agent-knowledge-repository = { path = "../repository" }
 serde.workspace = true
+serde_json.workspace = true
 serde-saphyr.workspace = true
 tar.workspace = true

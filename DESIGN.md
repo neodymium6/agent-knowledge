@@ -1397,6 +1397,9 @@ Configuration, rather than architecture, controls:
 - maximum payload path components;
 - maximum front-matter bytes;
 - Gateway submit and client transfer timeouts;
+- committed-index entry and aggregate Markdown-byte limits;
+- search document, Markdown-byte, and execution-time limits;
+- encoded read-response byte limits;
 - incoming quarantine and reap age thresholds;
 - allowed attachment extensions;
 - project identifiers;

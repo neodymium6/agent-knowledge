@@ -69,8 +69,11 @@ impl Drop for TestDirectory {
 }
 
 fn gateway(root: &TestDirectory) -> Gateway {
+    if !root.path().join("repository").exists() {
+        initialize_committed_content(root);
+    }
     let yaml = format!(
-        "schema_version: 2\nstorage:\n  queue_root: {}\n  git_directory: {}\n  content_root: {}\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
+        "schema_version: 2\nstorage:\n  queue_root: {}\n  git_directory: {}\n  content_root: {}\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
         root.path().join("queue").display(),
         root.path().join("repository").display(),
         root.path().join("content").display(),
@@ -168,7 +171,6 @@ fn run_git(working_directory: Option<&Path>, arguments: &[&str]) {
 #[test]
 fn serves_list_recent_get_and_search_from_one_committed_revision() {
     let root = TestDirectory::create();
-    initialize_committed_content(&root);
     let gateway = gateway(&root);
     let filter = ReadFilterRequest {
         project: Some(
@@ -202,6 +204,26 @@ fn serves_list_recent_get_and_search_from_one_committed_revision() {
         .unwrap_or_else(|error| panic!("committed search must succeed: {error}"));
     assert_eq!(search.documents.len(), 1);
     assert_eq!(search.commit, list.commit);
+}
+
+#[test]
+fn rejects_overlapping_storage_before_initializing_the_queue() {
+    let root = TestDirectory::create();
+    initialize_committed_content(&root);
+    let content = root.path().join("content");
+    let yaml = format!(
+        "schema_version: 2\nstorage:\n  queue_root: {}\n  git_directory: {}\n  content_root: {}\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
+        content.display(),
+        root.path().join("repository").display(),
+        content.display(),
+    );
+    let settings = GatewaySettings::decode(&yaml)
+        .unwrap_or_else(|error| panic!("overlap settings must decode: {error}"));
+    assert!(matches!(
+        Gateway::open(&settings),
+        Err(GatewayError::OverlappingStorage)
+    ));
+    assert!(!content.join("queue-id").exists());
 }
 
 fn append_entry(builder: &mut Builder<Vec<u8>>, path: &str, kind: EntryType, contents: &[u8]) {

@@ -218,6 +218,29 @@ fn rejects_unsafe_entries_and_enforces_bounds() {
         ),
         Err(ContentIndexError::MarkdownTooLarge { maximum: 8, .. })
     ));
+
+    assert!(matches!(
+        ContentIndex::build(
+            root.path(),
+            ContentPolicy {
+                maximum_total_markdown_bytes: 8,
+                ..ContentPolicy::default()
+            },
+            &PackagePolicy::default()
+        ),
+        Err(ContentIndexError::MarkdownByteLimitExceeded { maximum: 8 })
+    ));
+    assert!(matches!(
+        ContentIndex::build(
+            root.path(),
+            ContentPolicy {
+                scan_deadline: Some(std::time::Instant::now()),
+                ..ContentPolicy::default()
+            },
+            &PackagePolicy::default()
+        ),
+        Err(ContentIndexError::ScanDeadlineExceeded)
+    ));
 }
 
 #[test]

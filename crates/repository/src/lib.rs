@@ -16,5 +16,5 @@ pub use index::{
 };
 pub use read::{
     CommittedDocument, CommittedReadError, CommittedSnapshot, CommittedStore, LinearSearch,
-    ReadFilter, SearchBackend, SearchMetadataFields,
+    ReadFilter, SearchBackend, SearchMetadataFields, SearchPolicy,
 };

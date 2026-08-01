@@ -1,4 +1,6 @@
 use std::fmt;
+use std::io::{self, Write};
+use std::time::Instant;
 
 use agent_knowledge_core::{DocumentLimits, ErrorCode};
 use agent_knowledge_protocol::{
@@ -8,20 +10,22 @@ use agent_knowledge_protocol::{
 use agent_knowledge_queue::PackagePolicy;
 use agent_knowledge_repository::{
     CommittedReadError, CommittedStore, ContentPolicy, DocumentRecord, LinearSearch, ReadFilter,
-    SearchBackend, SearchMetadataFields,
+    SearchBackend, SearchMetadataFields, SearchPolicy,
 };
 
 use crate::{GatewayError, GatewaySettings};
 
 pub(super) fn list(
     settings: &GatewaySettings,
+    store: &CommittedStore,
     request: &ListRequest,
     recent: bool,
 ) -> Result<ListResponse, GatewayError> {
     validate_version(request.protocol_version)?;
     validate_filter(&request.filter)?;
     validate_result_limit(settings, request.maximum_results)?;
-    let snapshot = snapshot(settings)?;
+    let deadline = read_deadline(settings)?;
+    let snapshot = snapshot(settings, store, deadline)?;
     let filter = repository_filter(&request.filter);
     let records = if recent {
         snapshot.recent(&filter, request.maximum_results)
@@ -33,15 +37,19 @@ pub(super) fn list(
         .into_iter()
         .map(document_summary)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(ListResponse::new(snapshot.commit().to_owned(), documents))
+    let response = ListResponse::new(snapshot.commit().to_owned(), documents);
+    ensure_response_size(settings, &response)?;
+    Ok(response)
 }
 
 pub(super) fn get(
     settings: &GatewaySettings,
+    store: &CommittedStore,
     request: GetRequest,
 ) -> Result<GetResponse, GatewayError> {
     validate_version(request.protocol_version)?;
-    let snapshot = snapshot(settings)?;
+    let deadline = read_deadline(settings)?;
+    let snapshot = snapshot(settings, store, deadline)?;
     let committed_document = snapshot.get(request.document_id).map_err(committed)?;
     let summary = document_summary(committed_document.record())?;
     let markdown = std::str::from_utf8(committed_document.markdown())
@@ -51,20 +59,24 @@ pub(super) fn get(
             })
         })?
         .to_owned();
-    Ok(GetResponse::new(
+    let response = GetResponse::new(
         snapshot.commit().to_owned(),
         DocumentContent { summary, markdown },
-    ))
+    );
+    ensure_response_size(settings, &response)?;
+    Ok(response)
 }
 
 pub(super) fn search(
     settings: &GatewaySettings,
+    store: &CommittedStore,
     request: &SearchRequest,
 ) -> Result<ListResponse, GatewayError> {
     validate_version(request.protocol_version)?;
     validate_filter(&request.filter)?;
     validate_result_limit(settings, request.maximum_results)?;
-    let snapshot = snapshot(settings)?;
+    let deadline = read_deadline(settings)?;
+    let snapshot = snapshot(settings, store, deadline)?;
     let fields = settings.search_metadata_fields();
     let search = LinearSearch::new(SearchMetadataFields::new(
         fields[0], fields[1], fields[2], fields[3],
@@ -74,29 +86,85 @@ pub(super) fn search(
             &snapshot,
             &request.query,
             &repository_filter(&request.filter),
-            settings.maximum_search_query_characters(),
-            request.maximum_results,
+            SearchPolicy {
+                maximum_query_characters: settings.maximum_search_query_characters(),
+                maximum_results: request.maximum_results,
+                maximum_scanned_documents: settings.maximum_search_documents(),
+                maximum_scanned_markdown_bytes: settings.maximum_search_markdown_bytes(),
+                deadline: Some(deadline),
+            },
         )
         .map_err(committed)?;
     let documents = records
         .into_iter()
         .map(document_summary)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(ListResponse::new(snapshot.commit().to_owned(), documents))
+    let response = ListResponse::new(snapshot.commit().to_owned(), documents);
+    ensure_response_size(settings, &response)?;
+    Ok(response)
 }
 
 fn snapshot(
     settings: &GatewaySettings,
+    store: &CommittedStore,
+    deadline: Instant,
 ) -> Result<agent_knowledge_repository::CommittedSnapshot, GatewayError> {
-    let store = CommittedStore::open(
-        settings.git_directory(),
-        settings.content_root(),
-        settings.official_branch(),
-    )
-    .map_err(committed)?;
+    let policy = ContentPolicy {
+        maximum_entry_count: settings.maximum_index_entries(),
+        maximum_total_markdown_bytes: settings.maximum_index_markdown_bytes(),
+        scan_deadline: Some(deadline),
+        ..ContentPolicy::default()
+    };
     store
-        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .snapshot(policy, &PackagePolicy::default())
         .map_err(committed)
+}
+
+fn read_deadline(settings: &GatewaySettings) -> Result<Instant, GatewayError> {
+    Instant::now()
+        .checked_add(settings.read_operation_timeout())
+        .ok_or(GatewayError::ReadRequest(ReadRequestError::InvalidDeadline))
+}
+
+fn ensure_response_size(
+    settings: &GatewaySettings,
+    response: &impl serde::Serialize,
+) -> Result<(), GatewayError> {
+    let mut counter = ResponseCounter {
+        written: 0,
+        maximum: settings.maximum_response_bytes(),
+    };
+    if serde_json::to_writer(&mut counter, response).is_err() {
+        return Err(GatewayError::ReadRequest(
+            ReadRequestError::ResponseTooLarge {
+                maximum: settings.maximum_response_bytes(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+struct ResponseCounter {
+    written: u64,
+    maximum: u64,
+}
+
+impl Write for ResponseCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let next = self
+            .written
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| io::Error::other("response byte limit exceeded"))?;
+        if next > self.maximum {
+            return Err(io::Error::other("response byte limit exceeded"));
+        }
+        self.written = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn repository_filter(filter: &ReadFilterRequest) -> ReadFilter {
@@ -174,7 +242,26 @@ pub(super) fn committed_error_code(error: &CommittedReadError) -> ErrorCode {
         CommittedReadError::EmptyQuery | CommittedReadError::InvalidResultLimit => {
             ErrorCode::InvalidRequest
         }
-        CommittedReadError::QueryTooLong { .. } => ErrorCode::LimitExceeded,
+        CommittedReadError::QueryTooLong { .. }
+        | CommittedReadError::SearchDocumentLimitExceeded { .. }
+        | CommittedReadError::SearchMarkdownByteLimitExceeded { .. } => ErrorCode::LimitExceeded,
+        CommittedReadError::Content(source)
+            if matches!(
+                source.as_ref(),
+                agent_knowledge_repository::ContentIndexError::EntryLimitExceeded { .. }
+                    | agent_knowledge_repository::ContentIndexError::MarkdownByteLimitExceeded { .. }
+            ) =>
+        {
+            ErrorCode::LimitExceeded
+        }
+        CommittedReadError::Content(source)
+            if matches!(
+                source.as_ref(),
+                agent_knowledge_repository::ContentIndexError::ScanDeadlineExceeded
+            ) =>
+        {
+            ErrorCode::TemporaryFailure
+        }
         CommittedReadError::Content(_) | CommittedReadError::InvalidMarkdownEncoding { .. } => {
             ErrorCode::ContentValidationFailed
         }
@@ -186,7 +273,8 @@ pub(super) fn committed_error_code(error: &CommittedReadError) -> ErrorCode {
         | CommittedReadError::Busy
         | CommittedReadError::CanonicalOutOfDate { .. }
         | CommittedReadError::PinnedPath(_)
-        | CommittedReadError::ContentChanged { .. } => ErrorCode::TemporaryFailure,
+        | CommittedReadError::ContentChanged { .. }
+        | CommittedReadError::SearchDeadlineExceeded => ErrorCode::TemporaryFailure,
     }
 }
 
@@ -216,6 +304,13 @@ pub enum ReadRequestError {
     },
     /// Validated committed content unexpectedly had a non-UTF-8 path.
     InvalidCommittedPath,
+    /// The absolute operation deadline could not be represented.
+    InvalidDeadline,
+    /// The encoded successful response exceeded deployment policy.
+    ResponseTooLarge {
+        /// Maximum encoded response bytes.
+        maximum: u64,
+    },
 }
 
 impl ReadRequestError {
@@ -226,6 +321,8 @@ impl ReadRequestError {
             Self::TagTooLong { .. } | Self::InvalidResultLimit { .. } => ErrorCode::LimitExceeded,
             Self::InvalidTag => ErrorCode::InvalidRequest,
             Self::InvalidCommittedPath => ErrorCode::ContentValidationFailed,
+            Self::InvalidDeadline => ErrorCode::InternalError,
+            Self::ResponseTooLarge { .. } => ErrorCode::LimitExceeded,
         }
     }
 }
@@ -250,8 +347,38 @@ impl fmt::Display for ReadRequestError {
             Self::InvalidCommittedPath => {
                 formatter.write_str("committed document path is not UTF-8")
             }
+            Self::InvalidDeadline => formatter.write_str("read operation deadline is invalid"),
+            Self::ResponseTooLarge { maximum } => {
+                write!(formatter, "encoded response exceeds {maximum} bytes")
+            }
         }
     }
 }
 
 impl std::error::Error for ReadRequestError {}
+
+#[cfg(test)]
+mod tests {
+    use agent_knowledge_protocol::ListResponse;
+
+    use super::{ReadRequestError, ensure_response_size};
+    use crate::{GatewayError, GatewaySettings};
+
+    #[test]
+    fn rejects_a_success_response_over_the_shared_wire_budget() {
+        let settings = GatewaySettings::decode(
+            "schema_version: 2\nstorage:\n  queue_root: /srv/fictional-knowledge/queue\n  git_directory: /srv/fictional-knowledge/repository\n  content_root: /srv/fictional-knowledge/content\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 8\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
+        )
+        .unwrap_or_else(|error| panic!("response-budget settings must decode: {error}"));
+        let response = ListResponse::new(
+            "0123456789abcdef0123456789abcdef01234567".into(),
+            Vec::new(),
+        );
+        assert!(matches!(
+            ensure_response_size(&settings, &response),
+            Err(GatewayError::ReadRequest(
+                ReadRequestError::ResponseTooLarge { maximum: 8 }
+            ))
+        ));
+    }
+}

@@ -168,7 +168,7 @@ where
             if now >= self.deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "Gateway submit deadline expired",
+                    "Gateway input deadline expired",
                 ));
             }
             let remaining = self.deadline.saturating_duration_since(now);
@@ -178,7 +178,7 @@ where
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "Gateway submit deadline expired",
+                        "Gateway input deadline expired",
                     ));
                 }
                 Ok(_) => return self.inner.read(buffer),
@@ -213,6 +213,9 @@ impl GatewayCommandError {
                 ErrorCode::InvalidProtocol
             }
             Self::ControlRequestTooLarge => ErrorCode::LimitExceeded,
+            Self::ControlInput(error) if error.kind() == io::ErrorKind::TimedOut => {
+                ErrorCode::TemporaryFailure
+            }
             Self::Gateway(error) => error.error_code(),
             Self::InvalidClientIdEncoding
             | Self::ClientId(_)
@@ -304,6 +307,14 @@ mod tests {
             Ok("{\"protocol_version\":1,\"error_code\":\"INVALID_PROTOCOL\"}\n")
         );
         assert_eq!(error.error_code(), ErrorCode::InvalidProtocol);
+        assert_eq!(
+            GatewayCommandError::ControlInput(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "fictional timeout"
+            ))
+            .error_code(),
+            ErrorCode::TemporaryFailure
+        );
         assert!(
             GatewayCommandError::MissingCommand
                 .to_string()

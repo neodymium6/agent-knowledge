@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use agent_knowledge_core::{PinnedDirectory, PinnedPathError, RequestId, Revision};
 use agent_knowledge_protocol::{
-    CURRENT_GATEWAY_PROTOCOL_VERSION, ProtocolErrorResponse, SUBMIT_COMMAND, SubmitOutcome,
-    SubmitResponse,
+    CURRENT_GATEWAY_PROTOCOL_VERSION, GET_COMMAND, GetRequest, GetResponse, ProtocolErrorResponse,
+    SUBMIT_COMMAND, SubmitOutcome, SubmitResponse,
 };
 use agent_knowledge_queue::{
     PackagePolicy, PackageValidationError, PayloadMetadata, ValidatedPackage, validate_package,
@@ -24,7 +24,7 @@ use tar::{Builder, EntryType, Header};
 const SSH_PROGRAM: &str = "ssh";
 const MAXIMUM_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
-const MAXIMUM_CONTROL_RESPONSE_BYTES: u64 = 96 * 1024 * 1024;
+const MAXIMUM_CONTROL_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(crate) fn submit(
     destination: &OsStr,
@@ -62,6 +62,50 @@ where
         output,
         io::stderr(),
     )
+}
+
+pub(crate) fn get(
+    destination: &OsStr,
+    request: &GetRequest,
+    timeout: Duration,
+    output: impl Write,
+) -> Result<(), ClientCommandError> {
+    get_with_program(
+        OsStr::new(SSH_PROGRAM),
+        destination,
+        request,
+        timeout,
+        output,
+        io::stderr(),
+    )
+}
+
+fn get_with_program(
+    program: &OsStr,
+    destination: &OsStr,
+    request: &GetRequest,
+    timeout: Duration,
+    mut output: impl Write,
+    diagnostic_output: impl Write,
+) -> Result<(), ClientCommandError> {
+    let mut encoded = Vec::new();
+    control_with_program::<_, GetResponse>(
+        program,
+        destination,
+        GET_COMMAND,
+        request,
+        timeout,
+        &mut encoded,
+        diagnostic_output,
+    )?;
+    let response: GetResponse =
+        serde_json::from_slice(&encoded).map_err(ClientCommandError::InvalidResponse)?;
+    if response.document.summary.metadata.document_id != request.document_id {
+        return Err(ClientCommandError::DocumentResponseMismatch);
+    }
+    output
+        .write_all(&encoded)
+        .map_err(ClientCommandError::Output)
 }
 
 fn control_with_program<Request, Response>(
@@ -688,6 +732,7 @@ pub(crate) enum ClientCommandError {
         actual: u16,
     },
     ResponseMismatch,
+    DocumentResponseMismatch,
     DiagnosticOutput(io::Error),
     EncodeResponse(serde_json::Error),
     Output(io::Error),
@@ -813,6 +858,9 @@ impl fmt::Display for ClientCommandError {
             Self::ResponseMismatch => formatter.write_str(
                 "Gateway response request ID or digest does not match the submitted package",
             ),
+            Self::DocumentResponseMismatch => {
+                formatter.write_str("Gateway response document ID does not match the request")
+            }
             Self::DiagnosticOutput(error) => {
                 write!(formatter, "could not write ssh diagnostics: {error}")
             }
@@ -859,7 +907,8 @@ impl std::error::Error for ClientCommandError {
             | Self::SshFailed { .. }
             | Self::GatewayRejected(_)
             | Self::UnsupportedProtocolVersion { .. }
-            | Self::ResponseMismatch => None,
+            | Self::ResponseMismatch
+            | Self::DocumentResponseMismatch => None,
         }
     }
 }

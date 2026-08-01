@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use agent_knowledge_core::PinnedDirectory;
 use agent_knowledge_protocol::{
-    LIST_COMMAND, ListRequest, ListResponse, ProtocolErrorResponse, ReadFilterRequest,
+    GetRequest, LIST_COMMAND, ListRequest, ListResponse, ProtocolErrorResponse, ReadFilterRequest,
     SubmitResponse,
 };
 use agent_knowledge_queue::{PackagePolicy, validate_package};
@@ -15,8 +15,8 @@ use tar::Archive;
 
 use super::{
     ClientCommandError, MAXIMUM_RESPONSE_BYTES, PreparedPackage, control_with_program,
-    decode_protocol_version, open_payload, read_bounded_diagnostic, read_bounded_response,
-    submit_with_program,
+    decode_protocol_version, get_with_program, open_payload, read_bounded_diagnostic,
+    read_bounded_response, submit_with_program,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -215,6 +215,31 @@ fn sends_typed_control_json_and_validates_the_response() {
     .unwrap_or_else(|error| panic!("control request must decode: {error}"));
     assert_eq!(sent, request);
     assert_eq!(String::from_utf8_lossy(&output), format!("{response}\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_get_response_for_a_different_document() {
+    let root = TestDirectory::create();
+    let program = root.path().join("fictional-get-ssh");
+    write_program(
+        &program,
+        "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{\"protocol_version\":1,\"commit\":\"0123456789abcdef0123456789abcdef01234567\",\"document\":{\"summary\":{\"path\":\"projects/fictional-project/runbooks/fictional/index.md\",\"document_type\":\"runbook\",\"project\":\"fictional-project\",\"archived\":false,\"revision\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"metadata\":{\"schema_version\":1,\"document_id\":\"01K00000000000000000000002\",\"title\":\"Fictional response\",\"created\":\"2026-07-31T03:50:00Z\",\"request_id\":\"01K00000000000000000000003\",\"status\":\"active\"}},\"markdown\":\"---\\n---\\n\"}}'\n",
+    );
+    let requested = "01K00000000000000000000001"
+        .parse()
+        .unwrap_or_else(|error| panic!("requested document ID must parse: {error}"));
+    assert!(matches!(
+        get_with_program(
+            program.as_os_str(),
+            OsStr::new("fictional-alias"),
+            &GetRequest::new(requested),
+            Duration::from_secs(5),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(ClientCommandError::DocumentResponseMismatch)
+    ));
 }
 
 #[test]

@@ -10,7 +10,7 @@ use agent_knowledge_queue::PackagePolicy;
 
 use super::{
     CommittedReadError, CommittedStore, LinearSearch, ReadFilter, SearchBackend,
-    SearchMetadataFields,
+    SearchMetadataFields, SearchPolicy,
 };
 use crate::ContentPolicy;
 
@@ -182,12 +182,17 @@ fn snapshots_one_commit_and_queries_validated_documents() {
 
     let search = LinearSearch::default();
     let matches = search
-        .search(&snapshot, "needle", &filter, 64, 10)
+        .search(&snapshot, "needle", &filter, SearchPolicy::new(64, 10))
         .unwrap_or_else(|error| panic!("body search must succeed: {error}"));
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].metadata().document_id, log_id);
     let metadata_matches = search
-        .search(&snapshot, "fictional-node-a", &filter, 64, 10)
+        .search(
+            &snapshot,
+            "fictional-node-a",
+            &filter,
+            SearchPolicy::new(64, 10),
+        )
         .unwrap_or_else(|error| panic!("metadata search must succeed: {error}"));
     assert_eq!(metadata_matches.len(), 1);
     assert!(!snapshot.commit().is_empty());
@@ -215,8 +220,7 @@ fn filters_tags_and_disables_unselected_search_metadata() {
                 &snapshot,
                 "fictional-node-a",
                 &ReadFilter::default(),
-                64,
-                10,
+                SearchPolicy::new(64, 10),
             )
             .unwrap_or_else(|error| panic!("restricted metadata search must succeed: {error}"))
             .is_empty()
@@ -246,8 +250,37 @@ fn rejects_writer_contention_dirty_content_and_invalid_bounds() {
         Err(CommittedReadError::InvalidResultLimit)
     ));
     assert!(matches!(
-        LinearSearch::default().search(&snapshot, " ", &ReadFilter::default(), 64, 10),
+        LinearSearch::default().search(
+            &snapshot,
+            " ",
+            &ReadFilter::default(),
+            SearchPolicy::new(64, 10),
+        ),
         Err(CommittedReadError::EmptyQuery)
+    ));
+    assert!(matches!(
+        LinearSearch::default().search(
+            &snapshot,
+            "not-present",
+            &ReadFilter::default(),
+            SearchPolicy {
+                maximum_scanned_documents: 1,
+                ..SearchPolicy::new(64, 10)
+            },
+        ),
+        Err(CommittedReadError::SearchDocumentLimitExceeded { maximum: 1 })
+    ));
+    assert!(matches!(
+        LinearSearch::default().search(
+            &snapshot,
+            "not-present",
+            &ReadFilter::default(),
+            SearchPolicy {
+                maximum_scanned_markdown_bytes: 1,
+                ..SearchPolicy::new(64, 10)
+            },
+        ),
+        Err(CommittedReadError::SearchMarkdownByteLimitExceeded { maximum: 1 })
     ));
     drop(snapshot);
 

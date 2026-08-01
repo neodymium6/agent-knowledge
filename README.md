@@ -100,6 +100,12 @@ repository:
 reads:
   maximum_results: 100
   maximum_query_characters: 512
+  maximum_index_entries: 100000
+  maximum_index_markdown_bytes: 536870912
+  maximum_search_documents: 10000
+  maximum_search_markdown_bytes: 536870912
+  operation_timeout_seconds: 30
+  maximum_response_bytes: 268435456
   search_metadata:
     node: true
     agent: true

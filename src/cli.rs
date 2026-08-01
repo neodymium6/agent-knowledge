@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_knowledge_protocol::{
-    GET_COMMAND, GetRequest, GetResponse, LIST_COMMAND, ListRequest, ListResponse, RECENT_COMMAND,
-    ReadFilterRequest, SEARCH_COMMAND, SearchRequest,
+    GetRequest, LIST_COMMAND, ListRequest, ListResponse, RECENT_COMMAND, ReadFilterRequest,
+    SEARCH_COMMAND, SearchRequest,
 };
 use agent_knowledge_queue::{
     EnqueueOutcome, FileQueue, PackagePolicy, PackageValidationError, QueueError, validate_package,
@@ -72,10 +72,7 @@ where
             destination,
             request,
             timeout,
-        } => {
-            client::control::<_, GetResponse>(&destination, GET_COMMAND, &request, timeout, output)
-                .map_err(CliError::Client)
-        }
+        } => client::get(&destination, &request, timeout, output).map_err(CliError::Client),
         Command::ClientSearch {
             destination,
             request,

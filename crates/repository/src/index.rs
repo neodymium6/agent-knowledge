@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use agent_knowledge_core::{
     AttachmentName, DocumentId, DocumentLimits, DocumentMetadata, DocumentParseError,
@@ -19,10 +20,14 @@ pub struct ContentPolicy {
     pub maximum_entry_count: usize,
     /// Maximum bytes in one Markdown document.
     pub maximum_markdown_bytes: u64,
+    /// Maximum aggregate Markdown bytes inspected while building the index.
+    pub maximum_total_markdown_bytes: u64,
     /// Maximum bytes in one Markdown front matter section.
     pub maximum_front_matter_bytes: usize,
     /// Shared typed metadata limits.
     pub document: DocumentLimits,
+    /// Optional absolute deadline for one index scan.
+    pub scan_deadline: Option<Instant>,
 }
 
 impl Default for ContentPolicy {
@@ -30,8 +35,10 @@ impl Default for ContentPolicy {
         Self {
             maximum_entry_count: 1_000_000,
             maximum_markdown_bytes: 32 * 1024 * 1024,
+            maximum_total_markdown_bytes: 8 * 1024 * 1024 * 1024,
             maximum_front_matter_bytes: 64 * 1024,
             document: DocumentLimits::default(),
+            scan_deadline: None,
         }
     }
 }
@@ -167,7 +174,9 @@ impl ContentIndex {
         let mut attachments = Vec::new();
         let mut pending = vec![content_root.to_path_buf()];
         let mut entry_count = 0_usize;
+        let mut markdown_bytes = 0_u64;
         while let Some(directory) = pending.pop() {
+            check_scan_deadline(policy.scan_deadline)?;
             let remaining = policy.maximum_entry_count.saturating_sub(entry_count);
             let mut entries = Vec::with_capacity(remaining.min(1_024));
             for entry in fs::read_dir(&directory).map_err(ContentIndexError::Io)? {
@@ -188,6 +197,7 @@ impl ContentIndex {
             entries.sort_by_key(fs::DirEntry::file_name);
             let mut child_directories = Vec::new();
             for entry in entries {
+                check_scan_deadline(policy.scan_deadline)?;
                 entry_count =
                     entry_count
                         .checked_add(1)
@@ -240,6 +250,16 @@ impl ContentIndex {
                         path: relative_path,
                         maximum: policy.maximum_markdown_bytes,
                         actual: metadata.len(),
+                    });
+                }
+                markdown_bytes = markdown_bytes.checked_add(metadata.len()).ok_or(
+                    ContentIndexError::MarkdownByteLimitExceeded {
+                        maximum: policy.maximum_total_markdown_bytes,
+                    },
+                )?;
+                if markdown_bytes > policy.maximum_total_markdown_bytes {
+                    return Err(ContentIndexError::MarkdownByteLimitExceeded {
+                        maximum: policy.maximum_total_markdown_bytes,
                     });
                 }
 
@@ -340,6 +360,13 @@ impl ContentIndex {
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
     }
+}
+
+fn check_scan_deadline(deadline: Option<Instant>) -> Result<(), ContentIndexError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(ContentIndexError::ScanDeadlineExceeded);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -675,6 +702,13 @@ pub enum ContentIndexError {
         /// Observed bytes.
         actual: u64,
     },
+    /// Aggregate Markdown bytes exceeded the configured index-work bound.
+    MarkdownByteLimitExceeded {
+        /// Configured maximum aggregate bytes.
+        maximum: u64,
+    },
+    /// The configured absolute index-scan deadline expired.
+    ScanDeadlineExceeded,
     /// Markdown front matter could not be decoded safely.
     InvalidDocument {
         /// Document path relative to the content root.
@@ -768,6 +802,13 @@ impl fmt::Display for ContentIndexError {
                 "Markdown `{}` is {actual} bytes; maximum is {maximum}",
                 path.display()
             ),
+            Self::MarkdownByteLimitExceeded { maximum } => write!(
+                formatter,
+                "content hierarchy exceeds {maximum} aggregate Markdown bytes"
+            ),
+            Self::ScanDeadlineExceeded => {
+                formatter.write_str("content index scan deadline expired")
+            }
             Self::InvalidDocument { path, source } => {
                 write!(
                     formatter,
