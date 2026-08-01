@@ -34,6 +34,7 @@ static BUILD_PROCESS_LEASE: Mutex<()> = Mutex::new(());
 #[derive(Clone, Debug)]
 pub struct QuartzBuilder {
     configured_program: PathBuf,
+    program: PathBuf,
     program_handle: Arc<File>,
     configured_integration_directory: PathBuf,
     integration_directory: PathBuf,
@@ -81,6 +82,7 @@ impl QuartzBuilder {
         let program_handle =
             Arc::new(File::open(&configured_program).map_err(QuartzBuildError::Io)?);
         validate_executable_program(&configured_program, &program_handle)?;
+        let program = stable_file_path(&program_handle, &configured_program)?;
         let configured_integration_directory = canonical_directory(integration_directory.as_ref())?;
         let integration_handle =
             Arc::new(File::open(&configured_integration_directory).map_err(QuartzBuildError::Io)?);
@@ -88,6 +90,7 @@ impl QuartzBuilder {
             stable_file_path(&integration_handle, &configured_integration_directory)?;
         Ok(Self {
             configured_program,
+            program,
             program_handle,
             configured_integration_directory,
             integration_directory,
@@ -125,6 +128,15 @@ impl QuartzBuilder {
     }
 
     fn build_path(&self, content: &Path, output: &Path) -> Result<(), QuartzBuildError> {
+        self.build_path_with_hook(content, output, || {})
+    }
+
+    fn build_path_with_hook(
+        &self,
+        content: &Path,
+        output: &Path,
+        before_spawn: impl FnOnce(),
+    ) -> Result<(), QuartzBuildError> {
         if !content.is_absolute() || !output.is_absolute() {
             return Err(QuartzBuildError::BuildPathsMustBeAbsolute);
         }
@@ -139,11 +151,12 @@ impl QuartzBuilder {
         }
         self.validate_live_command()?;
         let _process_lease = BuildProcessLease::acquire()?;
+        before_spawn();
         let deadline = Instant::now()
             .checked_add(self.timeout)
             .ok_or(QuartzBuildError::InvalidTimeout)?;
 
-        let mut command = Command::new(&self.configured_program);
+        let mut command = Command::new(&self.program);
         command
             .current_dir(&self.integration_directory)
             .arg(OsStr::new("build"))

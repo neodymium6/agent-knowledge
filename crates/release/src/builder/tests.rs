@@ -107,7 +107,7 @@ fn invokes_quartz_with_fixed_content_and_output_arguments() {
     assert_eq!(
         fs::read_to_string(output.join("program-path.txt"))
             .unwrap_or_else(|error| panic!("program path must be readable: {error}")),
-        format!("{}\n", program.display())
+        format!("{}\n", builder.program.display())
     );
 }
 
@@ -670,6 +670,51 @@ fn rejects_replaced_command_configuration() {
             .next()
             .is_none()
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn launch_uses_the_pinned_program_after_path_replacement() {
+    let root = TestDirectory::new();
+    let integration = root.0.join("integration");
+    let content = root.0.join("content");
+    let output = root.0.join("output");
+    for directory in [&integration, &content, &output] {
+        fs::create_dir(directory)
+            .unwrap_or_else(|error| panic!("fixture directory must be created: {error}"));
+    }
+    let program = root.0.join("fake-quartz");
+    let detached = root.0.join("pinned-fake-quartz");
+    let replacement_marker = root.0.join("replacement-ran");
+    executable(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' pinned > \"$5/index.html\"\n",
+    );
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("Quartz builder must initialize: {error}"));
+
+    let result = builder.build_path_with_hook(&content, &output, || {
+        fs::rename(&program, &detached)
+            .unwrap_or_else(|error| panic!("pinned program must be moved: {error}"));
+        executable(
+            &program,
+            &format!(
+                "#!/bin/sh\nprintf replacement > '{}'\nprintf '%s\\n' replacement > \"$5/index.html\"\n",
+                replacement_marker.display()
+            ),
+        );
+    });
+
+    assert!(matches!(
+        result,
+        Err(QuartzBuildError::CommandIdentityChanged)
+    ));
+    assert_eq!(
+        fs::read_to_string(output.join("index.html"))
+            .unwrap_or_else(|error| panic!("pinned output must be readable: {error}")),
+        "pinned\n"
+    );
+    assert!(!replacement_marker.exists());
 }
 
 #[cfg(unix)]
