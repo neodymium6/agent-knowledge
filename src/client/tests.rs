@@ -14,9 +14,9 @@ use agent_knowledge_queue::{PackagePolicy, validate_package};
 use tar::Archive;
 
 use super::{
-    ClientCommandError, MAXIMUM_RESPONSE_BYTES, PreparedPackage, control_with_program,
-    decode_protocol_version, get_with_program, open_payload, read_bounded_diagnostic,
-    read_bounded_response, status_with_program, submit_with_program,
+    ClientCommandError, ControlOperation, MAXIMUM_CONTROL_RESPONSE_BYTES, MAXIMUM_RESPONSE_BYTES,
+    PreparedPackage, control_with_program, decode_protocol_version, get_with_program, open_payload,
+    read_bounded_diagnostic, read_bounded_response, status_with_program, submit_with_program,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -195,7 +195,7 @@ fn sends_typed_control_json_and_validates_the_response() {
     control_with_program::<_, ListResponse>(
         program.as_os_str(),
         OsStr::new("fictional-alias"),
-        LIST_COMMAND,
+        ControlOperation::new(LIST_COMMAND, MAXIMUM_CONTROL_RESPONSE_BYTES),
         &request,
         Duration::from_secs(5),
         &mut output,
@@ -280,6 +280,23 @@ fn sends_status_request_and_rejects_a_mismatched_response() {
     )
     .unwrap_or_else(|error| panic!("status request must decode: {error}"));
     assert_eq!(sent.request_id, request_id);
+
+    let oversized_program = root.path().join("fictional-oversized-status-ssh");
+    write_program(
+        &oversized_program,
+        "#!/bin/sh\ncat > /dev/null\nhead -c 4097 /dev/zero\n",
+    );
+    assert!(matches!(
+        status_with_program(
+            oversized_program.as_os_str(),
+            OsStr::new("fictional-alias"),
+            &StatusRequest::new(request_id),
+            Duration::from_secs(5),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(ClientCommandError::ControlResponseTooLarge { maximum: 4096 })
+    ));
 }
 
 #[test]

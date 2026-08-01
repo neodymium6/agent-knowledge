@@ -25,6 +25,22 @@ const SSH_PROGRAM: &str = "ssh";
 const MAXIMUM_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+const MAXIMUM_STATUS_RESPONSE_BYTES: u64 = 4 * 1024;
+
+#[derive(Clone, Copy)]
+struct ControlOperation<'a> {
+    remote_command: &'a str,
+    maximum_response_bytes: u64,
+}
+
+impl<'a> ControlOperation<'a> {
+    const fn new(remote_command: &'a str, maximum_response_bytes: u64) -> Self {
+        Self {
+            remote_command,
+            maximum_response_bytes,
+        }
+    }
+}
 
 pub(crate) fn submit(
     destination: &OsStr,
@@ -56,7 +72,7 @@ where
     control_with_program::<Request, Response>(
         OsStr::new(SSH_PROGRAM),
         destination,
-        remote_command,
+        ControlOperation::new(remote_command, MAXIMUM_CONTROL_RESPONSE_BYTES),
         request,
         timeout,
         output,
@@ -108,7 +124,7 @@ fn status_with_program(
     control_with_program::<_, StatusResponse>(
         program,
         destination,
-        STATUS_COMMAND,
+        ControlOperation::new(STATUS_COMMAND, MAXIMUM_STATUS_RESPONSE_BYTES),
         request,
         timeout,
         &mut encoded,
@@ -136,7 +152,7 @@ fn get_with_program(
     control_with_program::<_, GetResponse>(
         program,
         destination,
-        GET_COMMAND,
+        ControlOperation::new(GET_COMMAND, MAXIMUM_CONTROL_RESPONSE_BYTES),
         request,
         timeout,
         &mut encoded,
@@ -155,7 +171,7 @@ fn get_with_program(
 fn control_with_program<Request, Response>(
     program: &OsStr,
     destination: &OsStr,
-    remote_command: &str,
+    operation: ControlOperation<'_>,
     request: &Request,
     timeout: Duration,
     mut output: impl Write,
@@ -177,7 +193,7 @@ where
     }
 
     let mut command = Command::new(program);
-    configure_ssh_command(&mut command, destination, remote_command);
+    configure_ssh_command(&mut command, destination, operation.remote_command);
     let mut child = command.spawn().map_err(ClientCommandError::StartSsh)?;
     let Some(mut stdin) = child.stdin.take() else {
         terminate_process_group(&mut child);
@@ -203,7 +219,7 @@ where
     });
     let response_events = events.clone();
     let response = thread::spawn(move || {
-        let result = read_bounded_control_response(&mut stdout);
+        let result = read_bounded_control_response(&mut stdout, operation.maximum_response_bytes);
         notify_transfer(
             &response_events,
             TransferEvent::Response {
@@ -546,14 +562,19 @@ fn read_bounded_response(input: &mut impl Read) -> Result<Vec<u8>, ClientCommand
     Ok(response)
 }
 
-fn read_bounded_control_response(input: &mut impl Read) -> Result<Vec<u8>, ClientCommandError> {
+fn read_bounded_control_response(
+    input: &mut impl Read,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, ClientCommandError> {
     let mut response = Vec::new();
     input
-        .take(MAXIMUM_CONTROL_RESPONSE_BYTES.saturating_add(1))
+        .take(maximum_bytes.saturating_add(1))
         .read_to_end(&mut response)
         .map_err(ClientCommandError::ReadResponse)?;
-    if response.len() as u64 > MAXIMUM_CONTROL_RESPONSE_BYTES {
-        return Err(ClientCommandError::ControlResponseTooLarge);
+    if response.len() as u64 > maximum_bytes {
+        return Err(ClientCommandError::ControlResponseTooLarge {
+            maximum: maximum_bytes,
+        });
     }
     Ok(response)
 }
@@ -756,7 +777,9 @@ pub(crate) enum ClientCommandError {
     DiagnosticThreadPanicked,
     ReadResponse(io::Error),
     ResponseTooLarge,
-    ControlResponseTooLarge,
+    ControlResponseTooLarge {
+        maximum: u64,
+    },
     ReadDiagnostic(io::Error),
     DiagnosticTooLarge,
     TransferCancelled,
@@ -859,9 +882,9 @@ impl fmt::Display for ClientCommandError {
                 formatter,
                 "Gateway response exceeds {MAXIMUM_RESPONSE_BYTES} bytes"
             ),
-            Self::ControlResponseTooLarge => write!(
+            Self::ControlResponseTooLarge { maximum } => write!(
                 formatter,
-                "Gateway control response exceeds {MAXIMUM_CONTROL_RESPONSE_BYTES} bytes"
+                "Gateway control response exceeds {maximum} bytes"
             ),
             Self::ReadDiagnostic(error) => {
                 write!(formatter, "could not read ssh diagnostics: {error}")
@@ -946,7 +969,7 @@ impl std::error::Error for ClientCommandError {
             | Self::ResponseThreadPanicked
             | Self::DiagnosticThreadPanicked
             | Self::ResponseTooLarge
-            | Self::ControlResponseTooLarge
+            | Self::ControlResponseTooLarge { .. }
             | Self::DiagnosticTooLarge
             | Self::TransferCancelled
             | Self::TransferState
