@@ -66,6 +66,24 @@ impl BatchProcessor {
             .map_err(BatchProcessorError::repository)
     }
 
+    /// Reads durable transaction metadata before queue recovery completes.
+    ///
+    /// This supports accurate interruption and failure reporting only. A
+    /// caller must still use [`Self::unfinished_transaction`] after queue
+    /// recovery before replaying repository state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the repository journal or queue binding is invalid.
+    pub fn unfinished_transaction_summary(
+        &self,
+        worker: &WorkerSession,
+    ) -> Result<Option<RepositoryTransaction>, BatchProcessorError> {
+        self.repository
+            .unfinished_transaction_summary(worker)
+            .map_err(BatchProcessorError::repository)
+    }
+
     /// Applies, publishes, reconciles, and finalizes one claimed batch.
     ///
     /// # Errors

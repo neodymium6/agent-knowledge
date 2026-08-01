@@ -429,10 +429,41 @@ impl GitRepository {
         &self,
         worker: &WorkerSession,
     ) -> Result<Option<RepositoryTransaction>, GitTransactionError> {
+        self.discover_unfinished_transaction(worker, true)
+    }
+
+    /// Discovers durable transaction metadata while queue recovery is in progress.
+    ///
+    /// This read-only operation validates the repository, journal, and queue
+    /// binding but does not authorize transaction replay. Call
+    /// [`Self::unfinished_transaction`] after queue recovery before mutating
+    /// repository state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage or journal validation fails.
+    pub fn unfinished_transaction_summary(
+        &self,
+        worker: &WorkerSession,
+    ) -> Result<Option<RepositoryTransaction>, GitTransactionError> {
+        self.discover_unfinished_transaction(worker, false)
+    }
+
+    fn discover_unfinished_transaction(
+        &self,
+        worker: &WorkerSession,
+        require_transaction_ready: bool,
+    ) -> Result<Option<RepositoryTransaction>, GitTransactionError> {
         let _writer = self.lock_writer()?;
-        worker
-            .ensure_transaction_ready()
-            .map_err(GitTransactionError::Queue)?;
+        if require_transaction_ready {
+            worker
+                .ensure_transaction_ready()
+                .map_err(GitTransactionError::Queue)?;
+        } else {
+            worker
+                .queue_identity()
+                .map_err(GitTransactionError::Queue)?;
+        }
         self.validate_live_storage()?;
 
         let mut transaction = None;

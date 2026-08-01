@@ -884,7 +884,10 @@ from validated packages and durable phase records. No other Worker transition
 is allowed until that recovery scan completes successfully; an error leaves the
 session recovery-gated. This also recovers requests for which rename succeeded
 but the previous process failed before returning a token or completing
-directory synchronization.
+directory synchronization. Before the bounded scan, the Worker performs a
+read-only validation of any repository journal and its queue binding so early
+shutdown or scan errors can report the journaled claim-failure count. It repeats
+full transaction discovery after queue recovery before any replay mutation.
 
 ## 17. Revisions and conflicts
 

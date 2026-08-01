@@ -718,6 +718,17 @@ fn runtime_resumes_a_terminal_repository_transaction() {
     assert!(matches!(result, Err(GitTransactionError::TrialBuildFailed)));
     drop(worker);
 
+    assert!(matches!(
+        WorkerRuntime::start_interruptible(
+            &queue,
+            fixture.processor(repository.clone()),
+            Default::default(),
+            created_at(),
+            &|| true,
+        ),
+        Ok(InterruptibleStart::Stopped { failed_requests: 2 })
+    ));
+
     let stop_checks = Cell::new(0_u8);
     let stop_after_discovery = || {
         let current = stop_checks.get();
@@ -838,6 +849,43 @@ fn recovery_batch_mismatch_retains_journaled_claim_failures() {
             repository,
             failed_requests: 6,
         } if processing == batch_id() && repository == journal_batch_id
+    ));
+}
+
+#[test]
+fn multiple_processing_batches_retain_journaled_claim_failures() {
+    let fixture = Fixture::create();
+    let repository = fixture.repository();
+    let (queue, mut worker) = fixture.queue_and_worker();
+    let first = enqueue_and_claim(&queue, &mut worker);
+    enqueue_create_with_ids(&queue, SECOND_REQUEST_ID, SECOND_DOCUMENT_ID);
+    let second_request_id: RequestId = SECOND_REQUEST_ID
+        .parse()
+        .unwrap_or_else(|error| panic!("second request ID must parse: {error}"));
+    let second_batch_id: BatchId = "01K00000000000000000000010"
+        .parse()
+        .unwrap_or_else(|error| panic!("second batch ID must parse: {error}"));
+    worker
+        .claim(second_request_id, second_batch_id)
+        .unwrap_or_else(|error| panic!("second package must be claimed: {error}"));
+    write_preparing_journal(&fixture, &worker, &first, batch_id(), 8);
+    drop(worker);
+
+    let error = match WorkerRuntime::start(
+        &queue,
+        fixture.processor(repository),
+        Default::default(),
+        created_at(),
+    ) {
+        Ok(_) => panic!("multiple processing batches must fail recovery"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.failed_requests(), 8);
+    assert!(matches!(
+        error,
+        WorkerRunError::StartupRecovery { source, .. }
+            if matches!(*source, WorkerRunError::MultipleProcessingBatches { .. })
     ));
 }
 

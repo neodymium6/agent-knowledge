@@ -232,11 +232,22 @@ impl WorkerRuntime {
         should_stop: &impl Fn() -> bool,
     ) -> Result<InterruptibleStart<(Self, StartupOutcome)>, WorkerRunError> {
         let mut session = queue.try_worker_session().map_err(WorkerRunError::queue)?;
-        let Some(claims) = recover_processing(&mut session, limits, should_stop)? else {
-            return Ok(InterruptibleStart::Stopped { failed_requests: 0 });
+        let summary = processor
+            .unfinished_transaction_summary(&session)
+            .map_err(|error| WorkerRunError::processor(error, 0))?;
+        let summary_failures = summary.map_or(0, RepositoryTransaction::claim_failures);
+        let Some(claims) = recover_processing(&mut session, limits, should_stop)
+            .map_err(|error| error.with_failed_requests(summary_failures))?
+        else {
+            return Ok(InterruptibleStart::Stopped {
+                failed_requests: summary_failures,
+            });
         };
-        let processing_batch = single_processing_batch(&claims)?;
-        let transaction = processor.unfinished_transaction(&session)?;
+        let processing_batch = single_processing_batch(&claims)
+            .map_err(|error| error.with_failed_requests(summary_failures))?;
+        let transaction = processor
+            .unfinished_transaction(&session)
+            .map_err(|error| WorkerRunError::processor(error, summary_failures))?;
         let journal_failures = transaction.map_or(0, RepositoryTransaction::claim_failures);
         if should_stop() {
             return Ok(InterruptibleStart::Stopped {
@@ -609,6 +620,13 @@ pub enum WorkerRunError {
         /// Requests rejected before repository processing began.
         failed_requests: usize,
     },
+    /// Startup recovery failed after a durable journal count was discovered.
+    StartupRecovery {
+        /// Concrete recovery failure.
+        source: Box<WorkerRunError>,
+        /// Requests rejected before startup recovery began.
+        failed_requests: usize,
+    },
     /// Interrupted processing exceeded the configured in-memory batch bound.
     TooManyProcessingClaims {
         /// Configured maximum number of claims.
@@ -653,12 +671,26 @@ impl WorkerRunError {
         }
     }
 
+    fn with_failed_requests(self, failed_requests: usize) -> Self {
+        if failed_requests == 0 || self.failed_requests() > 0 {
+            self
+        } else {
+            Self::StartupRecovery {
+                source: Box::new(self),
+                failed_requests,
+            }
+        }
+    }
+
     /// Returns requests durably rejected before this cycle failed.
     #[must_use]
     pub const fn failed_requests(&self) -> usize {
         match self {
             Self::Queue(error) => error.failed_requests(),
             Self::Processor {
+                failed_requests, ..
+            } => *failed_requests,
+            Self::StartupRecovery {
                 failed_requests, ..
             } => *failed_requests,
             Self::TransactionBatchMismatch {
@@ -684,6 +716,9 @@ impl fmt::Display for WorkerRunError {
             Self::Queue(error) => write!(formatter, "Worker queue operation failed: {error}"),
             Self::Processor { source, .. } => {
                 write!(formatter, "Worker batch processing failed: {source}")
+            }
+            Self::StartupRecovery { source, .. } => {
+                write!(formatter, "Worker startup recovery failed: {source}")
             }
             Self::TooManyProcessingClaims { maximum } => write!(
                 formatter,
@@ -717,6 +752,7 @@ impl std::error::Error for WorkerRunError {
         match self {
             Self::Queue(error) => Some(error),
             Self::Processor { source, .. } => Some(source),
+            Self::StartupRecovery { source, .. } => Some(source),
             Self::TooManyProcessingClaims { .. }
             | Self::MultipleProcessingBatches { .. }
             | Self::TransactionBatchMismatch { .. }
