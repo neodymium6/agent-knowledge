@@ -318,16 +318,19 @@ run on an independent background thread that is woken by local publication and
 otherwise sleeps until a retry or bounded low-frequency verification poll is
 due. They use an exact commit-to-branch refspec, non-interactive Git and SSH
 credential modes, a per-attempt timeout, shutdown cancellation, and capped
-exponential backoff. Mirror remotes are incompatible and rejected. Pushes never
-force-update the remote branch and replication inspection does not acquire the
-local repository writer lock. A fingerprint of the configured push URL is part
+exponential backoff. Mirror remotes and multiple push destinations are
+incompatible and rejected. Pushes never force-update the remote branch, and
+replication inspection does not acquire the local repository writer lock. A
+fingerprint of the configured push URL is part
 of the durable destination identity, so repointing a named remote invalidates
 its previous success record without persisting sensitive URL text. Reportable
 events are retained in a bounded queue; replication pauses when it is full
 rather than overwriting an unread event. Each attempt revalidates the pinned
 repository identity and local Git configuration without taking writer
-ownership. An unexpected replication-thread exit is a distinct operational
-error rather than an idle state.
+ownership, then pushes through an isolated temporary Git directory to the exact
+validated URL snapshot. One absolute deadline and the shutdown signal cover
+every Git subprocess in the attempt. An unexpected replication-thread exit is
+a distinct operational error rather than an idle state.
 
 ## 8. Storage layout
 

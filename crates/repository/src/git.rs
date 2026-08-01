@@ -1116,9 +1116,13 @@ impl GitRepository {
         Ok(writer)
     }
 
-    pub(crate) fn validate_replication_read(&self) -> Result<(), GitTransactionError> {
+    pub(crate) fn validate_replication_read(
+        &self,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(), GitTransactionError> {
         validate_pinned_directory(&self.configured_git_directory, &self.git_root_handle)?;
-        validate_local_git_config(&self.git_directory)
+        validate_local_git_config_controlled(&self.git_directory, deadline, cancelled)
     }
 
     fn validate_live_storage(&self) -> Result<(), GitTransactionError> {
@@ -1401,6 +1405,27 @@ impl GitRepository {
                 OsStr::new("--verify"),
                 OsStr::new(&expression),
             ],
+        )?;
+        parse_object_id(&output.stdout)
+    }
+
+    pub(crate) fn resolve_commit_controlled(
+        &self,
+        revision: &str,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<String, GitTransactionError> {
+        let expression = format!("{revision}^{{commit}}");
+        let output = run_git_until_controlled(
+            None,
+            Some(&self.git_directory),
+            [
+                OsStr::new("rev-parse"),
+                OsStr::new("--verify"),
+                OsStr::new(&expression),
+            ],
+            deadline,
+            cancelled,
         )?;
         parse_object_id(&output.stdout)
     }
@@ -2466,13 +2491,33 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_git_for_read_controlled(
+        working_directory,
+        git_directory,
+        arguments,
+        deadline,
+        &|| false,
+    )
+}
+
+pub(crate) fn run_git_for_read_controlled<I, S>(
+    working_directory: Option<&Path>,
+    git_directory: Option<&Path>,
+    arguments: I,
+    deadline: Option<Instant>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Output, GitTransactionError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     match deadline {
         Some(deadline) => run_git_until_controlled(
             working_directory,
             git_directory,
             arguments,
             deadline,
-            &|| false,
+            cancelled,
         ),
         None => run_git(working_directory, git_directory, arguments),
     }
@@ -2489,7 +2534,38 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_git_until_controlled_with_environment(
+        working_directory,
+        git_directory,
+        arguments,
+        deadline,
+        cancelled,
+        None,
+    )
+}
+
+pub(crate) fn run_git_until_controlled_with_environment<I, S>(
+    working_directory: Option<&Path>,
+    git_directory: Option<&Path>,
+    arguments: I,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+    environment: Option<(&OsStr, &OsStr)>,
+) -> Result<Output, GitTransactionError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    if cancelled() {
+        return Err(GitTransactionError::GitCancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(GitTransactionError::GitDeadlineExceeded);
+    }
     let mut command = git_command();
+    if let Some((name, value)) = environment {
+        command.env(name, value);
+    }
     if let Some(working_directory) = working_directory {
         command.arg("-C").arg(working_directory);
     }
@@ -2779,7 +2855,16 @@ pub(crate) fn validate_local_git_config_until(
     git_directory: &Path,
     deadline: Option<Instant>,
 ) -> Result<(), GitTransactionError> {
-    let output = run_git_for_read(
+    validate_local_git_config_controlled(git_directory, deadline, &|| false)
+}
+
+fn validate_local_git_config_controlled(
+    git_directory: &Path,
+    deadline: impl Into<Option<Instant>>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), GitTransactionError> {
+    let deadline = deadline.into();
+    let output = run_git_for_read_controlled(
         None,
         Some(git_directory),
         [
@@ -2790,6 +2875,7 @@ pub(crate) fn validate_local_git_config_until(
             OsStr::new("--list"),
         ],
         deadline,
+        cancelled,
     )?;
     for key in output.stdout.split(|byte| *byte == 0) {
         if key.is_empty() {
@@ -2808,18 +2894,19 @@ pub(crate) fn validate_local_git_config_until(
             return Err(GitTransactionError::UnsafeGitConfig);
         }
     }
-    require_local_boolean(git_directory, "core.bare", true, deadline)?;
-    require_local_boolean(git_directory, "core.filemode", true, deadline)?;
+    require_local_boolean_controlled(git_directory, "core.bare", true, deadline, cancelled)?;
+    require_local_boolean_controlled(git_directory, "core.filemode", true, deadline, cancelled)?;
     Ok(())
 }
 
-fn require_local_boolean(
+fn require_local_boolean_controlled(
     git_directory: &Path,
     key: &str,
     expected: bool,
     deadline: Option<Instant>,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<(), GitTransactionError> {
-    let output = run_git_for_read(
+    let output = run_git_for_read_controlled(
         None,
         Some(git_directory),
         [
@@ -2830,6 +2917,7 @@ fn require_local_boolean(
             OsStr::new(key),
         ],
         deadline,
+        cancelled,
     )?;
     if parse_text(&output.stdout)? == if expected { "true" } else { "false" } {
         Ok(())

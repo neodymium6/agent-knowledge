@@ -86,8 +86,9 @@ batch:
 ```
 
 `repository.replication` is optional. When present, the named non-mirror remote
-must already exist in the bare repository. Authentication belongs in the
-service account's Git/SSH deployment configuration; credentials are not
+must already exist in the bare repository and resolve to exactly one push URL.
+Authentication belongs in the service account's Git/SSH deployment
+configuration; credentials are not
 accepted in the Worker configuration. A push failure never rolls back the local
 commit, canonical content, active Quartz release, or completed request. The
 Worker performs pushes on an independent background thread, so a slow remote
@@ -96,8 +97,10 @@ it sleeps until a retry is due, with a bounded low-frequency verification poll.
 It persists the last confirmed commit, a fingerprint of the configured push
 URL, and an exponential retry deadline under the bare repository. It caps delay
 at `maximum_backoff_seconds`, disables interactive Git and SSH credential
-prompts, revalidates the pinned repository and local Git configuration before
-each push, and applies `timeout_seconds` to every attempt.
+prompts, and applies `timeout_seconds` to the complete attempt, including local
+Git inspection. Each push uses an isolated temporary Git directory and the
+exact validated URL snapshot, so later changes to the main repository's local
+Git configuration cannot change that attempt's destination or behavior.
 
 Submit a validated request package through an SSH host alias:
 

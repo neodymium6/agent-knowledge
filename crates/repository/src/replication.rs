@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError as FileTryLockError};
 use std::io::{self, Read, Write};
@@ -9,10 +10,15 @@ use agent_knowledge_core::Revision;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+use ulid::Ulid;
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 
 use crate::git::{
     GitRepository, GitTransactionError, open_stable_directory, run_git_for_read,
-    run_git_until_controlled, same_metadata, validate_pinned_directory,
+    run_git_for_read_controlled, run_git_until_controlled,
+    run_git_until_controlled_with_environment, same_metadata, validate_pinned_directory,
 };
 
 const REPLICATION_STATE_VERSION: u16 = 1;
@@ -20,6 +26,8 @@ const MAXIMUM_STATE_BYTES: u64 = 64 * 1024;
 const STATE_FILE_NAME: &str = "remote-replication-v1.json";
 const LOCK_FILE_NAME: &str = "remote-replication.lock";
 const TEMPORARY_STATE_FILE_NAME: &str = ".remote-replication.tmp";
+const PUSH_URL_ENVIRONMENT: &str = "AGENT_KNOWLEDGE_PUSH_URL";
+const SNAPSHOT_REMOTE: &str = "agent-knowledge-snapshot";
 
 /// Validated retry and destination settings for asynchronous Git replication.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,7 +153,10 @@ impl RemoteReplicator {
             None,
         )
         .map_err(|_| RemoteReplicationError::InvalidPolicy("branch"))?;
-        configured_remote_fingerprint(&repository, &policy)?;
+        let deadline = Instant::now()
+            .checked_add(policy.timeout)
+            .ok_or(RemoteReplicationError::InvalidPolicy("timeout"))?;
+        configured_remote_snapshot(&repository, &policy, deadline, &|| false)?;
         let configured_state_directory = fs::canonicalize(repository.repository_state_directory())
             .map_err(RemoteReplicationError::Io)?;
         let (state_directory_handle, state_directory) =
@@ -223,6 +234,11 @@ impl RemoteReplicator {
         let unlock = self.lock.unlock().map_err(RemoteReplicationError::Io);
         match (result, unlock) {
             (Ok(outcome), Ok(())) => Ok(outcome),
+            (Err(RemoteReplicationError::Repository(error)), _)
+                if matches!(*error, GitTransactionError::GitCancelled) =>
+            {
+                Ok(RemoteReplicationOutcome::Cancelled)
+            }
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
         }
@@ -234,6 +250,9 @@ impl RemoteReplicator {
         completed_at: &impl Fn() -> OffsetDateTime,
         cancelled: &impl Fn() -> bool,
     ) -> Result<RemoteReplicationOutcome, RemoteReplicationError> {
+        let deadline = Instant::now()
+            .checked_add(self.policy.timeout)
+            .ok_or(RemoteReplicationError::InvalidPolicy("timeout"))?;
         validate_pinned_directory(
             &self.configured_state_directory,
             &self.state_directory_handle,
@@ -241,9 +260,11 @@ impl RemoteReplicator {
         .map_err(RemoteReplicationError::repository)?;
         let target = self
             .repository
-            .resolve_commit(self.repository.official_ref())
+            .resolve_commit_controlled(self.repository.official_ref(), deadline, cancelled)
             .map_err(RemoteReplicationError::repository)?;
-        let remote_fingerprint = configured_remote_fingerprint(&self.repository, &self.policy)?;
+        let remote =
+            configured_remote_snapshot(&self.repository, &self.policy, deadline, cancelled)?;
+        let remote_fingerprint = remote.fingerprint;
         let mut state = read_state(&self.state_path)?.unwrap_or_else(|| {
             ReplicationState::new(
                 self.policy.remote(),
@@ -275,20 +296,10 @@ impl RemoteReplicator {
             });
         }
 
-        let deadline = Instant::now()
-            .checked_add(self.policy.timeout)
-            .ok_or(RemoteReplicationError::InvalidPolicy("timeout"))?;
-        self.repository
-            .validate_replication_read()
-            .map_err(RemoteReplicationError::repository)?;
         let refspec = format!("{target}:refs/heads/{}", self.policy.branch);
-        let push = run_git_until_controlled(
-            None,
-            Some(self.repository.git_directory()),
-            ["push", "--porcelain", "--", self.policy.remote(), &refspec],
-            deadline,
-            cancelled,
-        );
+        let push_repository =
+            PushRepository::create(&self.repository, remote.object_format, deadline, cancelled)?;
+        let push = push_repository.push(&remote.url, &refspec, deadline, cancelled);
         match push {
             Ok(_) => {
                 state.replicated_commit = Some(target.clone());
@@ -394,15 +405,23 @@ fn fingerprint_remote_urls(urls: &[u8]) -> Result<Revision, RemoteReplicationErr
     Ok(Revision::from_bytes(Sha256::digest(urls).into()))
 }
 
-fn configured_remote_fingerprint(
+struct ConfiguredRemote {
+    fingerprint: Revision,
+    url: OsString,
+    object_format: &'static str,
+}
+
+fn configured_remote_snapshot(
     repository: &GitRepository,
     policy: &RemoteReplicationPolicy,
-) -> Result<Revision, RemoteReplicationError> {
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> Result<ConfiguredRemote, RemoteReplicationError> {
     repository
-        .validate_replication_read()
+        .validate_replication_read(deadline, cancelled)
         .map_err(RemoteReplicationError::repository)?;
     let mirror_key = format!("remote.{}.mirror", policy.remote());
-    let mirror = run_git_for_read(
+    let mirror = run_git_for_read_controlled(
         None,
         Some(repository.git_directory()),
         [
@@ -413,20 +432,155 @@ fn configured_remote_fingerprint(
             "--get",
             mirror_key.as_str(),
         ],
-        None,
+        Some(deadline),
+        cancelled,
     )
     .map_err(RemoteReplicationError::repository)?;
     if mirror.stdout != b"false\n" {
         return Err(RemoteReplicationError::InvalidPolicy("remote.mirror"));
     }
-    let urls = run_git_for_read(
+    let urls = run_git_for_read_controlled(
         None,
         Some(repository.git_directory()),
         ["remote", "get-url", "--push", "--all", policy.remote()],
-        None,
+        Some(deadline),
+        cancelled,
     )
-    .map_err(|_| RemoteReplicationError::RemoteUnavailable)?;
-    fingerprint_remote_urls(&urls.stdout)
+    .map_err(remote_lookup_error)?;
+    let fingerprint = fingerprint_remote_urls(&urls.stdout)?;
+    let url = parse_single_push_url(&urls.stdout)?;
+    let object_format = run_git_until_controlled(
+        None,
+        Some(repository.git_directory()),
+        ["rev-parse", "--show-object-format"],
+        deadline,
+        cancelled,
+    )
+    .map_err(RemoteReplicationError::repository)?;
+    let object_format = parse_object_format(&object_format.stdout)?;
+    Ok(ConfiguredRemote {
+        fingerprint,
+        url,
+        object_format,
+    })
+}
+
+fn remote_lookup_error(error: GitTransactionError) -> RemoteReplicationError {
+    match error {
+        GitTransactionError::GitCommand { .. } => RemoteReplicationError::RemoteUnavailable,
+        error => RemoteReplicationError::repository(error),
+    }
+}
+
+fn parse_single_push_url(output: &[u8]) -> Result<OsString, RemoteReplicationError> {
+    let url = output
+        .strip_suffix(b"\n")
+        .ok_or(RemoteReplicationError::InvalidPolicy("remote.pushurl"))?;
+    if url.is_empty() || url.iter().any(u8::is_ascii_control) {
+        return Err(RemoteReplicationError::InvalidPolicy("remote.pushurl"));
+    }
+    #[cfg(unix)]
+    {
+        Ok(OsString::from_vec(url.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(url.to_vec())
+            .map(OsString::from)
+            .map_err(|_| RemoteReplicationError::InvalidPolicy("remote.pushurl"))
+    }
+}
+
+fn parse_object_format(output: &[u8]) -> Result<&'static str, RemoteReplicationError> {
+    match output {
+        b"sha1\n" => Ok("sha1"),
+        b"sha256\n" => Ok("sha256"),
+        _ => Err(RemoteReplicationError::Repository(Box::new(
+            GitTransactionError::InvalidGitOutput,
+        ))),
+    }
+}
+
+struct PushRepository {
+    path: PathBuf,
+}
+
+impl PushRepository {
+    fn create(
+        repository: &GitRepository,
+        object_format: &str,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Self, RemoteReplicationError> {
+        let path = std::env::temp_dir().join(format!(
+            "agent-knowledge-push-{}-{}.git",
+            std::process::id(),
+            Ulid::generate()
+        ));
+        fs::create_dir(&path).map_err(RemoteReplicationError::Io)?;
+        let snapshot = Self { path };
+        let object_format = format!("--object-format={object_format}");
+        run_git_until_controlled(
+            None,
+            None,
+            [
+                OsStr::new("init"),
+                OsStr::new("--bare"),
+                OsStr::new(&object_format),
+                snapshot.path.as_os_str(),
+            ],
+            deadline,
+            cancelled,
+        )
+        .map_err(RemoteReplicationError::repository)?;
+        let mut alternate = repository
+            .git_directory()
+            .join("objects")
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec();
+        if alternate.contains(&b'\n') {
+            return Err(RemoteReplicationError::Repository(Box::new(
+                GitTransactionError::InvalidGitOutput,
+            )));
+        }
+        alternate.push(b'\n');
+        fs::write(snapshot.path.join("objects/info/alternates"), alternate)
+            .map_err(RemoteReplicationError::Io)?;
+        Ok(snapshot)
+    }
+
+    fn push(
+        &self,
+        url: &OsStr,
+        refspec: &str,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(), GitTransactionError> {
+        let config = format!("--config-env=remote.{SNAPSHOT_REMOTE}.url={PUSH_URL_ENVIRONMENT}");
+        run_git_until_controlled_with_environment(
+            None,
+            Some(&self.path),
+            [
+                OsStr::new(&config),
+                OsStr::new("push"),
+                OsStr::new("--porcelain"),
+                OsStr::new("--"),
+                OsStr::new(SNAPSHOT_REMOTE),
+                OsStr::new(refspec),
+            ],
+            deadline,
+            cancelled,
+            Some((OsStr::new(PUSH_URL_ENVIRONMENT), url)),
+        )?;
+        Ok(())
+    }
+}
+
+impl Drop for PushRepository {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 fn validate_state(state: &ReplicationState) -> Result<(), RemoteReplicationError> {
@@ -612,14 +766,14 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use time::OffsetDateTime;
     use ulid::Ulid;
 
     use super::{
-        LOCK_FILE_NAME, RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicationPolicy,
-        RemoteReplicator, STATE_FILE_NAME,
+        LOCK_FILE_NAME, PushRepository, RemoteReplicationError, RemoteReplicationOutcome,
+        RemoteReplicationPolicy, RemoteReplicator, STATE_FILE_NAME, configured_remote_snapshot,
     };
     use crate::{GitIdentity, GitRepository};
 
@@ -788,6 +942,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_multiple_push_destinations() {
+        let fixture = Fixture::create();
+        let repository = fixture.repository();
+        let git_directory = format!("--git-dir={}", fixture.repository.display());
+        let second = fixture.root.join("second-remote");
+        for url in [&fixture.remote, &second] {
+            git(
+                None,
+                [
+                    git_directory.as_str(),
+                    "config",
+                    "--add",
+                    "remote.fictional-backup.pushurl",
+                ],
+                Some(url),
+            );
+        }
+
+        assert!(matches!(
+            RemoteReplicator::open(repository, fixture.policy()),
+            Err(RemoteReplicationError::InvalidPolicy("remote.pushurl"))
+        ));
+    }
+
+    #[test]
     fn rejects_a_remote_changed_to_mirror_mode_before_a_push() {
         let fixture = Fixture::create();
         let repository = fixture.repository();
@@ -834,6 +1013,55 @@ mod tests {
             Err(RemoteReplicationError::Repository(error))
                 if matches!(*error, crate::GitTransactionError::UnsafeGitConfig)
         ));
+    }
+
+    #[test]
+    fn push_uses_the_validated_destination_and_isolated_config_snapshot() {
+        let fixture = Fixture::create();
+        let repository = fixture.repository();
+        let policy = fixture.policy();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let remote = configured_remote_snapshot(&repository, &policy, deadline, &|| false)
+            .unwrap_or_else(|error| panic!("remote snapshot must be captured: {error}"));
+        let replacement = fixture.root.join("replacement-remote");
+        git(
+            None,
+            ["init", "--bare", "--initial-branch=main"],
+            Some(&replacement),
+        );
+        let git_directory = format!("--git-dir={}", fixture.repository.display());
+        git(
+            None,
+            [
+                git_directory.as_str(),
+                "remote",
+                "set-url",
+                "fictional-backup",
+            ],
+            Some(&replacement),
+        );
+        git(
+            None,
+            [
+                git_directory.as_str(),
+                "config",
+                "credential.helper",
+                "fictional-helper",
+            ],
+            None,
+        );
+        let push_repository =
+            PushRepository::create(&repository, remote.object_format, deadline, &|| false)
+                .unwrap_or_else(|error| {
+                    panic!("isolated push repository must initialize: {error}")
+                });
+        let commit = fixture.local_commit();
+        let refspec = format!("{commit}:refs/heads/main");
+
+        push_repository
+            .push(&remote.url, &refspec, deadline, &|| false)
+            .unwrap_or_else(|error| panic!("captured destination push must succeed: {error}"));
+        assert_eq!(fixture.remote_commit(), commit);
     }
 
     #[test]
@@ -1062,6 +1290,31 @@ mod tests {
                 .join(STATE_FILE_NAME)
                 .exists()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_covers_a_blocked_pre_push_config_inspection() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let fixture = Fixture::create();
+        let repository = fixture.repository();
+        let replicator = RemoteReplicator::open(repository, fixture.policy())
+            .unwrap_or_else(|error| panic!("replicator must open: {error}"));
+        let config = fixture.repository.join("config");
+        fs::rename(&config, fixture.repository.join("config.saved"))
+            .unwrap_or_else(|error| panic!("repository config must be moved: {error}"));
+        mkfifo(&config, Mode::S_IRUSR | Mode::S_IWUSR)
+            .unwrap_or_else(|error| panic!("blocking config fixture must be created: {error}"));
+        let started = Instant::now();
+
+        let outcome = replicator.replicate_interruptible(OffsetDateTime::UNIX_EPOCH, &|| {
+            started.elapsed() >= Duration::from_millis(50)
+        });
+
+        assert!(matches!(outcome, Ok(RemoteReplicationOutcome::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
