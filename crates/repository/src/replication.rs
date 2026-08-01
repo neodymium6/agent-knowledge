@@ -327,20 +327,15 @@ fn finish_replication(
     result: Result<RemoteReplicationOutcome, RemoteReplicationError>,
     unlock: Result<(), RemoteReplicationError>,
 ) -> Result<RemoteReplicationOutcome, RemoteReplicationError> {
-    match (result, unlock) {
-        (Ok(outcome), Ok(())) => Ok(outcome),
-        (Err(RemoteReplicationError::Repository(error)), Err(unlock_error))
-            if matches!(*error, GitTransactionError::GitCancelled) =>
-        {
-            Err(unlock_error)
-        }
-        (Err(RemoteReplicationError::Repository(error)), Ok(()))
+    unlock?;
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(RemoteReplicationError::Repository(error))
             if matches!(*error, GitTransactionError::GitCancelled) =>
         {
             Ok(RemoteReplicationOutcome::Cancelled)
         }
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+        Err(error) => Err(error),
     }
 }
 
@@ -1306,19 +1301,24 @@ mod tests {
     }
 
     #[test]
-    fn unlock_failure_takes_precedence_over_pre_push_cancellation() {
-        let cancellation = Err(RemoteReplicationError::Repository(Box::new(
-            GitTransactionError::GitCancelled,
-        )));
-        let unlock = Err(RemoteReplicationError::Io(std::io::Error::other(
-            "fictional unlock failure",
-        )));
+    fn unlock_failure_takes_precedence_over_every_replication_result() {
+        let results: [Result<RemoteReplicationOutcome, RemoteReplicationError>; 2] = [
+            Err(RemoteReplicationError::Repository(Box::new(
+                GitTransactionError::GitCancelled,
+            ))),
+            Err(RemoteReplicationError::InvalidState),
+        ];
 
-        assert!(matches!(
-            finish_replication(cancellation, unlock),
-            Err(RemoteReplicationError::Io(error))
-                if error.to_string() == "fictional unlock failure"
-        ));
+        for result in results {
+            let unlock = Err(RemoteReplicationError::Io(std::io::Error::other(
+                "fictional unlock failure",
+            )));
+            assert!(matches!(
+                finish_replication(result, unlock),
+                Err(RemoteReplicationError::Io(error))
+                    if error.to_string() == "fictional unlock failure"
+            ));
+        }
     }
 
     #[cfg(target_os = "linux")]
