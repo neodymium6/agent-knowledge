@@ -39,6 +39,7 @@ dependencies = [
  "agent-knowledge-core",
  "agent-knowledge-protocol",
  "agent-knowledge-queue",
+ "agent-knowledge-repository",
  "serde",
  "serde-saphyr",
  "tar",

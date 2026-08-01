@@ -1,5 +1,7 @@
 //! Versioned SSH command and JSON wire types shared by Gateway and client.
 
+mod read;
+
 use std::ffi::OsStr;
 use std::fmt;
 use std::str::FromStr;
@@ -7,10 +9,23 @@ use std::str::FromStr;
 use agent_knowledge_core::{ErrorCode, RequestId, Revision};
 use serde::{Deserialize, Serialize};
 
+pub use read::{
+    DocumentContent, DocumentSummary, GetRequest, GetResponse, ListRequest, ListResponse,
+    ReadFilterRequest, SearchRequest,
+};
+
 /// The protocol version encoded in Gateway commands and JSON responses.
 pub const CURRENT_GATEWAY_PROTOCOL_VERSION: u16 = 1;
 /// The exact remote command used to submit one request package.
 pub const SUBMIT_COMMAND: &str = "akp-v1 submit";
+/// The exact remote command used to list committed documents.
+pub const LIST_COMMAND: &str = "akp-v1 list";
+/// The exact remote command used to list recently changed committed documents.
+pub const RECENT_COMMAND: &str = "akp-v1 recent";
+/// The exact remote command used to retrieve one committed Markdown document.
+pub const GET_COMMAND: &str = "akp-v1 get";
+/// The exact remote command used to search committed documents.
+pub const SEARCH_COMMAND: &str = "akp-v1 search";
 const MAXIMUM_CLIENT_ID_BYTES: usize = 63;
 
 /// One operation selected by an authenticated SSH session.
@@ -18,6 +33,14 @@ const MAXIMUM_CLIENT_ID_BYTES: usize = 63;
 pub enum GatewayCommand {
     /// Streams one uncompressed request-package tar archive on standard input.
     Submit,
+    /// Lists committed document metadata.
+    List,
+    /// Lists committed documents by effective update time.
+    Recent,
+    /// Retrieves one committed Markdown document.
+    Get,
+    /// Searches committed Markdown and permitted metadata.
+    Search,
 }
 
 impl GatewayCommand {
@@ -28,10 +51,13 @@ impl GatewayCommand {
     /// Returns [`GatewayCommandError`] for missing, malformed, or unsupported
     /// commands, including leading or trailing whitespace.
     pub fn parse(original: &OsStr) -> Result<Self, GatewayCommandError> {
-        if original == OsStr::new(SUBMIT_COMMAND) {
-            Ok(Self::Submit)
-        } else {
-            Err(GatewayCommandError)
+        match original {
+            value if value == OsStr::new(SUBMIT_COMMAND) => Ok(Self::Submit),
+            value if value == OsStr::new(LIST_COMMAND) => Ok(Self::List),
+            value if value == OsStr::new(RECENT_COMMAND) => Ok(Self::Recent),
+            value if value == OsStr::new(GET_COMMAND) => Ok(Self::Get),
+            value if value == OsStr::new(SEARCH_COMMAND) => Ok(Self::Search),
+            _ => Err(GatewayCommandError),
         }
     }
 
@@ -40,6 +66,10 @@ impl GatewayCommand {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Submit => SUBMIT_COMMAND,
+            Self::List => LIST_COMMAND,
+            Self::Recent => RECENT_COMMAND,
+            Self::Get => GET_COMMAND,
+            Self::Search => SEARCH_COMMAND,
         }
     }
 }
@@ -232,8 +262,8 @@ mod tests {
     use agent_knowledge_core::ErrorCode;
 
     use super::{
-        CURRENT_GATEWAY_PROTOCOL_VERSION, ClientId, GatewayCommand, ProtocolErrorResponse,
-        SUBMIT_COMMAND,
+        CURRENT_GATEWAY_PROTOCOL_VERSION, ClientId, GET_COMMAND, GatewayCommand, LIST_COMMAND,
+        ProtocolErrorResponse, RECENT_COMMAND, SEARCH_COMMAND, SUBMIT_COMMAND,
     };
 
     #[test]
@@ -242,6 +272,15 @@ mod tests {
             GatewayCommand::parse(OsStr::new(SUBMIT_COMMAND)),
             Ok(GatewayCommand::Submit)
         );
+        for (command, expected) in [
+            (LIST_COMMAND, GatewayCommand::List),
+            (RECENT_COMMAND, GatewayCommand::Recent),
+            (GET_COMMAND, GatewayCommand::Get),
+            (SEARCH_COMMAND, GatewayCommand::Search),
+        ] {
+            assert_eq!(GatewayCommand::parse(OsStr::new(command)), Ok(expected));
+            assert_eq!(expected.as_str(), command);
+        }
         for rejected in [
             "",
             "akp-v1",

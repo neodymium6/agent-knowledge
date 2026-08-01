@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 use agent_knowledge_core::ErrorCode;
 use agent_knowledge_gateway::{Gateway, GatewayConfigError, GatewayError, GatewaySettings};
 use agent_knowledge_protocol::{ClientId, ClientIdError, GatewayCommand, ProtocolErrorResponse};
+use serde::de::DeserializeOwned;
+
+const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
 
 #[cfg(target_os = "linux")]
 pub fn run_stdio<W>(
@@ -80,7 +83,56 @@ where
             serde_json::to_writer(&mut output, &response).map_err(GatewayCommandError::Json)?;
             output.write_all(b"\n").map_err(GatewayCommandError::Io)
         }
+        GatewayCommand::List => {
+            let request = decode_control_request(input)?;
+            write_json_response(&mut output, &gateway.list(&request).map_err(gateway_error)?)
+        }
+        GatewayCommand::Recent => {
+            let request = decode_control_request(input)?;
+            write_json_response(
+                &mut output,
+                &gateway.recent(&request).map_err(gateway_error)?,
+            )
+        }
+        GatewayCommand::Get => {
+            let request = decode_control_request(input)?;
+            write_json_response(&mut output, &gateway.get(request).map_err(gateway_error)?)
+        }
+        GatewayCommand::Search => {
+            let request = decode_control_request(input)?;
+            write_json_response(
+                &mut output,
+                &gateway.search(&request).map_err(gateway_error)?,
+            )
+        }
     }
+}
+
+fn decode_control_request<T: DeserializeOwned>(
+    mut input: impl Read,
+) -> Result<T, GatewayCommandError> {
+    let mut bytes = Vec::new();
+    input
+        .by_ref()
+        .take(MAXIMUM_CONTROL_REQUEST_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(GatewayCommandError::ControlInput)?;
+    if bytes.len() as u64 > MAXIMUM_CONTROL_REQUEST_BYTES {
+        return Err(GatewayCommandError::ControlRequestTooLarge);
+    }
+    serde_json::from_slice(&bytes).map_err(GatewayCommandError::ControlJson)
+}
+
+fn write_json_response(
+    mut output: impl Write,
+    response: &impl serde::Serialize,
+) -> Result<(), GatewayCommandError> {
+    serde_json::to_writer(&mut output, response).map_err(GatewayCommandError::Json)?;
+    output.write_all(b"\n").map_err(GatewayCommandError::Io)
+}
+
+fn gateway_error(error: GatewayError) -> GatewayCommandError {
+    GatewayCommandError::Gateway(Box::new(error))
 }
 
 #[cfg(target_os = "linux")]
@@ -146,6 +198,9 @@ pub enum GatewayCommandError {
     Config(Box<GatewayConfigError>),
     Gateway(Box<GatewayError>),
     InputSetup(io::Error),
+    ControlInput(io::Error),
+    ControlRequestTooLarge,
+    ControlJson(serde_json::Error),
     Json(serde_json::Error),
     Io(io::Error),
 }
@@ -154,12 +209,16 @@ impl GatewayCommandError {
     #[must_use]
     pub fn error_code(&self) -> ErrorCode {
         match self {
-            Self::MissingCommand | Self::InvalidCommand => ErrorCode::InvalidProtocol,
+            Self::MissingCommand | Self::InvalidCommand | Self::ControlJson(_) => {
+                ErrorCode::InvalidProtocol
+            }
+            Self::ControlRequestTooLarge => ErrorCode::LimitExceeded,
             Self::Gateway(error) => error.error_code(),
             Self::InvalidClientIdEncoding
             | Self::ClientId(_)
             | Self::Config(_)
             | Self::InputSetup(_)
+            | Self::ControlInput(_)
             | Self::Json(_)
             | Self::Io(_) => ErrorCode::InternalError,
         }
@@ -186,6 +245,12 @@ impl fmt::Display for GatewayCommandError {
             Self::Config(error) => write!(formatter, "Gateway configuration failed: {error}"),
             Self::Gateway(error) => error.fmt(formatter),
             Self::InputSetup(error) => write!(formatter, "Gateway input setup failed: {error}"),
+            Self::ControlInput(error) => write!(formatter, "Gateway control input failed: {error}"),
+            Self::ControlRequestTooLarge => write!(
+                formatter,
+                "Gateway control request exceeds {MAXIMUM_CONTROL_REQUEST_BYTES} bytes"
+            ),
+            Self::ControlJson(error) => write!(formatter, "invalid Gateway control JSON: {error}"),
             Self::Json(error) => write!(formatter, "Gateway JSON encoding failed: {error}"),
             Self::Io(error) => write!(formatter, "Gateway response output failed: {error}"),
         }
@@ -199,9 +264,14 @@ impl std::error::Error for GatewayCommandError {
             Self::Config(error) => Some(error.as_ref()),
             Self::Gateway(error) => Some(error.as_ref()),
             Self::InputSetup(error) => Some(error),
+            Self::ControlInput(error) => Some(error),
+            Self::ControlJson(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::MissingCommand | Self::InvalidCommand | Self::InvalidClientIdEncoding => None,
+            Self::MissingCommand
+            | Self::InvalidCommand
+            | Self::InvalidClientIdEncoding
+            | Self::ControlRequestTooLarge => None,
         }
     }
 }
