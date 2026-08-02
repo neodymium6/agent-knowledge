@@ -625,6 +625,8 @@ where
             connection_timeout: Duration::from_secs(
                 connection_timeout_seconds.unwrap_or(DEFAULT_INGRESS_CONNECTION_TIMEOUT_SECONDS),
             ),
+            #[cfg(test)]
+            deadline_observer: None,
         },
     })
 }

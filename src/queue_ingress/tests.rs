@@ -9,15 +9,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_knowledge_core::PathAttestation;
 use agent_knowledge_gateway::{IngressClient, IngressClientError};
 use agent_knowledge_protocol::{ClientId, StatusRequest};
 use agent_knowledge_queue::{FileQueue, PackagePolicy};
 use tar::{Builder, EntryType, Header};
 
 use super::{
-    ListenSettings, PublishedSocket, QueueIngressListenerError, SOCKET_MODE,
-    bind_in_pinned_directory, listen_until,
+    ListenSettings, PublishedSocket, QueueIngressListenerError, SOCKET_MODE, SocketIdentity,
+    SocketState, listen_until, write_socket_state,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -62,6 +61,7 @@ fn settings(root: &Path) -> ListenSettings {
         socket_path: root.join("run/queue-ingress.sock"),
         maximum_connections: NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
         connection_timeout: Duration::from_secs(5),
+        deadline_observer: None,
     }
 }
 
@@ -224,6 +224,8 @@ fn shutdown_cancels_a_handler_waiting_for_the_queue_lock() {
         .unwrap_or_else(|error| panic!("runtime directory mode must be set: {error}"));
     let mut settings = settings(root.path());
     settings.connection_timeout = Duration::from_secs(30);
+    let (deadline_sender, deadline_receiver) = std::sync::mpsc::channel();
+    settings.deadline_observer = Some(deadline_sender);
     let queue_lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -252,7 +254,17 @@ fn shutdown_cancels_a_handler_waiting_for_the_queue_lock() {
         )
     });
 
-    thread::sleep(Duration::from_millis(100));
+    let operation_deadline = deadline_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("handler deadline must be observed: {error}"));
+    let observation_deadline = Instant::now() + Duration::from_secs(2);
+    while !operation_deadline.lock_wait_observed() {
+        assert!(
+            Instant::now() < observation_deadline,
+            "handler must reach the contended queue lock"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     let shutdown_started = Instant::now();
     stopping.store(true, Ordering::Relaxed);
     listener
@@ -347,16 +359,11 @@ fn replaces_a_stale_socket_recorded_by_a_prior_listener() {
     drop(stale);
     let metadata = fs::symlink_metadata(&socket_path)
         .unwrap_or_else(|error| panic!("stale socket must be inspectable: {error}"));
-    let lock_path = root.path().join(super::LISTENER_LOCK_FILE);
-    let mut lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(lock_path)
-        .unwrap_or_else(|error| panic!("prior listener state must open: {error}"));
-    super::write_socket_identity(&mut lock, super::SocketIdentity::from_metadata(&metadata))
-        .unwrap_or_else(|error| panic!("prior listener state must be recorded: {error}"));
+    write_socket_state(
+        root.path(),
+        SocketState::Owned(SocketIdentity::from_metadata(&metadata)),
+    )
+    .unwrap_or_else(|error| panic!("prior listener state must be recorded: {error}"));
 
     let published = PublishedSocket::bind(&socket_path)
         .unwrap_or_else(|error| panic!("owned stale socket must be replaced: {error}"));
@@ -366,24 +373,46 @@ fn replaces_a_stale_socket_recorded_by_a_prior_listener() {
 }
 
 #[test]
-fn binds_in_the_pinned_parent_after_the_configured_path_is_replaced() {
+fn recovers_a_socket_left_after_preparing_state_was_published() {
     let root = TestDirectory::create();
-    let configured = root.path().join("run");
-    let pinned = root.path().join("pinned-run");
-    fs::create_dir(&configured)
-        .unwrap_or_else(|error| panic!("runtime directory must be created: {error}"));
-    fs::set_permissions(&configured, fs::Permissions::from_mode(0o2750))
-        .unwrap_or_else(|error| panic!("runtime directory mode must be set: {error}"));
-    let parent = PathAttestation::resolve_destination(&configured)
-        .unwrap_or_else(|error| panic!("runtime directory must be pinned: {error}"));
-    fs::rename(&configured, &pinned)
-        .unwrap_or_else(|error| panic!("runtime directory must be moved: {error}"));
-    fs::create_dir(&configured)
-        .unwrap_or_else(|error| panic!("replacement runtime directory must be created: {error}"));
+    let socket_path = root.path().join("queue-ingress.sock");
+    write_socket_state(root.path(), SocketState::Preparing)
+        .unwrap_or_else(|error| panic!("preparing state must be durable: {error}"));
+    fs::write(
+        root.path().join(super::SOCKET_STATE_TEMPORARY_FILE),
+        b"fictional interrupted replacement",
+    )
+    .unwrap_or_else(|error| panic!("interrupted temporary state must be written: {error}"));
+    let stale = UnixListener::bind(&socket_path)
+        .unwrap_or_else(|error| panic!("interrupted listener fixture must bind: {error}"));
+    drop(stale);
 
-    let listener = bind_in_pinned_directory(parent.stable_path(), "queue-ingress.sock".as_ref())
-        .unwrap_or_else(|error| panic!("socket must bind below pinned parent: {error}"));
-    assert!(pinned.join("queue-ingress.sock").exists());
-    assert!(!configured.join("queue-ingress.sock").exists());
-    drop(listener);
+    let published = PublishedSocket::bind(&socket_path)
+        .unwrap_or_else(|error| panic!("preparing state must authorize recovery: {error}"));
+    drop(published);
+    assert!(!socket_path.exists());
+}
+
+#[test]
+fn refuses_a_runtime_directory_in_an_unprotected_namespace() {
+    let root = TestDirectory::create();
+    let namespace = root.path().join("namespace");
+    let runtime = namespace.join("run");
+    fs::create_dir(&namespace)
+        .unwrap_or_else(|error| panic!("namespace directory must be created: {error}"));
+    fs::set_permissions(&namespace, fs::Permissions::from_mode(0o0770))
+        .unwrap_or_else(|error| panic!("unsafe namespace mode must be set: {error}"));
+    fs::create_dir(&runtime)
+        .unwrap_or_else(|error| panic!("runtime directory must be created: {error}"));
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o2750))
+        .unwrap_or_else(|error| panic!("runtime directory mode must be set: {error}"));
+
+    let error = match PublishedSocket::bind(&runtime.join("queue-ingress.sock")) {
+        Ok(_) => panic!("an unprotected namespace must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        QueueIngressListenerError::UnsafeSocketNamespace
+    ));
 }

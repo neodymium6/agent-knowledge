@@ -1465,7 +1465,14 @@ fn cancelled_ingress_deadline_interrupts_a_queue_lock_wait() {
     let operation_deadline = deadline.clone();
     let thread = thread::spawn(move || queue.begin_until(Some(&operation_deadline)));
 
-    thread::sleep(Duration::from_millis(50));
+    let observation_deadline = Instant::now() + Duration::from_secs(2);
+    while !deadline.lock_wait_observed() {
+        assert!(
+            Instant::now() < observation_deadline,
+            "begin must observe the contended queue lock"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     deadline.cancel();
     let result = thread
         .join()

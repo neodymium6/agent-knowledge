@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -19,7 +19,7 @@ use ulid::Ulid;
 
 use crate::{
     AcceptanceMetadata, PackageDigest, PackagePolicy, PackageValidationError, ValidatedPackage,
-    validate_accepted_package, validate_package,
+    validate_accepted_package,
 };
 
 mod worker;
@@ -57,6 +57,8 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub struct QueueOperationDeadline {
     expires_at: Instant,
     cancelled: Arc<AtomicBool>,
+    lock_wait_observed: Arc<AtomicBool>,
+    checkpoints: Arc<AtomicU64>,
 }
 
 impl QueueOperationDeadline {
@@ -66,6 +68,8 @@ impl QueueOperationDeadline {
         Self {
             expires_at,
             cancelled: Arc::new(AtomicBool::new(false)),
+            lock_wait_observed: Arc::new(AtomicBool::new(false)),
+            checkpoints: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -80,7 +84,22 @@ impl QueueOperationDeadline {
         self.expires_at
     }
 
-    fn ensure_active(&self) -> Result<(), QueueError> {
+    /// Returns whether an operation sharing this deadline observed a contended lock.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn lock_wait_observed(&self) -> bool {
+        self.lock_wait_observed.load(Ordering::Acquire)
+    }
+
+    /// Returns the number of cooperative cancellation checkpoints observed.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn checkpoint_count(&self) -> u64 {
+        self.checkpoints.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ensure_active(&self) -> Result<(), QueueError> {
+        self.checkpoints.fetch_add(1, Ordering::Release);
         if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.expires_at {
             Err(QueueError::OperationDeadlineExceeded)
         } else {
@@ -905,10 +924,14 @@ impl IncomingPackage {
         hook: &mut dyn AcceptanceHook,
     ) -> Result<EnqueueOutcome, QueueError> {
         ensure_operation_active(deadline)?;
-        let validated = validate_package(&self.staging_path, &self.queue.policy)
-            .map_err(QueueError::Package)?;
+        let validated = crate::package::validate_package_until(
+            &self.staging_path,
+            &self.queue.policy,
+            deadline,
+        )
+        .map_err(QueueError::Package)?;
         write_digest_file(&self.staging_path, validated.digest())?;
-        sync_package(&self.staging_path, &validated)?;
+        sync_package(&self.staging_path, &validated, deadline)?;
         hook.reached(AcceptancePhase::PackageSynchronized)
             .map_err(QueueError::Io)?;
 
@@ -1705,14 +1728,21 @@ fn read_next_sequence(path: &Path) -> Result<u64, QueueError> {
     value.parse().map_err(|_| QueueError::InvalidSequenceState)
 }
 
-fn sync_package(package_root: &Path, package: &ValidatedPackage) -> Result<(), QueueError> {
+fn sync_package(
+    package_root: &Path,
+    package: &ValidatedPackage,
+    deadline: Option<&QueueOperationDeadline>,
+) -> Result<(), QueueError> {
+    ensure_operation_active(deadline)?;
     sync_file(&package_root.join(REQUEST_FILE_NAME))?;
+    ensure_operation_active(deadline)?;
     sync_file(&package_root.join(DIGEST_FILE_NAME))?;
 
     let payload_root = package_root.join(PAYLOAD_DIRECTORY_NAME);
     let mut directories = HashSet::new();
     directories.insert(payload_root.clone());
     for payload in package.payload() {
+        ensure_operation_active(deadline)?;
         sync_file(&payload_root.join(payload.path().as_str()))?;
 
         let mut current = payload_root
@@ -1734,8 +1764,10 @@ fn sync_package(package_root: &Path, package: &ValidatedPackage) -> Result<(), Q
     let mut directories = directories.into_iter().collect::<Vec<_>>();
     directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for directory in directories {
+        ensure_operation_active(deadline)?;
         sync_directory(&directory)?;
     }
+    ensure_operation_active(deadline)?;
     sync_directory(package_root)?;
     Ok(())
 }
@@ -1851,6 +1883,7 @@ fn lock_until(file: &File, deadline: Option<&QueueOperationDeadline>) -> Result<
         match file.try_lock() {
             Ok(()) => return Ok(()),
             Err(TryLockError::WouldBlock) => {
+                deadline.lock_wait_observed.store(true, Ordering::Release);
                 let remaining = deadline
                     .expires_at()
                     .saturating_duration_since(Instant::now());

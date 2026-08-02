@@ -339,9 +339,11 @@ bounded thread per accepted connection, applies both inactivity timeouts and
 an absolute connection lifetime, and cancels queue lock waits before joining
 handlers on `SIGINT` or `SIGTERM`. The deployment creates the runtime directory
 in advance, owned by the broker with mode `2750` and dedicated ingress group
-(`10004` in the container identity database). Descriptor-relative mutation and
-a private ownership record constrain
-stale-socket recovery to the listener's pinned directory and prior socket. The
+(`10004` in the container identity database). The parent namespace must be
+non-writable by untrusted identities or protected by the sticky bit. Mutations
+other than the Linux pathname-only socket bind use the pinned directory. An
+atomically published `preparing`/`owned` record makes stale-socket recovery
+crash-consistent and constrains it to the listener's prior publication. The
 listener never creates or guesses deployment ownership.
 
 The internal protocol is independent of the public SSH protocol. It begins
