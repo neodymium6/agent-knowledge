@@ -33,6 +33,9 @@
               ./Cargo.lock
               ./Cargo.toml
               ./crates
+              ./deploy/systemd/agent-knowledge-worker.service
+              ./deploy/systemd/agent-knowledge.conf.sysusers
+              ./deploy/systemd/agent-knowledge.conf.tmpfiles
               ./src
             ];
           };
@@ -54,6 +57,15 @@
                   pkgs.openssh
                 ]
               }
+
+            install -Dm644 deploy/systemd/agent-knowledge-worker.service \
+              "$out/lib/systemd/system/agent-knowledge-worker.service"
+            substituteInPlace "$out/lib/systemd/system/agent-knowledge-worker.service" \
+              --replace-fail '@agentKnowledge@' "$out"
+            install -Dm644 deploy/systemd/agent-knowledge.conf.sysusers \
+              "$out/lib/sysusers.d/agent-knowledge.conf"
+            install -Dm644 deploy/systemd/agent-knowledge.conf.tmpfiles \
+              "$out/lib/tmpfiles.d/agent-knowledge.conf"
           '';
 
           installCheckPhase = ''
@@ -82,18 +94,21 @@
         in
         {
           default = pkgs.mkShell {
-            packages = with pkgs; [
-              actionlint
-              cargo
-              clippy
-              gh
-              git
-              just
-              nixfmt-tree
-              pre-commit
-              rustc
-              rustfmt
-            ];
+            packages =
+              with pkgs;
+              [
+                actionlint
+                cargo
+                clippy
+                gh
+                git
+                just
+                nixfmt-tree
+                pre-commit
+                rustc
+                rustfmt
+              ]
+              ++ lib.optionals stdenv.isLinux [ systemd ];
           };
         }
       );

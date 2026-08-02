@@ -1,0 +1,2 @@
+# This account runs only the Worker. The SSH Gateway uses a separate account.
+u agent-knowledge - "Agent Knowledge Worker service account" /var/lib/agent-knowledge -

@@ -1,0 +1,6 @@
+d /var/lib/agent-knowledge 0750 root agent-knowledge -
+d /var/lib/agent-knowledge/queue 0750 agent-knowledge agent-knowledge -
+d /var/lib/agent-knowledge/repository 0750 agent-knowledge agent-knowledge -
+d /var/lib/agent-knowledge/content 0750 agent-knowledge agent-knowledge -
+d /var/lib/agent-knowledge/work 0750 agent-knowledge agent-knowledge -
+d /var/lib/agent-knowledge/releases 0750 agent-knowledge agent-knowledge -

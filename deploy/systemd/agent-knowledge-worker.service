@@ -1,0 +1,38 @@
+[Unit]
+Description=Agent Knowledge Repository Worker
+Documentation=https://github.com/neodymium6/agent-knowledge
+After=local-fs.target
+ConditionPathExists=/etc/agent-knowledge/worker.yaml
+StartLimitIntervalSec=5min
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=agent-knowledge
+Group=agent-knowledge
+WorkingDirectory=/var/lib/agent-knowledge
+ExecStart=@agentKnowledge@/bin/agent-knowledge worker run --config /etc/agent-knowledge/worker.yaml
+Restart=on-failure
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=15min
+UMask=0027
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/agent-knowledge
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
