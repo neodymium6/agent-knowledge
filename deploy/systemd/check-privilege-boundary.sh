@@ -57,6 +57,12 @@ test "$(stat -c '%u:%g:%a' "$fresh_root/var/lib/agent-knowledge/repository")" = 
   "$worker_uid:$gateway_gid:2750"
 test "$(stat -c '%u:%g:%a' "$fresh_root/run/agent-knowledge")" = \
   "$queue_uid:$ingress_gid:2750"
+install -D -m 0644 "$fresh_config" \
+  "$fresh_root/etc/tmpfiles.d/agent-knowledge.conf"
+rm -r -- "$fresh_root/run"
+systemd-tmpfiles --create --root="$fresh_root" agent-knowledge.conf
+test "$(stat -c '%u:%g:%a' "$fresh_root/run/agent-knowledge")" = \
+  "$queue_uid:$ingress_gid:2750"
 setpriv --reuid="$worker_uid" --regid="$worker_gid" --groups="$queue_gid" \
   touch "$fresh_root/var/lib/agent-knowledge/queue/pending/fresh-sidecar.fixture"
 test "$(stat -c '%g' "$fresh_root/var/lib/agent-knowledge/queue/pending/fresh-sidecar.fixture")" = \

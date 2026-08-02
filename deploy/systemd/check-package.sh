@@ -75,6 +75,9 @@ test_root=$(mktemp -d)
 trap 'rm -rf -- "$test_root"' EXIT
 systemd-sysusers --dry-run --root="$test_root" "$sysusers"
 systemd-tmpfiles --dry-run --create --graceful --root="$test_root" "$tmpfiles"
+install -D -m 0644 "$tmpfiles" "$test_root/etc/tmpfiles.d/agent-knowledge.conf"
+systemd-tmpfiles --dry-run --create --graceful --root="$test_root" \
+  agent-knowledge.conf
 test "$(grep -Ec '^u agent-knowledge - "Agent Knowledge Worker service account" /var/lib/agent-knowledge -$' "$sysusers")" -eq 1
 test "$(grep -Ec '^u agent-knowledge-queue - "Agent Knowledge queue ingress account" /var/lib/agent-knowledge -$' "$sysusers")" -eq 1
 test "$(grep -Ec '^g agent-knowledge-gateway - -$' "$sysusers")" -eq 1

@@ -116,7 +116,10 @@ sudo nix profile add --profile /nix/var/nix/profiles/agent-knowledge \
   .#agent-knowledge
 package_path=/nix/var/nix/profiles/agent-knowledge
 sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
-sudo systemd-tmpfiles --create "$package_path/lib/tmpfiles.d/agent-knowledge.conf"
+sudo ln -sfn \
+  "$package_path/lib/tmpfiles.d/agent-knowledge.conf" \
+  /etc/tmpfiles.d/agent-knowledge.conf
+sudo systemd-tmpfiles --create agent-knowledge.conf
 sudo install -d -m 0755 -o root -g root /etc/agent-knowledge
 sudo install -m 0640 -o root -g agent-knowledge \
   ./fictional-worker.yaml /etc/agent-knowledge/worker.yaml
@@ -126,6 +129,10 @@ sudo systemctl link \
 sudo systemctl link \
   "$package_path/lib/systemd/system/agent-knowledge-queue-ingress@.service"
 ```
+
+The `/etc/tmpfiles.d` link points through the stable system profile, so boot
+recreates the volatile runtime directory and profile upgrades select the new
+packaged definition.
 
 The supplied storage layout uses sibling roots below
 `/var/lib/agent-knowledge/`. A matching Worker configuration uses `queue`,
@@ -193,8 +200,10 @@ sudo "$package_path/bin/agent-knowledge" admin migrate-v1-storage \
   --queue-root /var/lib/agent-knowledge/queue \
   --git-directory /var/lib/agent-knowledge/repository \
   --content-root /var/lib/agent-knowledge/content
-sudo systemd-tmpfiles --create \
-  "$package_path/lib/tmpfiles.d/agent-knowledge.conf"
+sudo ln -sfn \
+  "$package_path/lib/tmpfiles.d/agent-knowledge.conf" \
+  /etc/tmpfiles.d/agent-knowledge.conf
+sudo systemd-tmpfiles --create agent-knowledge.conf
 sudo systemctl link --force \
   "$package_path/lib/systemd/system/agent-knowledge-worker.service"
 sudo systemctl link --force \
