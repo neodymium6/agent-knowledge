@@ -14,16 +14,23 @@ fmt:
   nix fmt -- flake.nix
   cargo fmt --all
 
-# Run all repository checks.
-check:
+# Run code checks and build the package for the current system.
+check: check-code check-package
+
+# Run source, test, and flake-schema checks without building a package.
+check-code:
   pre-commit run --all-files
   cargo fmt --all -- --check
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
   cargo test --workspace --all-features --locked
-  nix flake check .
+  nix flake check --no-build .
 
-# CI alias.
-ci: check
+# Build and install-check the production package for the current system.
+check-package:
+  nix build .#agent-knowledge --no-link
+
+# CI source-check alias; package jobs build each supported architecture.
+ci: check-code
 
 # Update pinned development-environment inputs.
 update:
