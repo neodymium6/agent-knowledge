@@ -155,8 +155,9 @@ tombstone before descriptor-relative deletion. Large trees may report
 `cleanup_pending_release_ids` and complete on a later invocation. Canonical
 content, Git history, accepted requests, and the active release are never
 removed. Interrupted intents are reconciled during the next bounded pass, and
-the scan retains only lightweight metadata rather than one open descriptor per
-release.
+the scan retains only lightweight manifest and filesystem identity metadata
+rather than one open descriptor per release. A selected directory must match
+that recorded identity when it is reopened for mutation.
 
 Submit a validated request package through an SSH host alias:
 

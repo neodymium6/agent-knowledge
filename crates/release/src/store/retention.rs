@@ -12,9 +12,12 @@ use super::{
     BY_ID_DIRECTORY, CURRENT_ENTRY, MANIFEST_FILE, ReleaseError, ReleaseManifest, ReleaseStore,
     cleanup_identity, open_directory, read_bounded_regular_file, read_manifest_file,
     release_id as canonical_release_id, release_id_from_commit_target, remove_empty_directory_at,
-    replace_regular_file, replace_symlink, stable_directory_path, sync_directory, validate_commit,
-    validate_pinned_directory, validate_release_id_component, validate_same_mount,
+    replace_regular_file, replace_symlink, same_metadata, stable_directory_path, sync_directory,
+    validate_commit, validate_pinned_directory, validate_release_id_component, validate_same_mount,
 };
+
+#[cfg(target_os = "linux")]
+use super::mount_id;
 
 #[cfg(unix)]
 use super::clear_directory_at;
@@ -165,24 +168,58 @@ struct ScannedRelease {
     manifest: Option<ReleaseManifest>,
     retired: bool,
     finalizing: bool,
+    identity: ScannedIdentity,
 }
 
-impl From<&PinnedRelease> for ScannedRelease {
-    fn from(release: &PinnedRelease) -> Self {
-        Self {
+#[derive(Clone, Debug)]
+struct ScannedIdentity {
+    metadata: fs::Metadata,
+    #[cfg(target_os = "linux")]
+    mount_id: u64,
+}
+
+impl ScannedRelease {
+    fn capture(release: &PinnedRelease) -> Result<Self, ReleaseError> {
+        Ok(Self {
             release_id: release.release_id.clone(),
             commit: release.commit.clone(),
             created_at: release.created_at,
             manifest: release.manifest.clone(),
             retired: release.retired,
             finalizing: release.finalizing,
+            identity: ScannedIdentity::capture(&release.handle)?,
+        })
+    }
+}
+
+impl ScannedIdentity {
+    fn capture(directory: &File) -> Result<Self, ReleaseError> {
+        Ok(Self {
+            metadata: directory.metadata().map_err(ReleaseError::Io)?,
+            #[cfg(target_os = "linux")]
+            mount_id: mount_id(directory)?,
+        })
+    }
+
+    fn validate(&self, directory: &File) -> Result<(), ReleaseError> {
+        if !same_metadata(
+            &self.metadata,
+            &directory.metadata().map_err(ReleaseError::Io)?,
+        ) {
+            return Err(ReleaseError::StorageBindingMismatch);
         }
+        #[cfg(target_os = "linux")]
+        if self.mount_id != mount_id(directory)? {
+            return Err(ReleaseError::StorageBindingMismatch);
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone, Debug)]
 struct KnownRelease {
     manifest: ReleaseManifest,
+    identity: ScannedIdentity,
 }
 
 impl ReleaseStore {
@@ -224,10 +261,10 @@ impl ReleaseStore {
         let known_releases = releases
             .iter()
             .filter_map(|release| {
-                release
-                    .manifest
-                    .clone()
-                    .map(|manifest| KnownRelease { manifest })
+                release.manifest.clone().map(|manifest| KnownRelease {
+                    manifest,
+                    identity: release.identity.clone(),
+                })
             })
             .collect::<Vec<_>>();
         let retained = policy.retained_releases.get().min(releases.len());
@@ -338,7 +375,7 @@ impl ReleaseStore {
                 manifest: Some(manifest),
                 ..pinned
             };
-            releases.push(ScannedRelease::from(&pinned));
+            releases.push(ScannedRelease::capture(&pinned)?);
         }
         Ok(releases)
     }
@@ -386,7 +423,7 @@ impl ReleaseStore {
                 finalizing,
                 ..pinned
             };
-            tombstones.push(ScannedRelease::from(&pinned));
+            tombstones.push(ScannedRelease::capture(&pinned)?);
         }
         Ok(tombstones)
     }
@@ -400,6 +437,7 @@ impl ReleaseStore {
             self.by_id.stable.join(&target.release_id)
         };
         let pinned = pin_release(path, target.release_id.clone(), target.retired)?;
+        target.identity.validate(&pinned.handle)?;
         let pinned = PinnedRelease {
             commit: target.commit.clone(),
             created_at: target.created_at,
@@ -595,6 +633,7 @@ impl ReleaseStore {
             }
             let handle = open_directory(&path)?;
             validate_pinned_directory(&path, &handle)?;
+            candidate.identity.validate(&handle)?;
             if read_manifest_file(&stable_directory_path(&handle, &path)?.join(MANIFEST_FILE))?
                 != candidate.manifest
             {
@@ -909,5 +948,41 @@ fn remove_retired_manifest(release: &Path) -> Result<(), ReleaseError> {
         Ok(_) => Err(ReleaseError::InvalidManifest),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(ReleaseError::Io(error)),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod identity_tests {
+    use super::*;
+    use ulid::Ulid;
+
+    #[test]
+    fn lightweight_scan_identity_rejects_a_replaced_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-knowledge-retention-identity-test-{}",
+            Ulid::generate()
+        ));
+        let selected = root.join("selected");
+        let replaced = root.join("replaced");
+        fs::create_dir_all(&selected)
+            .unwrap_or_else(|error| panic!("fixture directory must be created: {error}"));
+        let original = open_directory(&selected)
+            .unwrap_or_else(|error| panic!("fixture directory must open: {error}"));
+        let identity = ScannedIdentity::capture(&original)
+            .unwrap_or_else(|error| panic!("fixture identity must be captured: {error}"));
+        fs::rename(&selected, &replaced)
+            .unwrap_or_else(|error| panic!("fixture directory must be replaced: {error}"));
+        fs::create_dir(&selected)
+            .unwrap_or_else(|error| panic!("replacement directory must be created: {error}"));
+        let replacement = open_directory(&selected)
+            .unwrap_or_else(|error| panic!("replacement directory must open: {error}"));
+
+        assert!(matches!(
+            identity.validate(&replacement),
+            Err(ReleaseError::StorageBindingMismatch)
+        ));
+
+        fs::remove_dir_all(&root)
+            .unwrap_or_else(|error| panic!("fixture root must be removed: {error}"));
     }
 }

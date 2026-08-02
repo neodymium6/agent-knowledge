@@ -1322,13 +1322,14 @@ same Unix descriptor-relative, same-mount, bounded-action traversal as
 abandoned build cleanup, checks the operation deadline between actions, and
 preserves the release manifest until finalization. Retention is rejected on
 platforms without that Unix traversal. The bounded scan keeps lightweight
-manifest records and reopens only the release currently being changed. It also
-reconciles an intent left before its rename; final cleanup removes the intent
-before deleting an already empty tombstone, which makes either crash boundary
-resumable. If the action budget is exhausted, the command reports the release
-ID as cleanup-pending and a later invocation resumes it. This maintenance
-operation never removes content, repository history, queue entries, or the
-active release.
+manifest and filesystem identity records and reopens only the release currently
+being changed. The reopened directory must match the scanned device, inode, and
+Linux mount identity before mutation. Retention also reconciles an intent left
+before its rename; final cleanup removes the intent before deleting an already
+empty tombstone, which makes either crash boundary resumable. If the action
+budget is exhausted, the command reports the release ID as cleanup-pending and
+a later invocation resumes it. This maintenance operation never removes
+content, repository history, queue entries, or the active release.
 
 ## 22. Completion and replication
 
