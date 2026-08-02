@@ -23,6 +23,11 @@ mod config;
 pub use config::{CURRENT_WORKER_CONFIG_VERSION, WorkerConfigError, WorkerSettings};
 mod bootstrap;
 pub use bootstrap::{WorkerBootstrap, WorkerOpenError};
+mod status;
+pub use status::{
+    ActiveReleaseStatus, OperationalStatus, OperationalStatusError, PublicationStatus, QueueStatus,
+    ReplicationStatus, inspect_operational_status,
+};
 
 /// Connects one queue session, Git transaction, Quartz build, and release.
 #[derive(Clone, Debug)]

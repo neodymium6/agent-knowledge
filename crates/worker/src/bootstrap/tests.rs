@@ -11,7 +11,10 @@ use time::{Duration, OffsetDateTime};
 use std::os::unix::fs::PermissionsExt;
 
 use super::{WorkerBootstrap, WorkerOpenError};
-use crate::{RemoteReplicationOutcome, StartupOutcome, WorkerSettings};
+use crate::{
+    RemoteReplicationOutcome, ReplicationStatus, StartupOutcome, WorkerSettings,
+    inspect_operational_status,
+};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -58,6 +61,45 @@ fn opens_components_and_completes_clean_startup_recovery() {
 
     assert_eq!(startup, StartupOutcome::Clean);
     assert_eq!(schedule.debounce(), Duration::seconds(30));
+}
+
+#[test]
+fn inspects_initialized_components_without_starting_the_worker() {
+    let root = TestDirectory::create();
+    initialize_repository(root.path());
+    initialize_quartz(root.path());
+    let settings = WorkerSettings::decode(&valid_yaml(root.path()))
+        .unwrap_or_else(|error| panic!("fixture settings must decode: {error}"));
+    let _bootstrap = WorkerBootstrap::open(settings.clone())
+        .unwrap_or_else(|error| panic!("configured components must open: {error}"));
+
+    let status = inspect_operational_status(
+        &settings,
+        1024,
+        Some(Instant::now() + StandardDuration::from_secs(5)),
+        created_at(),
+    )
+    .unwrap_or_else(|error| panic!("operational status must be readable: {error}"));
+
+    assert_eq!(status.queue().pending(), 0);
+    assert_eq!(status.queue().processing(), 0);
+    assert_eq!(status.queue().completed(), 0);
+    assert_eq!(status.queue().failed(), 0);
+    assert_eq!(status.queue().oldest_pending_at(), None);
+    assert!(!status.queue().worker_active());
+    assert!(status.publication().active_release().is_none());
+    assert!(!status.publication().synchronized());
+    assert!(matches!(status.replication(), ReplicationStatus::Disabled));
+    let wire = serde_json::to_value(&status)
+        .unwrap_or_else(|error| panic!("operational status must serialize: {error}"));
+    assert_eq!(wire["schema_version"], 1);
+    assert_eq!(wire["observed_at"], "2026-07-31T04:00:00Z");
+    assert_eq!(wire["queue"]["worker_active"], false);
+    assert_eq!(
+        wire["publication"]["active_release"],
+        serde_json::Value::Null
+    );
+    assert_eq!(wire["replication"]["status"], "disabled");
 }
 
 #[test]
