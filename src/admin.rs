@@ -11,8 +11,6 @@ use agent_knowledge_worker::{
 use time::OffsetDateTime;
 
 #[cfg(target_os = "linux")]
-use std::collections::BTreeMap;
-#[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, OsStr};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
@@ -32,6 +30,8 @@ use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat, openat2};
 use nix::sys::stat::{Mode, fchmod};
 #[cfg(target_os = "linux")]
 use nix::unistd::{Gid, Group, Uid, User, dup, fchown};
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
 
 #[cfg(target_os = "linux")]
 const MAXIMUM_MIGRATION_DEPTH: usize = 128;
@@ -142,7 +142,7 @@ fn migrate_v1_storage_with_ids(
     require_empty_directory(&queue.file, Path::new("incoming"))?;
     require_empty_directory(&queue.file, Path::new("quarantine"))?;
 
-    let mut queue_snapshot = BTreeMap::new();
+    let mut queue_fingerprint = TreeFingerprintBuilder::new();
     migrate_directory(
         &queue.file,
         queue_group,
@@ -150,9 +150,10 @@ fn migrate_v1_storage_with_ids(
         Mode::from_bits_truncate(0o660),
         0,
         Path::new(""),
-        &mut queue_snapshot,
+        &mut queue_fingerprint,
     )?;
-    let mut git_snapshot = BTreeMap::new();
+    let queue_fingerprint = queue_fingerprint.finish();
+    let mut git_fingerprint = TreeFingerprintBuilder::new();
     migrate_directory(
         &git.file,
         gateway_group,
@@ -160,9 +161,10 @@ fn migrate_v1_storage_with_ids(
         Mode::from_bits_truncate(0o640),
         0,
         Path::new(""),
-        &mut git_snapshot,
+        &mut git_fingerprint,
     )?;
-    let mut content_snapshot = BTreeMap::new();
+    let git_fingerprint = git_fingerprint.finish();
+    let mut content_fingerprint = TreeFingerprintBuilder::new();
     migrate_directory(
         &content.file,
         gateway_group,
@@ -170,8 +172,9 @@ fn migrate_v1_storage_with_ids(
         Mode::from_bits_truncate(0o640),
         0,
         Path::new(""),
-        &mut content_snapshot,
+        &mut content_fingerprint,
     )?;
+    let content_fingerprint = content_fingerprint.finish();
 
     for relative in [
         "",
@@ -208,9 +211,9 @@ fn migrate_v1_storage_with_ids(
         queue_group,
         Mode::from_bits_truncate(0o660),
     )?;
-    verify_snapshot(&queue.file, &queue_snapshot)?;
-    verify_snapshot(&git.file, &git_snapshot)?;
-    verify_snapshot(&content.file, &content_snapshot)?;
+    verify_fingerprint(&queue.file, &queue_fingerprint)?;
+    verify_fingerprint(&git.file, &git_fingerprint)?;
+    verify_fingerprint(&content.file, &content_fingerprint)?;
     queue.file.sync_all().map_err(StorageMigrationError::Io)?;
     git.file.sync_all().map_err(StorageMigrationError::Io)?;
     content.file.sync_all().map_err(StorageMigrationError::Io)?;
@@ -447,7 +450,7 @@ fn migrate_directory(
     file_mode: Mode,
     depth: usize,
     relative: &Path,
-    snapshot: &mut BTreeMap<PathBuf, ObjectIdentity>,
+    fingerprint: &mut TreeFingerprintBuilder,
 ) -> Result<(), StorageMigrationError> {
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
@@ -469,7 +472,7 @@ fn migrate_directory(
                 file_mode,
                 depth + 1,
                 &path,
-                snapshot,
+                fingerprint,
             )?;
         } else if identity.file_type == nix::libc::S_IFREG && identity.links == 1 {
             let child = open_child_regular(directory, name)?;
@@ -477,7 +480,7 @@ fn migrate_directory(
                 return Err(StorageMigrationError::TreeChanged(path));
             }
             set_regular_identity_and_mode(&child, group, file_mode, &path)?;
-            snapshot.insert(path, object_identity(&child)?);
+            fingerprint.record(&path, object_identity(&child)?)?;
         } else {
             return Err(StorageMigrationError::UnsafeEntry(path));
         }
@@ -486,7 +489,7 @@ fn migrate_directory(
         return Err(StorageMigrationError::TreeChanged(relative.to_path_buf()));
     }
     set_identity_and_mode(directory, None, group, directory_mode)?;
-    snapshot.insert(relative.to_path_buf(), object_identity(directory)?);
+    fingerprint.record(relative, object_identity(directory)?)?;
     Ok(())
 }
 
@@ -562,13 +565,13 @@ fn set_regular_identity_and_mode(
 }
 
 #[cfg(target_os = "linux")]
-fn verify_snapshot(
+fn verify_fingerprint(
     root: &File,
-    expected: &BTreeMap<PathBuf, ObjectIdentity>,
+    expected: &TreeFingerprint,
 ) -> Result<(), StorageMigrationError> {
-    let mut observed = BTreeMap::new();
-    snapshot_directory(root, 0, Path::new(""), &mut observed)?;
-    if &observed == expected {
+    let mut observed = TreeFingerprintBuilder::new();
+    fingerprint_directory(root, 0, Path::new(""), &mut observed)?;
+    if &observed.finish() == expected {
         Ok(())
     } else {
         Err(StorageMigrationError::TreeChanged(PathBuf::new()))
@@ -576,33 +579,87 @@ fn verify_snapshot(
 }
 
 #[cfg(target_os = "linux")]
-fn snapshot_directory(
+fn fingerprint_directory(
     directory: &File,
     depth: usize,
     relative: &Path,
-    snapshot: &mut BTreeMap<PathBuf, ObjectIdentity>,
+    fingerprint: &mut TreeFingerprintBuilder,
 ) -> Result<(), StorageMigrationError> {
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
     }
-    for name in directory_entries(directory)? {
+    let entries = directory_entries(directory)?;
+    for name in &entries {
         let path = relative.join(OsStr::from_bytes(name.to_bytes()));
-        let pinned = open_child_path(directory, &name)?;
+        let pinned = open_child_path(directory, name)?;
         let identity = object_identity(&pinned)?;
         if identity.file_type == nix::libc::S_IFDIR {
-            let child = open_child_directory(directory, &name)?;
+            let child = open_child_directory(directory, name)?;
             if object_identity(&child)? != identity {
                 return Err(StorageMigrationError::TreeChanged(path));
             }
-            snapshot_directory(&child, depth + 1, &path, snapshot)?;
+            fingerprint_directory(&child, depth + 1, &path, fingerprint)?;
         } else if identity.file_type != nix::libc::S_IFREG || identity.links != 1 {
             return Err(StorageMigrationError::UnsafeEntry(path));
         } else {
-            snapshot.insert(path, identity);
+            fingerprint.record(&path, identity)?;
         }
     }
-    snapshot.insert(relative.to_path_buf(), object_identity(directory)?);
+    if entries != directory_entries(directory)? {
+        return Err(StorageMigrationError::TreeChanged(relative.to_path_buf()));
+    }
+    fingerprint.record(relative, object_identity(directory)?)?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Eq, PartialEq)]
+struct TreeFingerprint {
+    entries: u64,
+    digest: [u8; 32],
+}
+
+#[cfg(target_os = "linux")]
+struct TreeFingerprintBuilder {
+    entries: u64,
+    digest: Sha256,
+}
+
+#[cfg(target_os = "linux")]
+impl TreeFingerprintBuilder {
+    fn new() -> Self {
+        Self {
+            entries: 0,
+            digest: Sha256::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        path: &Path,
+        identity: ObjectIdentity,
+    ) -> Result<(), StorageMigrationError> {
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| StorageMigrationError::UnsafeEntry(path.to_path_buf()))?;
+        let path = path.as_os_str().as_bytes();
+        self.digest.update((path.len() as u64).to_be_bytes());
+        self.digest.update(path);
+        self.digest.update(identity.mount.to_be_bytes());
+        self.digest.update(identity.device.to_be_bytes());
+        self.digest.update(identity.inode.to_be_bytes());
+        self.digest.update(identity.file_type.to_be_bytes());
+        self.digest.update(identity.links.to_be_bytes());
+        Ok(())
+    }
+
+    fn finish(self) -> TreeFingerprint {
+        TreeFingerprint {
+            entries: self.entries,
+            digest: self.digest.finalize().into(),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
