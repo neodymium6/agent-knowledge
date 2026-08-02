@@ -2,12 +2,12 @@
 set -euo pipefail
 
 if [[ $# -ne 2 || $1 != /* || $2 != /* || $(id -u) -ne 0 ]]; then
-  echo "usage: sudo $0 <absolute-agent-knowledge-binary> <absolute-migration-script>" >&2
+  echo "usage: sudo $0 <absolute-agent-knowledge-binary> <absolute-tmpfiles-config>" >&2
   exit 2
 fi
 
 source_binary=$1
-migration_script=$2
+tmpfiles_config=$2
 test_root=$(mktemp -d)
 chmod 0711 "$test_root"
 activation_pid=
@@ -28,6 +28,26 @@ worker_uid=61102
 worker_gid=61102
 
 install -m 0755 "$source_binary" "$test_root/agent-knowledge"
+
+fresh_root=$test_root/fresh-root
+fresh_config=$test_root/fresh-tmpfiles.conf
+install -d -m 0755 "$fresh_root"
+sed \
+  -e "s/ agent-knowledge-queue agent-knowledge-queue / $queue_uid $queue_gid /g" \
+  -e "s/ agent-knowledge agent-knowledge-gateway / $worker_uid $gateway_gid /g" \
+  -e "s/ agent-knowledge agent-knowledge / $worker_uid $worker_gid /g" \
+  -e "s/ agent-knowledge-queue agent-knowledge-gateway / $queue_uid $gateway_gid /g" \
+  "$tmpfiles_config" >"$fresh_config"
+systemd-tmpfiles --create --root="$fresh_root" "$fresh_config"
+test "$(stat -c '%u:%g:%a' "$fresh_root/var/lib/agent-knowledge/queue")" = \
+  "$queue_uid:$queue_gid:2770"
+test "$(stat -c '%u:%g:%a' "$fresh_root/var/lib/agent-knowledge/repository")" = \
+  "$worker_uid:$gateway_gid:2750"
+setpriv --reuid="$worker_uid" --regid="$worker_gid" --groups="$queue_gid" \
+  touch "$fresh_root/var/lib/agent-knowledge/queue/pending/fresh-sidecar.fixture"
+test "$(stat -c '%g' "$fresh_root/var/lib/agent-knowledge/queue/pending/fresh-sidecar.fixture")" = \
+  "$queue_gid"
+
 install -d -m 0711 "$test_root/storage"
 install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
   "$test_root/storage/queue" "$test_root/storage/repository" \
@@ -73,12 +93,6 @@ EOF
 )
 grep -Fq '"status":"accepted"' "$test_root/legacy-submit.json"
 
-"$migration_script" "$test_root/storage" "$queue_uid" "$queue_gid" "$gateway_gid"
-test "$(stat -c '%u:%g:%a' "$test_root/storage/queue")" = "$queue_uid:$queue_gid:2770"
-test "$(stat -c '%g' "$test_root/storage/queue/queue-id")" = "$queue_gid"
-test "$(stat -c '%g:%a' "$test_root/storage/repository")" = "$gateway_gid:2750"
-test "$(stat -c '%g:%a' "$test_root/storage/content")" = "$gateway_gid:2750"
-
 install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
   "$test_root/worker-home" "$test_root/seed"
 worker_git=(
@@ -103,8 +117,30 @@ install -m 0640 -o "$worker_uid" -g "$worker_gid" \
 "${worker_git[@]}" --git-dir="$test_root/storage/repository" worktree add \
   "$test_root/storage/content" main
 
+"$test_root/agent-knowledge" admin migrate-v1-storage \
+  --queue-root "$test_root/storage/queue" \
+  --git-directory "$test_root/storage/repository" \
+  --content-root "$test_root/storage/content" \
+  --queue-owner "$queue_uid" \
+  --queue-group "$queue_gid" \
+  --gateway-group "$gateway_gid" >"$test_root/migration.json"
+grep -Fq '"status":"completed"' "$test_root/migration.json"
+test "$(stat -c '%u:%g:%a' "$test_root/storage/queue")" = "$queue_uid:$queue_gid:2770"
+test "$(stat -c '%g' "$test_root/storage/queue/queue-id")" = "$queue_gid"
+test "$(stat -c '%g:%a' "$test_root/storage/repository")" = "$gateway_gid:2750"
+test "$(stat -c '%g:%a' "$test_root/storage/content")" = "$gateway_gid:2750"
+test "$(stat -c '%g' "$test_root/storage/content/projects/fictional-project/experiments/fictional-run/index.md")" = "$gateway_gid"
+
 tar --format=gnu --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
   -C "$test_root/package" -cf "$test_root/request.tar" request.json payload
+cp -a "$test_root/package" "$test_root/package-two"
+sed -i \
+  -e 's/01K00000000000000000000000/01K00000000000000000000002/g' \
+  -e 's/01K00000000000000000000001/01K00000000000000000000003/g' \
+  "$test_root/package-two/request.json" \
+  "$test_root/package-two/payload/run/index.md"
+tar --format=gnu --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
+  -C "$test_root/package-two" -cf "$test_root/request-two.tar" request.json payload
 
 cat >"$test_root/gateway.yaml" <<EOF
 schema_version: 3
@@ -131,8 +167,9 @@ reads:
 transport:
   submit_timeout_seconds: 30
 EOF
-chown root:"$gateway_gid" "$test_root/gateway.yaml" "$test_root/request.tar"
-chmod 0640 "$test_root/gateway.yaml" "$test_root/request.tar"
+chown root:"$gateway_gid" \
+  "$test_root/gateway.yaml" "$test_root/request.tar" "$test_root/request-two.tar"
+chmod 0640 "$test_root/gateway.yaml" "$test_root/request.tar" "$test_root/request-two.tar"
 
 umask 0007
 systemd-socket-activate --accept --inetd \
@@ -158,6 +195,14 @@ submit_response=$(
 )
 grep -Fq '"status":"existing"' <<<"$submit_response"
 
+new_submit_response=$(
+  setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
+    env SSH_ORIGINAL_COMMAND='akp-v1 submit' \
+    "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
+    --client-id fictional-node-a <"$test_root/request-two.tar"
+)
+grep -Fq '"status":"accepted"' <<<"$new_submit_response"
+
 status_response=$(
   printf '%s\n' '{"protocol_version":1,"request_id":"01K00000000000000000000000"}' |
     setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
@@ -175,7 +220,6 @@ list_response=$(
       --client-id fictional-node-a
 )
 grep -Fq '01K00000000000000000000001' <<<"$list_response"
-test "$(stat -c '%g' "$test_root/storage/content/projects/fictional-project/experiments/fictional-run/index.md")" = "$gateway_gid"
 
 if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
   test -r "$test_root/storage/queue/queue-id"; then
@@ -195,7 +239,8 @@ if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
   exit 1
 fi
 setpriv --reuid="$worker_uid" --regid="$worker_gid" \
-  --groups="$queue_gid" touch \
-  "$test_root/storage/queue/pending/01K00000000000000000000000/phase.fixture"
-test -f "$test_root/storage/queue/pending/01K00000000000000000000000/phase.fixture"
-test "$(stat -c '%g' "$test_root/storage/queue/pending/01K00000000000000000000000/phase.fixture")" = "$queue_gid"
+  --groups="$queue_gid" sh -c \
+  'temporary=$1/phase.fixture.tmp; final=$1/phase.fixture; : >"$temporary"; mv "$temporary" "$final"' \
+  sh "$test_root/storage/queue/pending/01K00000000000000000000002"
+test -f "$test_root/storage/queue/pending/01K00000000000000000000002/phase.fixture"
+test "$(stat -c '%g' "$test_root/storage/queue/pending/01K00000000000000000000002/phase.fixture")" = "$queue_gid"
