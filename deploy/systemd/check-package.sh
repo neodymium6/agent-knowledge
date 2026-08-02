@@ -12,12 +12,15 @@ ingress_socket="$package_path/lib/systemd/system/agent-knowledge-queue-ingress.s
 ingress_service="$package_path/lib/systemd/system/agent-knowledge-queue-ingress@.service"
 sysusers="$package_path/lib/sysusers.d/agent-knowledge.conf"
 tmpfiles="$package_path/lib/tmpfiles.d/agent-knowledge.conf"
+migration="$package_path/libexec/agent-knowledge/migrate-v1-storage-permissions"
 
 test -f "$service"
 test -f "$ingress_socket"
 test -f "$ingress_service"
 test -f "$sysusers"
 test -f "$tmpfiles"
+test -x "$migration"
+bash -n "$migration"
 test "$(grep -Fxc "ExecStart=$package_path/bin/agent-knowledge worker run --config /etc/agent-knowledge/worker.yaml" "$service")" -eq 1
 for directive in \
   'Type=exec' \
@@ -85,7 +88,9 @@ fi
 test "$(grep -Ec '^d /var/lib/agent-knowledge 0711 root root -$' "$tmpfiles")" -eq 1
 test "$(grep -Ec '^d /var/lib/agent-knowledge/queue 2770 agent-knowledge-queue agent-knowledge-queue -$' "$tmpfiles")" -eq 1
 test "$(grep -Ec '^d /var/lib/agent-knowledge/queue/(\.locks|incoming|quarantine|worker-tmp|pending|processing|completed|failed) 2770 agent-knowledge-queue agent-knowledge-queue -$' "$tmpfiles")" -eq 8
+test "$(grep -Ec '^z /var/lib/agent-knowledge/queue(/(\.locks|incoming|quarantine|worker-tmp|pending|processing|completed|failed))? 2770 - - -$' "$tmpfiles")" -eq 9
 test "$(grep -Ec '^f /var/lib/agent-knowledge/queue/\.locks/(queue|repository-writer)\.lock 0660 agent-knowledge-queue agent-knowledge-queue -$' "$tmpfiles")" -eq 2
 test "$(grep -Ec '^d /var/lib/agent-knowledge/(repository|content) 2750 agent-knowledge agent-knowledge-gateway -$' "$tmpfiles")" -eq 2
+test "$(grep -Ec '^z /var/lib/agent-knowledge/(repository|content) 2750 - - -$' "$tmpfiles")" -eq 2
 test "$(grep -Ec '^d /var/lib/agent-knowledge/(work|releases) 0750 agent-knowledge agent-knowledge -$' "$tmpfiles")" -eq 2
 test "$(grep -Ec '^d /run/agent-knowledge 0750 agent-knowledge-queue agent-knowledge-gateway -$' "$tmpfiles")" -eq 1

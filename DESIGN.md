@@ -110,7 +110,7 @@ agent-knowledge admin submit \
 
 `package-root` contains extracted `request.json` and `payload/` entries. The
 command validates that directory, restreams every permitted file through the
-same `FileQueue` limits as the Gateway, and prints one JSON acceptance
+same `FileQueue` limits as the queue ingress broker, and prints one JSON acceptance
 result. It never copies an unchecked directory into an accepted queue state.
 
 Operators inspect an initialized deployment with the same trusted Worker
@@ -409,7 +409,7 @@ a distinct operational error rather than an idle state.
 knowledge/
 ├── content/                 # canonical committed checkout
 ├── queue/
-│   ├── incoming/            # incomplete Gateway writes
+│   ├── incoming/            # incomplete broker writes
 │   ├── quarantine/          # inactive incomplete packages awaiting reap
 │   ├── pending/
 │   ├── processing/
@@ -589,7 +589,7 @@ The exact required fields vary by operation and document type:
 - `updated` is required after the first update; and
 - `tags` may be empty.
 
-Timestamps use RFC 3339 with an explicit offset. The Gateway verifies
+Timestamps use RFC 3339 with an explicit offset. The queue ingress broker verifies
 client-supplied timestamps and records its own acceptance timestamp in the
 request package. Request and document timestamps later than that durable
 acceptance time are rejected, so a client clock cannot prevent later
@@ -624,7 +624,7 @@ created = 2026-07-31T03:50:00+09:00
 projects/cuda-solver/logs/2026/07/31/035000-<document-id>/index.md
 ```
 
-If classification is incomplete but otherwise valid, the Gateway selects a
+If classification is incomplete but otherwise valid, the queue ingress broker selects a
 type-specific path below `inbox/`. Explicitly invalid classification is
 rejected.
 
@@ -661,7 +661,7 @@ The document-type directory names are `logs`, `experiments`, `decisions`,
 archived. Log bundles are append-only and cannot be moved or archived by
 normal client operations.
 
-Path validation occurs independently in the Gateway and Worker using the same
+Path validation occurs independently in the queue ingress broker and Worker using the same
 shared Rust library. It:
 
 - rejects absolute paths;
@@ -841,12 +841,12 @@ identify a document by `document_id`, not only by path.
 
 ## 15. Idempotency
 
-The Gateway calculates a digest of the normalized request metadata and payload.
-It searches all queue states for the request ID.
+The queue ingress broker calculates a digest of the normalized request metadata
+and payload. It searches all queue states for the request ID.
 
 - A new request ID is accepted normally.
 - An existing ID with the same digest is revalidated as an immutable accepted
-  package before the Gateway returns its existing status.
+  package before the broker returns its existing status.
 - An existing ID with a different digest fails with
   `REQUEST_ID_REUSED`.
 
@@ -869,7 +869,7 @@ pending/
 └── 01K00000000000000000000000/
     ├── request.json
     ├── digest
-    ├── acceptance.json  # immutable Gateway sequence and timestamp
+    ├── acceptance.json  # immutable broker sequence and timestamp
     ├── phase.json       # optional Worker-owned sidecar
     ├── result.json      # optional Worker-owned sidecar
     └── payload/
@@ -884,9 +884,9 @@ timestamp, and a queue-local monotonic sequence allocated under the queue lock.
 Local administrative intake may omit the client ID for compatibility. Gaps are
 allowed after an interrupted acceptance, but accepted packages never share a
 sequence. Worker state and results use only the optional `phase.json` and `result.json`
-sidecars next to that immutable data. The Gateway never creates these
+sidecars next to that immutable data. The queue ingress broker never creates these
 sidecars. The Worker writes them through temporary files and atomic rename;
-package revalidation excludes Gateway and Worker metadata bytes from the
+package revalidation excludes broker and Worker metadata bytes from the
 immutable client-package digest but still rejects links, executable files,
 and any unknown top-level entry.
 
@@ -967,14 +967,14 @@ handle pins both lock-file inodes and opens an independent lock description
 through `/proc/self/fd` for every acquisition. Replacing either directory entry
 therefore invalidates the handle instead of creating a second lock universe.
 Both lock identities are also part of the durable root binding, so a new handle
-cannot adopt replacement lock files after a restart. The Gateway can continue
+cannot adopt replacement lock files after a restart. The broker can continue
 accepting requests while the Worker is otherwise idle or applying a batch.
 
 On Linux, each live queue handle retains an open descriptor for the initialized
 queue root and each fixed child directory, and performs queue I/O through
 `/proc/self/fd/<fd>`. It also compares every configured directory entry's
 device, inode, mount identity, and type, plus the immutable `queue-id`, with the
-pinned objects before Gateway staging, immediately before and after acceptance
+pinned objects before broker staging, immediately before and after acceptance
 promotion, and before every Worker transition. It re-canonicalizes the
 configured root to detect replacement of an ancestor with a symlink. Renaming,
 bind-mounting, copying, or snapshotting a queue or one of its fixed directories
@@ -1579,7 +1579,7 @@ explicitly permits them.
 
 ## 28. Security
 
-Both the Gateway and Worker treat every request and archive entry as
+Both the queue ingress broker and Worker treat every request and archive entry as
 untrusted. Defense in depth includes:
 
 - OpenSSH public-key authentication;

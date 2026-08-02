@@ -119,14 +119,25 @@ collection. The unit allows writes only below `/var/lib/agent-knowledge`, uses
 `KillMode=mixed`, and grants 15 minutes for transaction-boundary shutdown. A
 deployment using other durable roots must add them with a systemd drop-in. It
 must also increase `TimeoutStopSec` when its maximum expected Git or Quartz
-transaction can exceed 15 minutes. Upgrade the dedicated profile and reload the
-unit with:
+transaction can exceed 15 minutes.
+
+The first upgrade from the Worker-only queue layout is an offline migration.
+Disable new forced-command SSH sessions, wait for existing Gateway processes,
+stop the Worker and socket, and take a storage backup before running it. The
+migration takes both queue locks, requires an empty `queue/incoming`, rejects
+links, changes existing queue data to the queue group, and grants the Gateway
+group read-only access to existing repository/content descendants. For the
+default storage root, upgrade and reload with:
 
 ```sh
+sudo systemctl stop agent-knowledge-worker.service
+sudo systemctl stop agent-knowledge-queue-ingress.socket 2>/dev/null || true
 sudo nix profile upgrade \
   --profile /nix/var/nix/profiles/agent-knowledge agent-knowledge
 package_path=/nix/var/nix/profiles/agent-knowledge
 sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
+sudo "$package_path/libexec/agent-knowledge/migrate-v1-storage-permissions" \
+  /var/lib/agent-knowledge
 sudo systemd-tmpfiles --create \
   "$package_path/lib/tmpfiles.d/agent-knowledge.conf"
 sudo systemctl link --force \
@@ -135,10 +146,20 @@ sudo systemctl link --force \
   "$package_path/lib/systemd/system/agent-knowledge-queue-ingress.socket"
 sudo systemctl link --force \
   "$package_path/lib/systemd/system/agent-knowledge-queue-ingress@.service"
+# Before restarting, change Gateway schema_version to 3 and replace
+# storage.queue_root with:
+#   queue_socket: /run/agent-knowledge/queue-ingress.sock
 sudo systemctl daemon-reload
-sudo systemctl restart agent-knowledge-queue-ingress.socket
-sudo systemctl restart agent-knowledge-worker.service
+sudo systemctl enable --now agent-knowledge-queue-ingress.socket
+sudo systemctl start agent-knowledge-worker.service
 ```
+
+Gateway schema v2 is intentionally not accepted after this upgrade. Update
+`/etc/agent-knowledge/gateway.yaml` to schema v3 while access is disabled;
+replace `storage.queue_root` with `storage.queue_socket` as shown in the Gateway
+configuration example below. A deployment using non-default durable roots
+passes its common storage parent to the migration command and updates the
+systemd path restrictions with drop-ins.
 
 Configuration, SSH keys, Git credentials, Quartz, and service enablement remain
 deployment inputs.
@@ -307,9 +328,9 @@ error code and failure time. An unknown request ID returns
 read-operation deadline covers initialization, lookup or query work, response
 encoding, and delivery to the SSH channel. The response-byte limit includes
 the JSON Lines framing newline. Committed-content read processes open only the
-repository and content checkout. Status and submit processes open the durable
-queue, while per-request status takes no queue locks and does not run
-maintenance.
+repository and content checkout. Gateway status and submit processes open only
+the local ingress socket. The queue ingress broker alone opens the durable
+queue; per-request status takes no queue locks and does not run maintenance.
 
 The client validates and snapshots at most 64 MiB of package data before
 network output. It then invokes the system `ssh` executable directly, uses

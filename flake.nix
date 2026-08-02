@@ -38,6 +38,7 @@
               (./deploy/systemd + "/agent-knowledge-queue-ingress@.service")
               ./deploy/systemd/agent-knowledge.conf.sysusers
               ./deploy/systemd/agent-knowledge.conf.tmpfiles
+              ./deploy/systemd/migrate-v1-storage-permissions.sh
               ./src
             ];
           };
@@ -74,6 +75,17 @@
               "$out/lib/sysusers.d/agent-knowledge.conf"
             install -Dm644 deploy/systemd/agent-knowledge.conf.tmpfiles \
               "$out/lib/tmpfiles.d/agent-knowledge.conf"
+            install -Dm755 deploy/systemd/migrate-v1-storage-permissions.sh \
+              "$out/libexec/agent-knowledge/migrate-v1-storage-permissions"
+            patchShebangs "$out/libexec/agent-knowledge/migrate-v1-storage-permissions"
+            wrapProgram "$out/libexec/agent-knowledge/migrate-v1-storage-permissions" \
+              --prefix PATH : ${
+                pkgs.lib.makeBinPath [
+                  pkgs.coreutils
+                  pkgs.findutils
+                  pkgs.util-linux
+                ]
+              }
           '';
 
           installCheckPhase = ''
