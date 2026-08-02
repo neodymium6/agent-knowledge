@@ -14,7 +14,7 @@ use agent_knowledge_queue::{
 };
 use serde::Serialize;
 
-use crate::admin::{self, AdminStatusError};
+use crate::admin::{self, AdminRetentionError, AdminStatusError};
 use crate::client::{self, ClientCommandError};
 use crate::gateway::{self, GatewayCommandError};
 use crate::worker::{self, WorkerCommandError};
@@ -22,6 +22,7 @@ use crate::worker::{self, WorkerCommandError};
 const USAGE: &str = "usage:\n\
     agent-knowledge admin submit --queue-root <path> --package-root <path>\n\
     agent-knowledge admin status --config <path> [--maximum-queue-entries <count>] [--timeout-seconds <seconds>]\n\
+    agent-knowledge admin prune-releases --config <path> [--dry-run] [--timeout-seconds <seconds>]\n\
     agent-knowledge client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
     agent-knowledge client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge client recent --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
@@ -38,6 +39,8 @@ const DEFAULT_STATUS_QUEUE_ENTRIES: usize = 100_000;
 const MAXIMUM_STATUS_QUEUE_ENTRIES: usize = 1_000_000;
 const DEFAULT_STATUS_TIMEOUT_SECONDS: u64 = 30;
 const MAXIMUM_STATUS_TIMEOUT_SECONDS: u64 = 300;
+const DEFAULT_RETENTION_TIMEOUT_SECONDS: u64 = 300;
+const MAXIMUM_RETENTION_TIMEOUT_SECONDS: u64 = 3_600;
 
 pub fn run<I, W>(arguments: I, output: W) -> Result<(), CliError>
 where
@@ -55,6 +58,12 @@ where
             timeout,
         } => admin::status(&config, maximum_queue_entries, timeout, output)
             .map_err(CliError::AdminStatus),
+        Command::AdminPruneReleases {
+            config,
+            dry_run,
+            timeout,
+        } => admin::prune_releases(&config, dry_run, timeout, output)
+            .map_err(CliError::AdminRetention),
         Command::RunWorker { config } => worker::run(&config, output).map_err(CliError::Worker),
         Command::RunGateway { config, client_id } => gateway::run_stdio(
             &config,
@@ -113,6 +122,11 @@ enum Command {
     AdminStatus {
         config: PathBuf,
         maximum_queue_entries: usize,
+        timeout: Duration,
+    },
+    AdminPruneReleases {
+        config: PathBuf,
+        dry_run: bool,
         timeout: Duration,
     },
     RunWorker {
@@ -204,6 +218,12 @@ where
                 && action == std::ffi::OsStr::new("status") =>
         {
             parse_admin_status_arguments(arguments)
+        }
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("admin")
+                && action == std::ffi::OsStr::new("prune-releases") =>
+        {
+            parse_admin_prune_releases_arguments(arguments)
         }
         (Some(namespace), Some(action))
             if namespace == std::ffi::OsStr::new("worker")
@@ -509,6 +529,40 @@ where
     })
 }
 
+fn parse_admin_prune_releases_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut config = None;
+    let mut dry_run = false;
+    let mut timeout_seconds = None;
+    while let Some(flag) = arguments.next() {
+        if flag == std::ffi::OsStr::new("--dry-run") {
+            if dry_run {
+                return Err(CliError::Usage);
+            }
+            dry_run = true;
+            continue;
+        }
+        let value = arguments.next().ok_or(CliError::Usage)?;
+        match flag.to_str() {
+            Some("--config") if config.is_none() => config = Some(PathBuf::from(value)),
+            Some("--timeout-seconds") if timeout_seconds.is_none() => {
+                timeout_seconds = Some(parse_bounded_u64(
+                    &value,
+                    MAXIMUM_RETENTION_TIMEOUT_SECONDS,
+                )?);
+            }
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(Command::AdminPruneReleases {
+        config: config.ok_or(CliError::Usage)?,
+        dry_run,
+        timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_RETENTION_TIMEOUT_SECONDS)),
+    })
+}
+
 fn parse_worker_arguments<I>(mut arguments: I) -> Result<Command, CliError>
 where
     I: Iterator<Item = OsString>,
@@ -597,6 +651,7 @@ pub enum CliError {
     PackageValidation(PackageValidationError),
     Queue(QueueError),
     AdminStatus(AdminStatusError),
+    AdminRetention(AdminRetentionError),
     Worker(WorkerCommandError),
     Gateway(GatewayCommandError),
     Client(ClientCommandError),
@@ -623,6 +678,7 @@ impl fmt::Display for CliError {
             }
             Self::Queue(error) => write!(formatter, "durable queue submission failed: {error}"),
             Self::AdminStatus(error) => error.fmt(formatter),
+            Self::AdminRetention(error) => error.fmt(formatter),
             Self::Worker(error) => error.fmt(formatter),
             Self::Gateway(error) => error.fmt(formatter),
             Self::Client(error) => error.fmt(formatter),
@@ -638,6 +694,7 @@ impl std::error::Error for CliError {
             Self::PackageValidation(error) => Some(error),
             Self::Queue(error) => Some(error),
             Self::AdminStatus(error) => Some(error),
+            Self::AdminRetention(error) => Some(error),
             Self::Worker(error) => Some(error),
             Self::Gateway(error) => Some(error),
             Self::Client(error) => Some(error),

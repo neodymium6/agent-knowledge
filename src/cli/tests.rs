@@ -204,6 +204,51 @@ fn parses_and_bounds_the_local_operational_status_command() {
 }
 
 #[test]
+fn parses_and_bounds_the_release_retention_command() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "admin".into(),
+        "prune-releases".into(),
+        "--config".into(),
+        "/srv/fictional-knowledge/worker.yaml".into(),
+        "--dry-run".into(),
+        "--timeout-seconds".into(),
+        "900".into(),
+    ])
+    .unwrap_or_else(|error| panic!("release retention command must parse: {error}"));
+
+    assert!(matches!(
+        command,
+        Command::AdminPruneReleases { config, dry_run: true, timeout }
+            if config == Path::new("/srv/fictional-knowledge/worker.yaml")
+                && timeout == std::time::Duration::from_secs(900)
+    ));
+
+    for arguments in [
+        vec![
+            "agent-knowledge".into(),
+            "admin".into(),
+            "prune-releases".into(),
+            "--config".into(),
+            "/srv/fictional-knowledge/worker.yaml".into(),
+            "--dry-run".into(),
+            "--dry-run".into(),
+        ],
+        vec![
+            "agent-knowledge".into(),
+            "admin".into(),
+            "prune-releases".into(),
+            "--config".into(),
+            "/srv/fictional-knowledge/worker.yaml".into(),
+            "--timeout-seconds".into(),
+            "3601".into(),
+        ],
+    ] {
+        assert!(matches!(parse_arguments(arguments), Err(CliError::Usage)));
+    }
+}
+
+#[test]
 fn parses_the_forced_command_gateway_configuration() {
     let command = parse_arguments([
         "agent-knowledge".into(),

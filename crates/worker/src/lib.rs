@@ -20,7 +20,9 @@ use agent_knowledge_repository::{
 use time::OffsetDateTime;
 
 mod config;
+mod maintenance;
 pub use config::{CURRENT_WORKER_CONFIG_VERSION, WorkerConfigError, WorkerSettings};
+pub use maintenance::{ReleaseMaintenanceError, retain_derived_releases};
 mod bootstrap;
 pub use bootstrap::{WorkerBootstrap, WorkerOpenError};
 mod status;

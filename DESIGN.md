@@ -120,11 +120,22 @@ agent-knowledge admin status \
   --config /srv/agent-knowledge/worker.yaml \
   --maximum-queue-entries 100000 \
   --timeout-seconds 30
+
+agent-knowledge admin prune-releases \
+  --config /srv/agent-knowledge/worker.yaml \
+  --dry-run
 ```
 
 This is a local read-only administrative boundary, not a Gateway operation.
 It does not broaden authenticated coding-agent permissions, initialize or
 repair storage, or contact a configured Git remote.
+
+Derived Quartz release retention is also a local administrative boundary. A
+dry run and a mutating run share the same trusted Worker configuration,
+resolved-topology validation, exclusive release-store maintenance lock, scan
+bound, removal bound, and operation deadline. Retention never runs through the
+Gateway and never removes canonical content, Git history, or accepted request
+packages.
 
 The same executable can be used with different entry-point arguments in a
 container. Separate binaries may be produced from the same workspace later,
@@ -1291,9 +1302,34 @@ stack; deep subtrees are atomically rehomed inside the tombstone so a later
 pass can continue without recursive call-stack growth. Prepared `by-id/`
 releases are never removed by the publication path.
 
-Release retention is configurable. Removal of old derived releases is an
-administrative maintenance operation and never removes content or accepted
-requests.
+Release retention is configurable by the number of newest releases preserved,
+the maximum release-store entries scanned, and the maximum release trees
+selected per invocation. The active release is protected independently of its
+age. Removal is an explicit local administrative maintenance operation; it is
+not performed by the publication path or the Gateway.
+
+A retention pass acquires the exclusive release-store mutation lease, validates
+the resolved Worker storage topology, and selects oldest inactive releases
+only after a complete bounded scan. Precise manifest creation times determine
+newest ordering; the release ID is only the deterministic tie-breaker. Dry runs
+do not mutate storage and separately report already pending cleanup. A mutating
+pass first records a durable retention intent bound to the selected directory's
+identity, then atomically renames the `by-id/` tree into a deterministic private
+tombstone under `.staging/`. Only an intent-authenticated tombstone may be
+deleted. The derived `by-commit/` reference is then removed or atomically
+repointed to the newest surviving release for that commit. Cleanup uses the
+same Unix descriptor-relative, same-mount, bounded-action traversal as
+abandoned build cleanup, checks the operation deadline between actions, and
+preserves the release manifest until finalization. Retention is rejected on
+platforms without that Unix traversal. The bounded scan keeps lightweight
+manifest and filesystem identity records and reopens only the release currently
+being changed. The reopened directory must match the scanned device, inode, and
+Linux mount identity before mutation. Retention also reconciles an intent left
+before its rename; final cleanup removes the intent before deleting an already
+empty tombstone, which makes either crash boundary resumable. If the action
+budget is exhausted, the command reports the release ID as cleanup-pending and
+a later invocation resumes it. This maintenance operation never removes
+content, repository history, queue entries, or the active release.
 
 ## 22. Completion and replication
 
@@ -1566,8 +1602,8 @@ Implementation proceeds in these increments:
 5. Quartz trial builds and atomic releases.
 6. OpenSSH forced-command Gateway and client SSH transport.
 7. Committed reads and initial full-text search.
-8. Request status, remote push retry, and operational status (implemented), and
-   retention.
+8. Request status, remote push retry, operational status, and release retention
+   (implemented).
 9. Optional container and single-replica Kubernetes packaging.
 
 Every increment keeps `just check` passing and preserves the invariants in this
