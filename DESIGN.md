@@ -137,9 +137,15 @@ bound, removal bound, and operation deadline. Retention never runs through the
 Gateway and never removes canonical content, Git history, or accepted request
 packages.
 
+The flake publishes one wrapped production executable for `x86_64-linux` and
+`aarch64-linux`. Its runtime closure provides the Git and OpenSSH executables
+invoked by the application. Quartz remains an explicitly configured absolute
+program path and integration directory. The package contains no credentials,
+host keys, client keys, service configuration, or Quartz content.
+
 The same executable can be used with different entry-point arguments in a
-container. Separate binaries may be produced from the same workspace later,
-without changing protocol or domain logic.
+service or container. Separate binaries may be produced from the same
+workspace later, without changing protocol or domain logic.
 
 The implementation starts with synchronous I/O. OpenSSH creates a Gateway
 process for each connection, and the single Worker does not require an
@@ -1604,7 +1610,10 @@ Implementation proceeds in these increments:
 7. Committed reads and initial full-text search.
 8. Request status, remote push retry, operational status, and release retention
    (implemented).
-9. Optional container and single-replica Kubernetes packaging.
+9. Deployment packaging:
+   - reproducible Linux package output (implemented);
+   - conventional Linux service integration; and
+   - optional container and single-replica Kubernetes packaging.
 
 Every increment keeps `just check` passing and preserves the invariants in this
 document.

@@ -17,8 +17,9 @@ immutable Quartz releases. Coding agents can list, retrieve, and search an
 exact committed content snapshot and inspect durable request state through the
 same Gateway. Git remote replication runs asynchronously with durable retry
 state. Derived-release retention is available as a bounded local maintenance
-operation. Document-bundle export is implemented; deployment packaging remains
-future work.
+operation. Document-bundle export is implemented. Reproducible Linux package
+output is available through the flake; service, container, and Kubernetes
+packaging remain future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -47,6 +48,19 @@ Initialize the local Git hooks and run the repository checks:
 just init
 just check
 ```
+
+Build the production Linux package or run it directly through the flake:
+
+```sh
+nix build .#agent-knowledge
+nix run .#agent-knowledge -- client list --destination fictional-knowledge
+```
+
+The package is available for `x86_64-linux` and `aarch64-linux`. Its runtime
+wrapper provides the pinned Git and OpenSSH executables used by Worker,
+Gateway, and client operations. Quartz remains a deployment-supplied absolute
+program path and integration directory. The package does not contain service
+configuration, credentials, host keys, client keys, or Quartz content.
 
 Run the Repository Worker with a validated deployment configuration:
 
