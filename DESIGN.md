@@ -145,15 +145,17 @@ program path and integration directory. The package contains no credentials,
 host keys, client keys, deployment-specific Worker or Gateway configuration,
 or Quartz content.
 
-The flake also publishes a reproducible, Docker-compatible container image
-archive for `amd64` and `arm64`. The image uses the wrapped production
-executable as its direct entrypoint and contains no role-specific command,
-configuration, credentials, keys, or content. Its default identity is the
-non-root Worker account `10003:10003`; the filesystem identity database also
-reserves `10001:10001` for the Gateway and `10002:10002` for queue ingress.
-Deployments select the role through arguments, override the runtime identity
-when required, and mount configuration, secrets, durable storage, and a writable
-Worker home. No conventional shell path is exposed by the image.
+The flake also publishes a reproducible, Docker-compatible Worker image archive
+for `amd64` and `arm64`. Its entrypoint fixes the wrapped executable and the
+`worker run` role so deployment arguments cannot accidentally start another
+role with Worker authority. The image resolves the non-root Worker account to
+`10003:10003`, includes queue GID `10002` as a supplementary group, and provides
+an immutable CA bundle for HTTPS Git replication. Deployments mount
+configuration, secrets, durable storage, and a writable Worker home. No
+conventional shell path, role-specific configuration, credentials, keys, or
+content is included. Gateway and queue ingress images must similarly bind their
+entrypoints to their least-privilege identities when Kubernetes packaging is
+added.
 
 The same executable can be used with different entry-point arguments in a
 service or container. Separate binaries may be produced from the same
@@ -1692,8 +1694,9 @@ Implementation proceeds in these increments:
 9. Deployment packaging:
    - reproducible Linux package output (implemented);
    - conventional Linux Worker service integration (implemented); and
-   - reproducible container packaging (implemented); and
-   - optional single-replica Kubernetes packaging.
+   - reproducible Worker container packaging (implemented); and
+   - role-specific Gateway and queue ingress containers plus optional
+     single-replica Kubernetes packaging.
 10. Production Gateway privilege separation through the systemd-activated
     local queue-ingress broker, verified with distinct-UID integration tests
     (implemented).
