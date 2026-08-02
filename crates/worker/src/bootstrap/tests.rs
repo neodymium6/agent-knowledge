@@ -14,7 +14,7 @@ use super::{WorkerBootstrap, WorkerOpenError};
 use crate::status::inspect_operational_status_with_hook;
 use crate::{
     OperationalStatusError, RemoteReplicationOutcome, ReplicationStatus, StartupOutcome,
-    WorkerSettings, inspect_operational_status,
+    WorkerSettings, inspect_operational_status, retain_derived_releases,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -103,6 +103,28 @@ fn inspects_initialized_components_without_starting_the_worker() {
         serde_json::Value::Null
     );
     assert_eq!(wire["replication"]["status"], "disabled");
+}
+
+#[test]
+fn applies_release_maintenance_through_the_validated_worker_topology() {
+    let root = TestDirectory::create();
+    initialize_repository(root.path());
+    initialize_quartz(root.path());
+    let settings = WorkerSettings::decode(&valid_yaml(root.path()))
+        .unwrap_or_else(|error| panic!("fixture settings must decode: {error}"));
+    let _bootstrap = WorkerBootstrap::open(settings.clone())
+        .unwrap_or_else(|error| panic!("configured components must open: {error}"));
+
+    let outcome = retain_derived_releases(
+        &settings,
+        true,
+        Some(Instant::now() + StandardDuration::from_secs(5)),
+    )
+    .unwrap_or_else(|error| panic!("empty release maintenance must succeed: {error}"));
+
+    assert!(outcome.dry_run());
+    assert_eq!(outcome.releases_scanned(), 0);
+    assert!(outcome.planned_release_ids().is_empty());
 }
 
 #[test]

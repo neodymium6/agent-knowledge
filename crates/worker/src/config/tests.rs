@@ -80,6 +80,48 @@ fn decodes_strict_versioned_operational_settings() {
     assert_eq!(settings.limits().maximum_scan_entries().get(), 1024);
     assert_eq!(settings.limits().maximum_requests().get(), 100);
     assert_eq!(settings.limits().maximum_recovery_requests().get(), 10_000);
+    assert_eq!(settings.release_retention().retained_releases().get(), 10);
+    assert_eq!(
+        settings.release_retention().maximum_scan_entries().get(),
+        10_000
+    );
+    assert_eq!(settings.release_retention().maximum_removals().get(), 10);
+}
+
+#[test]
+fn decodes_optional_release_retention_policy() {
+    let yaml = format!(
+        "{}retention:\n  retained_releases: 7\n  maximum_scan_entries: 500\n  maximum_removals: 25\n",
+        valid_yaml(Path::new("/srv/fictional-knowledge"))
+    );
+    let settings = WorkerSettings::decode(&yaml)
+        .unwrap_or_else(|error| panic!("retention settings must decode: {error}"));
+
+    assert_eq!(settings.release_retention().retained_releases().get(), 7);
+    assert_eq!(
+        settings.release_retention().maximum_scan_entries().get(),
+        500
+    );
+    assert_eq!(settings.release_retention().maximum_removals().get(), 25);
+
+    for (field, invalid_field) in [
+        ("retained_releases: 7", "retained_releases: 0"),
+        ("maximum_scan_entries: 500", "maximum_scan_entries: 0"),
+        ("maximum_removals: 25", "maximum_removals: 0"),
+    ] {
+        let invalid = yaml.replace(field, invalid_field);
+        assert!(matches!(
+            WorkerSettings::decode(&invalid),
+            Err(WorkerConfigError::InvalidValue { .. })
+        ));
+    }
+    let excessive = yaml.replace("maximum_removals: 25", "maximum_removals: 501");
+    assert!(matches!(
+        WorkerSettings::decode(&excessive),
+        Err(WorkerConfigError::InvalidValue {
+            field: "retention.maximum_removals"
+        })
+    ));
 }
 
 #[test]

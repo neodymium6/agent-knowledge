@@ -6,6 +6,7 @@ use std::time::Duration as StandardDuration;
 use std::time::Instant;
 
 use agent_knowledge_core::{BoundedFileError, read_bounded_regular_file};
+use agent_knowledge_release::ReleaseRetentionPolicy;
 use agent_knowledge_repository::{GitIdentity, RemoteReplicationPolicy};
 use serde::Deserialize;
 use time::Duration;
@@ -30,6 +31,7 @@ pub struct WorkerSettings {
     quartz_program: PathBuf,
     quartz_integration_root: PathBuf,
     quartz_timeout: StandardDuration,
+    release_retention: ReleaseRetentionPolicy,
     schedule: BatchSchedule,
     limits: WorkerRunLimits,
 }
@@ -154,6 +156,12 @@ impl WorkerSettings {
         self.quartz_timeout
     }
 
+    /// Returns the bounded derived-release retention policy.
+    #[must_use]
+    pub const fn release_retention(&self) -> ReleaseRetentionPolicy {
+        self.release_retention
+    }
+
     /// Returns the validated batch-closing thresholds.
     #[must_use]
     pub const fn schedule(&self) -> BatchSchedule {
@@ -234,6 +242,31 @@ impl TryFrom<WireWorkerConfig> for WorkerSettings {
             .transpose()?;
         let quartz_timeout =
             positive_standard_duration("quartz.timeout_seconds", wire.quartz.timeout_seconds)?;
+        let release_retention = wire
+            .retention
+            .map(|retention| {
+                let retained_releases =
+                    positive_usize("retention.retained_releases", retention.retained_releases)?;
+                let maximum_scan_entries = positive_usize(
+                    "retention.maximum_scan_entries",
+                    retention.maximum_scan_entries,
+                )?;
+                let maximum_removals =
+                    positive_usize("retention.maximum_removals", retention.maximum_removals)?;
+                if maximum_removals > maximum_scan_entries {
+                    return Err(WorkerConfigError::InvalidValue {
+                        field: "retention.maximum_removals",
+                    });
+                }
+                ReleaseRetentionPolicy::new(
+                    retained_releases.get(),
+                    maximum_scan_entries.get(),
+                    maximum_removals.get(),
+                )
+                .map_err(|_| WorkerConfigError::InvalidValue { field: "retention" })
+            })
+            .transpose()?
+            .unwrap_or_default();
         let debounce =
             positive_time_duration("batch.debounce_seconds", wire.batch.debounce_seconds)?;
         let maximum_age =
@@ -270,6 +303,7 @@ impl TryFrom<WireWorkerConfig> for WorkerSettings {
             quartz_program: wire.quartz.program,
             quartz_integration_root: wire.quartz.integration_root,
             quartz_timeout,
+            release_retention,
             schedule,
             limits: WorkerRunLimits::new(
                 maximum_scan_entries,
@@ -364,6 +398,7 @@ struct WireWorkerConfig {
     repository: WireRepository,
     quartz: WireQuartz,
     batch: WireBatch,
+    retention: Option<WireReleaseRetention>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,6 +446,14 @@ struct WireBatch {
     maximum_scan_entries: u64,
     maximum_requests: u64,
     maximum_recovery_requests: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireReleaseRetention {
+    retained_releases: u64,
+    maximum_scan_entries: u64,
+    maximum_removals: u64,
 }
 
 /// Invalid Worker configuration input.
