@@ -251,12 +251,14 @@ changed.
 The listener publishes the socket as `0660`, refuses to overwrite live,
 non-socket, or unowned stale paths, recovers a stale socket recorded by its own
 locked state file after a crash, and rejects a socket basename change while a
-prior recorded socket still exists. It bounds concurrent connections and
-handler shutdown, keeps connection diagnostics outside the listener control
-loop, and stops accepting and cancels active queue lock waits on `SIGINT` or
-`SIGTERM`. A handler that ignores cancellation past the grace period makes the
-listener exit with failure so its supervisor can replace the process without
-accumulating detached threads.
+prior recorded socket still exists, including while upgrading v1 state through
+a bounded identity scan. Internal lock and state basenames are reserved. The
+listener bounds concurrent connections and handler shutdown, hands diagnostics
+to a capacity-one best-effort reporter after connection completion, and stops
+accepting and cancels active queue lock waits on `SIGINT` or `SIGTERM`. A
+handler that ignores cancellation past the grace period makes the listener exit
+with failure so its supervisor can replace the process without accumulating
+detached threads.
 `queue-ingress serve` remains the one-connection entrypoint used by the
 packaged systemd units.
 

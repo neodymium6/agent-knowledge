@@ -341,9 +341,10 @@ handler that cannot finish within the bounded shutdown grace period on
 `SIGINT` or `SIGTERM`. If an expired handler cannot stop within that grace
 period during normal operation, the listener fails instead of releasing its
 slot and accumulating unbounded threads; the supervisor then replaces the
-process. Connection diagnostics are emitted on a best-effort basis by the
-bounded handler path, not the listener control loop, so a blocked diagnostic
-sink cannot stop accepts, deadline enforcement, or signal handling. The
+process. Connection diagnostics are handed to a capacity-one, best-effort
+reporter after connection completion, outside both the bounded handler slots
+and the listener control loop. A blocked diagnostic sink therefore cannot stop
+accepts, deadline enforcement, or signal handling. The
 deployment creates the runtime directory in advance, owned by the broker with
 mode `2750` and dedicated ingress group
 (`10004` in the container identity database). The parent namespace must be
@@ -358,7 +359,10 @@ crash-consistent, records the public socket basename, and constrains recovery
 to the listener's prior publication. A changed basename is rejected while the
 recorded public or temporary socket still exists. Socket probes use the
 preflighted canonical path and are nonblocking so a saturated listener backlog
-cannot stall startup.
+cannot stall startup. The three internal lock and state basenames are reserved
+and cannot be selected as the public socket. During a v1 state upgrade, a
+bounded directory scan locates the recorded socket identity before assigning
+its previously unstored basename.
 The listener never creates or guesses deployment ownership.
 
 The internal protocol is independent of the public SSH protocol. It begins

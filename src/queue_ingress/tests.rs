@@ -89,6 +89,16 @@ impl TestDirectory {
         Self(path)
     }
 
+    fn create_short() -> Self {
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("ak-l-{}-{sequence}", std::process::id()));
+        fs::create_dir(&path)
+            .unwrap_or_else(|error| panic!("listener test directory must be created: {error}"));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o2750))
+            .unwrap_or_else(|error| panic!("listener test directory mode must be set: {error}"));
+        Self(path)
+    }
+
     fn path(&self) -> &Path {
         &self.0
     }
@@ -410,7 +420,8 @@ fn blocking_diagnostics_do_not_block_listener_shutdown() {
         .unwrap_or_else(|error| panic!("runtime directory must be created: {error}"));
     fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o2750))
         .unwrap_or_else(|error| panic!("runtime directory mode must be set: {error}"));
-    let settings = settings(root.path());
+    let mut settings = settings(root.path());
+    settings.maximum_connections = NonZeroUsize::MIN;
     let socket_path = settings.socket_path.clone();
     let blocker = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
     let output = BlockingDiagnosticOutput {
@@ -525,6 +536,26 @@ fn rejects_a_socket_parent_reached_through_a_symbolic_link() {
         QueueIngressListenerError::NonCanonicalSocketParent
     ));
     assert!(!runtime.join(super::SOCKET_STATE_FILE).exists());
+}
+
+#[test]
+fn rejects_socket_names_reserved_for_listener_state() {
+    let root = TestDirectory::create_short();
+    for reserved in [
+        super::LISTENER_LOCK_FILE,
+        super::SOCKET_STATE_FILE,
+        super::SOCKET_STATE_TEMPORARY_FILE,
+    ] {
+        let error = match PublishedSocket::bind(&root.path().join(reserved)) {
+            Ok(_) => panic!("reserved listener basename must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            QueueIngressListenerError::ReservedSocketName
+        ));
+        assert!(!root.path().join(reserved).exists());
+    }
 }
 
 #[test]
@@ -803,6 +834,40 @@ fn legacy_owned_state_recovers_the_configured_public_socket() {
         .unwrap_or_else(|error| panic!("legacy owned socket must be recovered: {error}"));
     drop(published);
     assert!(!socket_path.exists());
+}
+
+#[test]
+fn legacy_owned_state_rejects_a_changed_public_socket_name() {
+    let root = TestDirectory::create();
+    let prior_socket_path = root.path().join("prior.sock");
+    let stale = UnixListener::bind(&prior_socket_path)
+        .unwrap_or_else(|error| panic!("legacy prior listener fixture must bind: {error}"));
+    drop(stale);
+    let metadata = fs::symlink_metadata(&prior_socket_path)
+        .unwrap_or_else(|error| panic!("legacy prior socket must be inspectable: {error}"));
+    let legacy_state = format!(
+        "{} owned {} {}\n",
+        super::LEGACY_SOCKET_STATE_FORMAT,
+        metadata.dev(),
+        metadata.ino()
+    );
+    let state_path = root.path().join(super::SOCKET_STATE_FILE);
+    fs::write(&state_path, legacy_state)
+        .unwrap_or_else(|error| panic!("legacy owned state must be written: {error}"));
+    fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600))
+        .unwrap_or_else(|error| panic!("legacy state mode must be set: {error}"));
+
+    let replacement_socket_path = root.path().join("replacement.sock");
+    let error = match PublishedSocket::bind(&replacement_socket_path) {
+        Ok(_) => panic!("legacy state must not orphan its prior public socket"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        QueueIngressListenerError::SocketConfigurationChanged { .. }
+    ));
+    assert!(prior_socket_path.exists());
+    assert!(!replacement_socket_path.exists());
 }
 
 #[test]
