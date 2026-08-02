@@ -248,6 +248,46 @@ fn parses_and_bounds_the_release_retention_command() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn parses_the_descriptor_relative_storage_migration_command() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "admin".into(),
+        "migrate-v1-storage".into(),
+        "--queue-root".into(),
+        "/srv/fictional-queue".into(),
+        "--git-directory".into(),
+        "/srv/fictional-repository".into(),
+        "--content-root".into(),
+        "/srv/fictional-content".into(),
+        "--queue-owner".into(),
+        "61101".into(),
+        "--queue-group".into(),
+        "61102".into(),
+        "--gateway-group".into(),
+        "61103".into(),
+    ])
+    .unwrap_or_else(|error| panic!("storage migration command must parse: {error}"));
+
+    assert!(matches!(
+        command,
+        Command::AdminMigrateV1Storage {
+            queue_root,
+            git_directory,
+            content_root,
+            queue_owner,
+            queue_group,
+            gateway_group,
+        } if queue_root == Path::new("/srv/fictional-queue")
+            && git_directory == Path::new("/srv/fictional-repository")
+            && content_root == Path::new("/srv/fictional-content")
+            && queue_owner == "61101"
+            && queue_group == "61102"
+            && gateway_group == "61103"
+    ));
+}
+
 #[test]
 fn parses_the_forced_command_gateway_configuration() {
     let command = parse_arguments([

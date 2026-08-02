@@ -9,17 +9,18 @@ restricted gateway; they do not synchronize the repository with Git.
 
 ## Status
 
-The architecture is defined, delivery increments 1 through 7 are implemented,
-and the request-status, Git-replication, and operational-status portions of
-increment 8 are complete. The current executable can accept requests locally or through an
-OpenSSH forced command, process them through the single Writer, and publish
-immutable Quartz releases. Coding agents can list, retrieve, and search an
-exact committed content snapshot and inspect durable request state through the
-same Gateway. Git remote replication runs asynchronously with durable retry
-state. Derived-release retention is available as a bounded local maintenance
-operation. Document-bundle export is implemented. Reproducible Linux package
-output and conventional systemd Worker service integration are available
-through the flake; container and Kubernetes packaging remain future work.
+The architecture is defined, delivery increments 1 through 8 and the Linux
+portion of increment 9 are implemented. The current executable can accept
+requests locally or through an OpenSSH forced command, process them through the
+single Writer, and publish immutable Quartz releases. Coding agents can list,
+retrieve, and search an exact committed content snapshot and inspect durable
+request state through the same Gateway. Git remote replication runs
+asynchronously with durable retry state. Derived-release retention and
+document-bundle export are implemented. The flake provides reproducible Linux
+packaging, a conventional systemd Worker service, and a systemd-activated local
+queue-ingress broker that isolates the forced-command Gateway from durable queue
+access under distinct service identities. Container and Kubernetes packaging
+remain future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -124,10 +125,12 @@ transaction can exceed 15 minutes.
 The first upgrade from the Worker-only queue layout is an offline migration.
 Disable new forced-command SSH sessions, wait for existing Gateway processes,
 stop the Worker and socket, and take a storage backup before running it. The
-migration takes both queue locks, requires an empty `queue/incoming`, rejects
-links, changes existing queue data to the queue group, and grants the Gateway
-group read-only access to existing repository/content descendants. For the
-default storage root, upgrade and reload with:
+migration takes both queue locks, requires empty `queue/incoming` and
+`queue/quarantine` directories, rejects links, special files, hard links,
+cross-mount traversal, and concurrent tree changes, changes existing queue data
+to the queue group, and grants the Gateway group read-only access to existing
+repository/content descendants. For the default storage root, upgrade and
+reload with:
 
 ```sh
 sudo systemctl stop agent-knowledge-worker.service
@@ -136,8 +139,10 @@ sudo nix profile upgrade \
   --profile /nix/var/nix/profiles/agent-knowledge agent-knowledge
 package_path=/nix/var/nix/profiles/agent-knowledge
 sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
-sudo "$package_path/libexec/agent-knowledge/migrate-v1-storage-permissions" \
-  /var/lib/agent-knowledge
+sudo "$package_path/bin/agent-knowledge" admin migrate-v1-storage \
+  --queue-root /var/lib/agent-knowledge/queue \
+  --git-directory /var/lib/agent-knowledge/repository \
+  --content-root /var/lib/agent-knowledge/content
 sudo systemd-tmpfiles --create \
   "$package_path/lib/tmpfiles.d/agent-knowledge.conf"
 sudo systemctl link --force \
@@ -158,8 +163,9 @@ Gateway schema v2 is intentionally not accepted after this upgrade. Update
 `/etc/agent-knowledge/gateway.yaml` to schema v3 while access is disabled;
 replace `storage.queue_root` with `storage.queue_socket` as shown in the Gateway
 configuration example below. A deployment using non-default durable roots
-passes its common storage parent to the migration command and updates the
-systemd path restrictions with drop-ins.
+passes the three configured roots independently to the migration command and
+updates `ReadWritePaths`, `WorkingDirectory`, and the queue-ingress service's
+`ExecStart` queue root with systemd drop-ins.
 
 Configuration, SSH keys, Git credentials, Quartz, and service enablement remain
 deployment inputs.

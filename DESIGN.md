@@ -1684,7 +1684,8 @@ Implementation proceeds in these increments:
    - conventional Linux Worker service integration (implemented); and
    - optional container and single-replica Kubernetes packaging.
 10. Production Gateway privilege separation through the systemd-activated
-    local queue-ingress broker, verified with distinct-UID integration tests.
+    local queue-ingress broker, verified with distinct-UID integration tests
+    (implemented).
 
 Every increment keeps `just check` passing and preserves the invariants in this
 document.
