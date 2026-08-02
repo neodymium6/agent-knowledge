@@ -4,14 +4,15 @@ use std::time::Instant;
 
 use agent_knowledge_core::{DocumentLimits, ErrorCode};
 use agent_knowledge_protocol::{
-    CURRENT_GATEWAY_PROTOCOL_VERSION, DocumentContent, DocumentSummary, GetRequest, GetResponse,
-    ListRequest, ListResponse, ReadFilterRequest, SearchRequest,
+    CURRENT_GATEWAY_PROTOCOL_VERSION, DocumentContent, DocumentSummary, ExportRequest, GetRequest,
+    GetResponse, ListRequest, ListResponse, ReadFilterRequest, SearchRequest,
 };
 use agent_knowledge_queue::PackagePolicy;
 use agent_knowledge_repository::{
-    CommittedReadError, CommittedStore, ContentPolicy, DocumentRecord, LinearSearch, ReadFilter,
-    SearchBackend, SearchMetadataFields, SearchPolicy,
+    CommittedBundleEntry, CommittedReadError, CommittedStore, ContentPolicy, DocumentRecord,
+    LinearSearch, ReadFilter, SearchBackend, SearchMetadataFields, SearchPolicy,
 };
+use tar::{Builder, EntryType, Header};
 
 use crate::{GatewayError, GatewaySettings};
 
@@ -73,6 +74,63 @@ pub(super) fn get_until(
     );
     drop(snapshot);
     prepare_response(settings, response, deadline)
+}
+
+pub(super) fn export_until(
+    settings: &GatewaySettings,
+    store: &CommittedStore,
+    request: ExportRequest,
+    deadline: Instant,
+) -> Result<PreparedExport, GatewayError> {
+    validate_version(request.protocol_version)?;
+    let snapshot = snapshot(settings, store, deadline)?;
+    let entries = snapshot
+        .bundle(request.document_id)
+        .map_err(committed)?
+        .into_entries();
+    let mut counter = ResponseCounter::new(settings.maximum_response_bytes(), Some(deadline));
+    let archive_result = write_export_archive(&entries, &mut counter);
+    if archive_result.is_err() {
+        return Err(response_counter_error(settings, &counter));
+    }
+    if Instant::now() >= deadline {
+        return Err(GatewayError::OperationDeadlineExceeded);
+    }
+    Ok(PreparedExport { entries })
+}
+
+/// One validated committed bundle ready for bounded tar delivery.
+#[derive(Debug)]
+pub struct PreparedExport {
+    entries: Vec<CommittedBundleEntry>,
+}
+
+impl PreparedExport {
+    /// Writes the deterministic uncompressed tar representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first archive or output error.
+    pub fn write_to(&self, output: impl Write) -> io::Result<()> {
+        write_export_archive(&self.entries, output)
+    }
+}
+
+fn write_export_archive(entries: &[CommittedBundleEntry], output: impl Write) -> io::Result<()> {
+    let mut archive = Builder::new(output);
+    archive.mode(tar::HeaderMode::Deterministic);
+    for entry in entries {
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_size(entry.bytes().len() as u64);
+        header.set_cksum();
+        archive.append_data(&mut header, entry.name(), entry.bytes())?;
+    }
+    archive.finish()
 }
 
 pub(super) fn search(
@@ -151,11 +209,7 @@ where
     T: serde::Serialize,
 {
     let mut buffer = ResponseBuffer {
-        bytes: Vec::new(),
-        maximum: settings.maximum_response_bytes(),
-        deadline: Some(deadline),
-        deadline_exceeded: false,
-        limit_exceeded: false,
+        ..ResponseBuffer::new(settings.maximum_response_bytes(), Some(deadline))
     };
     let encoded = serde_json::to_writer(&mut buffer, &response)
         .and_then(|()| buffer.write_all(b"\n").map_err(serde_json::Error::io));
@@ -194,6 +248,76 @@ struct ResponseBuffer {
     deadline: Option<Instant>,
     deadline_exceeded: bool,
     limit_exceeded: bool,
+}
+
+impl ResponseBuffer {
+    const fn new(maximum: u64, deadline: Option<Instant>) -> Self {
+        Self {
+            bytes: Vec::new(),
+            maximum,
+            deadline,
+            deadline_exceeded: false,
+            limit_exceeded: false,
+        }
+    }
+}
+
+struct ResponseCounter {
+    bytes: u64,
+    maximum: u64,
+    deadline: Option<Instant>,
+    deadline_exceeded: bool,
+    limit_exceeded: bool,
+}
+
+impl ResponseCounter {
+    const fn new(maximum: u64, deadline: Option<Instant>) -> Self {
+        Self {
+            bytes: 0,
+            maximum,
+            deadline,
+            deadline_exceeded: false,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl Write for ResponseCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.deadline_exceeded = true;
+            return Err(io::Error::other("response deadline exceeded"));
+        }
+        let next = self
+            .bytes
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| io::Error::other("response byte limit exceeded"))?;
+        if next > self.maximum {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("response byte limit exceeded"));
+        }
+        self.bytes = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn response_counter_error(settings: &GatewaySettings, counter: &ResponseCounter) -> GatewayError {
+    if counter.deadline_exceeded {
+        GatewayError::OperationDeadlineExceeded
+    } else if counter.limit_exceeded {
+        GatewayError::ReadRequest(ReadRequestError::ResponseTooLarge {
+            maximum: settings.maximum_response_bytes(),
+        })
+    } else {
+        GatewayError::ReadRequest(ReadRequestError::ArchiveEncoding)
+    }
 }
 
 impl Write for ResponseBuffer {
@@ -298,7 +422,9 @@ pub(super) fn committed_error_code(error: &CommittedReadError) -> ErrorCode {
         }
         CommittedReadError::QueryTooLong { .. }
         | CommittedReadError::SearchDocumentLimitExceeded { .. }
-        | CommittedReadError::SearchMarkdownByteLimitExceeded { .. } => ErrorCode::LimitExceeded,
+        | CommittedReadError::SearchMarkdownByteLimitExceeded { .. }
+        | CommittedReadError::BundleEntryLimitExceeded { .. }
+        | CommittedReadError::BundleByteLimitExceeded { .. } => ErrorCode::LimitExceeded,
         CommittedReadError::Content(source)
             if matches!(
                 source.as_ref(),
@@ -368,6 +494,8 @@ pub enum ReadRequestError {
     },
     /// A typed successful response unexpectedly failed JSON encoding.
     ResponseEncoding,
+    /// A validated bundle unexpectedly failed deterministic tar encoding.
+    ArchiveEncoding,
 }
 
 impl ReadRequestError {
@@ -381,6 +509,7 @@ impl ReadRequestError {
             Self::InvalidDeadline => ErrorCode::InternalError,
             Self::ResponseTooLarge { .. } => ErrorCode::LimitExceeded,
             Self::ResponseEncoding => ErrorCode::InternalError,
+            Self::ArchiveEncoding => ErrorCode::InternalError,
         }
     }
 }
@@ -410,6 +539,7 @@ impl fmt::Display for ReadRequestError {
                 write!(formatter, "encoded response exceeds {maximum} bytes")
             }
             Self::ResponseEncoding => formatter.write_str("successful response encoding failed"),
+            Self::ArchiveEncoding => formatter.write_str("document bundle encoding failed"),
         }
     }
 }

@@ -307,6 +307,18 @@ impl PinnedRegularFile {
         self.length
     }
 
+    /// Returns current metadata for the pinned file descriptor.
+    ///
+    /// This permits callers with stricter content policies to revalidate link
+    /// count and mode without resolving the pathname again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when descriptor metadata cannot be read.
+    pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
     /// Clones the pinned readable descriptor without resolving its path again.
     ///
     /// # Errors

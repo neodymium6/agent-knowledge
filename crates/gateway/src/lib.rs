@@ -10,14 +10,14 @@ use std::io::Read;
 
 use agent_knowledge_core::{ErrorCode, PathAttestation, PathAttestationError, RequestId};
 use agent_knowledge_protocol::{
-    ClientId, GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest, StatusRequest,
-    StatusResponse, SubmitResponse,
+    ClientId, ExportRequest, GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest,
+    StatusRequest, StatusResponse, SubmitResponse,
 };
 use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueError, QueueReader};
 use agent_knowledge_repository::{CommittedReadError, CommittedStore};
 
 pub use config::{CURRENT_GATEWAY_CONFIG_VERSION, GatewayConfigError, GatewaySettings};
-pub use read::ReadRequestError;
+pub use read::{PreparedExport, ReadRequestError};
 pub use submit::ArchiveError;
 
 /// Gateway state opened exclusively for accepting submissions.
@@ -187,6 +187,15 @@ impl ReadGateway {
     /// Retrieves one exact committed Markdown document.
     pub fn get(&self, request: GetRequest) -> Result<GetResponse, GatewayError> {
         read::get(&self.settings, &self.committed, request).map(|prepared| prepared.response)
+    }
+
+    /// Encodes one committed document bundle as a deterministic tar archive.
+    pub fn prepare_export_until(
+        &self,
+        request: ExportRequest,
+        deadline: std::time::Instant,
+    ) -> Result<PreparedExport, GatewayError> {
+        read::export_until(&self.settings, &self.committed, request, deadline)
     }
 
     /// Searches committed Markdown and configured metadata fields.

@@ -12,12 +12,13 @@ pub use git::{
     GitTransactionError, PublicationError, RepositoryTransaction, RequestFailure,
 };
 pub use index::{
-    ContentIndex, ContentIndexError, ContentPolicy, DocumentLocation, DocumentRecord,
-    RevisionCheckError,
+    AttachmentRecord, ContentIndex, ContentIndexError, ContentPolicy, DocumentLocation,
+    DocumentRecord, RevisionCheckError,
 };
 pub use read::{
-    CommittedDocument, CommittedReadError, CommittedSnapshot, CommittedStore, LinearSearch,
-    ReadFilter, SearchBackend, SearchMetadataFields, SearchPolicy,
+    CommittedBundle, CommittedBundleEntry, CommittedDocument, CommittedReadError,
+    CommittedSnapshot, CommittedStore, LinearSearch, ReadFilter, SearchBackend,
+    SearchMetadataFields, SearchPolicy,
 };
 pub use replication::{
     RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicationPolicy,

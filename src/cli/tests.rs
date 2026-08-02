@@ -345,6 +345,18 @@ fn parses_committed_read_and_search_commands() {
     ])
     .unwrap_or_else(|error| panic!("client get command must parse: {error}"));
     assert!(matches!(get, Command::ClientGet { .. }));
+
+    let export = parse_arguments([
+        "agent-knowledge".into(),
+        "client".into(),
+        "export".into(),
+        "--destination".into(),
+        "fictional-knowledge".into(),
+        "--document-id".into(),
+        "01K00000000000000000000001".into(),
+    ])
+    .unwrap_or_else(|error| panic!("client export command must parse: {error}"));
+    assert!(matches!(export, Command::ClientExport { .. }));
 }
 
 #[test]

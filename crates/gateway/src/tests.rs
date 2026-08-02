@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_knowledge_core::ErrorCode;
 use agent_knowledge_protocol::{
-    ClientId, GetRequest, ListRequest, ReadFilterRequest, RequestStatus, SearchRequest,
-    StatusRequest, SubmitOutcome,
+    ClientId, ExportRequest, GetRequest, ListRequest, ReadFilterRequest, RequestStatus,
+    SearchRequest, StatusRequest, SubmitOutcome,
 };
 use agent_knowledge_queue::{PackagePolicy, validate_accepted_package};
 use tar::{Builder, EntryType, Header};
@@ -121,10 +121,25 @@ fn initialize_committed_content(root: &TestDirectory) {
     )
     .unwrap_or_else(|error| panic!("document fixture directory must be created: {error}"));
     fs::write(
-        document,
+        &document,
         "---\nschema_version: 1\ndocument_id: 01K00000000000000000000001\ntitle: Fictional restart guide\ncreated: 2026-07-31T03:50:00Z\nrequest_id: 01K00000000000000000000002\ntags:\n  - operations\nstatus: active\n---\nRestart the fictional service safely.\n",
     )
     .unwrap_or_else(|error| panic!("document fixture must be written: {error}"));
+    fs::write(
+        document
+            .parent()
+            .unwrap_or_else(|| panic!("document fixture must have a parent"))
+            .join("procedure.json"),
+        b"{\"fictional\":true}\n",
+    )
+    .unwrap_or_else(|error| panic!("attachment fixture must be written: {error}"));
+    fs::create_dir_all(seed.join("projects/fictional-project/assets"))
+        .unwrap_or_else(|error| panic!("shared asset directory must be created: {error}"));
+    fs::write(
+        seed.join("projects/fictional-project/assets/shared.json"),
+        b"{\"shared\":true}\n",
+    )
+    .unwrap_or_else(|error| panic!("shared asset fixture must be written: {error}"));
     run_git(Some(&seed), &["add", "."]);
     run_git(
         Some(&seed),
@@ -216,6 +231,44 @@ fn serves_list_recent_get_and_search_from_one_committed_revision() {
         .unwrap_or_else(|error| panic!("committed search must succeed: {error}"));
     assert_eq!(search.documents.len(), 1);
     assert_eq!(search.commit, list.commit);
+}
+
+#[test]
+fn exports_a_deterministic_committed_document_bundle() {
+    let root = TestDirectory::create();
+    let gateway = read_gateway(&root);
+    let document_id = "01K00000000000000000000001"
+        .parse()
+        .unwrap_or_else(|error| panic!("document fixture must parse: {error}"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let export = gateway
+        .prepare_export_until(ExportRequest::new(document_id), deadline)
+        .unwrap_or_else(|error| panic!("committed export must succeed: {error}"));
+    let mut archive = Vec::new();
+    export
+        .write_to(&mut archive)
+        .unwrap_or_else(|error| panic!("committed export must encode: {error}"));
+    let mut entries = tar::Archive::new(Cursor::new(archive))
+        .entries()
+        .unwrap_or_else(|error| panic!("export archive must decode: {error}"))
+        .map(|entry| {
+            let mut entry =
+                entry.unwrap_or_else(|error| panic!("export entry must decode: {error}"));
+            let path = entry
+                .path()
+                .unwrap_or_else(|error| panic!("export path must decode: {error}"))
+                .into_owned();
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .unwrap_or_else(|error| panic!("export entry must read: {error}"));
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.remove(0).0, Path::new("index.md"));
+    assert_eq!(entries[0].0, Path::new("procedure.json"));
+    assert_eq!(entries[0].1, b"{\"fictional\":true}\n");
 }
 
 #[cfg(target_family = "unix")]

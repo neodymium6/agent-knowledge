@@ -11,8 +11,8 @@ use agent_knowledge_core::{ErrorCode, RequestId, Revision};
 use serde::{Deserialize, Serialize};
 
 pub use read::{
-    DocumentContent, DocumentSummary, GetRequest, GetResponse, ListRequest, ListResponse,
-    ReadFilterRequest, SearchRequest,
+    DocumentContent, DocumentSummary, ExportRequest, GetRequest, GetResponse, ListRequest,
+    ListResponse, ReadFilterRequest, SearchRequest,
 };
 pub use status::{RequestStatus, StatusRequest, StatusResponse};
 
@@ -26,6 +26,8 @@ pub const LIST_COMMAND: &str = "akp-v1 list";
 pub const RECENT_COMMAND: &str = "akp-v1 recent";
 /// The exact remote command used to retrieve one committed Markdown document.
 pub const GET_COMMAND: &str = "akp-v1 get";
+/// The exact remote command used to export one committed document bundle.
+pub const EXPORT_COMMAND: &str = "akp-v1 export";
 /// The exact remote command used to search committed documents.
 pub const SEARCH_COMMAND: &str = "akp-v1 search";
 /// The exact remote command used to inspect one durable request state.
@@ -43,6 +45,8 @@ pub enum GatewayCommand {
     Recent,
     /// Retrieves one committed Markdown document.
     Get,
+    /// Exports one committed document bundle as an uncompressed tar stream.
+    Export,
     /// Searches committed Markdown and permitted metadata.
     Search,
     /// Retrieves one durable change-request status.
@@ -62,6 +66,7 @@ impl GatewayCommand {
             value if value == OsStr::new(LIST_COMMAND) => Ok(Self::List),
             value if value == OsStr::new(RECENT_COMMAND) => Ok(Self::Recent),
             value if value == OsStr::new(GET_COMMAND) => Ok(Self::Get),
+            value if value == OsStr::new(EXPORT_COMMAND) => Ok(Self::Export),
             value if value == OsStr::new(SEARCH_COMMAND) => Ok(Self::Search),
             value if value == OsStr::new(STATUS_COMMAND) => Ok(Self::Status),
             _ => Err(GatewayCommandError),
@@ -76,6 +81,7 @@ impl GatewayCommand {
             Self::List => LIST_COMMAND,
             Self::Recent => RECENT_COMMAND,
             Self::Get => GET_COMMAND,
+            Self::Export => EXPORT_COMMAND,
             Self::Search => SEARCH_COMMAND,
             Self::Status => STATUS_COMMAND,
         }
@@ -270,8 +276,9 @@ mod tests {
     use agent_knowledge_core::ErrorCode;
 
     use super::{
-        CURRENT_GATEWAY_PROTOCOL_VERSION, ClientId, GET_COMMAND, GatewayCommand, LIST_COMMAND,
-        ProtocolErrorResponse, RECENT_COMMAND, SEARCH_COMMAND, STATUS_COMMAND, SUBMIT_COMMAND,
+        CURRENT_GATEWAY_PROTOCOL_VERSION, ClientId, EXPORT_COMMAND, GET_COMMAND, GatewayCommand,
+        LIST_COMMAND, ProtocolErrorResponse, RECENT_COMMAND, SEARCH_COMMAND, STATUS_COMMAND,
+        SUBMIT_COMMAND,
     };
 
     #[test]
@@ -284,6 +291,7 @@ mod tests {
             (LIST_COMMAND, GatewayCommand::List),
             (RECENT_COMMAND, GatewayCommand::Recent),
             (GET_COMMAND, GatewayCommand::Get),
+            (EXPORT_COMMAND, GatewayCommand::Export),
             (SEARCH_COMMAND, GatewayCommand::Search),
             (STATUS_COMMAND, GatewayCommand::Status),
         ] {

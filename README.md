@@ -17,7 +17,8 @@ immutable Quartz releases. Coding agents can list, retrieve, and search an
 exact committed content snapshot and inspect durable request state through the
 same Gateway. Git remote replication runs asynchronously with durable retry
 state. Derived-release retention is available as a bounded local maintenance
-operation. Bundle export and packaging remain future work.
+operation. Document-bundle export is implemented; deployment packaging remains
+future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -186,8 +187,22 @@ agent-knowledge client search \
   --maximum-results 25
 ```
 
+Export a committed document and its colocated attachments as an uncompressed
+tar archive:
+
+```sh
+agent-knowledge client export \
+  --destination fictional-knowledge \
+  --document-id 01K00000000000000000000001 \
+  > bundle.tar
+```
+
+The archive contains `index.md` followed by attachment files in deterministic
+name order. Project-shared `assets/` are not part of a document bundle.
+
 The `list`, `recent`, `get`, `search`, and `status` commands return strict
-versioned JSON. Every successful committed-content response identifies the
+versioned JSON; `export` returns an uncompressed tar stream. Every successful
+JSON committed-content response identifies the
 exact official Git commit used for the operation. List and search operations
 support exact project, tag, and session filters; archived documents are
 excluded unless `--include-archived` is supplied. Status returns `pending`,

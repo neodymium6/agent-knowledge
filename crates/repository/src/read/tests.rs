@@ -103,6 +103,14 @@ impl Fixture {
             ),
         )
         .unwrap_or_else(|error| panic!("runbook fixture must be written: {error}"));
+        fs::write(
+            runbook_path
+                .parent()
+                .unwrap_or_else(|| panic!("runbook fixture must have a parent"))
+                .join("procedure.json"),
+            b"{\"fictional\":true}\n",
+        )
+        .unwrap_or_else(|error| panic!("attachment fixture must be written: {error}"));
         run_git(Some(&seed), ["add", "."]);
         run_git(
             Some(&seed),
@@ -184,6 +192,17 @@ fn snapshots_one_commit_and_queries_validated_documents() {
         std::str::from_utf8(document.markdown())
             .is_ok_and(|markdown| markdown.contains("Needle OOM analysis"))
     );
+    let runbook_id = RUNBOOK_ID
+        .parse::<DocumentId>()
+        .unwrap_or_else(|error| panic!("document fixture must parse: {error}"));
+    let bundle = snapshot
+        .bundle(runbook_id)
+        .unwrap_or_else(|error| panic!("committed bundle must load: {error}"));
+    assert_eq!(bundle.record().metadata().document_id, runbook_id);
+    assert_eq!(bundle.entries().len(), 2);
+    assert_eq!(bundle.entries()[0].name(), Path::new("index.md"));
+    assert_eq!(bundle.entries()[1].name(), Path::new("procedure.json"));
+    assert_eq!(bundle.entries()[1].bytes(), b"{\"fictional\":true}\n");
 
     let search = LinearSearch::default();
     let matches = search
@@ -350,5 +369,55 @@ fn shared_snapshot_lock_blocks_publication_until_drop() {
             }
             Err(error) => panic!("writer lock must succeed after snapshot drop: {error}"),
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn bundle_export_rejects_an_attachment_replaced_by_a_hard_link() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let attachment = fixture
+        .content
+        .join("projects/fictional-project/runbooks")
+        .join(format!("2026-07-31-{RUNBOOK_ID}/procedure.json"));
+    let external = fixture._root.path().join("external.json");
+    fs::write(&external, b"{\"fictional\":true}\n")
+        .unwrap_or_else(|error| panic!("external fixture must be written: {error}"));
+    fs::remove_file(&attachment)
+        .unwrap_or_else(|error| panic!("attachment fixture must be removed: {error}"));
+    fs::hard_link(&external, &attachment)
+        .unwrap_or_else(|error| panic!("hard-link fixture must be created: {error}"));
+    let document_id = RUNBOOK_ID
+        .parse()
+        .unwrap_or_else(|error| panic!("document fixture must parse: {error}"));
+    assert!(matches!(
+        snapshot.bundle(document_id),
+        Err(CommittedReadError::Io(_))
+    ));
+}
+
+#[test]
+fn bundle_export_rejects_same_length_uncommitted_attachment_bytes() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let attachment = fixture
+        .content
+        .join("projects/fictional-project/runbooks")
+        .join(format!("2026-07-31-{RUNBOOK_ID}/procedure.json"));
+    fs::write(&attachment, b"{\"fictional\":null}\n")
+        .unwrap_or_else(|error| panic!("attachment mutation must be written: {error}"));
+    let document_id = RUNBOOK_ID
+        .parse()
+        .unwrap_or_else(|error| panic!("document fixture must parse: {error}"));
+    match snapshot.bundle(document_id) {
+        Err(CommittedReadError::ContentChanged { document_id: found }) if found == document_id => {}
+        other => panic!("same-length mutation must be rejected as changed content: {other:?}"),
     }
 }

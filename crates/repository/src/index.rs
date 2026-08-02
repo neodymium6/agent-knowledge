@@ -53,6 +53,27 @@ pub struct DocumentRecord {
     byte_length: u64,
 }
 
+/// Indexed path, revision, and length for one validated attachment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachmentRecord {
+    relative_path: PathBuf,
+    byte_length: u64,
+}
+
+impl AttachmentRecord {
+    /// Returns the attachment path relative to the content root.
+    #[must_use]
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    /// Returns the validated attachment byte length.
+    #[must_use]
+    pub const fn byte_length(&self) -> u64 {
+        self.byte_length
+    }
+}
+
 impl DocumentRecord {
     /// Returns the document path relative to the content root.
     #[must_use]
@@ -117,6 +138,7 @@ impl DocumentLocation {
 #[derive(Clone, Debug)]
 pub struct ContentIndex {
     documents: HashMap<DocumentId, DocumentRecord>,
+    attachments: Vec<AttachmentRecord>,
 }
 
 impl ContentIndex {
@@ -250,7 +272,10 @@ impl ContentIndex {
                     if !package_policy.allows_attachment_name(name) {
                         return Err(ContentIndexError::UnsupportedAttachment(relative_path));
                     }
-                    attachments.push(relative_path);
+                    attachments.push(AttachmentRecord {
+                        relative_path,
+                        byte_length: metadata.len(),
+                    });
                     continue;
                 }
                 if metadata.len() > policy.maximum_markdown_bytes {
@@ -332,7 +357,10 @@ impl ContentIndex {
         validate_attachment_locations(&attachments, &documents, package_policy)?;
         check_scan_deadline(policy.scan_deadline)?;
 
-        Ok(Self { documents })
+        Ok(Self {
+            documents,
+            attachments,
+        })
     }
 
     /// Returns the uniquely indexed document, if present.
@@ -347,6 +375,17 @@ impl ContentIndex {
     /// apply an explicit deterministic ordering.
     pub fn documents(&self) -> impl Iterator<Item = &DocumentRecord> {
         self.documents.values()
+    }
+
+    /// Iterates over attachments stored beside one indexed document.
+    pub fn attachments_beside(
+        &self,
+        document: &DocumentRecord,
+    ) -> impl Iterator<Item = &AttachmentRecord> {
+        let directory = document.relative_path.parent();
+        self.attachments
+            .iter()
+            .filter(move |attachment| attachment.relative_path.parent() == directory)
     }
 
     /// Resolves a document and checks its exact byte revision.
@@ -429,7 +468,7 @@ fn read_bounded_file(
 }
 
 fn validate_attachment_locations(
-    attachments: &[PathBuf],
+    attachments: &[AttachmentRecord],
     documents: &HashMap<DocumentId, DocumentRecord>,
     package_policy: &PackagePolicy,
 ) -> Result<(), ContentIndexError> {
@@ -438,6 +477,7 @@ fn validate_attachment_locations(
         .filter_map(|document| document.relative_path.parent().map(Path::to_path_buf))
         .collect::<HashSet<_>>();
     for attachment in attachments {
+        let attachment = attachment.relative_path();
         let beside_document = attachment
             .parent()
             .is_some_and(|parent| document_directories.contains(parent));
@@ -446,10 +486,14 @@ fn validate_attachment_locations(
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.parse::<AttachmentName>().is_ok());
         if !valid_name {
-            return Err(ContentIndexError::InvalidAttachmentPath(attachment.clone()));
+            return Err(ContentIndexError::InvalidAttachmentPath(
+                attachment.to_path_buf(),
+            ));
         }
         if !beside_document && !is_project_asset(attachment, package_policy) {
-            return Err(ContentIndexError::OrphanAttachment(attachment.clone()));
+            return Err(ContentIndexError::OrphanAttachment(
+                attachment.to_path_buf(),
+            ));
         }
     }
     Ok(())

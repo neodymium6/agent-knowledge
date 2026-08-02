@@ -15,10 +15,13 @@ use sha2::{Digest, Sha256};
 
 use crate::git::{
     ensure_canonical_worktree_clean_until, ensure_real_directory, ensure_supported_git_until,
-    open_stable_directory, parse_object_id, run_git_for_read, validate_local_git_config_until,
-    validate_repository_layout_until,
+    open_stable_directory, parse_object_id, run_git_for_read, run_git_for_read_with_output_limit,
+    validate_local_git_config_until, validate_repository_layout_until,
 };
-use crate::{ContentIndex, ContentIndexError, ContentPolicy, DocumentRecord, GitTransactionError};
+use crate::{
+    AttachmentRecord, ContentIndex, ContentIndexError, ContentPolicy, DocumentRecord,
+    GitTransactionError,
+};
 
 /// A validated read-only handle to the official repository and content tree.
 #[derive(Clone, Debug)]
@@ -148,10 +151,14 @@ impl CommittedStore {
             .map_err(CommittedReadError::PinnedPath)?;
         Ok(CommittedSnapshot {
             commit: official,
+            git_directory: self.git_directory.clone(),
             index,
             root,
             maximum_markdown_bytes: content_policy.maximum_markdown_bytes,
+            maximum_bundle_bytes: package_policy.limits().maximum_total_bytes,
+            maximum_bundle_entries: package_policy.limits().maximum_file_count,
             deadline,
+            _git_root_handle: Arc::clone(&self.git_root_handle),
             _content_lock: content_lock,
         })
     }
@@ -257,10 +264,14 @@ fn same_directory_metadata(_left: &fs::Metadata, _right: &fs::Metadata) -> bool 
 #[derive(Debug)]
 pub struct CommittedSnapshot {
     commit: String,
+    git_directory: PathBuf,
     index: ContentIndex,
     root: PinnedDirectory,
     maximum_markdown_bytes: u64,
+    maximum_bundle_bytes: u64,
+    maximum_bundle_entries: usize,
     deadline: Option<Instant>,
+    _git_root_handle: Arc<File>,
     _content_lock: File,
 }
 
@@ -347,12 +358,70 @@ impl CommittedSnapshot {
         Ok(CommittedDocument { record, markdown })
     }
 
+    /// Retrieves one document and every attachment stored beside it.
+    ///
+    /// Entries use names relative to the bundle directory and are ordered
+    /// deterministically with `index.md` first and attachments by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document is absent, the bundle exceeds the
+    /// configured package bounds, or any file changed after indexing.
+    pub fn bundle(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<CommittedBundle<'_>, CommittedReadError> {
+        check_operation_deadline(self.deadline)?;
+        let record = self
+            .index
+            .get(document_id)
+            .ok_or(CommittedReadError::DocumentNotFound { document_id })?;
+        let mut attachment_records = self.index.attachments_beside(record).collect::<Vec<_>>();
+        attachment_records.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
+        let entry_count = attachment_records.len().checked_add(1).ok_or(
+            CommittedReadError::BundleEntryLimitExceeded {
+                maximum: self.maximum_bundle_entries,
+            },
+        )?;
+        if entry_count > self.maximum_bundle_entries {
+            return Err(CommittedReadError::BundleEntryLimitExceeded {
+                maximum: self.maximum_bundle_entries,
+            });
+        }
+
+        let mut total_bytes = record.byte_length();
+        for attachment in &attachment_records {
+            total_bytes = total_bytes.checked_add(attachment.byte_length()).ok_or(
+                CommittedReadError::BundleByteLimitExceeded {
+                    maximum: self.maximum_bundle_bytes,
+                },
+            )?;
+            if total_bytes > self.maximum_bundle_bytes {
+                return Err(CommittedReadError::BundleByteLimitExceeded {
+                    maximum: self.maximum_bundle_bytes,
+                });
+            }
+        }
+
+        let mut entries = Vec::with_capacity(entry_count);
+        entries.push(CommittedBundleEntry {
+            name: PathBuf::from("index.md"),
+            bytes: self.read_markdown(record)?,
+        });
+        for attachment in attachment_records {
+            entries.push(self.read_attachment(record, attachment)?);
+        }
+        check_operation_deadline(self.deadline)?;
+        Ok(CommittedBundle { record, entries })
+    }
+
     fn read_markdown(&self, record: &DocumentRecord) -> Result<Vec<u8>, CommittedReadError> {
         check_operation_deadline(self.deadline)?;
         let mut file = self
             .root
             .open_regular_beneath(record.relative_path())
             .map_err(CommittedReadError::PinnedPath)?;
+        validate_pinned_content_file(&file).map_err(CommittedReadError::Io)?;
         if file.byte_length() > self.maximum_markdown_bytes {
             return Err(CommittedReadError::ContentChanged {
                 document_id: record.metadata().document_id,
@@ -381,6 +450,111 @@ impl CommittedSnapshot {
         }
         Ok(markdown)
     }
+
+    fn read_attachment(
+        &self,
+        document: &DocumentRecord,
+        attachment: &AttachmentRecord,
+    ) -> Result<CommittedBundleEntry, CommittedReadError> {
+        check_operation_deadline(self.deadline)?;
+        let mut file = self
+            .root
+            .open_regular_beneath(attachment.relative_path())
+            .map_err(CommittedReadError::PinnedPath)?;
+        validate_pinned_content_file(&file).map_err(CommittedReadError::Io)?;
+        if file.byte_length() != attachment.byte_length() {
+            return Err(CommittedReadError::ContentChanged {
+                document_id: document.metadata().document_id,
+            });
+        }
+        let capacity = usize::try_from(file.byte_length().min(64 * 1024)).unwrap_or(64 * 1024);
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut bounded = file
+            .by_ref()
+            .take(attachment.byte_length().saturating_add(1));
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            check_operation_deadline(self.deadline)?;
+            let count = bounded.read(&mut buffer).map_err(CommittedReadError::Io)?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        if bytes.len() as u64 != attachment.byte_length() {
+            return Err(CommittedReadError::ContentChanged {
+                document_id: document.metadata().document_id,
+            });
+        }
+        let committed =
+            self.read_committed_attachment(document.metadata().document_id, attachment)?;
+        let actual_revision = Revision::from_bytes(Sha256::digest(&bytes).into());
+        let committed_revision = Revision::from_bytes(Sha256::digest(&committed).into());
+        if bytes.len() != committed.len() || actual_revision != committed_revision {
+            return Err(CommittedReadError::ContentChanged {
+                document_id: document.metadata().document_id,
+            });
+        }
+        let name = attachment
+            .relative_path()
+            .file_name()
+            .map(PathBuf::from)
+            .ok_or(CommittedReadError::ContentChanged {
+                document_id: document.metadata().document_id,
+            })?;
+        Ok(CommittedBundleEntry { name, bytes })
+    }
+
+    fn read_committed_attachment(
+        &self,
+        document_id: DocumentId,
+        attachment: &AttachmentRecord,
+    ) -> Result<Vec<u8>, CommittedReadError> {
+        check_operation_deadline(self.deadline)?;
+        let path = attachment
+            .relative_path()
+            .to_str()
+            .ok_or(CommittedReadError::ContentChanged { document_id })?;
+        let object = format!("{}:{path}", self.commit);
+        let maximum = usize::try_from(attachment.byte_length())
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let output = run_git_for_read_with_output_limit(
+            None,
+            Some(&self.git_directory),
+            [
+                OsStr::new("cat-file"),
+                OsStr::new("blob"),
+                OsStr::new(&object),
+            ],
+            self.deadline,
+            maximum,
+        )
+        .map_err(CommittedReadError::repository)?;
+        check_operation_deadline(self.deadline)?;
+        if output.stdout.len() as u64 != attachment.byte_length() {
+            return Err(CommittedReadError::ContentChanged { document_id });
+        }
+        Ok(output.stdout)
+    }
+}
+
+#[cfg(unix)]
+fn validate_pinned_content_file(file: &agent_knowledge_core::PinnedRegularFile) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = file.metadata()?;
+    if metadata.nlink() != 1 || metadata.permissions().mode() & 0o111 != 0 {
+        return Err(io::Error::other(
+            "committed content file is linked or executable",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_pinned_content_file(_file: &agent_knowledge_core::PinnedRegularFile) -> io::Result<()> {
+    Ok(())
 }
 
 fn validate_result_limit(maximum_results: usize) -> Result<(), CommittedReadError> {
@@ -404,6 +578,54 @@ fn check_operation_deadline(deadline: Option<Instant>) -> Result<(), CommittedRe
 pub struct CommittedDocument<'a> {
     record: &'a DocumentRecord,
     markdown: Vec<u8>,
+}
+
+/// One immutable committed document bundle prepared for deterministic export.
+#[derive(Debug)]
+pub struct CommittedBundle<'a> {
+    record: &'a DocumentRecord,
+    entries: Vec<CommittedBundleEntry>,
+}
+
+impl CommittedBundle<'_> {
+    /// Returns the indexed document record owning this bundle.
+    #[must_use]
+    pub const fn record(&self) -> &DocumentRecord {
+        self.record
+    }
+
+    /// Returns the complete, deterministic bundle entry sequence.
+    #[must_use]
+    pub fn entries(&self) -> &[CommittedBundleEntry] {
+        &self.entries
+    }
+
+    /// Consumes the bundle and returns its owned entries.
+    #[must_use]
+    pub fn into_entries(self) -> Vec<CommittedBundleEntry> {
+        self.entries
+    }
+}
+
+/// One regular file in a committed document bundle.
+#[derive(Debug)]
+pub struct CommittedBundleEntry {
+    name: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl CommittedBundleEntry {
+    /// Returns the single-component path relative to the bundle directory.
+    #[must_use]
+    pub fn name(&self) -> &Path {
+        &self.name
+    }
+
+    /// Returns the exact committed file bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 impl CommittedDocument<'_> {
@@ -728,6 +950,16 @@ pub enum CommittedReadError {
         /// Configured maximum inspected Markdown bytes.
         maximum: u64,
     },
+    /// A document bundle contained more files than package policy permits.
+    BundleEntryLimitExceeded {
+        /// Configured maximum bundle files.
+        maximum: usize,
+    },
+    /// A document bundle contained more bytes than package policy permits.
+    BundleByteLimitExceeded {
+        /// Configured maximum uncompressed file bytes.
+        maximum: u64,
+    },
     /// The configured absolute committed-read deadline expired.
     OperationDeadlineExceeded,
 }
@@ -784,6 +1016,12 @@ impl fmt::Display for CommittedReadError {
                     formatter,
                     "search exceeds {maximum} inspected Markdown bytes"
                 )
+            }
+            Self::BundleEntryLimitExceeded { maximum } => {
+                write!(formatter, "document bundle exceeds {maximum} files")
+            }
+            Self::BundleByteLimitExceeded { maximum } => {
+                write!(formatter, "document bundle exceeds {maximum} bytes")
             }
             Self::OperationDeadlineExceeded => {
                 formatter.write_str("committed read deadline expired")
