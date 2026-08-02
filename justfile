@@ -23,7 +23,7 @@ check-code:
   cargo fmt --all -- --check
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
   cargo test --workspace --all-features --locked
-  nix flake check --no-build .
+  nix flake check --no-build --all-systems .
 
 # Build and install-check the production package for the current system.
 check-package:
