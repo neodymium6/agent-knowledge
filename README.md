@@ -16,7 +16,8 @@ OpenSSH forced command, process them through the single Writer, and publish
 immutable Quartz releases. Coding agents can list, retrieve, and search an
 exact committed content snapshot and inspect durable request state through the
 same Gateway. Git remote replication runs asynchronously with durable retry
-state. Bundle export, retention, and packaging remain future work.
+state. Derived-release retention is available as a bounded local maintenance
+operation. Bundle export and packaging remain future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -82,6 +83,10 @@ batch:
   maximum_scan_entries: 1024
   maximum_requests: 100
   maximum_recovery_requests: 10000
+retention:
+  retained_releases: 10
+  maximum_scan_entries: 10000
+  maximum_removals: 10
 ```
 
 `repository.replication` is optional. When present, the named non-mirror remote
@@ -125,6 +130,29 @@ local filesystem calls remain subject to the host filesystem's I/O behavior.
 The command verifies the official commit again after inspecting release and
 replication state; a concurrent publication causes a transient failure instead
 of a mixed committed-content snapshot.
+
+Preview and apply bounded retention of old derived Quartz releases:
+
+```sh
+agent-knowledge admin prune-releases \
+  --config /srv/agent-knowledge/worker.yaml \
+  --dry-run
+
+agent-knowledge admin prune-releases \
+  --config /srv/agent-knowledge/worker.yaml
+```
+
+The optional `retention` configuration defaults to the values shown above.
+Each pass preserves the newest `retained_releases` and always protects the
+active release, even when it is older. `maximum_scan_entries` bounds all
+release-store directory entries inspected, and `maximum_removals` bounds the
+release trees selected per invocation. The command takes the release-store
+maintenance lock, does not initialize missing storage, and emits versioned
+JSON. A non-dry-run pass atomically moves each selected derived tree into a
+private tombstone before descriptor-relative deletion. Large trees may report
+`cleanup_pending_release_ids` and complete on a later invocation. Canonical
+content, Git history, accepted requests, and the active release are never
+removed.
 
 Submit a validated request package through an SSH host alias:
 
