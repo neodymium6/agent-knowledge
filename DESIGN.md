@@ -94,6 +94,7 @@ The initial release produces one executable with subcommands:
 ```text
 agent-knowledge client ...
 agent-knowledge gateway ...
+agent-knowledge queue-ingress serve ...
 agent-knowledge worker ...
 agent-knowledge admin ...
 ```
@@ -241,8 +242,14 @@ configuration examples.
                    ▼
 ┌─────────────────────────────────────┐
 │ Gateway                             │
-│ authenticate, validate, enqueue,    │
-│ read, search, and report status     │
+│ authenticate, validate, read,       │
+│ search, and call local queue ingress│
+└──────────────────┬──────────────────┘
+                   │ bounded local Unix socket protocol
+                   ▼
+┌─────────────────────────────────────┐
+│ Queue ingress broker                │
+│ validate, enqueue, and report status│
 └──────────────────┬──────────────────┘
                    │ durable request package
                    ▼
@@ -277,22 +284,54 @@ The Gateway:
 - receives only forced-command SSH sessions;
 - derives a client ID from the authenticated public key configuration;
 - validates the wire format and operation;
-- enforces request, file-count, stored-byte, and materialized-output limits;
-- rejects unsafe archive entries and paths;
-- validates request metadata and front matter;
-- derives create destinations from fixed rules;
-- assigns incomplete classification to `inbox/`;
-- checks request idempotency;
-- durably stores accepted changes in `queue/pending/`;
+- forwards authenticated submissions over the local queue-ingress socket;
 - serves committed documents and attachments;
 - searches committed Markdown and permitted metadata; and
 - reports request status.
 
-The Gateway does not write `content/`, mutate Git state, or run Quartz. Committed
-reads may invoke allowlisted, read-only Git inspection commands to verify that
-the canonical worktree still represents the official branch.
+The Gateway does not open the queue file system, write `content/`, mutate Git
+state, or run Quartz. Committed reads may invoke allowlisted, read-only Git
+inspection commands to verify that the canonical worktree still represents the
+official branch.
 
-### 7.2 Repository Worker
+### 7.2 Queue ingress broker
+
+The queue ingress broker is the only network-adjacent process that may open and
+mutate the durable queue. It runs under a dedicated queue-owner account which
+cannot open the repository, content checkout, Worker worktrees, releases, or
+replication credentials. It:
+
+- receives one request on an already connected local Unix socket;
+- accepts only the versioned `submit` and `status` operations;
+- binds submit audit metadata to the client ID supplied by the authenticated
+  Gateway;
+- enforces archive, package, and queue limits before durable acceptance;
+- performs idempotency checks and durable queue writes; and
+- reads durable request status without opening repository storage.
+
+The conventional Linux deployment uses a systemd Unix socket with `Accept=yes`
+and an instantiated service for each connection. The broker therefore needs no
+custom listener, accept loop, daemon lifecycle, or concurrency scheduler.
+`SocketMode` and `SocketGroup` allow only the dedicated Gateway group to
+connect. A bounded connection count and service runtime cap resource use.
+
+The internal protocol is independent of the public SSH protocol. It begins
+with exactly one bounded newline-terminated JSON header:
+
+```json
+{"protocol_version":1,"operation":"submit","client_id":"fictional-node-a"}
+```
+
+For `submit`, the uncompressed package tar stream follows the newline and ends
+at write shutdown. For `status`, the header contains `request_id` and no body.
+The broker returns exactly one bounded newline-terminated JSON success or error
+response and then closes the connection. Unknown versions, operations, fields,
+trailing status bytes, oversized headers, invalid UTF-8, and incomplete bodies
+fail closed. The Gateway applies its existing absolute operation deadline to
+connect, transfer, and response receipt. A disconnect before a complete broker
+response is a retryable temporary failure.
+
+### 7.3 Repository Worker
 
 The Repository Worker is the only writer to authoritative content. It:
 
@@ -647,13 +686,21 @@ The project does not implement an SSH server. The target production deployment
 uses a dedicated Gateway operating-system account with OpenSSH public-key
 authentication and per-key forced commands. It is distinct from the Worker
 account and cannot write the Git repository, canonical content, worktrees, or
-releases, or read Worker replication credentials. A local enqueue broker or
-equivalent durable ownership-handoff boundary mediates queue operations;
-ordinary groups or ACLs must not grant the Gateway direct queue mutation.
+releases, or read Worker replication credentials. The local queue-ingress
+broker mediates queue submission and status operations; ordinary groups or
+ACLs never grant the Gateway direct queue access. The Gateway account belongs
+to a group which may connect to the broker socket and read the committed
+repository and content checkout, but not to the queue-owner group. The Worker
+belongs to the queue-owner group so it can transition queue entries, while the
+broker account has no access to Worker-owned storage.
 
-The forced-command application and protocol are implemented, but production
-Gateway deployment remains unsupported until that handoff and distinct-UID
-integration tests in delivery increment 10 are implemented.
+The Linux storage layout makes queue directories setgid and owned by the queue
+account and group. `tmpfiles.d` creates the fixed queue directories and lock
+files before either process can initialize the queue, so permissions do not
+depend on whether the Worker or first broker connection starts first. The
+repository and content roots are setgid to the Gateway reader group; the Worker
+owns them and its `0027` umask grants the Gateway read/execute access without
+write access. Worktrees, releases, and credentials remain Worker-only.
 
 A fictional `authorized_keys` entry has this form:
 
@@ -850,7 +897,7 @@ from durable queue metadata before accepting another request.
 
 ### 16.2 Durable acceptance
 
-The Gateway accepts a request as follows:
+The queue ingress broker accepts a request as follows:
 
 1. While holding the queue lock, create a randomly named directory below
    `queue/incoming/`, acquire its advisory lease, and then release the queue
@@ -867,8 +914,9 @@ The Gateway accepts a request as follows:
 9. Synchronize the `pending/` directory.
 10. Return success.
 
-Gateway success therefore means that the request survives a normal process or
-host crash according to the guarantees of the configured storage.
+Gateway success therefore means that the broker reported acceptance only after
+the request survives a normal process or host crash according to the guarantees
+of the configured storage.
 
 All queue-state directories must be on the same file system. Moving a request
 between states uses atomic rename followed by parent-directory
@@ -1388,11 +1436,12 @@ operations include:
 The current delivery implements directory-ordered listing, recent documents,
 document lookup with exact Markdown retrieval, deterministic document-bundle
 export, project/tag/session filtering, full-text search, and durable
-request-status lookup. Status observes only the
-existing `pending`, `processing`, `completed`, and `failed` queue entries. It
-does not take queue locks, initialize storage, or open the repository and
-content checkout. Failed responses include the durable error code and failure
-time; an unknown request ID returns `REQUEST_NOT_FOUND`. Bundle exports contain
+request-status lookup. Status is mediated by the queue ingress broker and
+observes only the existing `pending`, `processing`, `completed`, and `failed`
+queue entries. It does not take queue locks, initialize storage, or open the
+repository and content checkout. Failed responses include the durable error
+code and failure time; an unknown request ID returns `REQUEST_NOT_FOUND`.
+Bundle exports contain
 `index.md` first, followed by colocated attachments in deterministic name
 order. Project-shared assets are outside a selected document bundle.
 
@@ -1634,9 +1683,8 @@ Implementation proceeds in these increments:
    - reproducible Linux package output (implemented);
    - conventional Linux Worker service integration (implemented); and
    - optional container and single-replica Kubernetes packaging.
-10. Production Gateway privilege separation through a local enqueue broker or
-    equivalent durable ownership handoff, verified with distinct-UID
-    integration tests.
+10. Production Gateway privilege separation through the systemd-activated
+    local queue-ingress broker, verified with distinct-UID integration tests.
 
 Every increment keeps `just check` passing and preserves the invariants in this
 document.
