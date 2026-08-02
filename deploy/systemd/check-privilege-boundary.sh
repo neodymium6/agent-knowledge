@@ -33,6 +33,7 @@ queue_uid=61101
 queue_gid=61101
 worker_uid=61102
 worker_gid=61102
+document_bundle=2026-07-31-01K00000000000000000000001
 
 install -m 0755 "$source_binary" "$test_root/agent-knowledge"
 
@@ -115,10 +116,10 @@ worker_git=(
 "${worker_git[@]}" -C "$test_root/seed" config user.name "Fictional Writer"
 "${worker_git[@]}" -C "$test_root/seed" config user.email writer@fictional.invalid
 install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
-  "$test_root/seed/projects/fictional-project/experiments/fictional-run"
+  "$test_root/seed/projects/fictional-project/experiments/$document_bundle"
 install -m 0640 -o "$worker_uid" -g "$worker_gid" \
   "$test_root/package/payload/run/index.md" \
-  "$test_root/seed/projects/fictional-project/experiments/fictional-run/index.md"
+  "$test_root/seed/projects/fictional-project/experiments/$document_bundle/index.md"
 "${worker_git[@]}" -C "$test_root/seed" add .
 "${worker_git[@]}" -C "$test_root/seed" commit -m "Initialize fictional knowledge"
 "${worker_git[@]}" -C "$test_root/seed" remote add origin "$test_root/storage/repository"
@@ -142,7 +143,7 @@ test "$(stat -c '%u:%g:%a' "$test_root/storage/queue")" = "$queue_uid:$queue_gid
 test "$(stat -c '%g' "$test_root/storage/queue/queue-id")" = "$queue_gid"
 test "$(stat -c '%g:%a' "$test_root/storage/repository")" = "$gateway_gid:2750"
 test "$(stat -c '%g:%a' "$test_root/storage/content")" = "$gateway_gid:2750"
-test "$(stat -c '%g' "$test_root/storage/content/projects/fictional-project/experiments/fictional-run/index.md")" = "$gateway_gid"
+test "$(stat -c '%g' "$test_root/storage/content/projects/fictional-project/experiments/$document_bundle/index.md")" = "$gateway_gid"
 setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
   test -r "$test_root/storage"
 if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
