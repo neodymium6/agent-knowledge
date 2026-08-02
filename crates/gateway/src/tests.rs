@@ -241,9 +241,13 @@ fn exports_a_deterministic_committed_document_bundle() {
         .parse()
         .unwrap_or_else(|error| panic!("document fixture must parse: {error}"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let archive = gateway
-        .export_encoded_until(ExportRequest::new(document_id), deadline)
+    let export = gateway
+        .prepare_export_until(ExportRequest::new(document_id), deadline)
         .unwrap_or_else(|error| panic!("committed export must succeed: {error}"));
+    let mut archive = Vec::new();
+    export
+        .write_to(&mut archive)
+        .unwrap_or_else(|error| panic!("committed export must encode: {error}"));
     let mut entries = tar::Archive::new(Cursor::new(archive))
         .entries()
         .unwrap_or_else(|error| panic!("export archive must decode: {error}"))

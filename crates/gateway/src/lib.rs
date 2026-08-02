@@ -17,7 +17,7 @@ use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueError, QueueReader};
 use agent_knowledge_repository::{CommittedReadError, CommittedStore};
 
 pub use config::{CURRENT_GATEWAY_CONFIG_VERSION, GatewayConfigError, GatewaySettings};
-pub use read::ReadRequestError;
+pub use read::{PreparedExport, ReadRequestError};
 pub use submit::ArchiveError;
 
 /// Gateway state opened exclusively for accepting submissions.
@@ -190,11 +190,11 @@ impl ReadGateway {
     }
 
     /// Encodes one committed document bundle as a deterministic tar archive.
-    pub fn export_encoded_until(
+    pub fn prepare_export_until(
         &self,
         request: ExportRequest,
         deadline: std::time::Instant,
-    ) -> Result<Vec<u8>, GatewayError> {
+    ) -> Result<PreparedExport, GatewayError> {
         read::export_until(&self.settings, &self.committed, request, deadline)
     }
 

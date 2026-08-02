@@ -119,10 +119,11 @@ where
             let deadline = read_deadline(&settings);
             let gateway =
                 ReadGateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
-            let encoded = gateway
-                .export_encoded_until(request, deadline)
+            let export = gateway
+                .prepare_export_until(request, deadline)
                 .map_err(gateway_error)?;
-            write_encoded_response_until(output, encoded, deadline)
+            let mut output = DeadlineWriter::new(output, deadline)?;
+            export.write_to(&mut output).map_err(output_error)
         }
         GatewayCommand::Search => {
             let request = decode_control_request(input)?;
@@ -174,75 +175,101 @@ fn write_encoded_response_until<W>(
 where
     W: AsFd,
 {
-    use nix::errno::Errno;
-    use nix::fcntl::{FcntlArg, OFlag, fcntl};
-    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    let mut output = DeadlineWriter::new(output, deadline)?;
+    output.write_all(&response).map_err(output_error)
+}
 
-    let original_flags =
-        OFlag::from_bits_truncate(fcntl(&output, FcntlArg::F_GETFL).map_err(|error| {
-            GatewayCommandError::Io(io::Error::from_raw_os_error(error as i32))
-        })?);
-    fcntl(
-        &output,
-        FcntlArg::F_SETFL(original_flags | OFlag::O_NONBLOCK),
-    )
-    .map_err(|error| GatewayCommandError::Io(io::Error::from_raw_os_error(error as i32)))?;
-    let _flags = OutputFlagGuard {
-        output: &output,
-        original_flags,
-    };
-    let mut written = 0_usize;
-    while written < response.len() {
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(GatewayCommandError::OutputDeadline);
+fn output_error(error: io::Error) -> GatewayCommandError {
+    if error.kind() == io::ErrorKind::TimedOut {
+        GatewayCommandError::OutputDeadline
+    } else {
+        GatewayCommandError::Io(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct DeadlineWriter<W: AsFd> {
+    output: W,
+    original_flags: nix::fcntl::OFlag,
+    deadline: Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl<W: AsFd> DeadlineWriter<W> {
+    fn new(output: W, deadline: Instant) -> Result<Self, GatewayCommandError> {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+        let original_flags =
+            OFlag::from_bits_truncate(fcntl(&output, FcntlArg::F_GETFL).map_err(|error| {
+                GatewayCommandError::Io(io::Error::from_raw_os_error(error as i32))
+            })?);
+        fcntl(
+            &output,
+            FcntlArg::F_SETFL(original_flags | OFlag::O_NONBLOCK),
+        )
+        .map_err(|error| GatewayCommandError::Io(io::Error::from_raw_os_error(error as i32)))?;
+        Ok(Self {
+            output,
+            original_flags,
+            deadline,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<W: AsFd> Write for DeadlineWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        use nix::errno::Errno;
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+        if buffer.is_empty() {
+            return Ok(0);
         }
-        let timeout = PollTimeout::try_from(deadline.saturating_duration_since(now))
-            .unwrap_or(PollTimeout::MAX);
-        let mut descriptors = [PollFd::new(output.as_fd(), PollFlags::POLLOUT)];
-        match poll(&mut descriptors, timeout) {
-            Ok(0) => return Err(GatewayCommandError::OutputDeadline),
-            Ok(_) => match nix::unistd::write(&output, &response[written..]) {
+        loop {
+            let now = Instant::now();
+            if now >= self.deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Gateway response deadline expired",
+                ));
+            }
+            let timeout = PollTimeout::try_from(self.deadline.saturating_duration_since(now))
+                .unwrap_or(PollTimeout::MAX);
+            let mut descriptors = [PollFd::new(self.output.as_fd(), PollFlags::POLLOUT)];
+            match poll(&mut descriptors, timeout) {
                 Ok(0) => {
-                    return Err(GatewayCommandError::Io(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "Gateway response output stopped accepting bytes",
-                    )));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Gateway response deadline expired",
+                    ));
                 }
-                Ok(count) => written += count,
-                Err(Errno::EAGAIN) => {}
+                Ok(_) => match nix::unistd::write(&self.output, buffer) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "Gateway response output stopped accepting bytes",
+                        ));
+                    }
+                    Ok(count) => return Ok(count),
+                    Err(Errno::EAGAIN | Errno::EINTR) => {}
+                    Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+                },
                 Err(Errno::EINTR) => {}
-                Err(error) => {
-                    return Err(GatewayCommandError::Io(io::Error::from_raw_os_error(
-                        error as i32,
-                    )));
-                }
-            },
-            Err(Errno::EINTR) => {}
-            Err(error) => {
-                return Err(GatewayCommandError::Io(io::Error::from_raw_os_error(
-                    error as i32,
-                )));
+                Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
             }
         }
     }
-    Ok(())
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
-struct OutputFlagGuard<'a, W: AsFd> {
-    output: &'a W,
-    original_flags: nix::fcntl::OFlag,
-}
-
-#[cfg(target_os = "linux")]
-impl<W> Drop for OutputFlagGuard<'_, W>
-where
-    W: AsFd,
-{
+impl<W: AsFd> Drop for DeadlineWriter<W> {
     fn drop(&mut self) {
         let _ = nix::fcntl::fcntl(
-            self.output,
+            &self.output,
             nix::fcntl::FcntlArg::F_SETFL(self.original_flags),
         );
     }

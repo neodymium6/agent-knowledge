@@ -57,7 +57,6 @@ pub struct DocumentRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttachmentRecord {
     relative_path: PathBuf,
-    revision: Revision,
     byte_length: u64,
 }
 
@@ -66,12 +65,6 @@ impl AttachmentRecord {
     #[must_use]
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
-    }
-
-    /// Returns the SHA-256 revision of the exact attachment bytes.
-    #[must_use]
-    pub const fn revision(&self) -> Revision {
-        self.revision
     }
 
     /// Returns the validated attachment byte length.
@@ -279,14 +272,9 @@ impl ContentIndex {
                     if !package_policy.allows_attachment_name(name) {
                         return Err(ContentIndexError::UnsupportedAttachment(relative_path));
                     }
-                    let bytes = read_bounded_file(&path, maximum, policy.scan_deadline)?;
-                    if bytes.len() as u64 != metadata.len() {
-                        return Err(ContentIndexError::FileChangedDuringScan(relative_path));
-                    }
                     attachments.push(AttachmentRecord {
                         relative_path,
-                        revision: Revision::from_bytes(Sha256::digest(&bytes).into()),
-                        byte_length: bytes.len() as u64,
+                        byte_length: metadata.len(),
                     });
                     continue;
                 }

@@ -405,7 +405,15 @@ impl CommittedSnapshot {
             bytes: self.read_markdown(record)?,
         });
         for attachment in attachment_records {
-            entries.push(self.read_attachment(record, attachment)?);
+            let first = self.read_attachment(record, attachment)?;
+            let first_revision = Revision::from_bytes(Sha256::digest(&first.bytes).into());
+            drop(first);
+            let second = self.read_attachment(record, attachment)?;
+            let second_revision = Revision::from_bytes(Sha256::digest(&second.bytes).into());
+            if first_revision != second_revision {
+                return Err(CommittedReadError::ContentChanged { document_id });
+            }
+            entries.push(second);
         }
         check_operation_deadline(self.deadline)?;
         Ok(CommittedBundle { record, entries })
@@ -417,6 +425,7 @@ impl CommittedSnapshot {
             .root
             .open_regular_beneath(record.relative_path())
             .map_err(CommittedReadError::PinnedPath)?;
+        validate_pinned_content_file(&file).map_err(CommittedReadError::Io)?;
         if file.byte_length() > self.maximum_markdown_bytes {
             return Err(CommittedReadError::ContentChanged {
                 document_id: record.metadata().document_id,
@@ -456,6 +465,7 @@ impl CommittedSnapshot {
             .root
             .open_regular_beneath(attachment.relative_path())
             .map_err(CommittedReadError::PinnedPath)?;
+        validate_pinned_content_file(&file).map_err(CommittedReadError::Io)?;
         if file.byte_length() != attachment.byte_length() {
             return Err(CommittedReadError::ContentChanged {
                 document_id: document.metadata().document_id,
@@ -475,8 +485,7 @@ impl CommittedSnapshot {
             }
             bytes.extend_from_slice(&buffer[..count]);
         }
-        let revision = Revision::from_bytes(Sha256::digest(&bytes).into());
-        if bytes.len() as u64 != attachment.byte_length() || revision != attachment.revision() {
+        if bytes.len() as u64 != attachment.byte_length() {
             return Err(CommittedReadError::ContentChanged {
                 document_id: document.metadata().document_id,
             });
@@ -490,6 +499,24 @@ impl CommittedSnapshot {
             })?;
         Ok(CommittedBundleEntry { name, bytes })
     }
+}
+
+#[cfg(unix)]
+fn validate_pinned_content_file(file: &agent_knowledge_core::PinnedRegularFile) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = file.metadata()?;
+    if metadata.nlink() != 1 || metadata.permissions().mode() & 0o111 != 0 {
+        return Err(io::Error::other(
+            "committed content file is linked or executable",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_pinned_content_file(_file: &agent_knowledge_core::PinnedRegularFile) -> io::Result<()> {
+    Ok(())
 }
 
 fn validate_result_limit(maximum_results: usize) -> Result<(), CommittedReadError> {
@@ -533,6 +560,12 @@ impl CommittedBundle<'_> {
     #[must_use]
     pub fn entries(&self) -> &[CommittedBundleEntry] {
         &self.entries
+    }
+
+    /// Consumes the bundle and returns its owned entries.
+    #[must_use]
+    pub fn into_entries(self) -> Vec<CommittedBundleEntry> {
+        self.entries
     }
 }
 

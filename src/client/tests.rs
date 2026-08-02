@@ -17,7 +17,7 @@ use super::{
     ClientCommandError, ControlOperation, MAXIMUM_CONTROL_RESPONSE_BYTES, MAXIMUM_RESPONSE_BYTES,
     PreparedPackage, control_with_program, decode_protocol_version, export_with_program,
     get_with_program, open_payload, read_bounded_diagnostic, read_bounded_response,
-    status_with_program, submit_with_program,
+    status_with_program, submit_with_program, validate_export_archive,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -288,15 +288,43 @@ fn rejects_an_export_for_a_different_document() {
     ));
 }
 
+#[test]
+fn rejects_noncanonical_export_order_and_trailing_data() {
+    let document_id = "01K00000000000000000000001"
+        .parse()
+        .unwrap_or_else(|error| panic!("document ID fixture must parse: {error}"));
+    let unordered = build_export_archive(
+        "01K00000000000000000000001",
+        &["z-result.json", "a-result.json"],
+    );
+    assert!(matches!(
+        validate_export_archive(&unordered, document_id),
+        Err(ClientCommandError::InvalidExportArchive(_))
+    ));
+
+    let mut trailing = export_archive("01K00000000000000000000001");
+    trailing.extend_from_slice(b"fictional trailing data");
+    assert!(matches!(
+        validate_export_archive(&trailing, document_id),
+        Err(ClientCommandError::InvalidExportArchive(_))
+    ));
+}
+
 fn export_archive(document_id: &str) -> Vec<u8> {
+    build_export_archive(document_id, &["result.json"])
+}
+
+fn build_export_archive(document_id: &str, attachments: &[&str]) -> Vec<u8> {
     let markdown = format!(
         "---\nschema_version: 1\ndocument_id: {document_id}\ntitle: Fictional export\ncreated: 2026-07-31T03:50:00Z\nrequest_id: 01K00000000000000000000000\nstatus: active\n---\nFictional export body.\n"
     );
     let mut builder = tar::Builder::new(Vec::new());
-    for (path, bytes) in [
-        ("index.md", markdown.as_bytes()),
-        ("result.json", b"{\"fictional\":true}\n".as_slice()),
-    ] {
+    let entries = std::iter::once(("index.md", markdown.as_bytes())).chain(
+        attachments
+            .iter()
+            .map(|path| (*path, b"{\"fictional\":true}\n".as_slice())),
+    );
+    for (path, bytes) in entries {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Regular);
         header.set_mode(0o644);

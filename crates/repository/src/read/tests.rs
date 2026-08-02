@@ -371,3 +371,31 @@ fn shared_snapshot_lock_blocks_publication_until_drop() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn bundle_export_rejects_an_attachment_replaced_by_a_hard_link() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let attachment = fixture
+        .content
+        .join("projects/fictional-project/runbooks")
+        .join(format!("2026-07-31-{RUNBOOK_ID}/procedure.json"));
+    let external = fixture._root.path().join("external.json");
+    fs::write(&external, b"{\"fictional\":true}\n")
+        .unwrap_or_else(|error| panic!("external fixture must be written: {error}"));
+    fs::remove_file(&attachment)
+        .unwrap_or_else(|error| panic!("attachment fixture must be removed: {error}"));
+    fs::hard_link(&external, &attachment)
+        .unwrap_or_else(|error| panic!("hard-link fixture must be created: {error}"));
+    let document_id = RUNBOOK_ID
+        .parse()
+        .unwrap_or_else(|error| panic!("document fixture must parse: {error}"));
+    assert!(matches!(
+        snapshot.bundle(document_id),
+        Err(CommittedReadError::Io(_))
+    ));
+}

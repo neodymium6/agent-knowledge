@@ -344,6 +344,10 @@ fn validate_export_archive(
     let mut names = std::collections::HashSet::new();
     let mut total_bytes = 0_u64;
     let mut document_id = None;
+    let mut previous_attachment = None::<PathBuf>;
+    let comparison = CanonicalArchiveWriter::new(archive);
+    let mut canonical = Builder::new(comparison);
+    canonical.mode(tar::HeaderMode::Deterministic);
     for (index, entry) in entries.enumerate() {
         if index >= limits.maximum_file_count {
             return Err(ClientCommandError::InvalidExportArchive(io::Error::other(
@@ -384,6 +388,7 @@ fn validate_export_archive(
                 "document bundle must begin with index.md",
             )));
         }
+        let mut header = regular_export_header(size);
         if path != Path::new("index.md") {
             let valid_name = path
                 .to_str()
@@ -397,13 +402,18 @@ fn validate_export_archive(
                     "document bundle contains an unsupported attachment name",
                 )));
             }
-            let copied = io::copy(&mut entry, &mut io::sink())
-                .map_err(ClientCommandError::InvalidExportArchive)?;
-            if copied != size {
+            if previous_attachment
+                .as_ref()
+                .is_some_and(|previous| previous >= &path)
+            {
                 return Err(ClientCommandError::InvalidExportArchive(io::Error::other(
-                    "document bundle entry is truncated",
+                    "document bundle attachments are not in deterministic name order",
                 )));
             }
+            previous_attachment = Some(path.clone());
+            canonical
+                .append_data(&mut header, &path, &mut entry)
+                .map_err(ClientCommandError::InvalidExportArchive)?;
             continue;
         }
         let mut markdown = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
@@ -418,11 +428,75 @@ fn validate_export_archive(
         let metadata = decode_document_metadata(&markdown, limits.maximum_front_matter_bytes)
             .map_err(|error| ClientCommandError::InvalidExportArchive(io::Error::other(error)))?;
         document_id = Some(metadata.document_id);
+        canonical
+            .append_data(&mut header, &path, markdown.as_slice())
+            .map_err(ClientCommandError::InvalidExportArchive)?;
+    }
+    canonical
+        .finish()
+        .map_err(ClientCommandError::InvalidExportArchive)?;
+    let comparison = canonical
+        .into_inner()
+        .map_err(ClientCommandError::InvalidExportArchive)?;
+    if !comparison.is_complete() {
+        return Err(ClientCommandError::InvalidExportArchive(io::Error::other(
+            "document bundle contains noncanonical trailing data",
+        )));
     }
     if document_id != Some(expected_document_id) {
         return Err(ClientCommandError::ExportDocumentMismatch);
     }
     Ok(())
+}
+
+fn regular_export_header(size: u64) -> Header {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_size(size);
+    header.set_cksum();
+    header
+}
+
+struct CanonicalArchiveWriter<'a> {
+    expected: &'a [u8],
+    position: usize,
+}
+
+impl<'a> CanonicalArchiveWriter<'a> {
+    const fn new(expected: &'a [u8]) -> Self {
+        Self {
+            expected,
+            position: 0,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.position == self.expected.len()
+    }
+}
+
+impl Write for CanonicalArchiveWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let end = self
+            .position
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("canonical archive position overflowed"))?;
+        if self.expected.get(self.position..end) != Some(buffer) {
+            return Err(io::Error::other(
+                "document bundle is not canonically encoded",
+            ));
+        }
+        self.position = end;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn configure_ssh_command(command: &mut Command, destination: &OsStr, remote_command: &str) {
