@@ -209,7 +209,12 @@ fn send_submit(
     write_header(&mut output, request).map_err(SubmitStreamError::Output)?;
     let mut buffer = [0_u8; 16 * 1024];
     loop {
-        let count = input.read(&mut buffer).map_err(SubmitStreamError::Input)?;
+        let count = loop {
+            match input.read(&mut buffer) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result.map_err(SubmitStreamError::Input)?,
+            }
+        };
         if count == 0 {
             break;
         }
@@ -1030,6 +1035,61 @@ Fictional ingress body.\n";
             IngressClientError::Transport(error)
                 if error.kind() == std::io::ErrorKind::ConnectionAborted
         ));
+        server
+            .join()
+            .unwrap_or_else(|_| panic!("ingress fixture server must join"));
+    }
+
+    #[test]
+    fn submit_retries_interrupted_authenticated_input_reads() {
+        struct InterruptedInput {
+            interrupted: bool,
+            inner: Cursor<Vec<u8>>,
+        }
+
+        impl Read for InterruptedInput {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "fictional signal interruption",
+                    ));
+                }
+                self.inner.read(buffer)
+            }
+        }
+
+        let root = TestDirectory::create();
+        let queue = root.path().join("queue");
+        let socket = root.path().join("ingress.sock");
+        let listener = UnixListener::bind(&socket)
+            .unwrap_or_else(|error| panic!("ingress socket fixture must bind: {error}"));
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener
+                .accept()
+                .unwrap_or_else(|error| panic!("ingress fixture must accept: {error}"));
+            let input = stream
+                .try_clone()
+                .unwrap_or_else(|error| panic!("ingress stream must clone: {error}"));
+            serve(&queue, input, stream).unwrap_or_else(|error| {
+                panic!("interrupted ingress request must succeed: {error}")
+            });
+        });
+        let client_id: ClientId = "fictional-node-a"
+            .parse()
+            .unwrap_or_else(|error| panic!("client fixture must parse: {error}"));
+        let response = IngressClient::new(&socket)
+            .submit(
+                client_id,
+                InterruptedInput {
+                    interrupted: false,
+                    inner: Cursor::new(archive()),
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap_or_else(|error| panic!("interrupted input must be retried: {error}"));
+        assert!(matches!(response.outcome, SubmitOutcome::Accepted { .. }));
         server
             .join()
             .unwrap_or_else(|_| panic!("ingress fixture server must join"));
