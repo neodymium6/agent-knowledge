@@ -20,7 +20,8 @@ use ulid::Ulid;
 use super::{
     BatchCommitOutcome, ClaimedBatch, GitIdentity, GitRepository, GitTransactionError,
     RepositoryTransaction, TransactionHooks, accept_trial_build, decode_journal, git_command,
-    interrupt_publication, parse_git_version, parse_text, staged_stats, validate_journal_structure,
+    interrupt_publication, parse_git_version, parse_text, select_git_directory,
+    select_working_directory, staged_stats, validate_journal_structure,
 };
 #[cfg(target_os = "linux")]
 use super::{run_git_for_read_with_output_limit, run_git_until_controlled};
@@ -124,6 +125,49 @@ fn git_ssh_transport_is_noninteractive_and_disables_forwarding() {
     assert_eq!(
         ssh,
         Some(OsStr::new("ssh -oBatchMode=yes -oClearAllForwardings=yes"))
+    );
+}
+
+#[test]
+fn explicitly_selected_worktrees_are_command_scoped_safe_directories() {
+    let mut command = git_command();
+    select_working_directory(&mut command, Path::new("/srv/fictional-knowledge/content"));
+    let arguments = command.get_args().collect::<Vec<_>>();
+    assert!(arguments.windows(2).any(|arguments| {
+        arguments
+            == [
+                OsStr::new("-c"),
+                OsStr::new("safe.directory=/srv/fictional-knowledge/content"),
+            ]
+    }));
+    assert!(arguments.windows(2).any(|arguments| {
+        arguments
+            == [
+                OsStr::new("-C"),
+                OsStr::new("/srv/fictional-knowledge/content"),
+            ]
+    }));
+}
+
+#[test]
+fn explicitly_selected_bare_repositories_are_command_scoped_safe_directories() {
+    let mut command = git_command();
+    select_git_directory(
+        &mut command,
+        Path::new("/srv/fictional-knowledge/repository"),
+    );
+    let arguments = command.get_args().collect::<Vec<_>>();
+    assert!(arguments.windows(2).any(|arguments| {
+        arguments
+            == [
+                OsStr::new("-c"),
+                OsStr::new("safe.directory=/srv/fictional-knowledge/repository"),
+            ]
+    }));
+    assert!(
+        arguments.iter().any(
+            |argument| *argument == OsStr::new("--git-dir=/srv/fictional-knowledge/repository")
+        )
     );
 }
 

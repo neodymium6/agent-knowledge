@@ -10,9 +10,13 @@ use std::time::Instant;
 
 use agent_knowledge_core::ErrorCode;
 use agent_knowledge_gateway::{
-    GatewayConfigError, GatewayError, GatewaySettings, ReadGateway, StatusGateway, SubmitGateway,
+    GatewayConfigError, GatewayError, GatewaySettings, IngressClient, IngressClientError,
+    ReadGateway,
 };
-use agent_knowledge_protocol::{ClientId, ClientIdError, GatewayCommand, ProtocolErrorResponse};
+use agent_knowledge_protocol::{
+    CURRENT_GATEWAY_PROTOCOL_VERSION, ClientId, ClientIdError, GatewayCommand,
+    ProtocolErrorResponse,
+};
 use serde::de::DeserializeOwned;
 
 const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
@@ -76,11 +80,10 @@ where
         .map_err(|_| GatewayCommandError::InvalidCommand)?;
     match command {
         GatewayCommand::Submit => {
-            let gateway = SubmitGateway::open(&settings)
-                .map_err(|error| GatewayCommandError::Gateway(Box::new(error)))?;
-            let response = gateway
-                .submit(client_id, input)
-                .map_err(|error| GatewayCommandError::Gateway(Box::new(error)))?;
+            let ingress = IngressClient::new(settings.queue_socket());
+            let response = ingress
+                .submit(client_id, input, settings.submit_timeout())
+                .map_err(GatewayCommandError::Ingress)?;
             serde_json::to_writer(&mut output, &response).map_err(GatewayCommandError::Json)?;
             output.write_all(b"\n").map_err(GatewayCommandError::Io)
         }
@@ -136,13 +139,32 @@ where
             write_encoded_response_until(output, encoded, deadline)
         }
         GatewayCommand::Status => {
-            let request = decode_control_request(input)?;
+            let request: agent_knowledge_protocol::StatusRequest = decode_control_request(input)?;
+            if request.protocol_version != CURRENT_GATEWAY_PROTOCOL_VERSION {
+                return Err(GatewayCommandError::Gateway(Box::new(
+                    GatewayError::ReadRequest(
+                        agent_knowledge_gateway::ReadRequestError::UnsupportedProtocolVersion {
+                            found: request.protocol_version,
+                        },
+                    ),
+                )));
+            }
             let deadline = read_deadline(&settings);
-            let gateway =
-                StatusGateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
-            let encoded = gateway
-                .status_encoded_until(request, deadline)
-                .map_err(gateway_error)?;
+            let ingress = IngressClient::new(settings.queue_socket());
+            let response = ingress
+                .status(request, settings.read_operation_timeout())
+                .map_err(GatewayCommandError::Ingress)?;
+            let mut encoded = serde_json::to_vec(&response).map_err(GatewayCommandError::Json)?;
+            encoded.push(b'\n');
+            if encoded.len() as u64 > settings.maximum_response_bytes() {
+                return Err(GatewayCommandError::Gateway(Box::new(
+                    GatewayError::ReadRequest(
+                        agent_knowledge_gateway::ReadRequestError::ResponseTooLarge {
+                            maximum: settings.maximum_response_bytes(),
+                        },
+                    ),
+                )));
+            }
             write_encoded_response_until(output, encoded, deadline)
         }
     }
@@ -341,6 +363,7 @@ pub enum GatewayCommandError {
     ClientId(ClientIdError),
     Config(Box<GatewayConfigError>),
     Gateway(Box<GatewayError>),
+    Ingress(IngressClientError),
     InputSetup(io::Error),
     OutputSetup(io::Error),
     ControlInput(io::Error),
@@ -371,6 +394,7 @@ impl GatewayCommandError {
             Self::Io(error) if is_peer_disconnect(error.kind()) => ErrorCode::TemporaryFailure,
             Self::OutputDeadline => ErrorCode::TemporaryFailure,
             Self::Gateway(error) => error.error_code(),
+            Self::Ingress(error) => error.error_code(),
             Self::InvalidClientIdEncoding
             | Self::ClientId(_)
             | Self::Config(_)
@@ -413,6 +437,7 @@ impl fmt::Display for GatewayCommandError {
             }
             Self::Config(error) => write!(formatter, "Gateway configuration failed: {error}"),
             Self::Gateway(error) => error.fmt(formatter),
+            Self::Ingress(error) => error.fmt(formatter),
             Self::InputSetup(error) => write!(formatter, "Gateway input setup failed: {error}"),
             Self::OutputSetup(error) => write!(formatter, "Gateway output setup failed: {error}"),
             Self::ControlInput(error) => write!(formatter, "Gateway control input failed: {error}"),
@@ -434,6 +459,7 @@ impl std::error::Error for GatewayCommandError {
             Self::ClientId(error) => Some(error),
             Self::Config(error) => Some(error.as_ref()),
             Self::Gateway(error) => Some(error.as_ref()),
+            Self::Ingress(error) => Some(error),
             Self::InputSetup(error) => Some(error),
             Self::OutputSetup(error) => Some(error),
             Self::ControlInput(error) => Some(error),

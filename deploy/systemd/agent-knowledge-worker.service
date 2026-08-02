@@ -10,6 +10,7 @@ StartLimitBurst=5
 Type=exec
 User=agent-knowledge
 Group=agent-knowledge
+SupplementaryGroups=agent-knowledge-queue
 WorkingDirectory=/var/lib/agent-knowledge
 ExecStart=@agentKnowledge@/bin/agent-knowledge worker run --config /etc/agent-knowledge/worker.yaml
 Restart=on-failure

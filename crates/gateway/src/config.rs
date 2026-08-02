@@ -7,7 +7,7 @@ use agent_knowledge_core::{BoundedFileError, read_bounded_regular_file};
 use serde::Deserialize;
 
 /// Gateway configuration schema supported by this release.
-pub const CURRENT_GATEWAY_CONFIG_VERSION: u16 = 2;
+pub const CURRENT_GATEWAY_CONFIG_VERSION: u16 = 3;
 const MAXIMUM_GATEWAY_CONFIG_BYTES: u64 = 64 * 1024;
 const MAXIMUM_SUBMIT_TIMEOUT_SECONDS: u64 = 3_600;
 const MAXIMUM_READ_RESULTS: usize = 10_000;
@@ -22,7 +22,7 @@ const MAXIMUM_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 /// Validated settings for one forced-command Gateway process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewaySettings {
-    queue_root: PathBuf,
+    queue_socket: PathBuf,
     git_directory: PathBuf,
     content_root: PathBuf,
     official_branch: String,
@@ -88,10 +88,10 @@ impl GatewaySettings {
         Self::try_from(wire)
     }
 
-    /// Returns the durable request queue root.
+    /// Returns the local queue-ingress Unix socket.
     #[must_use]
-    pub fn queue_root(&self) -> &Path {
-        &self.queue_root
+    pub fn queue_socket(&self) -> &Path {
+        &self.queue_socket
     }
 
     /// Returns the bare repository containing the official branch.
@@ -181,7 +181,7 @@ impl TryFrom<WireGatewayConfig> for GatewaySettings {
                 found: wire.schema_version,
             });
         }
-        let queue_root = validate_storage_path(wire.storage.queue_root, "queue_root")?;
+        let queue_socket = validate_storage_path(wire.storage.queue_socket, "queue_socket")?;
         let git_directory = validate_storage_path(wire.storage.git_directory, "git_directory")?;
         let content_root = validate_storage_path(wire.storage.content_root, "content_root")?;
         if !valid_official_branch(&wire.repository.official_branch) {
@@ -231,7 +231,7 @@ impl TryFrom<WireGatewayConfig> for GatewaySettings {
             return Err(GatewayConfigError::InvalidSubmitTimeout);
         }
         Ok(Self {
-            queue_root,
+            queue_socket,
             git_directory,
             content_root,
             official_branch: wire.repository.official_branch,
@@ -308,7 +308,7 @@ struct WireGatewayConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireStorage {
-    queue_root: PathBuf,
+    queue_socket: PathBuf,
     git_directory: PathBuf,
     content_root: PathBuf,
 }
@@ -460,15 +460,15 @@ mod tests {
 
     use super::{GatewayConfigError, GatewaySettings};
 
-    const VALID_CONFIG: &str = "schema_version: 2\nstorage:\n  queue_root: /srv/fictional-knowledge/queue\n  git_directory: /srv/fictional-knowledge/repository\n  content_root: /srv/fictional-knowledge/content\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n";
+    const VALID_CONFIG: &str = "schema_version: 3\nstorage:\n  queue_socket: /run/agent-knowledge/queue-ingress.sock\n  git_directory: /srv/fictional-knowledge/repository\n  content_root: /srv/fictional-knowledge/content\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n";
 
     #[test]
     fn decodes_only_the_strict_versioned_gateway_shape() {
         let settings = GatewaySettings::decode(VALID_CONFIG)
             .unwrap_or_else(|error| panic!("Gateway fixture must decode: {error}"));
         assert_eq!(
-            settings.queue_root(),
-            std::path::Path::new("/srv/fictional-knowledge/queue")
+            settings.queue_socket(),
+            std::path::Path::new("/run/agent-knowledge/queue-ingress.sock")
         );
         assert_eq!(settings.submit_timeout(), Duration::from_secs(300));
         assert_eq!(settings.official_branch(), "main");
@@ -484,13 +484,13 @@ mod tests {
 
         assert!(
             GatewaySettings::decode(
-                &VALID_CONFIG.replace("schema_version: 2", "schema_version: 1")
+                &VALID_CONFIG.replace("schema_version: 3", "schema_version: 2")
             )
             .is_err()
         );
         assert!(
             GatewaySettings::decode(
-                &VALID_CONFIG.replace("/srv/fictional-knowledge/queue", "relative/queue")
+                &VALID_CONFIG.replace("/run/agent-knowledge/queue-ingress.sock", "relative/socket")
             )
             .is_err()
         );
@@ -532,9 +532,9 @@ mod tests {
         assert!(GatewaySettings::decode(&format!("{VALID_CONFIG}extra: true\n")).is_err());
         assert!(matches!(
             GatewaySettings::decode(
-                &VALID_CONFIG.replace("schema_version: 2", "schema_version: 3")
+                &VALID_CONFIG.replace("schema_version: 3", "schema_version: 4")
             ),
-            Err(GatewayConfigError::UnsupportedSchemaVersion { found: 3 })
+            Err(GatewayConfigError::UnsupportedSchemaVersion { found: 4 })
         ));
     }
 }

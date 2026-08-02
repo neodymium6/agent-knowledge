@@ -9,17 +9,18 @@ restricted gateway; they do not synchronize the repository with Git.
 
 ## Status
 
-The architecture is defined, delivery increments 1 through 7 are implemented,
-and the request-status, Git-replication, and operational-status portions of
-increment 8 are complete. The current executable can accept requests locally or through an
-OpenSSH forced command, process them through the single Writer, and publish
-immutable Quartz releases. Coding agents can list, retrieve, and search an
-exact committed content snapshot and inspect durable request state through the
-same Gateway. Git remote replication runs asynchronously with durable retry
-state. Derived-release retention is available as a bounded local maintenance
-operation. Document-bundle export is implemented. Reproducible Linux package
-output and conventional systemd Worker service integration are available
-through the flake; container and Kubernetes packaging remain future work.
+The architecture is defined, delivery increments 1 through 8 and the Linux
+portion of increment 9 are implemented. The current executable can accept
+requests locally or through an OpenSSH forced command, process them through the
+single Writer, and publish immutable Quartz releases. Coding agents can list,
+retrieve, and search an exact committed content snapshot and inspect durable
+request state through the same Gateway. Git remote replication runs
+asynchronously with durable retry state. Derived-release retention and
+document-bundle export are implemented. The flake provides reproducible Linux
+packaging, a conventional systemd Worker service, and a systemd-activated local
+queue-ingress broker that isolates the forced-command Gateway from durable queue
+access under distinct service identities. Container and Kubernetes packaging
+remain future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -65,8 +66,9 @@ client keys, or Quartz content.
 
 ### systemd service
 
-The Linux package contains a hardened Worker unit plus `sysusers.d` and
-`tmpfiles.d` definitions. Install them from the immutable package output:
+The Linux package contains hardened Worker and socket-activated queue-ingress
+units plus `sysusers.d` and `tmpfiles.d` definitions. Install them from the
+immutable package output:
 
 ```sh
 sudo nix profile add --profile /nix/var/nix/profiles/agent-knowledge \
@@ -78,6 +80,10 @@ sudo install -d -m 0755 -o root -g root /etc/agent-knowledge
 sudo install -m 0640 -o root -g agent-knowledge \
   ./fictional-worker.yaml /etc/agent-knowledge/worker.yaml
 sudo systemctl link "$package_path/lib/systemd/system/agent-knowledge-worker.service"
+sudo systemctl link \
+  "$package_path/lib/systemd/system/agent-knowledge-queue-ingress.socket"
+sudo systemctl link \
+  "$package_path/lib/systemd/system/agent-knowledge-queue-ingress@.service"
 ```
 
 The supplied storage layout uses sibling roots below
@@ -90,6 +96,7 @@ starting the service. The Worker intentionally does not invent these
 deployment inputs. After validating them, enable and start the Worker:
 
 ```sh
+sudo systemctl enable --now agent-knowledge-queue-ingress.socket
 sudo systemctl enable --now agent-knowledge-worker.service
 ```
 
@@ -98,36 +105,72 @@ startup failures are limited to five attempts in five minutes. Inspect a failed
 start with `systemctl status` and `journalctl -u agent-knowledge-worker` rather
 than repeatedly restarting an incompletely provisioned deployment.
 
-The packaged `agent-knowledge` account is a locked, non-login Worker account.
-Never use it for OpenSSH. This package does not yet provide a production
-Gateway service or account. The current filesystem queue requires the Gateway
-to mutate shared lock, sequence, and package state, so a separate Gateway UID
-cannot be granted a narrow ingress capability with ordinary groups or ACLs.
-Do not work around this by sharing the Worker UID or by granting broad queue or
-Worker-state permissions. Production Gateway deployment remains blocked on a
-local enqueue broker or equivalent durable ownership-handoff boundary, plus an
-integration test that exercises distinct Gateway and Worker UIDs.
+The packaged `agent-knowledge` and `agent-knowledge-queue` accounts are locked,
+non-login accounts for the Worker and queue ingress broker respectively. Never
+use either for OpenSSH. Create the deployment-specific SSH account according to
+the host's authentication policy and add only that account to the
+`agent-knowledge-gateway` group. That group can connect to the local ingress
+socket and read committed repository/content storage; it cannot open the
+durable queue. The broker owns the queue but cannot open Worker-owned storage.
+The Worker receives the queue group as a supplementary group so it can perform
+state transitions without sharing either service UID. The durable storage root
+is `0751 root:agent-knowledge-queue`: the broker and Worker can open it for
+directory durability syncs, while the Gateway can only traverse to its known
+read-only repository and content paths.
 
 The dedicated system profile keeps the package output live across Nix garbage
 collection. The unit allows writes only below `/var/lib/agent-knowledge`, uses
 `KillMode=mixed`, and grants 15 minutes for transaction-boundary shutdown. A
 deployment using other durable roots must add them with a systemd drop-in. It
 must also increase `TimeoutStopSec` when its maximum expected Git or Quartz
-transaction can exceed 15 minutes. Upgrade the dedicated profile and reload the
-unit with:
+transaction can exceed 15 minutes.
+
+The first upgrade from the Worker-only queue layout is an offline migration.
+Disable new forced-command SSH sessions, wait for existing Gateway processes,
+stop the Worker and socket, and take a storage backup before running it. The
+migration takes both queue locks, requires empty `queue/incoming` and
+`queue/quarantine` directories, rejects links, special files, hard links,
+cross-mount traversal, and concurrent tree changes, changes existing queue data
+to the queue group, and grants the Gateway group read-only access to existing
+repository/content descendants. Before changing permissions, it preflights all
+three roots and rejects stores exceeding 1,000,000 filesystem objects or 512
+MiB of cumulative relative-path bytes. For the default storage root, upgrade
+and reload with:
 
 ```sh
+sudo systemctl stop agent-knowledge-worker.service
+sudo systemctl stop agent-knowledge-queue-ingress.socket 2>/dev/null || true
 sudo nix profile upgrade \
   --profile /nix/var/nix/profiles/agent-knowledge agent-knowledge
 package_path=/nix/var/nix/profiles/agent-knowledge
 sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
+sudo "$package_path/bin/agent-knowledge" admin migrate-v1-storage \
+  --queue-root /var/lib/agent-knowledge/queue \
+  --git-directory /var/lib/agent-knowledge/repository \
+  --content-root /var/lib/agent-knowledge/content
 sudo systemd-tmpfiles --create \
   "$package_path/lib/tmpfiles.d/agent-knowledge.conf"
 sudo systemctl link --force \
   "$package_path/lib/systemd/system/agent-knowledge-worker.service"
+sudo systemctl link --force \
+  "$package_path/lib/systemd/system/agent-knowledge-queue-ingress.socket"
+sudo systemctl link --force \
+  "$package_path/lib/systemd/system/agent-knowledge-queue-ingress@.service"
+# Before restarting, change Gateway schema_version to 3 and replace
+# storage.queue_root with:
+#   queue_socket: /run/agent-knowledge/queue-ingress.sock
 sudo systemctl daemon-reload
-sudo systemctl restart agent-knowledge-worker.service
+sudo systemctl enable --now agent-knowledge-queue-ingress.socket
+sudo systemctl start agent-knowledge-worker.service
 ```
+
+Gateway schema v2 is intentionally not accepted after this upgrade. Update
+`/etc/agent-knowledge/gateway.yaml` to schema v3 while access is disabled;
+replace `storage.queue_root` with `storage.queue_socket` as shown in the Gateway
+configuration example below. A deployment using non-default durable roots
+passes the three configured roots independently to the migration command and
+updates `ReadWritePaths`, `WorkingDirectory`, and the queue-ingress service's
+`ExecStart` queue root with systemd drop-ins.
 
 Configuration, SSH keys, Git credentials, Quartz, and service enablement remain
 deployment inputs.
@@ -296,9 +339,9 @@ error code and failure time. An unknown request ID returns
 read-operation deadline covers initialization, lookup or query work, response
 encoding, and delivery to the SSH channel. The response-byte limit includes
 the JSON Lines framing newline. Committed-content read processes open only the
-repository and content checkout. Status and submit processes open the durable
-queue, while per-request status takes no queue locks and does not run
-maintenance.
+repository and content checkout. Gateway status and submit processes open only
+the local ingress socket. The queue ingress broker alone opens the durable
+queue; per-request status takes no queue locks and does not run maintenance.
 
 The client validates and snapshots at most 64 MiB of package data before
 network output. It then invokes the system `ssh` executable directly, uses
@@ -312,17 +355,16 @@ without following symbolic-link components. It runs SSH in a dedicated process
 group and terminates that group when the deadline or a stream-size limit is
 reached, including when a proxy descendant retains an output pipe.
 
-The forced-command examples below document the implemented protocol and
-configuration boundary; they are not a production deployment recipe. A
-production OpenSSH Gateway must wait for the separate-UID queue handoff
-described in the systemd section above.
+The forced-command account needs read access to this root-controlled
+configuration and membership in `agent-knowledge-gateway`, but no queue or
+Worker-account membership.
 
 The forced command requires a strict Gateway configuration such as:
 
 ```yaml
-schema_version: 2
+schema_version: 3
 storage:
-  queue_root: /srv/fictional-knowledge/queue
+  queue_socket: /run/agent-knowledge/queue-ingress.sock
   git_directory: /srv/fictional-knowledge/repository
   content_root: /srv/fictional-knowledge/content
 repository:

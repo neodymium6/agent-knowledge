@@ -34,6 +34,8 @@
               ./Cargo.toml
               ./crates
               ./deploy/systemd/agent-knowledge-worker.service
+              ./deploy/systemd/agent-knowledge-queue-ingress.socket
+              (./deploy/systemd + "/agent-knowledge-queue-ingress@.service")
               ./deploy/systemd/agent-knowledge.conf.sysusers
               ./deploy/systemd/agent-knowledge.conf.tmpfiles
               ./src
@@ -61,6 +63,12 @@
             install -Dm644 deploy/systemd/agent-knowledge-worker.service \
               "$out/lib/systemd/system/agent-knowledge-worker.service"
             substituteInPlace "$out/lib/systemd/system/agent-knowledge-worker.service" \
+              --replace-fail '@agentKnowledge@' "$out"
+            install -Dm644 deploy/systemd/agent-knowledge-queue-ingress.socket \
+              "$out/lib/systemd/system/agent-knowledge-queue-ingress.socket"
+            install -Dm644 deploy/systemd/agent-knowledge-queue-ingress@.service \
+              "$out/lib/systemd/system/agent-knowledge-queue-ingress@.service"
+            substituteInPlace "$out/lib/systemd/system/agent-knowledge-queue-ingress@.service" \
               --replace-fail '@agentKnowledge@' "$out"
             install -Dm644 deploy/systemd/agent-knowledge.conf.sysusers \
               "$out/lib/sysusers.d/agent-knowledge.conf"

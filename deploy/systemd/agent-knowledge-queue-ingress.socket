@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent Knowledge Queue Ingress Socket
+Documentation=https://github.com/neodymium6/agent-knowledge
+
+[Socket]
+ListenStream=/run/agent-knowledge/queue-ingress.sock
+SocketUser=agent-knowledge-queue
+SocketGroup=agent-knowledge-gateway
+SocketMode=0660
+DirectoryMode=0750
+Accept=yes
+MaxConnections=64
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

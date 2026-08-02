@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use agent_knowledge_gateway::IngressServeError;
 use agent_knowledge_protocol::{
     ExportRequest, GetRequest, LIST_COMMAND, ListRequest, ListResponse, RECENT_COMMAND,
     ReadFilterRequest, SEARCH_COMMAND, SearchRequest, StatusRequest,
@@ -15,6 +16,8 @@ use agent_knowledge_queue::{
 use serde::Serialize;
 
 use crate::admin::{self, AdminRetentionError, AdminStatusError};
+#[cfg(target_os = "linux")]
+use crate::admin::{StorageMigration, StorageMigrationError};
 use crate::client::{self, ClientCommandError};
 use crate::gateway::{self, GatewayCommandError};
 use crate::worker::{self, WorkerCommandError};
@@ -23,6 +26,7 @@ const USAGE: &str = "usage:\n\
     agent-knowledge admin submit --queue-root <path> --package-root <path>\n\
     agent-knowledge admin status --config <path> [--maximum-queue-entries <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge admin prune-releases --config <path> [--dry-run] [--timeout-seconds <seconds>]\n\
+    agent-knowledge admin migrate-v1-storage --queue-root <path> --git-directory <path> --content-root <path> [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>]\n\
     agent-knowledge client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
     agent-knowledge client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge client recent --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
@@ -31,6 +35,7 @@ const USAGE: &str = "usage:\n\
     agent-knowledge client status --destination <ssh-destination> --request-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge client search --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge gateway --config <path> --client-id <id>\n\
+    agent-knowledge queue-ingress serve --queue-root <path>\n\
     agent-knowledge worker run --config <path>";
 const DEFAULT_CLIENT_TIMEOUT_SECONDS: u64 = 300;
 const MAXIMUM_CLIENT_TIMEOUT_SECONDS: u64 = 3_600;
@@ -65,6 +70,26 @@ where
             timeout,
         } => admin::prune_releases(&config, dry_run, timeout, output)
             .map_err(CliError::AdminRetention),
+        #[cfg(target_os = "linux")]
+        Command::AdminMigrateV1Storage {
+            queue_root,
+            git_directory,
+            content_root,
+            queue_owner,
+            queue_group,
+            gateway_group,
+        } => admin::migrate_v1_storage_permissions(
+            StorageMigration {
+                queue_root: &queue_root,
+                git_directory: &git_directory,
+                content_root: &content_root,
+                queue_owner: &queue_owner,
+                queue_group: &queue_group,
+                gateway_group: &gateway_group,
+            },
+            output,
+        )
+        .map_err(CliError::StorageMigration),
         Command::RunWorker { config } => worker::run(&config, output).map_err(CliError::Worker),
         Command::RunGateway { config, client_id } => gateway::run_stdio(
             &config,
@@ -72,6 +97,10 @@ where
             std::env::var_os("SSH_ORIGINAL_COMMAND"),
         )
         .map_err(CliError::Gateway),
+        Command::ServeQueueIngress { queue_root } => {
+            agent_knowledge_gateway::serve_ingress(&queue_root, io::stdin().lock(), output)
+                .map_err(CliError::IngressServe)
+        }
         Command::ClientSubmit {
             destination,
             package_root,
@@ -135,12 +164,24 @@ enum Command {
         dry_run: bool,
         timeout: Duration,
     },
+    #[cfg(target_os = "linux")]
+    AdminMigrateV1Storage {
+        queue_root: PathBuf,
+        git_directory: PathBuf,
+        content_root: PathBuf,
+        queue_owner: OsString,
+        queue_group: OsString,
+        gateway_group: OsString,
+    },
     RunWorker {
         config: PathBuf,
     },
     RunGateway {
         config: PathBuf,
         client_id: OsString,
+    },
+    ServeQueueIngress {
+        queue_root: PathBuf,
     },
     ClientSubmit {
         destination: OsString,
@@ -187,6 +228,12 @@ where
         return parse_gateway_arguments(action.into_iter().chain(arguments));
     }
     match (namespace.as_deref(), action.as_deref()) {
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("queue-ingress")
+                && action == std::ffi::OsStr::new("serve") =>
+        {
+            parse_queue_ingress_arguments(arguments)
+        }
         (Some(namespace), Some(action))
             if namespace == std::ffi::OsStr::new("client")
                 && action == std::ffi::OsStr::new("submit") =>
@@ -241,6 +288,13 @@ where
                 && action == std::ffi::OsStr::new("prune-releases") =>
         {
             parse_admin_prune_releases_arguments(arguments)
+        }
+        #[cfg(target_os = "linux")]
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("admin")
+                && action == std::ffi::OsStr::new("migrate-v1-storage") =>
+        {
+            parse_admin_migrate_v1_storage_arguments(arguments)
         }
         (Some(namespace), Some(action))
             if namespace == std::ffi::OsStr::new("worker")
@@ -506,6 +560,25 @@ where
     })
 }
 
+fn parse_queue_ingress_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut queue_root = None;
+    while let Some(flag) = arguments.next() {
+        let value = arguments.next().ok_or(CliError::Usage)?;
+        match flag.to_str() {
+            Some("--queue-root") if queue_root.is_none() => {
+                queue_root = Some(PathBuf::from(value));
+            }
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(Command::ServeQueueIngress {
+        queue_root: queue_root.ok_or(CliError::Usage)?,
+    })
+}
+
 fn parse_submit_arguments<I>(mut arguments: I) -> Result<Command, CliError>
 where
     I: Iterator<Item = OsString>,
@@ -588,6 +661,45 @@ where
         config: config.ok_or(CliError::Usage)?,
         dry_run,
         timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_RETENTION_TIMEOUT_SECONDS)),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_admin_migrate_v1_storage_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut queue_root = None;
+    let mut git_directory = None;
+    let mut content_root = None;
+    let mut queue_owner = None;
+    let mut queue_group = None;
+    let mut gateway_group = None;
+    while let Some(flag) = arguments.next() {
+        let value = arguments.next().ok_or(CliError::Usage)?;
+        match flag.to_str() {
+            Some("--queue-root") if queue_root.is_none() => {
+                queue_root = Some(PathBuf::from(value));
+            }
+            Some("--git-directory") if git_directory.is_none() => {
+                git_directory = Some(PathBuf::from(value));
+            }
+            Some("--content-root") if content_root.is_none() => {
+                content_root = Some(PathBuf::from(value));
+            }
+            Some("--queue-owner") if queue_owner.is_none() => queue_owner = Some(value),
+            Some("--queue-group") if queue_group.is_none() => queue_group = Some(value),
+            Some("--gateway-group") if gateway_group.is_none() => gateway_group = Some(value),
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(Command::AdminMigrateV1Storage {
+        queue_root: queue_root.ok_or(CliError::Usage)?,
+        git_directory: git_directory.ok_or(CliError::Usage)?,
+        content_root: content_root.ok_or(CliError::Usage)?,
+        queue_owner: queue_owner.unwrap_or_else(|| "agent-knowledge-queue".into()),
+        queue_group: queue_group.unwrap_or_else(|| "agent-knowledge-queue".into()),
+        gateway_group: gateway_group.unwrap_or_else(|| "agent-knowledge-gateway".into()),
     })
 }
 
@@ -680,8 +792,11 @@ pub enum CliError {
     Queue(QueueError),
     AdminStatus(AdminStatusError),
     AdminRetention(AdminRetentionError),
+    #[cfg(target_os = "linux")]
+    StorageMigration(StorageMigrationError),
     Worker(WorkerCommandError),
     Gateway(GatewayCommandError),
+    IngressServe(IngressServeError),
     Client(ClientCommandError),
     Json(serde_json::Error),
 }
@@ -707,8 +822,11 @@ impl fmt::Display for CliError {
             Self::Queue(error) => write!(formatter, "durable queue submission failed: {error}"),
             Self::AdminStatus(error) => error.fmt(formatter),
             Self::AdminRetention(error) => error.fmt(formatter),
+            #[cfg(target_os = "linux")]
+            Self::StorageMigration(error) => error.fmt(formatter),
             Self::Worker(error) => error.fmt(formatter),
             Self::Gateway(error) => error.fmt(formatter),
+            Self::IngressServe(error) => error.fmt(formatter),
             Self::Client(error) => error.fmt(formatter),
             Self::Json(error) => write!(formatter, "JSON output encoding failed: {error}"),
         }
@@ -723,8 +841,11 @@ impl std::error::Error for CliError {
             Self::Queue(error) => Some(error),
             Self::AdminStatus(error) => Some(error),
             Self::AdminRetention(error) => Some(error),
+            #[cfg(target_os = "linux")]
+            Self::StorageMigration(error) => Some(error),
             Self::Worker(error) => Some(error),
             Self::Gateway(error) => Some(error),
+            Self::IngressServe(error) => Some(error),
             Self::Client(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Usage => None,
