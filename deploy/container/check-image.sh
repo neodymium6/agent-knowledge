@@ -110,7 +110,7 @@ validate_normalized_path() {
 
 normalized_layer_contents="$work_directory/normalized-layer-contents"
 while IFS= read -r member; do
-  if [[ $member == / || $member == ./ ]]; then
+  if [[ $member == / || $member == ./ || $member == . ]]; then
     continue
   fi
   normalized=$member
@@ -306,6 +306,25 @@ validate_image_ancestors() {
   done
 }
 
+validate_image_root() {
+  local layer_path member listing
+
+  while IFS= read -r layer_path; do
+    while IFS= read -r member; do
+      if [[ $member == / || $member == ./ || $member == . ]]; then
+        listing=$(tar --absolute-names --numeric-owner -t -v \
+          -f "$work_directory/$layer_path" -- "$member")
+        validate_immutable_metadata "$listing" /
+        if [[ ${listing:0:1} != d || ${listing:9:1} != x ]]; then
+          echo "container image root is not a traversable directory" >&2
+          return 1
+        fi
+      fi
+    done < <(tar --absolute-names -tf "$work_directory/$layer_path")
+  done <<<"$layer_paths"
+}
+
+validate_image_root
 extract_image_file etc/passwd "$work_directory/passwd"
 extract_image_file etc/group "$work_directory/group"
 extract_image_file "$entrypoint_path" "$work_directory/entrypoint" executable
