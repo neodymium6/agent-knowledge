@@ -117,12 +117,14 @@ This local administrative command emits one versioned JSON object containing
 queue counts, the oldest pending timestamp, Worker-lock activity, the official
 commit, the active Quartz release, and remote-replication progress. It is
 read-only: it neither initializes nor repairs storage nor contacts the Git
-remote. The queue scan has an explicit entry bound and briefly holds the shared
-accepted-state lock; concurrent submissions or transitions cause a transient
-failure instead of an inconsistent count. Its deadline covers bounded queue
-work and Git subprocesses; local filesystem calls remain subject to the host
-filesystem's I/O behavior. A publishing Worker may likewise cause the command
-to fail transiently instead of returning a mixed committed-content snapshot.
+remote. The queue scan has an explicit entry bound and does not take the
+accepted-state lock, so it does not block submissions or Worker transitions.
+Queue counts are best-effort observations and `counts_exact` is currently
+always `false`. Its deadline covers bounded queue work and Git subprocesses;
+local filesystem calls remain subject to the host filesystem's I/O behavior.
+The command verifies the official commit again after inspecting release and
+replication state; a concurrent publication causes a transient failure instead
+of a mixed committed-content snapshot.
 
 Submit a validated request package through an SSH host alias:
 

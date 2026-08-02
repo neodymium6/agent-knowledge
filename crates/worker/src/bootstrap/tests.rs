@@ -11,9 +11,10 @@ use time::{Duration, OffsetDateTime};
 use std::os::unix::fs::PermissionsExt;
 
 use super::{WorkerBootstrap, WorkerOpenError};
+use crate::status::inspect_operational_status_with_hook;
 use crate::{
-    RemoteReplicationOutcome, ReplicationStatus, StartupOutcome, WorkerSettings,
-    inspect_operational_status,
+    OperationalStatusError, RemoteReplicationOutcome, ReplicationStatus, StartupOutcome,
+    WorkerSettings, inspect_operational_status,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -87,6 +88,7 @@ fn inspects_initialized_components_without_starting_the_worker() {
     assert_eq!(status.queue().failed(), 0);
     assert_eq!(status.queue().oldest_pending_at(), None);
     assert!(!status.queue().worker_active());
+    assert!(!status.queue().counts_exact());
     assert!(status.publication().active_release().is_none());
     assert!(!status.publication().synchronized());
     assert!(matches!(status.replication(), ReplicationStatus::Disabled));
@@ -95,11 +97,51 @@ fn inspects_initialized_components_without_starting_the_worker() {
     assert_eq!(wire["schema_version"], 1);
     assert_eq!(wire["observed_at"], "2026-07-31T04:00:00Z");
     assert_eq!(wire["queue"]["worker_active"], false);
+    assert_eq!(wire["queue"]["counts_exact"], false);
     assert_eq!(
         wire["publication"]["active_release"],
         serde_json::Value::Null
     );
     assert_eq!(wire["replication"]["status"], "disabled");
+}
+
+#[test]
+fn operational_status_rejects_a_publication_changed_during_observation() {
+    let root = TestDirectory::create();
+    initialize_repository(root.path());
+    initialize_quartz(root.path());
+    let settings = WorkerSettings::decode(&valid_yaml(root.path()))
+        .unwrap_or_else(|error| panic!("fixture settings must decode: {error}"));
+    let _bootstrap = WorkerBootstrap::open(settings.clone())
+        .unwrap_or_else(|error| panic!("configured components must open: {error}"));
+
+    let result = inspect_operational_status_with_hook(
+        &settings,
+        1024,
+        Some(Instant::now() + StandardDuration::from_secs(5)),
+        created_at(),
+        || {
+            run_git(
+                Some(&root.path().join("content")),
+                [
+                    "-c",
+                    "user.name=Fictional Test Author",
+                    "-c",
+                    "user.email=worker@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "Advance fictional publication",
+                ],
+                None,
+            );
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(OperationalStatusError::PublicationChanged)
+    ));
 }
 
 #[test]

@@ -17,7 +17,7 @@ pub use index::{
 };
 pub use read::{
     CommittedDocument, CommittedReadError, CommittedSnapshot, CommittedStore, LinearSearch,
-    PinnedCommit, ReadFilter, SearchBackend, SearchMetadataFields, SearchPolicy,
+    ReadFilter, SearchBackend, SearchMetadataFields, SearchPolicy,
 };
 pub use replication::{
     RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicationPolicy,

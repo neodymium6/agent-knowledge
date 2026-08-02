@@ -1526,14 +1526,16 @@ The versioned local administrative status report includes:
 - the official commit and active release, including whether they match; and
 - durable remote replication state and lag relative to the observed commit.
 
-Queue enumeration has an operator-selected upper bound and briefly takes the
-shared accepted-state lock so successful counts describe one queue snapshot.
-Lock contention, corrupt or replaced storage, and publication ownership of the
-committed-content lock fail the command transiently or permanently as
-appropriate. It never infers state by scraping process logs. A last successful
-batch identifier and recent transient-failure windows require a separate
-bounded durable event record before they can be added without making logs
-authoritative.
+Queue enumeration has an operator-selected upper bound and does not take the
+accepted-state lock, so it does not block submissions or Worker transitions.
+Counts are best-effort observations and `counts_exact` is currently always
+`false`. Corrupt or replaced storage fails the command as appropriate. The
+official commit is read before and after release and replication inspection; a
+concurrent publication causes a transient failure rather than a mixed
+committed-content snapshot. It never infers state by scraping process logs. A
+last successful batch identifier and recent transient-failure windows require
+a separate bounded durable event record before they can be added without
+making logs authoritative.
 
 ## 30. Testing
 

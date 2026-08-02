@@ -334,6 +334,7 @@ fn operational_overview_counts_states_and_observes_the_worker_lock() {
     assert_eq!(overview.failed(), 1);
     assert!(overview.oldest_pending_at().is_some());
     assert!(overview.worker_active());
+    assert!(!overview.counts_exact());
     assert!(matches!(
         reader.overview_until(2, None),
         Err(QueueError::StatusScanLimitExceeded { maximum: 2 })
@@ -364,10 +365,10 @@ fn operational_overview_rejects_invalid_bounds_and_pending_metadata() {
     mutation
         .lock()
         .unwrap_or_else(|error| panic!("queue mutation fixture must lock: {error}"));
-    assert!(matches!(
-        reader.overview_until(1, None),
-        Err(QueueError::StatusBusy)
-    ));
+    let overview = reader
+        .overview_until(1, None)
+        .unwrap_or_else(|error| panic!("overview must not wait for the mutation lock: {error}"));
+    assert_eq!(overview.pending(), 1);
     drop(mutation);
     fs::write(
         root.path()
@@ -386,7 +387,7 @@ fn operational_overview_rejects_invalid_bounds_and_pending_metadata() {
 }
 
 #[test]
-fn operational_overview_rejects_a_request_in_multiple_states() {
+fn operational_overview_deduplicates_a_request_observed_in_multiple_states() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path(), PackagePolicy::default());
     accept(stage_package(&queue, RESULTS));
@@ -398,11 +399,12 @@ fn operational_overview_rejects_a_request_in_multiple_states() {
     let reader = QueueReader::open_until(root.path().join("queue"), None)
         .unwrap_or_else(|error| panic!("read-only queue fixture must open: {error}"));
 
-    assert!(matches!(
-        reader.overview_until(2, None),
-        Err(QueueError::RequestInMultipleStates { request_id })
-            if request_id.to_string() == "01K00000000000000000000000"
-    ));
+    let overview = reader
+        .overview_until(2, None)
+        .unwrap_or_else(|error| panic!("best-effort overview must deduplicate: {error}"));
+    assert_eq!(overview.pending(), 1);
+    assert_eq!(overview.completed(), 0);
+    assert!(!overview.counts_exact());
 }
 
 #[cfg(unix)]
@@ -423,6 +425,30 @@ fn operational_overview_rejects_a_fifo_acceptance_file_without_blocking() {
         .status()
         .unwrap_or_else(|error| panic!("mkfifo fixture command must run: {error}"));
     assert!(created.success(), "FIFO fixture must be created");
+    let reader = QueueReader::open_until(root.path().join("queue"), None)
+        .unwrap_or_else(|error| panic!("read-only queue fixture must open: {error}"));
+
+    assert!(matches!(
+        reader.overview_until(1, None),
+        Err(QueueError::CorruptState {
+            state: QueueState::Pending,
+            detail: "pending request acceptance metadata is invalid",
+            ..
+        })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn operational_overview_rejects_a_hard_linked_acceptance_file() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    let acceptance = root
+        .path()
+        .join("queue/pending/01K00000000000000000000000/acceptance.json");
+    fs::hard_link(&acceptance, root.path().join("linked-acceptance.json"))
+        .unwrap_or_else(|error| panic!("hard-link fixture must be created: {error}"));
     let reader = QueueReader::open_until(root.path().join("queue"), None)
         .unwrap_or_else(|error| panic!("read-only queue fixture must open: {error}"));
 

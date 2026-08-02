@@ -352,20 +352,3 @@ fn shared_snapshot_lock_blocks_publication_until_drop() {
         }
     }
 }
-
-#[test]
-fn pinned_commit_blocks_publication_until_drop() {
-    let fixture = Fixture::create();
-    let store = fixture.store();
-    let pinned = store
-        .pinned_commit_until(None)
-        .unwrap_or_else(|error| panic!("official commit must pin: {error}"));
-    assert!(!pinned.commit().is_empty());
-    let writer = File::open(&fixture.content)
-        .unwrap_or_else(|error| panic!("publication lock fixture must open: {error}"));
-    assert!(matches!(writer.try_lock(), Err(TryLockError::WouldBlock)));
-    drop(pinned);
-    writer
-        .try_lock()
-        .unwrap_or_else(|error| panic!("writer lock must succeed after guard drop: {error}"));
-}

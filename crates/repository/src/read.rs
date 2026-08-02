@@ -32,22 +32,6 @@ pub struct CommittedStore {
     official_ref: String,
 }
 
-/// A validated official commit whose canonical content cannot advance while
-/// this guard remains alive.
-#[derive(Debug)]
-pub struct PinnedCommit {
-    commit: String,
-    _content_lock: File,
-}
-
-impl PinnedCommit {
-    /// Returns the exact official commit held by this guard.
-    #[must_use]
-    pub fn commit(&self) -> &str {
-        &self.commit
-    }
-}
-
 impl CommittedStore {
     /// Returns attested identities for the bare repository and content root.
     ///
@@ -185,26 +169,8 @@ impl CommittedStore {
         &self,
         deadline: Option<Instant>,
     ) -> Result<String, CommittedReadError> {
-        self.pinned_commit_until(deadline)
-            .map(|pinned| pinned.commit)
-    }
-
-    /// Pins the current official commit and prevents canonical publication
-    /// from advancing until the returned guard is dropped.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same validation, contention, deadline, Git, and filesystem
-    /// errors as [`Self::current_commit_until`].
-    pub fn pinned_commit_until(
-        &self,
-        deadline: Option<Instant>,
-    ) -> Result<PinnedCommit, CommittedReadError> {
-        let (content_lock, commit) = self.pin_current_commit(deadline)?;
-        Ok(PinnedCommit {
-            commit,
-            _content_lock: content_lock,
-        })
+        self.pin_current_commit(deadline)
+            .map(|(_lock, commit)| commit)
     }
 
     fn pin_current_commit(

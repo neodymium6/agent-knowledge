@@ -59,6 +59,7 @@ pub struct QueueStatus {
     failed: u64,
     oldest_pending_at: Option<String>,
     worker_active: bool,
+    counts_exact: bool,
 }
 
 impl QueueStatus {
@@ -96,6 +97,12 @@ impl QueueStatus {
     #[must_use]
     pub const fn worker_active(&self) -> bool {
         self.worker_active
+    }
+
+    /// Reports whether the counts form one atomic queue snapshot.
+    #[must_use]
+    pub const fn counts_exact(&self) -> bool {
+        self.counts_exact
     }
 }
 
@@ -192,6 +199,22 @@ pub fn inspect_operational_status(
     deadline: Option<Instant>,
     observed_at: OffsetDateTime,
 ) -> Result<OperationalStatus, OperationalStatusError> {
+    inspect_operational_status_with_hook(
+        settings,
+        maximum_queue_entries,
+        deadline,
+        observed_at,
+        || {},
+    )
+}
+
+pub(crate) fn inspect_operational_status_with_hook(
+    settings: &WorkerSettings,
+    maximum_queue_entries: usize,
+    deadline: Option<Instant>,
+    observed_at: OffsetDateTime,
+    after_observation: impl FnOnce(),
+) -> Result<OperationalStatus, OperationalStatusError> {
     let topology =
         validate_resolved_topology(settings).map_err(OperationalStatusError::Topology)?;
     let queue = QueueReader::open_until(topology.queue_root.stable_path().to_path_buf(), deadline)
@@ -212,14 +235,14 @@ pub fn inspect_operational_status(
     let queue_overview = queue
         .overview_until(maximum_queue_entries, deadline)
         .map_err(OperationalStatusError::queue)?;
-    let pinned_commit = repository
-        .pinned_commit_until(deadline)
+    let official_commit = repository
+        .current_commit_until(deadline)
         .map_err(OperationalStatusError::repository)?;
-    let official_commit = pinned_commit.commit().to_owned();
     let active_release = releases
         .active_release()
         .map_err(OperationalStatusError::release)?;
     let replication = replication_status(settings, &topology, &official_commit, deadline)?;
+    after_observation();
 
     queue
         .storage_attestation()
@@ -230,7 +253,12 @@ pub fn inspect_operational_status(
     releases
         .storage_attestation()
         .map_err(|source| OperationalStatusError::attestation("release storage", source))?;
-    drop(pinned_commit);
+    let verified_commit = repository
+        .current_commit_until(deadline)
+        .map_err(OperationalStatusError::repository)?;
+    if verified_commit != official_commit {
+        return Err(OperationalStatusError::PublicationChanged);
+    }
 
     let queue = queue_status(queue_overview)?;
     let publication = publication_status(official_commit, active_release);
@@ -254,6 +282,7 @@ fn queue_status(overview: QueueOverview) -> Result<QueueStatus, OperationalStatu
             .map(format_timestamp)
             .transpose()?,
         worker_active: overview.worker_active(),
+        counts_exact: overview.counts_exact(),
     })
 }
 
@@ -339,6 +368,7 @@ pub enum OperationalStatusError {
     Repository(Box<CommittedReadError>),
     Release(Box<ReleaseError>),
     Replication(Box<RemoteReplicationError>),
+    PublicationChanged,
     Timestamp(time::error::Format),
 }
 
@@ -377,6 +407,9 @@ impl fmt::Display for OperationalStatusError {
             Self::Replication(error) => {
                 write!(formatter, "could not inspect remote replication: {error}")
             }
+            Self::PublicationChanged => {
+                formatter.write_str("local publication changed during operational inspection")
+            }
             Self::Timestamp(error) => {
                 write!(formatter, "could not format status timestamp: {error}")
             }
@@ -393,6 +426,7 @@ impl std::error::Error for OperationalStatusError {
             Self::Repository(error) => Some(error),
             Self::Release(error) => Some(error),
             Self::Replication(error) => Some(error),
+            Self::PublicationChanged => None,
             Self::Timestamp(error) => Some(error),
         }
     }

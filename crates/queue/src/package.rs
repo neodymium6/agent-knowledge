@@ -597,7 +597,7 @@ fn enforce_path_components(
     Ok(())
 }
 
-fn validate_regular_file(
+pub(crate) fn validate_regular_file(
     metadata: &fs::Metadata,
     relative_path: &Path,
 ) -> Result<(), PackageValidationError> {
