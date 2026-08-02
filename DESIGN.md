@@ -112,6 +112,20 @@ command validates that directory, restreams every permitted file through the
 same `FileQueue` limits as the Gateway, and prints one JSON acceptance
 result. It never copies an unchecked directory into an accepted queue state.
 
+Operators inspect an initialized deployment with the same trusted Worker
+configuration:
+
+```text
+agent-knowledge admin status \
+  --config /srv/agent-knowledge/worker.yaml \
+  --maximum-queue-entries 100000 \
+  --timeout-seconds 30
+```
+
+This is a local read-only administrative boundary, not a Gateway operation.
+It does not broaden authenticated coding-agent permissions, initialize or
+repair storage, or contact a configured Git remote.
+
 The same executable can be used with different entry-point arguments in a
 container. Separate binaries may be produced from the same workspace later,
 without changing protocol or domain logic.
@@ -1505,13 +1519,19 @@ than operation-start time.
 Logs must not contain document bodies, attachment contents, private keys,
 tokens, or Git credentials.
 
-Administrative status reports include:
+The versioned local administrative status report includes:
 
-- queue counts and oldest age;
-- current commit and release;
-- Worker lock and last successful batch;
-- remote replication lag; and
-- recent permanent and transient failure counts.
+- queue counts and the oldest pending acceptance timestamp;
+- Worker-lock activity;
+- the official commit and active release, including whether they match; and
+- durable remote replication state and lag relative to the observed commit.
+
+Queue enumeration has an operator-selected upper bound. The command fails on
+corrupt or replaced storage and may fail transiently while publication owns the
+committed-content lock. It never infers state by scraping process logs. A last
+successful batch identifier and recent transient-failure windows require a
+separate bounded durable event record before they can be added without making
+logs authoritative.
 
 ## 30. Testing
 
@@ -1542,7 +1562,7 @@ Implementation proceeds in these increments:
 5. Quartz trial builds and atomic releases.
 6. OpenSSH forced-command Gateway and client SSH transport.
 7. Committed reads and initial full-text search.
-8. Request status and remote push retry (implemented), operational status, and
+8. Request status, remote push retry, and operational status (implemented), and
    retention.
 9. Optional container and single-replica Kubernetes packaging.
 

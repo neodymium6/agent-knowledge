@@ -10,14 +10,13 @@ restricted gateway; they do not synchronize the repository with Git.
 ## Status
 
 The architecture is defined, delivery increments 1 through 7 are implemented,
-and the request-status and Git-replication portions of increment 8 are complete. The current
-executable can accept requests locally or through an
+and the request-status, Git-replication, and operational-status portions of
+increment 8 are complete. The current executable can accept requests locally or through an
 OpenSSH forced command, process them through the single Writer, and publish
 immutable Quartz releases. Coding agents can list, retrieve, and search an
 exact committed content snapshot and inspect durable request state through the
 same Gateway. Git remote replication runs asynchronously with durable retry
-state. Bundle export, operational status, retention, and packaging remain future
-work.
+state. Bundle export, retention, and packaging remain future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -103,6 +102,25 @@ I/O is outside that subprocess deadline. Each push uses an isolated temporary
 Git directory and the exact validated URL snapshot, so later changes to the
 main repository's local Git configuration cannot change that attempt's
 destination or behavior.
+
+Inspect the initialized local deployment through the same trusted Worker
+configuration:
+
+```sh
+agent-knowledge admin status \
+  --config /srv/agent-knowledge/worker.yaml \
+  --maximum-queue-entries 100000 \
+  --timeout-seconds 30
+```
+
+This local administrative command emits one versioned JSON object containing
+queue counts, the oldest pending timestamp, Worker-lock activity, the official
+commit, the active Quartz release, and remote-replication progress. It is
+read-only: it neither initializes nor repairs storage nor contacts the Git
+remote. The queue scan has an explicit entry bound. Its deadline covers bounded
+queue work and Git subprocesses; local filesystem calls remain subject to the
+host filesystem's I/O behavior. A publishing Worker may cause the command to
+fail transiently instead of returning a mixed committed-content snapshot.
 
 Submit a validated request package through an SSH host alias:
 
