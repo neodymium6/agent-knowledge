@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 
 use agent_knowledge_core::BatchId;
@@ -91,6 +91,25 @@ fn prepare_release(
     store
         .prepare(build, commit, timestamp(created_at))
         .unwrap_or_else(|error| panic!("release fixture must prepare: {error}"))
+}
+
+#[cfg(unix)]
+fn retention_intent_bytes(release: &Path, release_id: &str, commit: &str) -> Vec<u8> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut bytes = b"agent-knowledge-release-retention-intent-v1\0".to_vec();
+    bytes.extend_from_slice(release_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(commit.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(b"agent-knowledge-release-cleanup-intent-v2\0");
+    bytes.extend_from_slice(
+        &fs::metadata(release)
+            .unwrap_or_else(|error| panic!("release inode must be readable: {error}"))
+            .ino()
+            .to_le_bytes(),
+    );
+    bytes
 }
 
 #[test]
@@ -195,7 +214,13 @@ fn retention_orders_releases_by_precise_creation_time() {
     let store = ReleaseStore::open(&releases, ReleasePolicy::default())
         .unwrap_or_else(|error| panic!("release store must open: {error}"));
     let older = prepare_release(&store, FIRST_BATCH, HIGH_COMMIT, "2026-07-31T04:00:00.100Z");
-    let newer = prepare_release(&store, SECOND_BATCH, LOW_COMMIT, "2026-07-31T04:00:00.900Z");
+    let middle = prepare_release(
+        &store,
+        SECOND_BATCH,
+        SECOND_COMMIT,
+        "2026-07-31T04:00:00.500Z",
+    );
+    let newer = prepare_release(&store, THIRD_BATCH, LOW_COMMIT, "2026-07-31T04:00:00.900Z");
     store
         .activate(&newer)
         .unwrap_or_else(|error| panic!("newer release must activate: {error}"));
@@ -210,6 +235,7 @@ fn retention_orders_releases_by_precise_creation_time() {
         .unwrap_or_else(|error| panic!("retention must succeed: {error}"));
 
     assert_eq!(outcome.removed_release_ids(), &[older.release_id()]);
+    assert!(releases.join("by-id").join(middle.release_id()).is_dir());
     assert!(releases.join("by-id").join(newer.release_id()).is_dir());
 }
 
@@ -267,6 +293,88 @@ fn retention_rejects_an_unauthorized_private_tombstone() {
         Err(ReleaseError::InvalidRetentionIntent)
     ));
     assert!(tombstone.join("sentinel.txt").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn retention_reconciles_an_intent_left_before_the_tombstone_rename() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let release = prepare_release(&store, FIRST_BATCH, FIRST_COMMIT, "2026-07-31T04:00:00Z");
+    let release_path = releases.join("by-id").join(release.release_id());
+    let intent = releases
+        .join("cleanup-intent")
+        .join(format!("retention-{}", release.release_id()));
+    fs::write(
+        &intent,
+        retention_intent_bytes(&release_path, release.release_id(), FIRST_COMMIT),
+    )
+    .unwrap_or_else(|error| panic!("interrupted retention intent must be written: {error}"));
+
+    store
+        .retain_releases_until(ReleaseRetentionPolicy::default(), true, None)
+        .unwrap_or_else(|error| panic!("dry run must validate the interrupted intent: {error}"));
+    assert!(intent.is_file());
+    store
+        .retain_releases_until(ReleaseRetentionPolicy::default(), false, None)
+        .unwrap_or_else(|error| panic!("retention must reconcile the interrupted intent: {error}"));
+
+    assert!(!intent.exists());
+    assert!(release_path.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn retention_finalizes_an_empty_tombstone_after_intent_removal() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let release = prepare_release(&store, FIRST_BATCH, FIRST_COMMIT, "2026-07-31T04:00:00Z");
+    let release_path = releases.join("by-id").join(release.release_id());
+    let tombstone = releases
+        .join(".staging")
+        .join(format!(".retention-{}", release.release_id()));
+    let intent = releases
+        .join("cleanup-intent")
+        .join(format!("retention-{}", release.release_id()));
+    fs::write(
+        &intent,
+        retention_intent_bytes(&release_path, release.release_id(), FIRST_COMMIT),
+    )
+    .unwrap_or_else(|error| panic!("retention intent must be written: {error}"));
+    fs::rename(&release_path, &tombstone)
+        .unwrap_or_else(|error| panic!("release must move to its tombstone: {error}"));
+    fs::remove_file(releases.join("by-commit").join(FIRST_COMMIT))
+        .unwrap_or_else(|error| panic!("retired commit reference must be removed: {error}"));
+    for entry in fs::read_dir(&tombstone)
+        .unwrap_or_else(|error| panic!("tombstone must be readable: {error}"))
+    {
+        let entry =
+            entry.unwrap_or_else(|error| panic!("tombstone entry must be readable: {error}"));
+        if entry
+            .file_type()
+            .unwrap_or_else(|error| panic!("tombstone entry type must be readable: {error}"))
+            .is_dir()
+        {
+            fs::remove_dir_all(entry.path())
+                .unwrap_or_else(|error| panic!("tombstone subtree must be removed: {error}"));
+        } else {
+            fs::remove_file(entry.path())
+                .unwrap_or_else(|error| panic!("tombstone file must be removed: {error}"));
+        }
+    }
+    fs::remove_file(&intent)
+        .unwrap_or_else(|error| panic!("retention intent must be removed: {error}"));
+
+    let outcome = store
+        .retain_releases_until(ReleaseRetentionPolicy::default(), false, None)
+        .unwrap_or_else(|error| panic!("retention must finalize the empty tombstone: {error}"));
+
+    assert_eq!(outcome.removed_release_ids(), &[release.release_id()]);
+    assert!(!tombstone.exists());
 }
 
 #[test]

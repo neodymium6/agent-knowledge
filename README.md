@@ -154,7 +154,9 @@ durable intent and atomically moves each selected derived tree into a private
 tombstone before descriptor-relative deletion. Large trees may report
 `cleanup_pending_release_ids` and complete on a later invocation. Canonical
 content, Git history, accepted requests, and the active release are never
-removed.
+removed. Interrupted intents are reconciled during the next bounded pass, and
+the scan retains only lightweight metadata rather than one open descriptor per
+release.
 
 Submit a validated request package through an SSH host alias:
 
