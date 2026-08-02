@@ -101,6 +101,10 @@ if grep -Eq '(^|/)\.wh\.' "$normalized_layer_contents"; then
   echo "container image must not contain whiteout entries" >&2
   exit 1
 fi
+if grep -Eq '(^-|(^|/)\.\.?(/|$))' "$normalized_layer_contents"; then
+  echo "container image contains an unsafe layer path" >&2
+  exit 1
+fi
 
 entrypoint_path=${expected_entrypoint#/}
 ca_bundle_path=${expected_ca_bundle#/}
@@ -144,6 +148,16 @@ validate_immutable_metadata() {
   fi
 }
 
+validate_normalized_path() {
+  local target_path=$1
+
+  if [[ -z $target_path || $target_path == -* ]] ||
+    grep -Eq '(^|/)\.\.?(/|$)' <<<"$target_path"; then
+    echo "container image contains an unsafe link target: ${target_path}" >&2
+    return 1
+  fi
+}
+
 extract_image_file() {
   local target_path=$1
   local destination=$2
@@ -162,17 +176,21 @@ extract_image_file() {
       normalized=${normalized#/}
       normalized=${normalized%/}
       if [[ $normalized == "$target_path" ]]; then
-        listing=$(tar --absolute-names --numeric-owner -tvf \
-          "$work_directory/$layer_path" "$member")
+        listing=$(tar --absolute-names --numeric-owner -t -v \
+          -f "$work_directory/$layer_path" -- "$member")
         validate_immutable_metadata "$listing" "$target_path"
         case ${listing:0:1} in
           -)
+            if [[ ${listing:7:1} != r ]]; then
+              echo "container image path is not readable by the Worker: ${target_path}" >&2
+              return 1
+            fi
             if [[ $requirement == executable && ${listing:9:1} != x ]]; then
               echo "container image entrypoint is not executable: ${target_path}" >&2
               return 1
             fi
-            tar --absolute-names -xOf \
-              "$work_directory/$layer_path" "$member" >"$destination"
+            tar --absolute-names -x -O \
+              -f "$work_directory/$layer_path" -- "$member" >"$destination"
             return 0
             ;;
           l)
@@ -182,6 +200,7 @@ extract_image_file() {
               return 1
             fi
             link_target=${link_target#/}
+            validate_normalized_path "$link_target"
             extract_image_file \
               "$link_target" "$destination" "$requirement" "$((depth + 1))"
             return
@@ -214,11 +233,15 @@ validate_image_directory() {
       normalized=${normalized#/}
       normalized=${normalized%/}
       if [[ $normalized == "$target_path" ]]; then
-        listing=$(tar --absolute-names --numeric-owner -tvf \
-          "$work_directory/$layer_path" "$member")
+        listing=$(tar --absolute-names --numeric-owner -t -v \
+          -f "$work_directory/$layer_path" -- "$member")
         validate_immutable_metadata "$listing" "$target_path"
         case ${listing:0:1} in
           d)
+            if [[ ${listing:9:1} != x ]]; then
+              echo "container image working directory is not traversable: ${target_path}" >&2
+              return 1
+            fi
             return 0
             ;;
           l)
@@ -228,6 +251,7 @@ validate_image_directory() {
               return 1
             fi
             link_target=${link_target#/}
+            validate_normalized_path "$link_target"
             validate_image_directory "$link_target" "$((depth + 1))"
             return
             ;;
