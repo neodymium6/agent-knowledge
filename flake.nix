@@ -125,8 +125,8 @@
               "run"
             ];
             Env = [
-              "GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
               "HOME=/var/lib/agent-knowledge"
+              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
             ];
             StopSignal = "SIGTERM";
             Labels = {

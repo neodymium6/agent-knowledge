@@ -62,8 +62,8 @@ jq -e \
     .config.Entrypoint == [$entrypoint, "worker", "run"] and
     .config.Cmd == null and
     .config.Env == [
-      $ca_bundle,
-      "HOME=/var/lib/agent-knowledge"
+      "HOME=/var/lib/agent-knowledge",
+      $ca_bundle
     ] and
     .config.StopSignal == "SIGTERM" and
     .config.Labels == {
@@ -71,7 +71,7 @@ jq -e \
       "org.opencontainers.image.title": "Agent Knowledge Worker",
       "org.opencontainers.image.version": $version
     }
-  ' --arg ca_bundle "GIT_SSL_CAINFO=$expected_ca_bundle" <<<"$config" >/dev/null
+  ' --arg ca_bundle "SSL_CERT_FILE=$expected_ca_bundle" <<<"$config" >/dev/null
 
 layer_paths=$(jq -er '
   if length == 1 and
@@ -116,12 +116,33 @@ for required_path in \
   fi
 done
 
-for unique_path in etc/passwd etc/group "$entrypoint_path" "$ca_bundle_path"; do
+for unique_path in \
+  etc/passwd \
+  etc/group \
+  var/lib/agent-knowledge \
+  "$entrypoint_path" \
+  "$ca_bundle_path"; do
   if [[ $(grep -Fxc "$unique_path" "$normalized_layer_contents") -ne 1 ]]; then
     echo "container image path must occur in exactly one layer: ${unique_path}" >&2
     exit 1
   fi
 done
+
+validate_immutable_metadata() {
+  local listing=$1
+  local target_path=$2
+  local mode owner remainder
+
+  read -r mode owner remainder <<<"$listing"
+  if [[ $owner != 0/0 ]]; then
+    echo "container image path is not root-owned: ${target_path}" >&2
+    return 1
+  fi
+  if [[ ${mode:0:1} != l && (${mode:5:1} == w || ${mode:8:1} == w) ]]; then
+    echo "container image path is writable by a non-root identity: ${target_path}" >&2
+    return 1
+  fi
+}
 
 extract_image_file() {
   local target_path=$1
@@ -141,7 +162,9 @@ extract_image_file() {
       normalized=${normalized#/}
       normalized=${normalized%/}
       if [[ $normalized == "$target_path" ]]; then
-        listing=$(tar --absolute-names -tvf "$work_directory/$layer_path" "$member")
+        listing=$(tar --absolute-names --numeric-owner -tvf \
+          "$work_directory/$layer_path" "$member")
+        validate_immutable_metadata "$listing" "$target_path"
         case ${listing:0:1} in
           -)
             if [[ $requirement == executable && ${listing:9:1} != x ]]; then
@@ -175,10 +198,56 @@ extract_image_file() {
   return 1
 }
 
+validate_image_directory() {
+  local target_path=$1
+  local depth=${2:-0}
+  local layer_path member normalized listing link_target
+
+  if [[ $depth -gt 4 ]]; then
+    echo "container image directory link chain is too deep: ${target_path}" >&2
+    return 1
+  fi
+
+  while IFS= read -r layer_path; do
+    while IFS= read -r member; do
+      normalized=${member#./}
+      normalized=${normalized#/}
+      normalized=${normalized%/}
+      if [[ $normalized == "$target_path" ]]; then
+        listing=$(tar --absolute-names --numeric-owner -tvf \
+          "$work_directory/$layer_path" "$member")
+        validate_immutable_metadata "$listing" "$target_path"
+        case ${listing:0:1} in
+          d)
+            return 0
+            ;;
+          l)
+            link_target=${listing##* -> }
+            if [[ $link_target != /* ]]; then
+              echo "container image contains a relative directory link: ${target_path}" >&2
+              return 1
+            fi
+            link_target=${link_target#/}
+            validate_image_directory "$link_target" "$((depth + 1))"
+            return
+            ;;
+          *)
+            echo "container image working directory is not a directory: ${target_path}" >&2
+            return 1
+            ;;
+        esac
+      fi
+    done < <(tar --absolute-names -tf "$work_directory/$layer_path")
+  done <<<"$layer_paths"
+
+  return 1
+}
+
 extract_image_file etc/passwd "$work_directory/passwd"
 extract_image_file etc/group "$work_directory/group"
 extract_image_file "$entrypoint_path" "$work_directory/entrypoint" executable
 extract_image_file "$ca_bundle_path" "$work_directory/ca-bundle"
+validate_image_directory var/lib/agent-knowledge
 if ! cmp -s "$expected_passwd" "$work_directory/passwd"; then
   echo "container passwd database does not match the packaged identities" >&2
   exit 1
