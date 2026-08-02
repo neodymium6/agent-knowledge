@@ -133,6 +133,13 @@ fn initialize_committed_content(root: &TestDirectory) {
         b"{\"fictional\":true}\n",
     )
     .unwrap_or_else(|error| panic!("attachment fixture must be written: {error}"));
+    fs::create_dir_all(seed.join("projects/fictional-project/assets"))
+        .unwrap_or_else(|error| panic!("shared asset directory must be created: {error}"));
+    fs::write(
+        seed.join("projects/fictional-project/assets/shared.json"),
+        b"{\"shared\":true}\n",
+    )
+    .unwrap_or_else(|error| panic!("shared asset fixture must be written: {error}"));
     run_git(Some(&seed), &["add", "."]);
     run_git(
         Some(&seed),

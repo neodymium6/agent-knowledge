@@ -671,8 +671,7 @@ akp-v1 search
 
 The Gateway parses this string itself. It never evaluates it as a shell
 command. The current implementation accepts `submit`, `status`, `list`,
-`recent`, `get`, and `search`. The `export` name remains reserved in the
-version-one namespace for a later delivery increment.
+`recent`, `get`, `export`, and `search`.
 
 The current client invokes the equivalent of:
 
@@ -1361,14 +1360,15 @@ operations include:
 - request-status lookup.
 
 The current delivery implements directory-ordered listing, recent documents,
-document lookup with exact Markdown retrieval, project/tag/session filtering,
-full-text search, and durable request-status lookup. Status observes only the
+document lookup with exact Markdown retrieval, deterministic document-bundle
+export, project/tag/session filtering, full-text search, and durable
+request-status lookup. Status observes only the
 existing `pending`, `processing`, `completed`, and `failed` queue entries. It
 does not take queue locks, initialize storage, or open the repository and
 content checkout. Failed responses include the durable error code and failure
-time; an unknown request ID returns `REQUEST_NOT_FOUND`. Document-bundle export
-remains a separate follow-up increment because it crosses the attachment
-streaming boundary.
+time; an unknown request ID returns `REQUEST_NOT_FOUND`. Bundle exports contain
+`index.md` first, followed by colocated attachments in deterministic name
+order. Project-shared assets are outside a selected document bundle.
 
 Each content read pins the official commit at operation start. Pending and
 processing data is visible only through status operations, never through

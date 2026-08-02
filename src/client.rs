@@ -7,10 +7,14 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_knowledge_core::{PinnedDirectory, PinnedPathError, RequestId, Revision};
+use agent_knowledge_core::{
+    AttachmentName, DocumentId, PinnedDirectory, PinnedPathError, RequestId, Revision,
+    decode_document_metadata,
+};
 use agent_knowledge_protocol::{
-    CURRENT_GATEWAY_PROTOCOL_VERSION, GET_COMMAND, GetRequest, GetResponse, ProtocolErrorResponse,
-    STATUS_COMMAND, SUBMIT_COMMAND, StatusRequest, StatusResponse, SubmitOutcome, SubmitResponse,
+    CURRENT_GATEWAY_PROTOCOL_VERSION, EXPORT_COMMAND, ExportRequest, GET_COMMAND, GetRequest,
+    GetResponse, ProtocolErrorResponse, STATUS_COMMAND, SUBMIT_COMMAND, StatusRequest,
+    StatusResponse, SubmitOutcome, SubmitResponse,
 };
 use agent_knowledge_queue::{
     PackagePolicy, PackageValidationError, PayloadMetadata, ValidatedPackage, validate_package,
@@ -87,6 +91,22 @@ pub(crate) fn get(
     output: impl Write,
 ) -> Result<(), ClientCommandError> {
     get_with_program(
+        OsStr::new(SSH_PROGRAM),
+        destination,
+        request,
+        timeout,
+        output,
+        io::stderr(),
+    )
+}
+
+pub(crate) fn export(
+    destination: &OsStr,
+    request: &ExportRequest,
+    timeout: Duration,
+    output: impl Write,
+) -> Result<(), ClientCommandError> {
+    export_with_program(
         OsStr::new(SSH_PROGRAM),
         destination,
         request,
@@ -181,6 +201,30 @@ where
     Request: Serialize,
     Response: DeserializeOwned + Serialize,
 {
+    let (response, diagnostic) =
+        execute_control_with_program(program, destination, operation, request, timeout)?;
+    let protocol_version =
+        decode_protocol_version(&response).map_err(ClientCommandError::InvalidResponse)?;
+    require_current_protocol(protocol_version)?;
+    let response: Response =
+        serde_json::from_slice(&response).map_err(ClientCommandError::InvalidResponse)?;
+    diagnostic_output
+        .write_all(&diagnostic)
+        .map_err(ClientCommandError::DiagnosticOutput)?;
+    serde_json::to_writer(&mut output, &response).map_err(ClientCommandError::EncodeResponse)?;
+    output.write_all(b"\n").map_err(ClientCommandError::Output)
+}
+
+fn execute_control_with_program<Request>(
+    program: &OsStr,
+    destination: &OsStr,
+    operation: ControlOperation<'_>,
+    request: &Request,
+    timeout: Duration,
+) -> Result<(Vec<u8>, Vec<u8>), ClientCommandError>
+where
+    Request: Serialize,
+{
     if destination.is_empty() {
         return Err(ClientCommandError::EmptyDestination);
     }
@@ -260,16 +304,125 @@ where
         return Err(ClientCommandError::SshFailed { status, diagnostic });
     }
     input_result?;
-    let protocol_version =
-        decode_protocol_version(&response).map_err(ClientCommandError::InvalidResponse)?;
-    require_current_protocol(protocol_version)?;
-    let response: Response =
-        serde_json::from_slice(&response).map_err(ClientCommandError::InvalidResponse)?;
+    Ok((response, diagnostic))
+}
+
+fn export_with_program(
+    program: &OsStr,
+    destination: &OsStr,
+    request: &ExportRequest,
+    timeout: Duration,
+    mut output: impl Write,
+    mut diagnostic_output: impl Write,
+) -> Result<(), ClientCommandError> {
+    let (archive, diagnostic) = execute_control_with_program(
+        program,
+        destination,
+        ControlOperation::new(EXPORT_COMMAND, MAXIMUM_CONTROL_RESPONSE_BYTES),
+        request,
+        timeout,
+    )?;
+    validate_export_archive(&archive, request.document_id)?;
     diagnostic_output
         .write_all(&diagnostic)
         .map_err(ClientCommandError::DiagnosticOutput)?;
-    serde_json::to_writer(&mut output, &response).map_err(ClientCommandError::EncodeResponse)?;
-    output.write_all(b"\n").map_err(ClientCommandError::Output)
+    output
+        .write_all(&archive)
+        .map_err(ClientCommandError::Output)
+}
+
+fn validate_export_archive(
+    archive: &[u8],
+    expected_document_id: DocumentId,
+) -> Result<(), ClientCommandError> {
+    let policy = PackagePolicy::default();
+    let limits = policy.limits();
+    let mut reader = tar::Archive::new(archive);
+    let entries = reader
+        .entries()
+        .map_err(ClientCommandError::InvalidExportArchive)?;
+    let mut names = std::collections::HashSet::new();
+    let mut total_bytes = 0_u64;
+    let mut document_id = None;
+    for (index, entry) in entries.enumerate() {
+        if index >= limits.maximum_file_count {
+            return Err(ClientCommandError::InvalidExportArchive(io::Error::other(
+                "document bundle has too many entries",
+            )));
+        }
+        let mut entry = entry.map_err(ClientCommandError::InvalidExportArchive)?;
+        if entry.header().entry_type() != EntryType::Regular {
+            return Err(ClientCommandError::InvalidExportArchive(io::Error::other(
+                "document bundle contains a non-regular entry",
+            )));
+        }
+        let path = entry
+            .path()
+            .map_err(ClientCommandError::InvalidExportArchive)?
+            .into_owned();
+        if path.components().count() != 1 || !names.insert(path.clone()) {
+            return Err(ClientCommandError::InvalidExportArchive(io::Error::other(
+                "document bundle contains an invalid or duplicate path",
+            )));
+        }
+        let size = entry.size();
+        if size > limits.maximum_file_bytes {
+            return Err(ClientCommandError::InvalidExportArchive(io::Error::other(
+                "document bundle entry exceeds the file limit",
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(size)
+            .filter(|total| *total <= limits.maximum_total_bytes)
+            .ok_or_else(|| {
+                ClientCommandError::InvalidExportArchive(io::Error::other(
+                    "document bundle exceeds the byte limit",
+                ))
+            })?;
+        if index == 0 && path != Path::new("index.md") {
+            return Err(ClientCommandError::InvalidExportArchive(io::Error::other(
+                "document bundle must begin with index.md",
+            )));
+        }
+        if path != Path::new("index.md") {
+            let valid_name = path
+                .to_str()
+                .is_some_and(|name| name.parse::<AttachmentName>().is_ok())
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| policy.allows_attachment_name(name));
+            if !valid_name {
+                return Err(ClientCommandError::InvalidExportArchive(io::Error::other(
+                    "document bundle contains an unsupported attachment name",
+                )));
+            }
+            let copied = io::copy(&mut entry, &mut io::sink())
+                .map_err(ClientCommandError::InvalidExportArchive)?;
+            if copied != size {
+                return Err(ClientCommandError::InvalidExportArchive(io::Error::other(
+                    "document bundle entry is truncated",
+                )));
+            }
+            continue;
+        }
+        let mut markdown = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+        entry
+            .read_to_end(&mut markdown)
+            .map_err(ClientCommandError::InvalidExportArchive)?;
+        if markdown.len() as u64 != size {
+            return Err(ClientCommandError::InvalidExportArchive(io::Error::other(
+                "document bundle index is truncated",
+            )));
+        }
+        let metadata = decode_document_metadata(&markdown, limits.maximum_front_matter_bytes)
+            .map_err(|error| ClientCommandError::InvalidExportArchive(io::Error::other(error)))?;
+        document_id = Some(metadata.document_id);
+    }
+    if document_id != Some(expected_document_id) {
+        return Err(ClientCommandError::ExportDocumentMismatch);
+    }
+    Ok(())
 }
 
 fn configure_ssh_command(command: &mut Command, destination: &OsStr, remote_command: &str) {
@@ -800,6 +953,8 @@ pub(crate) enum ClientCommandError {
     },
     ResponseMismatch,
     DocumentResponseMismatch,
+    InvalidExportArchive(io::Error),
+    ExportDocumentMismatch,
     RequestStatusResponseMismatch,
     DiagnosticOutput(io::Error),
     EncodeResponse(serde_json::Error),
@@ -929,6 +1084,12 @@ impl fmt::Display for ClientCommandError {
             Self::DocumentResponseMismatch => {
                 formatter.write_str("Gateway response document ID does not match the request")
             }
+            Self::InvalidExportArchive(error) => {
+                write!(formatter, "Gateway export archive is invalid: {error}")
+            }
+            Self::ExportDocumentMismatch => {
+                formatter.write_str("Gateway export document ID does not match the request")
+            }
             Self::RequestStatusResponseMismatch => {
                 formatter.write_str("Gateway status response request ID does not match the request")
             }
@@ -957,6 +1118,7 @@ impl std::error::Error for ClientCommandError {
             | Self::WriteControlRequest(source)
             | Self::ReadResponse(source)
             | Self::ReadDiagnostic(source)
+            | Self::InvalidExportArchive(source)
             | Self::WaitForSsh(source)
             | Self::DiagnosticOutput(source)
             | Self::Output(source) => Some(source),
@@ -978,6 +1140,7 @@ impl std::error::Error for ClientCommandError {
             | Self::SshFailed { .. }
             | Self::GatewayRejected(_)
             | Self::UnsupportedProtocolVersion { .. }
+            | Self::ExportDocumentMismatch
             | Self::ResponseMismatch
             | Self::DocumentResponseMismatch
             | Self::RequestStatusResponseMismatch => None,

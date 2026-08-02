@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_knowledge_protocol::{
-    GetRequest, LIST_COMMAND, ListRequest, ListResponse, RECENT_COMMAND, ReadFilterRequest,
-    SEARCH_COMMAND, SearchRequest, StatusRequest,
+    ExportRequest, GetRequest, LIST_COMMAND, ListRequest, ListResponse, RECENT_COMMAND,
+    ReadFilterRequest, SEARCH_COMMAND, SearchRequest, StatusRequest,
 };
 use agent_knowledge_queue::{
     EnqueueOutcome, FileQueue, PackagePolicy, PackageValidationError, QueueError, validate_package,
@@ -27,6 +27,7 @@ const USAGE: &str = "usage:\n\
     agent-knowledge client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge client recent --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge client get --destination <ssh-destination> --document-id <id> [--timeout-seconds <seconds>]\n\
+    agent-knowledge client export --destination <ssh-destination> --document-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge client status --destination <ssh-destination> --request-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge client search --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge gateway --config <path> --client-id <id>\n\
@@ -94,6 +95,11 @@ where
             request,
             timeout,
         } => client::get(&destination, &request, timeout, output).map_err(CliError::Client),
+        Command::ClientExport {
+            destination,
+            request,
+            timeout,
+        } => client::export(&destination, &request, timeout, output).map_err(CliError::Client),
         Command::ClientSearch {
             destination,
             request,
@@ -152,6 +158,11 @@ enum Command {
         request: GetRequest,
         timeout: Duration,
     },
+    ClientExport {
+        destination: OsString,
+        request: ExportRequest,
+        timeout: Duration,
+    },
     ClientSearch {
         destination: OsString,
         request: SearchRequest,
@@ -193,7 +204,13 @@ where
             if namespace == std::ffi::OsStr::new("client")
                 && action == std::ffi::OsStr::new("get") =>
         {
-            parse_client_get_arguments(arguments)
+            parse_client_document_arguments(arguments, false)
+        }
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("client")
+                && action == std::ffi::OsStr::new("export") =>
+        {
+            parse_client_document_arguments(arguments, true)
         }
         (Some(namespace), Some(action))
             if namespace == std::ffi::OsStr::new("client")
@@ -378,7 +395,7 @@ where
     })
 }
 
-fn parse_client_get_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+fn parse_client_document_arguments<I>(mut arguments: I, export: bool) -> Result<Command, CliError>
 where
     I: Iterator<Item = OsString>,
 {
@@ -403,11 +420,22 @@ where
             _ => return Err(CliError::Usage),
         }
     }
-    Ok(Command::ClientGet {
-        destination: destination.ok_or(CliError::Usage)?,
-        request: GetRequest::new(document_id.ok_or(CliError::Usage)?),
-        timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECONDS)),
-    })
+    let destination = destination.ok_or(CliError::Usage)?;
+    let document_id = document_id.ok_or(CliError::Usage)?;
+    let timeout = Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECONDS));
+    if export {
+        Ok(Command::ClientExport {
+            destination,
+            request: ExportRequest::new(document_id),
+            timeout,
+        })
+    } else {
+        Ok(Command::ClientGet {
+            destination,
+            request: GetRequest::new(document_id),
+            timeout,
+        })
+    }
 }
 
 fn parse_client_status_arguments<I>(mut arguments: I) -> Result<Command, CliError>

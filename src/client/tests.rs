@@ -7,16 +7,17 @@ use std::time::{Duration, Instant};
 
 use agent_knowledge_core::PinnedDirectory;
 use agent_knowledge_protocol::{
-    GetRequest, LIST_COMMAND, ListRequest, ListResponse, ProtocolErrorResponse, ReadFilterRequest,
-    StatusRequest, SubmitResponse,
+    ExportRequest, GetRequest, LIST_COMMAND, ListRequest, ListResponse, ProtocolErrorResponse,
+    ReadFilterRequest, StatusRequest, SubmitResponse,
 };
 use agent_knowledge_queue::{PackagePolicy, validate_package};
 use tar::Archive;
 
 use super::{
     ClientCommandError, ControlOperation, MAXIMUM_CONTROL_RESPONSE_BYTES, MAXIMUM_RESPONSE_BYTES,
-    PreparedPackage, control_with_program, decode_protocol_version, get_with_program, open_payload,
-    read_bounded_diagnostic, read_bounded_response, status_with_program, submit_with_program,
+    PreparedPackage, control_with_program, decode_protocol_version, export_with_program,
+    get_with_program, open_payload, read_bounded_diagnostic, read_bounded_response,
+    status_with_program, submit_with_program,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -215,6 +216,102 @@ fn sends_typed_control_json_and_validates_the_response() {
     .unwrap_or_else(|error| panic!("control request must decode: {error}"));
     assert_eq!(sent, request);
     assert_eq!(String::from_utf8_lossy(&output), format!("{response}\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn exports_a_validated_document_bundle_without_a_shell() {
+    let root = TestDirectory::create();
+    let document_id = "01K00000000000000000000001"
+        .parse()
+        .unwrap_or_else(|error| panic!("document ID fixture must parse: {error}"));
+    let archive_path = root.path().join("bundle.tar");
+    let request_path = root.path().join("export-request.json");
+    let archive = export_archive("01K00000000000000000000001");
+    fs::write(&archive_path, &archive)
+        .unwrap_or_else(|error| panic!("export fixture must be written: {error}"));
+    let program = root.path().join("fictional-export-ssh");
+    let script = format!(
+        "#!/bin/sh\nset -eu\ncat > '{}'\ncat '{}'\n",
+        request_path.display(),
+        archive_path.display(),
+    );
+    write_program(&program, &script);
+
+    let mut output = Vec::new();
+    export_with_program(
+        program.as_os_str(),
+        OsStr::new("fictional-alias"),
+        &ExportRequest::new(document_id),
+        Duration::from_secs(5),
+        &mut output,
+        Vec::new(),
+    )
+    .unwrap_or_else(|error| panic!("client export must succeed: {error}"));
+    assert_eq!(output, archive);
+    let sent: ExportRequest = serde_json::from_slice(
+        &fs::read(request_path)
+            .unwrap_or_else(|error| panic!("export request must be readable: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("export request must decode: {error}"));
+    assert_eq!(sent, ExportRequest::new(document_id));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_an_export_for_a_different_document() {
+    let root = TestDirectory::create();
+    let requested = "01K00000000000000000000001"
+        .parse()
+        .unwrap_or_else(|error| panic!("document ID fixture must parse: {error}"));
+    let archive_path = root.path().join("mismatched-bundle.tar");
+    fs::write(&archive_path, export_archive("01K00000000000000000000009"))
+        .unwrap_or_else(|error| panic!("export fixture must be written: {error}"));
+    let program = root.path().join("fictional-mismatched-export-ssh");
+    write_program(
+        &program,
+        &format!(
+            "#!/bin/sh\nset -eu\ncat > /dev/null\ncat '{}'\n",
+            archive_path.display()
+        ),
+    );
+    assert!(matches!(
+        export_with_program(
+            program.as_os_str(),
+            OsStr::new("fictional-alias"),
+            &ExportRequest::new(requested),
+            Duration::from_secs(5),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(ClientCommandError::ExportDocumentMismatch)
+    ));
+}
+
+fn export_archive(document_id: &str) -> Vec<u8> {
+    let markdown = format!(
+        "---\nschema_version: 1\ndocument_id: {document_id}\ntitle: Fictional export\ncreated: 2026-07-31T03:50:00Z\nrequest_id: 01K00000000000000000000000\nstatus: active\n---\nFictional export body.\n"
+    );
+    let mut builder = tar::Builder::new(Vec::new());
+    for (path, bytes) in [
+        ("index.md", markdown.as_bytes()),
+        ("result.json", b"{\"fictional\":true}\n".as_slice()),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, bytes)
+            .unwrap_or_else(|error| panic!("export entry must append: {error}"));
+    }
+    builder
+        .into_inner()
+        .unwrap_or_else(|error| panic!("export archive must finish: {error}"))
 }
 
 #[cfg(unix)]
