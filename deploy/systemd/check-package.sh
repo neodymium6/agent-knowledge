@@ -82,7 +82,7 @@ if grep -Fq '/bin/sh' "$sysusers"; then
   echo "Worker account must not have a login shell" >&2
   exit 1
 fi
-test "$(grep -Ec '^d /var/lib/agent-knowledge 0711 root root -$' "$tmpfiles")" -eq 1
+test "$(grep -Ec '^d /var/lib/agent-knowledge 0751 root agent-knowledge-queue -$' "$tmpfiles")" -eq 1
 test "$(grep -Ec '^d /var/lib/agent-knowledge/queue 2770 agent-knowledge-queue agent-knowledge-queue -$' "$tmpfiles")" -eq 1
 test "$(grep -Ec '^d /var/lib/agent-knowledge/queue/(\.locks|incoming|quarantine|worker-tmp|pending|processing|completed|failed) 2770 agent-knowledge-queue agent-knowledge-queue -$' "$tmpfiles")" -eq 8
 test "$(grep -Ec '^z /var/lib/agent-knowledge/queue(/(\.locks|incoming|quarantine|worker-tmp|pending|processing|completed|failed))? 2770 - - -$' "$tmpfiles")" -eq 9

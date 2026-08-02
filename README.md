@@ -113,7 +113,10 @@ the host's authentication policy and add only that account to the
 socket and read committed repository/content storage; it cannot open the
 durable queue. The broker owns the queue but cannot open Worker-owned storage.
 The Worker receives the queue group as a supplementary group so it can perform
-state transitions without sharing either service UID.
+state transitions without sharing either service UID. The durable storage root
+is `0751 root:agent-knowledge-queue`: the broker and Worker can open it for
+directory durability syncs, while the Gateway can only traverse to its known
+read-only repository and content paths.
 
 The dedicated system profile keeps the package output live across Nix garbage
 collection. The unit allows writes only below `/var/lib/agent-knowledge`, uses

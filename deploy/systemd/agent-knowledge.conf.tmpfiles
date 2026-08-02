@@ -1,4 +1,4 @@
-d /var/lib/agent-knowledge 0711 root root -
+d /var/lib/agent-knowledge 0751 root agent-knowledge-queue -
 d /var/lib/agent-knowledge/queue 2770 agent-knowledge-queue agent-knowledge-queue -
 d /var/lib/agent-knowledge/queue/.locks 2770 agent-knowledge-queue agent-knowledge-queue -
 d /var/lib/agent-knowledge/queue/incoming 2770 agent-knowledge-queue agent-knowledge-queue -

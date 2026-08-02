@@ -33,12 +33,15 @@ fresh_root=$test_root/fresh-root
 fresh_config=$test_root/fresh-tmpfiles.conf
 install -d -m 0755 "$fresh_root"
 sed \
+  -e "s/ root agent-knowledge-queue / 0 $queue_gid /g" \
   -e "s/ agent-knowledge-queue agent-knowledge-queue / $queue_uid $queue_gid /g" \
   -e "s/ agent-knowledge agent-knowledge-gateway / $worker_uid $gateway_gid /g" \
   -e "s/ agent-knowledge agent-knowledge / $worker_uid $worker_gid /g" \
   -e "s/ agent-knowledge-queue agent-knowledge-gateway / $queue_uid $gateway_gid /g" \
   "$tmpfiles_config" >"$fresh_config"
 systemd-tmpfiles --create --root="$fresh_root" "$fresh_config"
+test "$(stat -c '%u:%g:%a' "$fresh_root/var/lib/agent-knowledge")" = \
+  "0:$queue_gid:751"
 test "$(stat -c '%u:%g:%a' "$fresh_root/var/lib/agent-knowledge/queue")" = \
   "$queue_uid:$queue_gid:2770"
 test "$(stat -c '%u:%g:%a' "$fresh_root/var/lib/agent-knowledge/repository")" = \
@@ -48,7 +51,7 @@ setpriv --reuid="$worker_uid" --regid="$worker_gid" --groups="$queue_gid" \
 test "$(stat -c '%g' "$fresh_root/var/lib/agent-knowledge/queue/pending/fresh-sidecar.fixture")" = \
   "$queue_gid"
 
-install -d -m 0711 "$test_root/storage"
+install -d -m 0750 -o 0 -g "$worker_gid" "$test_root/storage"
 install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
   "$test_root/storage/queue" "$test_root/storage/repository" \
   "$test_root/storage/content"
@@ -125,11 +128,21 @@ install -m 0640 -o "$worker_uid" -g "$worker_gid" \
   --queue-group "$queue_gid" \
   --gateway-group "$gateway_gid" >"$test_root/migration.json"
 grep -Fq '"status":"completed"' "$test_root/migration.json"
+chown 0:"$queue_gid" "$test_root/storage"
+chmod 0751 "$test_root/storage"
+test "$(stat -c '%u:%g:%a' "$test_root/storage")" = "0:$queue_gid:751"
 test "$(stat -c '%u:%g:%a' "$test_root/storage/queue")" = "$queue_uid:$queue_gid:2770"
 test "$(stat -c '%g' "$test_root/storage/queue/queue-id")" = "$queue_gid"
 test "$(stat -c '%g:%a' "$test_root/storage/repository")" = "$gateway_gid:2750"
 test "$(stat -c '%g:%a' "$test_root/storage/content")" = "$gateway_gid:2750"
 test "$(stat -c '%g' "$test_root/storage/content/projects/fictional-project/experiments/fictional-run/index.md")" = "$gateway_gid"
+setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
+  test -r "$test_root/storage"
+if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
+  test -r "$test_root/storage"; then
+  echo "Gateway identity can list the durable storage root" >&2
+  exit 1
+fi
 
 tar --format=gnu --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
   -C "$test_root/package" -cf "$test_root/request.tar" request.json payload
