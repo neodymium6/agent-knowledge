@@ -67,5 +67,5 @@ jobs:
         with:
           determinate: false
 
-      - name: Build production package and validate systemd integration
+      - name: Validate package, systemd integration, and container image
         run: nix develop --command just check-package

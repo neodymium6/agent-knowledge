@@ -19,8 +19,9 @@ asynchronously with durable retry state. Derived-release retention and
 document-bundle export are implemented. The flake provides reproducible Linux
 packaging, a conventional systemd Worker service, and a systemd-activated local
 queue-ingress broker that isolates the forced-command Gateway from durable queue
-access under distinct service identities. Container and Kubernetes packaging
-remain future work.
+access under distinct service identities. Reproducible Worker container
+packaging is implemented; role-specific Gateway and queue ingress containers
+and single-replica Kubernetes packaging remain future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -63,6 +64,30 @@ Gateway, and client operations. Quartz remains a deployment-supplied absolute
 program path and integration directory. The package does not contain
 deployment-specific Worker or Gateway configuration, credentials, host keys,
 client keys, or Quartz content.
+
+### Container image
+
+Build the Docker-compatible Worker image archive without a container daemon:
+
+```sh
+nix build .#worker-container-image
+docker load < result
+```
+
+The flake builds the image natively for both `x86_64-linux` (`amd64`) and
+`aarch64-linux` (`arm64`). Its entrypoint fixes the wrapped executable and
+`worker run` role; the configuration path is supplied as an argument by the
+deployment. The image resolves the non-root `agent-knowledge` account to
+`10003:10003` and its queue supplementary group to `10002`, and includes the CA
+bundle and `SSL_CERT_FILE` setting needed for HTTPS Git replication. It exposes
+no conventional shell path and contains no deployment configuration,
+credentials, keys, or Quartz content.
+
+`just check-package` validates the image archive, architecture, deterministic
+timestamp, role-locked entrypoint, non-root metadata, identity database, CA
+bundle, and required filesystem entries without Docker or Podman. Runtime
+storage, configuration, secrets, and a writable Worker home are
+deployment-supplied mounts.
 
 ### systemd service
 
