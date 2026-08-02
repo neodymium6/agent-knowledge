@@ -18,6 +18,10 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
       forLinuxSystems = nixpkgs.lib.genAttrs linuxSystems;
       projectVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+      containerArchitecture = {
+        x86_64-linux = "amd64";
+        aarch64-linux = "arm64";
+      };
       packageFor =
         system:
         let
@@ -93,6 +97,37 @@
             platforms = linuxSystems;
           };
         };
+      containerImageFor =
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          package = packageFor system;
+          rootFilesystem = pkgs.runCommand "agent-knowledge-container-root" { } ''
+            install -d "$out/etc" "$out/var/empty" "$out/var/lib/agent-knowledge"
+            install -m444 ${./deploy/container/passwd} "$out/etc/passwd"
+            install -m444 ${./deploy/container/group} "$out/etc/group"
+          '';
+        in
+        pkgs.dockerTools.buildLayeredImage {
+          name = "agent-knowledge";
+          tag = projectVersion;
+          contents = [
+            package
+            rootFilesystem
+          ];
+          config = {
+            User = "10003:10003";
+            WorkingDir = "/var/lib/agent-knowledge";
+            Entrypoint = [ "${package}/bin/agent-knowledge" ];
+            Env = [ "HOME=/var/lib/agent-knowledge" ];
+            StopSignal = "SIGTERM";
+            Labels = {
+              "org.opencontainers.image.title" = "Agent Knowledge";
+              "org.opencontainers.image.version" = projectVersion;
+              "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+            };
+          };
+        };
     in
     {
       devShells = forAllSystems (
@@ -123,6 +158,7 @@
 
       packages = forLinuxSystems (system: rec {
         agent-knowledge = packageFor system;
+        container-image = containerImageFor system;
         default = agent-knowledge;
       });
 
@@ -135,9 +171,34 @@
         default = agent-knowledge;
       });
 
-      checks = forLinuxSystems (system: {
-        package = packageFor system;
-      });
+      checks = forLinuxSystems (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          package = packageFor system;
+          containerImage = containerImageFor system;
+        in
+        {
+          package = package;
+          container-image =
+            pkgs.runCommand "check-agent-knowledge-container-image"
+              {
+                nativeBuildInputs = [
+                  pkgs.gnutar
+                  pkgs.gzip
+                  pkgs.jq
+                ];
+              }
+              ''
+                ${pkgs.bash}/bin/bash ${./deploy/container/check-image.sh} \
+                      ${containerImage} \
+                      ${containerArchitecture.${system}} \
+                      ${package}/bin/agent-knowledge \
+                      ${projectVersion}
+                    touch "$out"
+              '';
+        }
+      );
 
       formatter = forAllSystems (system: (import nixpkgs { inherit system; }).nixfmt-tree);
     };

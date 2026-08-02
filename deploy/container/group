@@ -1,0 +1,3 @@
+agent-knowledge-gateway:x:10001:
+agent-knowledge-queue:x:10002:agent-knowledge
+agent-knowledge:x:10003:
