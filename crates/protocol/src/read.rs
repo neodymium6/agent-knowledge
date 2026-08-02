@@ -69,6 +69,27 @@ impl GetRequest {
     }
 }
 
+/// Input for exporting one committed document bundle.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportRequest {
+    /// Independent Gateway protocol version.
+    pub protocol_version: u16,
+    /// Permanent identity of the document whose bundle is requested.
+    pub document_id: DocumentId,
+}
+
+impl ExportRequest {
+    /// Constructs a request using the current protocol version.
+    #[must_use]
+    pub const fn new(document_id: DocumentId) -> Self {
+        Self {
+            protocol_version: CURRENT_GATEWAY_PROTOCOL_VERSION,
+            document_id,
+        }
+    }
+}
+
 /// Input for one committed full-text search.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -176,7 +197,7 @@ impl GetResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{GetRequest, ListRequest, ReadFilterRequest, SearchRequest};
+    use super::{ExportRequest, GetRequest, ListRequest, ReadFilterRequest, SearchRequest};
 
     #[test]
     fn read_requests_use_strict_versioned_shapes() {
@@ -202,6 +223,12 @@ mod tests {
         }
         assert!(
             serde_json::from_str::<GetRequest>(
+                r#"{"protocol_version":1,"document_id":"01K00000000000000000000000","extra":true}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ExportRequest>(
                 r#"{"protocol_version":1,"document_id":"01K00000000000000000000000","extra":true}"#
             )
             .is_err()

@@ -103,6 +103,14 @@ impl Fixture {
             ),
         )
         .unwrap_or_else(|error| panic!("runbook fixture must be written: {error}"));
+        fs::write(
+            runbook_path
+                .parent()
+                .unwrap_or_else(|| panic!("runbook fixture must have a parent"))
+                .join("procedure.json"),
+            b"{\"fictional\":true}\n",
+        )
+        .unwrap_or_else(|error| panic!("attachment fixture must be written: {error}"));
         run_git(Some(&seed), ["add", "."]);
         run_git(
             Some(&seed),
@@ -184,6 +192,17 @@ fn snapshots_one_commit_and_queries_validated_documents() {
         std::str::from_utf8(document.markdown())
             .is_ok_and(|markdown| markdown.contains("Needle OOM analysis"))
     );
+    let runbook_id = RUNBOOK_ID
+        .parse::<DocumentId>()
+        .unwrap_or_else(|error| panic!("document fixture must parse: {error}"));
+    let bundle = snapshot
+        .bundle(runbook_id)
+        .unwrap_or_else(|error| panic!("committed bundle must load: {error}"));
+    assert_eq!(bundle.record().metadata().document_id, runbook_id);
+    assert_eq!(bundle.entries().len(), 2);
+    assert_eq!(bundle.entries()[0].name(), Path::new("index.md"));
+    assert_eq!(bundle.entries()[1].name(), Path::new("procedure.json"));
+    assert_eq!(bundle.entries()[1].bytes(), b"{\"fictional\":true}\n");
 
     let search = LinearSearch::default();
     let matches = search

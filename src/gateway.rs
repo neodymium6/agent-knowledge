@@ -114,6 +114,16 @@ where
                 .map_err(gateway_error)?;
             write_encoded_response_until(output, encoded, deadline)
         }
+        GatewayCommand::Export => {
+            let request = decode_control_request(input)?;
+            let deadline = read_deadline(&settings);
+            let gateway =
+                ReadGateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
+            let encoded = gateway
+                .export_encoded_until(request, deadline)
+                .map_err(gateway_error)?;
+            write_encoded_response_until(output, encoded, deadline)
+        }
         GatewayCommand::Search => {
             let request = decode_control_request(input)?;
             let deadline = read_deadline(&settings);
