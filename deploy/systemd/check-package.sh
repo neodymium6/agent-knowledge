@@ -15,6 +15,19 @@ test -f "$service"
 test -f "$sysusers"
 test -f "$tmpfiles"
 test "$(grep -Fxc "ExecStart=$package_path/bin/agent-knowledge worker run --config /etc/agent-knowledge/worker.yaml" "$service")" -eq 1
+for directive in \
+  'Type=exec' \
+  'User=agent-knowledge' \
+  'Group=agent-knowledge' \
+  'Restart=on-failure' \
+  'KillMode=mixed' \
+  'TimeoutStopSec=15min' \
+  'ConditionPathExists=/etc/agent-knowledge/worker.yaml' \
+  'StartLimitIntervalSec=5min' \
+  'StartLimitBurst=5' \
+  'ReadWritePaths=/var/lib/agent-knowledge'; do
+  test "$(grep -Fxc "$directive" "$service")" -eq 1
+done
 if grep -Fq '@agentKnowledge@' "$service"; then
   echo "unsubstituted service placeholder" >&2
   exit 1

@@ -2,6 +2,9 @@
 Description=Agent Knowledge Repository Worker
 Documentation=https://github.com/neodymium6/agent-knowledge
 After=local-fs.target
+ConditionPathExists=/etc/agent-knowledge/worker.yaml
+StartLimitIntervalSec=5min
+StartLimitBurst=5
 
 [Service]
 Type=exec
