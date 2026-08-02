@@ -200,6 +200,25 @@ updates `ReadWritePaths`, `WorkingDirectory`, and the queue-ingress service's
 Configuration, SSH keys, Git credentials, Quartz, and service enablement remain
 deployment inputs.
 
+Supervisors that do not provide systemd-style socket activation can run the
+broker as one long-lived process:
+
+```sh
+agent-knowledge queue-ingress listen \
+  --queue-root /srv/fictional-knowledge/queue \
+  --socket-path /run/fictional-knowledge/queue-ingress.sock \
+  --maximum-connections 64 \
+  --connection-timeout-seconds 3900
+```
+
+The runtime directory must already exist, be writable by the queue-ingress
+identity, and use a setgid group accepted by the Gateway identity. The listener
+publishes the socket as `0660`, refuses to overwrite live or non-socket paths,
+recovers its own stale socket after a crash, bounds concurrent connections,
+and stops accepting and disconnects active clients on `SIGINT` or `SIGTERM`.
+`queue-ingress serve` remains the one-connection entrypoint used by the
+packaged systemd units.
+
 Run the Repository Worker with a validated deployment configuration:
 
 ```sh

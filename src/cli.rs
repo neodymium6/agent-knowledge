@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,6 +21,7 @@ use crate::admin::{self, AdminRetentionError, AdminStatusError};
 use crate::admin::{StorageMigration, StorageMigrationError};
 use crate::client::{self, ClientCommandError};
 use crate::gateway::{self, GatewayCommandError};
+use crate::queue_ingress::{self, ListenSettings, QueueIngressCommandError};
 use crate::worker::{self, WorkerCommandError};
 
 const USAGE: &str = "usage:\n\
@@ -36,6 +38,7 @@ const USAGE: &str = "usage:\n\
     agent-knowledge client search --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge gateway --config <path> --client-id <id>\n\
     agent-knowledge queue-ingress serve --queue-root <path>\n\
+    agent-knowledge queue-ingress listen --queue-root <path> --socket-path <path> [--maximum-connections <count>] [--connection-timeout-seconds <seconds>]\n\
     agent-knowledge worker run --config <path>";
 const DEFAULT_CLIENT_TIMEOUT_SECONDS: u64 = 300;
 const MAXIMUM_CLIENT_TIMEOUT_SECONDS: u64 = 3_600;
@@ -47,6 +50,10 @@ const DEFAULT_STATUS_TIMEOUT_SECONDS: u64 = 30;
 const MAXIMUM_STATUS_TIMEOUT_SECONDS: u64 = 300;
 const DEFAULT_RETENTION_TIMEOUT_SECONDS: u64 = 300;
 const MAXIMUM_RETENTION_TIMEOUT_SECONDS: u64 = 3_600;
+const DEFAULT_INGRESS_MAXIMUM_CONNECTIONS: usize = 64;
+const MAXIMUM_INGRESS_CONNECTIONS: usize = 1_024;
+const DEFAULT_INGRESS_CONNECTION_TIMEOUT_SECONDS: u64 = 3_900;
+const MAXIMUM_INGRESS_CONNECTION_TIMEOUT_SECONDS: u64 = 3_900;
 
 pub fn run<I, W>(arguments: I, output: W) -> Result<(), CliError>
 where
@@ -100,6 +107,9 @@ where
         Command::ServeQueueIngress { queue_root } => {
             agent_knowledge_gateway::serve_ingress(&queue_root, io::stdin().lock(), output)
                 .map_err(CliError::IngressServe)
+        }
+        Command::ListenQueueIngress { settings } => {
+            queue_ingress::run(settings, output).map_err(CliError::IngressListen)
         }
         Command::ClientSubmit {
             destination,
@@ -183,6 +193,9 @@ enum Command {
     ServeQueueIngress {
         queue_root: PathBuf,
     },
+    ListenQueueIngress {
+        settings: ListenSettings,
+    },
     ClientSubmit {
         destination: OsString,
         package_root: PathBuf,
@@ -228,11 +241,8 @@ where
         return parse_gateway_arguments(action.into_iter().chain(arguments));
     }
     match (namespace.as_deref(), action.as_deref()) {
-        (Some(namespace), Some(action))
-            if namespace == std::ffi::OsStr::new("queue-ingress")
-                && action == std::ffi::OsStr::new("serve") =>
-        {
-            parse_queue_ingress_arguments(arguments)
+        (Some(namespace), Some(action)) if namespace == std::ffi::OsStr::new("queue-ingress") => {
+            parse_queue_ingress_arguments(arguments, action)
         }
         (Some(namespace), Some(action))
             if namespace == std::ffi::OsStr::new("client")
@@ -560,22 +570,62 @@ where
     })
 }
 
-fn parse_queue_ingress_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+fn parse_queue_ingress_arguments<I>(
+    mut arguments: I,
+    action: &std::ffi::OsStr,
+) -> Result<Command, CliError>
 where
     I: Iterator<Item = OsString>,
 {
     let mut queue_root = None;
+    let mut socket_path = None;
+    let mut maximum_connections = None;
+    let mut connection_timeout_seconds = None;
     while let Some(flag) = arguments.next() {
         let value = arguments.next().ok_or(CliError::Usage)?;
         match flag.to_str() {
             Some("--queue-root") if queue_root.is_none() => {
                 queue_root = Some(PathBuf::from(value));
             }
+            Some("--socket-path") if socket_path.is_none() => {
+                socket_path = Some(PathBuf::from(value));
+            }
+            Some("--maximum-connections") if maximum_connections.is_none() => {
+                maximum_connections =
+                    Some(parse_bounded_usize(&value, MAXIMUM_INGRESS_CONNECTIONS)?);
+            }
+            Some("--connection-timeout-seconds") if connection_timeout_seconds.is_none() => {
+                connection_timeout_seconds = Some(parse_bounded_u64(
+                    &value,
+                    MAXIMUM_INGRESS_CONNECTION_TIMEOUT_SECONDS,
+                )?);
+            }
             _ => return Err(CliError::Usage),
         }
     }
-    Ok(Command::ServeQueueIngress {
-        queue_root: queue_root.ok_or(CliError::Usage)?,
+    let queue_root = queue_root.ok_or(CliError::Usage)?;
+    if action == std::ffi::OsStr::new("serve")
+        && socket_path.is_none()
+        && maximum_connections.is_none()
+        && connection_timeout_seconds.is_none()
+    {
+        return Ok(Command::ServeQueueIngress { queue_root });
+    }
+    if action != std::ffi::OsStr::new("listen") {
+        return Err(CliError::Usage);
+    }
+    Ok(Command::ListenQueueIngress {
+        settings: ListenSettings {
+            queue_root,
+            socket_path: socket_path.ok_or(CliError::Usage)?,
+            maximum_connections: NonZeroUsize::new(
+                maximum_connections.unwrap_or(DEFAULT_INGRESS_MAXIMUM_CONNECTIONS),
+            )
+            .ok_or(CliError::Usage)?,
+            connection_timeout: Duration::from_secs(
+                connection_timeout_seconds.unwrap_or(DEFAULT_INGRESS_CONNECTION_TIMEOUT_SECONDS),
+            ),
+        },
     })
 }
 
@@ -797,6 +847,7 @@ pub enum CliError {
     Worker(WorkerCommandError),
     Gateway(GatewayCommandError),
     IngressServe(IngressServeError),
+    IngressListen(QueueIngressCommandError),
     Client(ClientCommandError),
     Json(serde_json::Error),
 }
@@ -827,6 +878,7 @@ impl fmt::Display for CliError {
             Self::Worker(error) => error.fmt(formatter),
             Self::Gateway(error) => error.fmt(formatter),
             Self::IngressServe(error) => error.fmt(formatter),
+            Self::IngressListen(error) => error.fmt(formatter),
             Self::Client(error) => error.fmt(formatter),
             Self::Json(error) => write!(formatter, "JSON output encoding failed: {error}"),
         }
@@ -846,6 +898,7 @@ impl std::error::Error for CliError {
             Self::Worker(error) => Some(error),
             Self::Gateway(error) => Some(error),
             Self::IngressServe(error) => Some(error),
+            Self::IngressListen(error) => Some(error),
             Self::Client(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Usage => None,

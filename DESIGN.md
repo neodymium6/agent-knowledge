@@ -95,6 +95,7 @@ The initial release produces one executable with subcommands:
 agent-knowledge client ...
 agent-knowledge gateway ...
 agent-knowledge queue-ingress serve ...
+agent-knowledge queue-ingress listen ...
 agent-knowledge worker ...
 agent-knowledge admin ...
 ```
@@ -322,10 +323,19 @@ replication credentials. It:
 - reads durable request status without opening repository storage.
 
 The conventional Linux deployment uses a systemd Unix socket with `Accept=yes`
-and an instantiated service for each connection. The broker therefore needs no
-custom listener, accept loop, daemon lifecycle, or concurrency scheduler.
+and an instantiated `queue-ingress serve` process for each connection.
 `SocketMode` and `SocketGroup` allow only the dedicated Gateway group to
 connect. A bounded connection count and service runtime cap resource use.
+
+Supervisors without socket activation use `queue-ingress listen`. This native
+listener owns the Unix socket for its complete lifetime, fixes its mode to
+`0660`, holds an exclusive lock, refuses to replace a live or non-socket
+target, and safely replaces a socket left by a crashed prior process. It uses a
+bounded thread per accepted connection, applies both inactivity timeouts and
+an absolute connection lifetime, and closes active sockets before joining
+their handlers on `SIGINT` or `SIGTERM`. The deployment creates the runtime
+directory in advance with its setgid group set to the Gateway connector group;
+the listener never creates or guesses deployment ownership.
 
 The internal protocol is independent of the public SSH protocol. It begins
 with exactly one bounded newline-terminated JSON header:
@@ -1695,6 +1705,8 @@ Implementation proceeds in these increments:
    - reproducible Linux package output (implemented);
    - conventional Linux Worker service integration (implemented); and
    - reproducible Worker container packaging (implemented); and
+   - native queue-ingress listener for supervisors without socket activation
+     (implemented); and
    - role-specific Gateway and queue ingress containers plus optional
      single-replica Kubernetes packaging.
 10. Production Gateway privilege separation through the systemd-activated

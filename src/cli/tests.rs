@@ -327,6 +327,34 @@ fn parses_the_systemd_activated_queue_ingress_command() {
 }
 
 #[test]
+fn parses_the_long_running_queue_ingress_command() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "queue-ingress".into(),
+        "listen".into(),
+        "--queue-root".into(),
+        "/srv/fictional-knowledge/queue".into(),
+        "--socket-path".into(),
+        "/run/fictional-knowledge/queue-ingress.sock".into(),
+        "--maximum-connections".into(),
+        "12".into(),
+        "--connection-timeout-seconds".into(),
+        "900".into(),
+    ])
+    .unwrap_or_else(|error| panic!("queue ingress listener command must parse: {error}"));
+
+    assert!(matches!(
+        command,
+        Command::ListenQueueIngress { settings }
+            if settings.queue_root == Path::new("/srv/fictional-knowledge/queue")
+                && settings.socket_path
+                    == Path::new("/run/fictional-knowledge/queue-ingress.sock")
+                && settings.maximum_connections.get() == 12
+                && settings.connection_timeout == std::time::Duration::from_secs(900)
+    ));
+}
+
+#[test]
 fn parses_the_ssh_client_submission_command() {
     let command = parse_arguments([
         "agent-knowledge".into(),
