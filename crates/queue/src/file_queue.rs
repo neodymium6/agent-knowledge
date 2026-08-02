@@ -210,8 +210,10 @@ impl FileQueue {
         if !parent_metadata.is_dir() {
             return Err(QueueError::InvalidStoragePath(configured_parent.into()));
         }
-        ensure_directory(&configured_path)?;
-        sync_directory(configured_parent)?;
+        let parent_sync_required = ensure_directory(&configured_path)?;
+        if parent_sync_required {
+            sync_directory(configured_parent)?;
+        }
         let root_handle = Arc::new(File::open(&configured_path).map_err(QueueError::Io)?);
         let configured_queue_root = fs::canonicalize(&configured_path).map_err(QueueError::Io)?;
         #[cfg(target_os = "linux")]
@@ -1121,15 +1123,17 @@ fn validate_current_queue(binding: QueueBinding<'_>) -> Result<Revision, QueueEr
     }
 }
 
-fn ensure_directory(path: &Path) -> Result<(), QueueError> {
+fn ensure_directory(path: &Path) -> Result<bool, QueueError> {
+    // A prior NotFound observation requires a parent sync even if another
+    // initializer wins the subsequent create race.
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(false),
         Ok(_) => Err(QueueError::InvalidStoragePath(path.into())),
         Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(path) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(true),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 match fs::symlink_metadata(path) {
-                    Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+                    Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
                     Ok(_) => Err(QueueError::InvalidStoragePath(path.into())),
                     Err(error) => Err(QueueError::Io(error)),
                 }

@@ -912,6 +912,20 @@ Fictional ingress body.\n";
     }
 
     #[test]
+    fn reopens_an_existing_queue_through_the_attested_path() {
+        let root = TestDirectory::create();
+        let queue = root.path().join("queue");
+        drop(
+            super::open_queue(&queue)
+                .unwrap_or_else(|error| panic!("queue fixture must initialize: {error}")),
+        );
+        drop(
+            super::open_queue(&queue)
+                .unwrap_or_else(|error| panic!("existing queue must reopen: {error}")),
+        );
+    }
+
+    #[test]
     fn early_broker_rejection_takes_precedence_over_a_broken_submit_write() {
         let root = TestDirectory::create();
         let queue = root.path().join("queue");
