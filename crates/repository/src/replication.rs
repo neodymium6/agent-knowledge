@@ -118,6 +118,85 @@ pub enum RemoteReplicationOutcome {
     Cancelled,
 }
 
+/// Last durable result recorded by asynchronous Git replication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteReplicationStatus {
+    replicated_commit: Option<String>,
+    consecutive_failures: u32,
+    retry_at: Option<OffsetDateTime>,
+}
+
+impl RemoteReplicationStatus {
+    /// Returns the last commit confirmed at the configured destination.
+    #[must_use]
+    pub fn replicated_commit(&self) -> Option<&str> {
+        self.replicated_commit.as_deref()
+    }
+
+    /// Returns the number of consecutive remote failures.
+    #[must_use]
+    pub const fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// Returns the durable retry deadline after a remote failure.
+    #[must_use]
+    pub const fn retry_at(&self) -> Option<OffsetDateTime> {
+        self.retry_at
+    }
+}
+
+/// Reads durable replication state without contacting or modifying the remote.
+///
+/// Missing state, including state for an older configured destination, is
+/// reported as `None` because the current destination has not been confirmed.
+///
+/// # Errors
+///
+/// Returns an error when repository storage is unsafe or existing durable
+/// state is malformed.
+pub fn read_remote_replication_status(
+    git_directory: &Path,
+    policy: &RemoteReplicationPolicy,
+) -> Result<Option<RemoteReplicationStatus>, RemoteReplicationError> {
+    let configured_git_directory =
+        fs::canonicalize(git_directory).map_err(RemoteReplicationError::Io)?;
+    let (git_handle, stable_git_directory) =
+        open_stable_directory(git_directory).map_err(RemoteReplicationError::repository)?;
+    let configured_state_directory = configured_git_directory.join("agent-knowledge");
+    let stable_state_directory = stable_git_directory.join("agent-knowledge");
+    let state_metadata = match fs::symlink_metadata(&stable_state_directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            validate_pinned_directory(&configured_git_directory, &git_handle)
+                .map_err(RemoteReplicationError::repository)?;
+            return Ok(None);
+        }
+        Err(error) => return Err(RemoteReplicationError::Io(error)),
+    };
+    if !state_metadata.file_type().is_dir() {
+        return Err(RemoteReplicationError::InvalidState);
+    }
+    let (state_handle, stable_state_directory) = open_stable_directory(&stable_state_directory)
+        .map_err(RemoteReplicationError::repository)?;
+    let state = read_state(&stable_state_directory.join(STATE_FILE_NAME))?;
+    validate_pinned_directory(&configured_state_directory, &state_handle)
+        .map_err(RemoteReplicationError::repository)?;
+    validate_pinned_directory(&configured_git_directory, &git_handle)
+        .map_err(RemoteReplicationError::repository)?;
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    if state.remote != policy.remote() || state.branch != policy.branch() {
+        return Ok(None);
+    }
+    Ok(Some(RemoteReplicationStatus {
+        replicated_commit: state.replicated_commit,
+        consecutive_failures: state.consecutive_failures,
+        retry_at: state.retry_at,
+    }))
+}
+
 /// Replicates the latest official local commit without participating in publication.
 #[derive(Debug)]
 pub struct RemoteReplicator {
@@ -781,7 +860,7 @@ mod tests {
     use super::{
         GitTransactionError, LOCK_FILE_NAME, PushRepository, RemoteReplicationError,
         RemoteReplicationOutcome, RemoteReplicationPolicy, RemoteReplicator, STATE_FILE_NAME,
-        configured_remote_snapshot, finish_replication,
+        configured_remote_snapshot, finish_replication, read_remote_replication_status,
     };
     use crate::{GitIdentity, GitRepository};
 
@@ -1075,10 +1154,16 @@ mod tests {
     #[test]
     fn pushes_each_new_official_commit_and_records_success() {
         let fixture = Fixture::create();
-        let replicator = RemoteReplicator::open(fixture.repository(), fixture.policy())
+        let policy = fixture.policy();
+        let replicator = RemoteReplicator::open(fixture.repository(), policy.clone())
             .unwrap_or_else(|error| panic!("replicator must open: {error}"));
         let now = OffsetDateTime::UNIX_EPOCH;
         let initial = fixture.local_commit();
+        assert_eq!(
+            read_remote_replication_status(&fixture.repository, &policy)
+                .unwrap_or_else(|error| panic!("empty replication state must read: {error}")),
+            None
+        );
 
         assert_eq!(
             replicate(&replicator, now),
@@ -1087,6 +1172,12 @@ mod tests {
             }
         );
         assert_eq!(fixture.remote_commit(), initial);
+        let status = read_remote_replication_status(&fixture.repository, &policy)
+            .unwrap_or_else(|error| panic!("replication state must read: {error}"))
+            .unwrap_or_else(|| panic!("replication state must exist"));
+        assert_eq!(status.replicated_commit(), Some(initial.as_str()));
+        assert_eq!(status.consecutive_failures(), 0);
+        assert_eq!(status.retry_at(), None);
         assert_eq!(
             replicate(&replicator, now),
             RemoteReplicationOutcome::UpToDate {
@@ -1104,6 +1195,32 @@ mod tests {
             }
         );
         assert_eq!(fixture.remote_commit(), advanced);
+    }
+
+    #[test]
+    fn ignores_durable_state_for_a_different_destination() {
+        let fixture = Fixture::create();
+        let policy = fixture.policy();
+        let replicator = RemoteReplicator::open(fixture.repository(), policy)
+            .unwrap_or_else(|error| panic!("replicator must open: {error}"));
+        assert!(matches!(
+            replicate(&replicator, OffsetDateTime::UNIX_EPOCH),
+            RemoteReplicationOutcome::Pushed { .. }
+        ));
+        let changed_policy = RemoteReplicationPolicy::new(
+            "fictional-backup",
+            "next",
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            Duration::from_secs(40),
+        )
+        .unwrap_or_else(|error| panic!("changed policy must be valid: {error}"));
+
+        assert_eq!(
+            read_remote_replication_status(&fixture.repository, &changed_policy)
+                .unwrap_or_else(|error| panic!("replication state must read: {error}")),
+            None
+        );
     }
 
     #[test]
