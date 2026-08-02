@@ -37,7 +37,11 @@ jobs:
         run: nix develop --command just ci
 
       - name: Exercise distinct Gateway, queue, and Worker identities
-        run: sudo deploy/systemd/check-privilege-boundary.sh "$PWD/target/debug/agent-knowledge"
+        run: |
+          nix develop --command cargo build --locked
+          sudo deploy/systemd/check-privilege-boundary.sh \
+            "$PWD/target/debug/agent-knowledge" \
+            "$PWD/deploy/systemd/migrate-v1-storage-permissions.sh"
 
   packages:
     name: Package (${{ matrix.system }})

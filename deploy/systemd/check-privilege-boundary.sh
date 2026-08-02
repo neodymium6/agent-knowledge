@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 || $1 != /* || $(id -u) -ne 0 ]]; then
-  echo "usage: sudo $0 <absolute-agent-knowledge-binary>" >&2
+if [[ $# -ne 2 || $1 != /* || $2 != /* || $(id -u) -ne 0 ]]; then
+  echo "usage: sudo $0 <absolute-agent-knowledge-binary> <absolute-migration-script>" >&2
   exit 2
 fi
 
 source_binary=$1
+migration_script=$2
 test_root=$(mktemp -d)
 chmod 0711 "$test_root"
 activation_pid=
@@ -28,18 +29,9 @@ worker_gid=61102
 
 install -m 0755 "$source_binary" "$test_root/agent-knowledge"
 install -d -m 0711 "$test_root/storage"
-install -d -m 2770 -o "$queue_uid" -g "$queue_gid" \
-  "$test_root/storage/queue" "$test_root/storage/queue/.locks" \
-  "$test_root/storage/queue/incoming" "$test_root/storage/queue/quarantine" \
-  "$test_root/storage/queue/worker-tmp" "$test_root/storage/queue/pending" \
-  "$test_root/storage/queue/processing" "$test_root/storage/queue/completed" \
-  "$test_root/storage/queue/failed"
-install -m 0660 -o "$queue_uid" -g "$queue_gid" /dev/null \
-  "$test_root/storage/queue/.locks/queue.lock"
-install -m 0660 -o "$queue_uid" -g "$queue_gid" /dev/null \
-  "$test_root/storage/queue/.locks/repository-writer.lock"
-install -d -m 2750 -o "$worker_uid" -g "$gateway_gid" \
-  "$test_root/storage/repository" "$test_root/storage/content"
+install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
+  "$test_root/storage/queue" "$test_root/storage/repository" \
+  "$test_root/storage/content"
 install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
   "$test_root/storage/work" "$test_root/storage/releases"
 install -d -m 0750 -o "$queue_uid" -g "$gateway_gid" "$test_root/run"
@@ -71,6 +63,46 @@ status: active
 ---
 Fictional privilege-boundary body.
 EOF
+
+(
+  umask 0027
+  setpriv --reuid="$worker_uid" --regid="$worker_gid" --clear-groups \
+    "$test_root/agent-knowledge" admin submit \
+    --queue-root "$test_root/storage/queue" \
+    --package-root "$test_root/package" >"$test_root/legacy-submit.json"
+)
+grep -Fq '"status":"accepted"' "$test_root/legacy-submit.json"
+
+"$migration_script" "$test_root/storage" "$queue_uid" "$queue_gid" "$gateway_gid"
+test "$(stat -c '%u:%g:%a' "$test_root/storage/queue")" = "$queue_uid:$queue_gid:2770"
+test "$(stat -c '%g' "$test_root/storage/queue/queue-id")" = "$queue_gid"
+test "$(stat -c '%g:%a' "$test_root/storage/repository")" = "$gateway_gid:2750"
+test "$(stat -c '%g:%a' "$test_root/storage/content")" = "$gateway_gid:2750"
+
+install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
+  "$test_root/worker-home" "$test_root/seed"
+worker_git=(
+  setpriv --reuid="$worker_uid" --regid="$worker_gid" --clear-groups
+  env "HOME=$test_root/worker-home"
+  git
+)
+"${worker_git[@]}" init --bare "$test_root/storage/repository"
+"${worker_git[@]}" init --initial-branch=main "$test_root/seed"
+"${worker_git[@]}" -C "$test_root/seed" config user.name "Fictional Writer"
+"${worker_git[@]}" -C "$test_root/seed" config user.email writer@fictional.invalid
+install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
+  "$test_root/seed/projects/fictional-project/experiments/fictional-run"
+install -m 0640 -o "$worker_uid" -g "$worker_gid" \
+  "$test_root/package/payload/run/index.md" \
+  "$test_root/seed/projects/fictional-project/experiments/fictional-run/index.md"
+"${worker_git[@]}" -C "$test_root/seed" add .
+"${worker_git[@]}" -C "$test_root/seed" commit -m "Initialize fictional knowledge"
+"${worker_git[@]}" -C "$test_root/seed" remote add origin "$test_root/storage/repository"
+"${worker_git[@]}" -C "$test_root/seed" push origin main
+"${worker_git[@]}" --git-dir="$test_root/storage/repository" symbolic-ref HEAD refs/heads/main
+"${worker_git[@]}" --git-dir="$test_root/storage/repository" worktree add \
+  "$test_root/storage/content" main
+
 tar --format=gnu --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
   -C "$test_root/package" -cf "$test_root/request.tar" request.json payload
 
@@ -124,7 +156,7 @@ submit_response=$(
     "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
     --client-id fictional-node-a <"$test_root/request.tar"
 )
-grep -Fq '"status":"accepted"' <<<"$submit_response"
+grep -Fq '"status":"existing"' <<<"$submit_response"
 
 status_response=$(
   printf '%s\n' '{"protocol_version":1,"request_id":"01K00000000000000000000000"}' |
@@ -134,6 +166,16 @@ status_response=$(
       --client-id fictional-node-a
 )
 grep -Fq '"status":"pending"' <<<"$status_response"
+
+list_response=$(
+  printf '%s\n' '{"protocol_version":1,"maximum_results":10}' |
+    setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
+      env SSH_ORIGINAL_COMMAND='akp-v1 list' \
+      "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
+      --client-id fictional-node-a
+)
+grep -Fq '01K00000000000000000000001' <<<"$list_response"
+test "$(stat -c '%g' "$test_root/storage/content/projects/fictional-project/experiments/fictional-run/index.md")" = "$gateway_gid"
 
 if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
   test -r "$test_root/storage/queue/queue-id"; then
@@ -156,3 +198,4 @@ setpriv --reuid="$worker_uid" --regid="$worker_gid" \
   --groups="$queue_gid" touch \
   "$test_root/storage/queue/pending/01K00000000000000000000000/phase.fixture"
 test -f "$test_root/storage/queue/pending/01K00000000000000000000000/phase.fixture"
+test "$(stat -c '%g' "$test_root/storage/queue/pending/01K00000000000000000000000/phase.fixture")" = "$queue_gid"
