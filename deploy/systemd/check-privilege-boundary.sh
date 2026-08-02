@@ -12,11 +12,18 @@ test_root=$(mktemp -d)
 chmod 0711 "$test_root"
 activation_pid=
 cleanup() {
+  cleanup_status=$?
+  set +e
   if [[ -n $activation_pid ]]; then
     kill "$activation_pid" 2>/dev/null || true
     wait "$activation_pid" 2>/dev/null || true
   fi
+  if ((cleanup_status != 0)) && [[ -s $test_root/activation.log ]]; then
+    echo "queue ingress activation log:" >&2
+    sed 's/^/  /' "$test_root/activation.log" >&2
+  fi
   rm -rf -- "$test_root"
+  exit "$cleanup_status"
 }
 trap cleanup EXIT
 
