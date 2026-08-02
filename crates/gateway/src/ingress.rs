@@ -126,26 +126,21 @@ impl IngressClient {
             client_id,
         };
         let mut stream = self.connect(deadline)?;
-        let send_result = (|| {
-            let mut output = DeadlineWriter::new(&mut stream, deadline);
-            write_header(&mut output, &request)?;
-            io::copy(&mut input, &mut output)
-                .map(|_| ())
-                .map_err(IngressClientError::Transport)
-        })()
-        .and_then(|()| {
-            stream
-                .shutdown(std::net::Shutdown::Write)
-                .map_err(IngressClientError::Transport)
-        });
-        if let Err(send_error) = send_result {
-            let _ = stream.shutdown(std::net::Shutdown::Write);
-            if let Ok(IngressResponse::Error { error, .. }) =
-                read_response_until(&mut stream, deadline)
-            {
-                return Err(IngressClientError::Broker(error.error_code));
+        match send_submit(&mut stream, &request, &mut input, deadline) {
+            Ok(()) => {}
+            Err(SubmitStreamError::Input(error)) => {
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                return Err(IngressClientError::Transport(error));
             }
-            return Err(send_error);
+            Err(SubmitStreamError::Output(send_error)) => {
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                if let Ok(IngressResponse::Error { error, .. }) =
+                    read_response_until(&mut stream, deadline)
+                {
+                    return Err(IngressClientError::Broker(error.error_code));
+                }
+                return Err(send_error);
+            }
         }
         match read_response_until(&mut stream, deadline)? {
             IngressResponse::Submit { response, .. } => Ok(response),
@@ -197,6 +192,35 @@ impl IngressClient {
         set_remaining_timeout(&stream, deadline)?;
         Ok(stream)
     }
+}
+
+enum SubmitStreamError {
+    Input(io::Error),
+    Output(IngressClientError),
+}
+
+fn send_submit(
+    stream: &mut UnixStream,
+    request: &IngressRequest,
+    input: &mut impl Read,
+    deadline: Instant,
+) -> Result<(), SubmitStreamError> {
+    let mut output = DeadlineWriter::new(stream, deadline);
+    write_header(&mut output, request).map_err(SubmitStreamError::Output)?;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = input.read(&mut buffer).map_err(SubmitStreamError::Input)?;
+        if count == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|error| SubmitStreamError::Output(IngressClientError::Transport(error)))?;
+    }
+    output
+        .stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|error| SubmitStreamError::Output(IngressClientError::Transport(error)))
 }
 
 #[cfg(target_os = "linux")]
@@ -953,6 +977,62 @@ Fictional ingress body.\n";
             IngressClientError::Transport(error)
                 if error.kind() == std::io::ErrorKind::BrokenPipe
         ));
+    }
+
+    #[test]
+    fn submit_input_failures_take_precedence_over_truncated_archive_errors() {
+        struct FailingInput {
+            sent_prefix: bool,
+        }
+
+        impl Read for FailingInput {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.sent_prefix {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "fictional authenticated input failure",
+                    ));
+                }
+                self.sent_prefix = true;
+                let prefix = b"fictional truncated tar prefix";
+                buffer[..prefix.len()].copy_from_slice(prefix);
+                Ok(prefix.len())
+            }
+        }
+
+        let root = TestDirectory::create();
+        let queue = root.path().join("queue");
+        let socket = root.path().join("ingress.sock");
+        let listener = UnixListener::bind(&socket)
+            .unwrap_or_else(|error| panic!("ingress socket fixture must bind: {error}"));
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener
+                .accept()
+                .unwrap_or_else(|error| panic!("ingress fixture must accept: {error}"));
+            let input = stream
+                .try_clone()
+                .unwrap_or_else(|error| panic!("ingress stream must clone: {error}"));
+            assert!(serve(&queue, input, stream).is_err());
+        });
+        let client_id: ClientId = "fictional-node-a"
+            .parse()
+            .unwrap_or_else(|error| panic!("client fixture must parse: {error}"));
+        let error = match IngressClient::new(&socket).submit(
+            client_id,
+            FailingInput { sent_prefix: false },
+            Duration::from_secs(5),
+        ) {
+            Ok(_) => panic!("failed authenticated input must not be accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            IngressClientError::Transport(error)
+                if error.kind() == std::io::ErrorKind::ConnectionAborted
+        ));
+        server
+            .join()
+            .unwrap_or_else(|_| panic!("ingress fixture server must join"));
     }
 
     #[test]
