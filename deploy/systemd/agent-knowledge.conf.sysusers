@@ -1,0 +1,2 @@
+# The login shell is required because OpenSSH executes forced commands through it.
+u agent-knowledge - "Agent Knowledge service account" /var/lib/agent-knowledge /bin/sh
