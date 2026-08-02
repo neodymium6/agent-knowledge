@@ -36,6 +36,9 @@ jobs:
       - name: Run repository checks
         run: nix develop --command just ci
 
+      - name: Exercise distinct Gateway, queue, and Worker identities
+        run: sudo deploy/systemd/check-privilege-boundary.sh "$PWD/target/debug/agent-knowledge"
+
   packages:
     name: Package (${{ matrix.system }})
     runs-on: ${{ matrix.runner }}

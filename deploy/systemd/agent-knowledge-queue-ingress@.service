@@ -1,0 +1,32 @@
+[Unit]
+Description=Agent Knowledge Queue Ingress Connection
+Documentation=https://github.com/neodymium6/agent-knowledge
+
+[Service]
+Type=exec
+User=agent-knowledge-queue
+Group=agent-knowledge-queue
+WorkingDirectory=/var/lib/agent-knowledge
+ExecStart=@agentKnowledge@/bin/agent-knowledge queue-ingress serve --queue-root /var/lib/agent-knowledge/queue
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=65min
+UMask=0007
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/agent-knowledge/queue
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=

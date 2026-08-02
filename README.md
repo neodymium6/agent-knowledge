@@ -65,8 +65,9 @@ client keys, or Quartz content.
 
 ### systemd service
 
-The Linux package contains a hardened Worker unit plus `sysusers.d` and
-`tmpfiles.d` definitions. Install them from the immutable package output:
+The Linux package contains hardened Worker and socket-activated queue-ingress
+units plus `sysusers.d` and `tmpfiles.d` definitions. Install them from the
+immutable package output:
 
 ```sh
 sudo nix profile add --profile /nix/var/nix/profiles/agent-knowledge \
@@ -78,6 +79,10 @@ sudo install -d -m 0755 -o root -g root /etc/agent-knowledge
 sudo install -m 0640 -o root -g agent-knowledge \
   ./fictional-worker.yaml /etc/agent-knowledge/worker.yaml
 sudo systemctl link "$package_path/lib/systemd/system/agent-knowledge-worker.service"
+sudo systemctl link \
+  "$package_path/lib/systemd/system/agent-knowledge-queue-ingress.socket"
+sudo systemctl link \
+  "$package_path/lib/systemd/system/agent-knowledge-queue-ingress@.service"
 ```
 
 The supplied storage layout uses sibling roots below
@@ -90,6 +95,7 @@ starting the service. The Worker intentionally does not invent these
 deployment inputs. After validating them, enable and start the Worker:
 
 ```sh
+sudo systemctl enable --now agent-knowledge-queue-ingress.socket
 sudo systemctl enable --now agent-knowledge-worker.service
 ```
 
@@ -98,15 +104,15 @@ startup failures are limited to five attempts in five minutes. Inspect a failed
 start with `systemctl status` and `journalctl -u agent-knowledge-worker` rather
 than repeatedly restarting an incompletely provisioned deployment.
 
-The packaged `agent-knowledge` account is a locked, non-login Worker account.
-Never use it for OpenSSH. This package does not yet provide a production
-Gateway service or account. The current filesystem queue requires the Gateway
-to mutate shared lock, sequence, and package state, so a separate Gateway UID
-cannot be granted a narrow ingress capability with ordinary groups or ACLs.
-Do not work around this by sharing the Worker UID or by granting broad queue or
-Worker-state permissions. Production Gateway deployment remains blocked on a
-local enqueue broker or equivalent durable ownership-handoff boundary, plus an
-integration test that exercises distinct Gateway and Worker UIDs.
+The packaged `agent-knowledge` and `agent-knowledge-queue` accounts are locked,
+non-login accounts for the Worker and queue ingress broker respectively. Never
+use either for OpenSSH. Create the deployment-specific SSH account according to
+the host's authentication policy and add only that account to the
+`agent-knowledge-gateway` group. That group can connect to the local ingress
+socket and read committed repository/content storage; it cannot open the
+durable queue. The broker owns the queue but cannot open Worker-owned storage.
+The Worker receives the queue group as a supplementary group so it can perform
+state transitions without sharing either service UID.
 
 The dedicated system profile keeps the package output live across Nix garbage
 collection. The unit allows writes only below `/var/lib/agent-knowledge`, uses
@@ -125,7 +131,12 @@ sudo systemd-tmpfiles --create \
   "$package_path/lib/tmpfiles.d/agent-knowledge.conf"
 sudo systemctl link --force \
   "$package_path/lib/systemd/system/agent-knowledge-worker.service"
+sudo systemctl link --force \
+  "$package_path/lib/systemd/system/agent-knowledge-queue-ingress.socket"
+sudo systemctl link --force \
+  "$package_path/lib/systemd/system/agent-knowledge-queue-ingress@.service"
 sudo systemctl daemon-reload
+sudo systemctl restart agent-knowledge-queue-ingress.socket
 sudo systemctl restart agent-knowledge-worker.service
 ```
 
@@ -312,17 +323,16 @@ without following symbolic-link components. It runs SSH in a dedicated process
 group and terminates that group when the deadline or a stream-size limit is
 reached, including when a proxy descendant retains an output pipe.
 
-The forced-command examples below document the implemented protocol and
-configuration boundary; they are not a production deployment recipe. A
-production OpenSSH Gateway must wait for the separate-UID queue handoff
-described in the systemd section above.
+The forced-command account needs read access to this root-controlled
+configuration and membership in `agent-knowledge-gateway`, but no queue or
+Worker-account membership.
 
 The forced command requires a strict Gateway configuration such as:
 
 ```yaml
-schema_version: 2
+schema_version: 3
 storage:
-  queue_root: /srv/fictional-knowledge/queue
+  queue_socket: /run/agent-knowledge/queue-ingress.sock
   git_directory: /srv/fictional-knowledge/repository
   content_root: /srv/fictional-knowledge/content
 repository:
