@@ -84,6 +84,8 @@
         pkgs.runCommand "agent-knowledge-${projectVersion}"
           {
             nativeBuildInputs = [ pkgs.makeWrapper ];
+            pname = "agent-knowledge";
+            version = projectVersion;
             meta = unwrappedPackage.meta;
           }
           ''
@@ -238,10 +240,7 @@
           pkgs = import nixpkgs { inherit system; };
           package = packageFor system;
           workerContainerImage = workerContainerImageFor system;
-        in
-        {
-          package = package;
-          worker-container-image =
+          workerContainerImageCheck =
             pkgs.runCommand "check-agent-knowledge-container-image"
               {
                 nativeBuildInputs = [
@@ -267,6 +266,17 @@
                       ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
                     touch "$out"
               '';
+        in
+        {
+          package = package;
+          package-metadata =
+            assert package.pname == "agent-knowledge";
+            assert package.version == projectVersion;
+            pkgs.runCommand "check-agent-knowledge-package-metadata" { } ''
+              touch "$out"
+            '';
+          container-image = workerContainerImageCheck;
+          worker-container-image = workerContainerImageCheck;
           queue-ingress-container-image =
             let
               queueIngressContainerImage = queueIngressContainerImageFor system;
