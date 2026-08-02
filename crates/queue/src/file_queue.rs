@@ -4,8 +4,10 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use agent_knowledge_core::{
     BoundedFileError, ErrorCode, PathAttestation, PathAttestationError, PayloadPath,
@@ -48,6 +50,44 @@ const MAXIMUM_SEQUENCE_FILE_BYTES: u64 = 32;
 const MAXIMUM_QUEUE_IDENTITY_BYTES: u64 = 72;
 const MAXIMUM_QUARANTINE_MARKER_BYTES: u64 = 64;
 const MAXIMUM_STAGING_NAME_ATTEMPTS: usize = 16;
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// A shared absolute deadline and cancellation signal for one queue operation.
+#[derive(Clone, Debug)]
+pub struct QueueOperationDeadline {
+    expires_at: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl QueueOperationDeadline {
+    /// Creates an active operation deadline.
+    #[must_use]
+    pub fn new(expires_at: Instant) -> Self {
+        Self {
+            expires_at,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Requests cancellation of operations sharing this deadline.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Returns the immutable absolute expiration time.
+    #[must_use]
+    pub const fn expires_at(&self) -> Instant {
+        self.expires_at
+    }
+
+    fn ensure_active(&self) -> Result<(), QueueError> {
+        if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.expires_at {
+            Err(QueueError::OperationDeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// An accepted queue state represented by one directory below `queue/`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -201,6 +241,22 @@ impl FileQueue {
         queue_root: impl Into<PathBuf>,
         policy: PackagePolicy,
     ) -> Result<Self, QueueError> {
+        Self::initialize_until(queue_root, policy, None)
+    }
+
+    /// Creates missing queue state and opens a queue handle within an operation deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::initialize`] and
+    /// [`QueueError::OperationDeadlineExceeded`] when the deadline expires or
+    /// is cancelled while waiting for the queue lock.
+    pub fn initialize_until(
+        queue_root: impl Into<PathBuf>,
+        policy: PackagePolicy,
+        deadline: Option<&QueueOperationDeadline>,
+    ) -> Result<Self, QueueError> {
+        ensure_operation_active(deadline)?;
         let configured_path = queue_root.into();
         let configured_parent = configured_path
             .parent()
@@ -275,7 +331,7 @@ impl FileQueue {
             .write(true)
             .open(&stable_lock_file)
             .map_err(QueueError::Io)?;
-        initialization_lock.lock().map_err(QueueError::Io)?;
+        lock_until(&initialization_lock, deadline)?;
         ensure_queue_root_binding(
             &queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
             &configured_queue_root,
@@ -310,6 +366,7 @@ impl FileQueue {
             policy,
             maintenance_scanners: Arc::new(Mutex::new(MaintenanceScanners::default())),
         };
+        ensure_operation_active(deadline)?;
         queue.current_identity_locked()?;
         Ok(queue)
     }
@@ -320,8 +377,22 @@ impl FileQueue {
     ///
     /// Returns an error when a staging directory cannot be created.
     pub fn begin(&self) -> Result<IncomingPackage, QueueError> {
+        self.begin_until(None)
+    }
+
+    /// Creates an incoming package while honoring an operation deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::begin`] and
+    /// [`QueueError::OperationDeadlineExceeded`] when the deadline expires or
+    /// is cancelled while waiting for the queue lock.
+    pub fn begin_until(
+        &self,
+        deadline: Option<&QueueOperationDeadline>,
+    ) -> Result<IncomingPackage, QueueError> {
         let queue_lock = self.open_queue_lock()?;
-        queue_lock.lock().map_err(QueueError::Io)?;
+        lock_until(&queue_lock, deadline)?;
         self.current_identity_locked()?;
         let incoming_root = &self.directories.incoming.stable;
         for _ in 0..MAXIMUM_STAGING_NAME_ATTEMPTS {
@@ -697,6 +768,21 @@ impl IncomingPackage {
         self.accept_with_hook(Some(client_id), &mut NoopAcceptanceHook)
     }
 
+    /// Durably accepts this package while honoring an operation deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::accept_for`] and
+    /// [`QueueError::OperationDeadlineExceeded`] when the deadline expires or
+    /// is cancelled before the atomic queue transition begins.
+    pub fn accept_for_until(
+        self,
+        client_id: ClientId,
+        deadline: Option<&QueueOperationDeadline>,
+    ) -> Result<EnqueueOutcome, QueueError> {
+        self.accept_with_hook_until(Some(client_id), deadline, &mut NoopAcceptanceHook)
+    }
+
     fn write_file(
         &mut self,
         destination: PathBuf,
@@ -805,10 +891,20 @@ impl IncomingPackage {
     }
 
     fn accept_with_hook(
-        mut self,
+        self,
         client_id: Option<ClientId>,
         hook: &mut dyn AcceptanceHook,
     ) -> Result<EnqueueOutcome, QueueError> {
+        self.accept_with_hook_until(client_id, None, hook)
+    }
+
+    fn accept_with_hook_until(
+        mut self,
+        client_id: Option<ClientId>,
+        deadline: Option<&QueueOperationDeadline>,
+        hook: &mut dyn AcceptanceHook,
+    ) -> Result<EnqueueOutcome, QueueError> {
+        ensure_operation_active(deadline)?;
         let validated = validate_package(&self.staging_path, &self.queue.policy)
             .map_err(QueueError::Package)?;
         write_digest_file(&self.staging_path, validated.digest())?;
@@ -817,7 +913,7 @@ impl IncomingPackage {
             .map_err(QueueError::Io)?;
 
         let lock = self.queue.open_queue_lock()?;
-        lock.lock().map_err(QueueError::Io)?;
+        lock_until(&lock, deadline)?;
         self.queue.current_identity_locked()?;
 
         let request_id = validated.request().request_id;
@@ -1742,6 +1838,29 @@ impl AcceptanceHook for NoopAcceptanceHook {
     }
 }
 
+fn ensure_operation_active(deadline: Option<&QueueOperationDeadline>) -> Result<(), QueueError> {
+    deadline.map_or(Ok(()), QueueOperationDeadline::ensure_active)
+}
+
+fn lock_until(file: &File, deadline: Option<&QueueOperationDeadline>) -> Result<(), QueueError> {
+    let Some(deadline) = deadline else {
+        return file.lock().map_err(QueueError::Io);
+    };
+    loop {
+        deadline.ensure_active()?;
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) => {
+                let remaining = deadline
+                    .expires_at()
+                    .saturating_duration_since(Instant::now());
+                thread::sleep(remaining.min(LOCK_POLL_INTERVAL));
+            }
+            Err(TryLockError::Error(error)) => return Err(QueueError::Io(error)),
+        }
+    }
+}
+
 /// A streaming queue limit that rejected package input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueueLimit {
@@ -1917,7 +2036,7 @@ impl fmt::Display for QueueError {
                 formatter.write_str("durable acceptance sequence state is invalid")
             }
             Self::OperationDeadlineExceeded => {
-                formatter.write_str("read-only queue operation deadline expired")
+                formatter.write_str("queue operation deadline expired or was cancelled")
             }
             Self::InvalidStatusScanLimit => {
                 formatter.write_str("operational-status queue scan limit must be positive")

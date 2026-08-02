@@ -4,20 +4,23 @@ use std::io::{self, Read};
 
 use agent_knowledge_core::{ErrorCode, PayloadPath};
 use agent_knowledge_protocol::{ClientId, RequestState, SubmitOutcome, SubmitResponse};
-use agent_knowledge_queue::{EnqueueOutcome, FileQueue, PackageLimits, QueueState};
+use agent_knowledge_queue::{
+    EnqueueOutcome, FileQueue, PackageLimits, QueueOperationDeadline, QueueState,
+};
 use tar::{Archive, EntryType};
 
 const TAR_BLOCK_BYTES: u64 = 512;
 const MAXIMUM_PATH_EXTENSION_BYTES_PER_ENTRY: u64 = 8 * 1024;
 const TRAILING_BUFFER_BYTES: usize = 16 * 1024;
 
-pub(crate) fn submit(
+pub(crate) fn submit_until(
     queue: &FileQueue,
     client_id: ClientId,
     input: impl Read,
+    deadline: Option<&QueueOperationDeadline>,
 ) -> Result<SubmitResponse, super::GatewayError> {
     let mut incoming = queue
-        .begin()
+        .begin_until(deadline)
         .map_err(|error| super::GatewayError::Queue(Box::new(error)))?;
     let limits = queue.policy().limits();
     let maximum_archive_bytes = maximum_archive_bytes(limits);
@@ -145,7 +148,7 @@ pub(crate) fn submit(
     }
 
     let outcome = incoming
-        .accept_for(client_id)
+        .accept_for_until(client_id, deadline)
         .map_err(|error| super::GatewayError::Queue(Box::new(error)))?;
     Ok(SubmitResponse::new(map_outcome(outcome)))
 }

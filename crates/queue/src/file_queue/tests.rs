@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_knowledge_core::{BatchId, ErrorCode, PayloadPath, RequestId};
 use agent_knowledge_protocol::ClientId;
@@ -13,8 +13,9 @@ use agent_knowledge_protocol::ClientId;
 use super::status::StatusObservationHook;
 use super::{
     AcceptanceHook, AcceptancePhase, ClaimToken, DirectoryScanner, EnqueueOutcome, FileQueue,
-    IncomingPackage, ProcessingScanOutcome, QueueError, QueueLimit, QueueReader,
-    QueueRequestStatus, QueueState, StaleAgeSource, WorkerQueueError, inactive_stale_directories,
+    IncomingPackage, ProcessingScanOutcome, QueueError, QueueLimit, QueueOperationDeadline,
+    QueueReader, QueueRequestStatus, QueueState, StaleAgeSource, WorkerQueueError,
+    inactive_stale_directories,
 };
 use crate::{PackageLimits, PackagePolicy, validate_accepted_package};
 
@@ -1448,6 +1449,29 @@ fn staging_directory_is_not_visible_before_its_lease_is_held() {
         Ok(()) => {}
         Err(_) => panic!("begin thread must not panic"),
     }
+}
+
+#[test]
+fn cancelled_ingress_deadline_interrupts_a_queue_lock_wait() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let queue_lock = queue
+        .open_queue_lock()
+        .unwrap_or_else(|error| panic!("queue lock fixture must open: {error}"));
+    queue_lock
+        .lock()
+        .unwrap_or_else(|error| panic!("queue lock fixture must be held: {error}"));
+    let deadline = QueueOperationDeadline::new(Instant::now() + Duration::from_secs(30));
+    let operation_deadline = deadline.clone();
+    let thread = thread::spawn(move || queue.begin_until(Some(&operation_deadline)));
+
+    thread::sleep(Duration::from_millis(50));
+    deadline.cancel();
+    let result = thread
+        .join()
+        .unwrap_or_else(|_| panic!("bounded begin thread must not panic"));
+    assert!(matches!(result, Err(QueueError::OperationDeadlineExceeded)));
+    drop(queue_lock);
 }
 
 #[test]

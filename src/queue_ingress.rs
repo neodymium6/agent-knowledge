@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -14,12 +15,17 @@ use std::time::{Duration, Instant};
 
 use agent_knowledge_core::{PathAttestation, PathAttestationError};
 use agent_knowledge_gateway::IngressServeError;
+use agent_knowledge_queue::QueueOperationDeadline;
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
+use nix::sched::{CloneFlags, unshare};
+use nix::unistd::{Uid, fchdir};
 use signal_hook::consts::{SIGINT, SIGTERM};
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LISTENER_LOCK_FILE: &str = ".agent-knowledge-queue-ingress.lock";
+const LISTENER_LOCK_FORMAT: &str = "agent-knowledge-queue-ingress-v1";
+const MAXIMUM_LISTENER_LOCK_BYTES: u64 = 256;
 const SOCKET_MODE: u32 = 0o660;
 
 #[derive(Clone, Debug)]
@@ -94,6 +100,7 @@ where
     }
 
     for connection in active.values() {
+        connection.deadline.cancel();
         let _ = connection.control.shutdown(std::net::Shutdown::Both);
     }
     drop(completion_sender);
@@ -136,16 +143,23 @@ fn start_connection(
     let control = stream
         .try_clone()
         .map_err(QueueIngressListenerError::ConnectionConfiguration)?;
-    let deadline = Instant::now()
+    let expires_at = Instant::now()
         .checked_add(settings.connection_timeout)
         .ok_or(QueueIngressListenerError::InvalidConnectionTimeout)?;
+    let deadline = QueueOperationDeadline::new(expires_at);
+    let handler_deadline = deadline.clone();
     let queue_root = settings.queue_root.clone();
     let sender = completion_sender.clone();
     let thread = thread::Builder::new()
         .name(format!("queue-ingress-{connection_id}"))
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                agent_knowledge_gateway::serve_ingress(&queue_root, &stream, &stream)
+                agent_knowledge_gateway::serve_ingress_until(
+                    &queue_root,
+                    &stream,
+                    &stream,
+                    &handler_deadline,
+                )
             }));
             let outcome = match result {
                 Ok(result) => ConnectionOutcome::Served(result),
@@ -166,7 +180,8 @@ fn start_connection(
 
 fn expire_connections(active: &HashMap<u64, ActiveConnection>, now: Instant) {
     for connection in active.values() {
-        if now >= connection.deadline {
+        if now >= connection.deadline.expires_at() {
+            connection.deadline.cancel();
             let _ = connection.control.shutdown(std::net::Shutdown::Both);
         }
     }
@@ -221,7 +236,7 @@ where
 
 struct ActiveConnection {
     control: UnixStream,
-    deadline: Instant,
+    deadline: QueueOperationDeadline,
     thread: JoinHandle<()>,
 }
 
@@ -258,8 +273,16 @@ impl PublishedSocket {
         if !parent_metadata.is_dir() {
             return Err(QueueIngressListenerError::InvalidSocketParent);
         }
+        let parent_mode = parent_metadata.mode();
+        if parent_metadata.uid() != Uid::effective().as_raw()
+            || parent_mode & 0o200 == 0
+            || parent_mode & 0o022 != 0
+            || parent_mode & 0o2000 == 0
+        {
+            return Err(QueueIngressListenerError::UnsafeSocketParent);
+        }
 
-        let lock_path = parent.path().join(LISTENER_LOCK_FILE);
+        let lock_path = parent.stable_path().join(LISTENER_LOCK_FILE);
         let lock_file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -277,7 +300,7 @@ impl PublishedSocket {
         lock_file
             .set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(QueueIngressListenerError::LockPermissions)?;
-        let lock =
+        let mut lock =
             Flock::lock(lock_file, FlockArg::LockExclusiveNonblock).map_err(|(_file, error)| {
                 if error == Errno::EWOULDBLOCK || error == Errno::EAGAIN {
                     QueueIngressListenerError::AlreadyRunning
@@ -285,17 +308,28 @@ impl PublishedSocket {
                     QueueIngressListenerError::Lock(io::Error::from_raw_os_error(error as i32))
                 }
             })?;
+        let previous_socket = read_socket_identity(&mut lock)?;
 
-        let stable_socket_path = parent.path().join(
-            socket_path
-                .file_name()
-                .ok_or(QueueIngressListenerError::InvalidSocketPath)?,
-        );
+        let socket_name = socket_path
+            .file_name()
+            .ok_or(QueueIngressListenerError::InvalidSocketPath)?;
+        let stable_socket_path = parent.stable_path().join(socket_name);
         match fs::symlink_metadata(&stable_socket_path) {
             Ok(metadata) if metadata.file_type().is_socket() => {
                 match UnixStream::connect(&stable_socket_path) {
                     Ok(_) => return Err(QueueIngressListenerError::AlreadyRunning),
                     Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                        let observed = SocketIdentity::from_metadata(&metadata);
+                        if previous_socket != Some(observed) {
+                            return Err(QueueIngressListenerError::UnownedStaleSocket);
+                        }
+                        let current = fs::symlink_metadata(&stable_socket_path)
+                            .map_err(QueueIngressListenerError::SocketInspection)?;
+                        if !current.file_type().is_socket()
+                            || SocketIdentity::from_metadata(&current) != observed
+                        {
+                            return Err(QueueIngressListenerError::SocketIdentityChanged);
+                        }
                         fs::remove_file(&stable_socket_path)
                             .map_err(QueueIngressListenerError::StaleSocketRemoval)?;
                     }
@@ -308,18 +342,11 @@ impl PublishedSocket {
             Err(error) => return Err(QueueIngressListenerError::SocketInspection(error)),
         }
 
-        let listener =
-            UnixListener::bind(&stable_socket_path).map_err(QueueIngressListenerError::Bind)?;
+        let listener = bind_in_pinned_directory(parent.stable_path(), socket_name)?;
         let socket_node = OwnedSocketNode::capture(stable_socket_path.clone())?;
-        let observed_parent = PathAttestation::resolve_destination(parent.path())
-            .map_err(QueueIngressListenerError::ParentAttestation)?;
-        if !parent.matches_destination(&observed_parent) {
-            return Err(QueueIngressListenerError::ParentAttestation(
-                PathAttestationError::BindingMismatch,
-            ));
-        }
         fs::set_permissions(&stable_socket_path, fs::Permissions::from_mode(SOCKET_MODE))
             .map_err(QueueIngressListenerError::SocketPermissions)?;
+        write_socket_identity(&mut lock, socket_node.identity())?;
         listener
             .set_nonblocking(true)
             .map_err(QueueIngressListenerError::Nonblocking)?;
@@ -330,6 +357,102 @@ impl PublishedSocket {
             _lock: lock,
         })
     }
+}
+
+fn bind_in_pinned_directory(
+    stable_parent: &Path,
+    socket_name: &OsStr,
+) -> Result<UnixListener, QueueIngressListenerError> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY)
+        .open(stable_parent)
+        .map_err(QueueIngressListenerError::ParentInspection)?;
+    let socket_name = PathBuf::from(socket_name);
+    thread::Builder::new()
+        .name("queue-ingress-bind".into())
+        .spawn(move || {
+            unshare(CloneFlags::CLONE_FS).map_err(errno_io)?;
+            fchdir(&directory).map_err(errno_io)?;
+            UnixListener::bind(socket_name)
+        })
+        .map_err(QueueIngressListenerError::BindThreadSpawn)?
+        .join()
+        .map_err(|_| QueueIngressListenerError::BindThreadPanicked)?
+        .map_err(QueueIngressListenerError::Bind)
+}
+
+fn errno_io(error: Errno) -> io::Error {
+    io::Error::from_raw_os_error(error as i32)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl SocketIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+fn read_socket_identity(
+    file: &mut File,
+) -> Result<Option<SocketIdentity>, QueueIngressListenerError> {
+    let length = file
+        .metadata()
+        .map_err(QueueIngressListenerError::LockInspection)?
+        .len();
+    if length == 0 {
+        return Ok(None);
+    }
+    if length > MAXIMUM_LISTENER_LOCK_BYTES {
+        return Err(QueueIngressListenerError::InvalidLockContents);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(QueueIngressListenerError::LockContents)?;
+    let mut contents = String::new();
+    file.take(MAXIMUM_LISTENER_LOCK_BYTES)
+        .read_to_string(&mut contents)
+        .map_err(QueueIngressListenerError::LockContents)?;
+    let mut fields = contents.trim_end().split(' ');
+    let format = fields.next();
+    let device = fields.next().and_then(|value| value.parse().ok());
+    let inode = fields.next().and_then(|value| value.parse().ok());
+    if format != Some(LISTENER_LOCK_FORMAT)
+        || device.is_none()
+        || inode.is_none()
+        || fields.next().is_some()
+    {
+        return Err(QueueIngressListenerError::InvalidLockContents);
+    }
+    Ok(Some(SocketIdentity {
+        device: device.unwrap_or_default(),
+        inode: inode.unwrap_or_default(),
+    }))
+}
+
+fn write_socket_identity(
+    file: &mut File,
+    identity: SocketIdentity,
+) -> Result<(), QueueIngressListenerError> {
+    file.set_len(0)
+        .map_err(QueueIngressListenerError::LockContents)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(QueueIngressListenerError::LockContents)?;
+    writeln!(
+        file,
+        "{LISTENER_LOCK_FORMAT} {} {}",
+        identity.device, identity.inode
+    )
+    .map_err(QueueIngressListenerError::LockContents)?;
+    file.sync_all()
+        .map_err(QueueIngressListenerError::LockContents)
 }
 
 #[derive(Debug)]
@@ -351,6 +474,13 @@ impl OwnedSocketNode {
             device: metadata.dev(),
             inode: metadata.ino(),
         })
+    }
+
+    const fn identity(&self) -> SocketIdentity {
+        SocketIdentity {
+            device: self.device,
+            inode: self.inode,
+        }
     }
 }
 
@@ -403,16 +533,23 @@ pub(crate) enum QueueIngressListenerError {
     ParentAttestation(PathAttestationError),
     ParentInspection(io::Error),
     InvalidSocketParent,
+    UnsafeSocketParent,
     LockOpen(io::Error),
     LockInspection(io::Error),
     InvalidLockFile,
     LockPermissions(io::Error),
+    LockContents(io::Error),
+    InvalidLockContents,
     AlreadyRunning,
     Lock(io::Error),
     SocketInspection(io::Error),
     SocketProbe(io::Error),
     InvalidSocketTarget,
+    UnownedStaleSocket,
+    SocketIdentityChanged,
     StaleSocketRemoval(io::Error),
+    BindThreadSpawn(io::Error),
+    BindThreadPanicked,
     Bind(io::Error),
     SocketPermissions(io::Error),
     Nonblocking(io::Error),
@@ -447,6 +584,9 @@ impl fmt::Display for QueueIngressListenerError {
             Self::InvalidSocketParent => {
                 formatter.write_str("queue ingress socket parent is not a directory")
             }
+            Self::UnsafeSocketParent => formatter.write_str(
+                "queue ingress socket parent must be owner-writable, setgid, and not writable by group or other",
+            ),
             Self::LockOpen(error) => {
                 write!(
                     formatter,
@@ -468,6 +608,12 @@ impl fmt::Display for QueueIngressListenerError {
                     "could not restrict queue ingress listener lock: {error}"
                 )
             }
+            Self::LockContents(error) => {
+                write!(formatter, "could not update queue ingress listener state: {error}")
+            }
+            Self::InvalidLockContents => {
+                formatter.write_str("queue ingress listener state is malformed")
+            }
             Self::AlreadyRunning => {
                 formatter.write_str("queue ingress listener is already running")
             }
@@ -488,6 +634,12 @@ impl fmt::Display for QueueIngressListenerError {
             }
             Self::InvalidSocketTarget => formatter
                 .write_str("queue ingress socket path exists and is not a Unix domain socket"),
+            Self::UnownedStaleSocket => formatter.write_str(
+                "queue ingress socket is stale but was not published by this listener",
+            ),
+            Self::SocketIdentityChanged => {
+                formatter.write_str("queue ingress socket identity changed during recovery")
+            }
             Self::StaleSocketRemoval(error) => {
                 write!(
                     formatter,
@@ -495,6 +647,12 @@ impl fmt::Display for QueueIngressListenerError {
                 )
             }
             Self::Bind(error) => write!(formatter, "could not bind queue ingress socket: {error}"),
+            Self::BindThreadSpawn(error) => {
+                write!(formatter, "could not start queue ingress bind thread: {error}")
+            }
+            Self::BindThreadPanicked => {
+                formatter.write_str("queue ingress bind thread panicked")
+            }
             Self::SocketPermissions(error) => {
                 write!(
                     formatter,
@@ -555,10 +713,12 @@ impl std::error::Error for QueueIngressListenerError {
             | Self::LockOpen(error)
             | Self::LockInspection(error)
             | Self::LockPermissions(error)
+            | Self::LockContents(error)
             | Self::Lock(error)
             | Self::SocketInspection(error)
             | Self::SocketProbe(error)
             | Self::StaleSocketRemoval(error)
+            | Self::BindThreadSpawn(error)
             | Self::Bind(error)
             | Self::SocketPermissions(error)
             | Self::Nonblocking(error)
@@ -568,9 +728,14 @@ impl std::error::Error for QueueIngressListenerError {
             | Self::Diagnostic(error) => Some(error),
             Self::InvalidSocketPath
             | Self::InvalidSocketParent
+            | Self::UnsafeSocketParent
             | Self::InvalidLockFile
+            | Self::InvalidLockContents
             | Self::AlreadyRunning
             | Self::InvalidSocketTarget
+            | Self::UnownedStaleSocket
+            | Self::SocketIdentityChanged
+            | Self::BindThreadPanicked
             | Self::InvalidConnectionTimeout
             | Self::CompletionChannelClosed
             | Self::UnknownConnection
