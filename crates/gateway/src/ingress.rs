@@ -126,17 +126,28 @@ impl IngressClient {
             client_id,
         };
         let mut stream = self.connect(deadline)?;
-        {
+        let send_result = (|| {
             let mut output = DeadlineWriter::new(&mut stream, deadline);
             write_header(&mut output, &request)?;
-            io::copy(&mut input, &mut output).map_err(IngressClientError::Transport)?;
+            io::copy(&mut input, &mut output)
+                .map(|_| ())
+                .map_err(IngressClientError::Transport)
+        })()
+        .and_then(|()| {
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .map_err(IngressClientError::Transport)
+        });
+        if let Err(send_error) = send_result {
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            if let Ok(IngressResponse::Error { error, .. }) =
+                read_response_until(&mut stream, deadline)
+            {
+                return Err(IngressClientError::Broker(error.error_code));
+            }
+            return Err(send_error);
         }
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .map_err(IngressClientError::Transport)?;
-        set_remaining_timeout(&stream, deadline)?;
-        let mut input = DeadlineReader::new(&mut stream, deadline);
-        match read_response(&mut input)? {
+        match read_response_until(&mut stream, deadline)? {
             IngressResponse::Submit { response, .. } => Ok(response),
             IngressResponse::Error { error, .. } => {
                 Err(IngressClientError::Broker(error.error_code))
@@ -167,9 +178,7 @@ impl IngressClient {
         stream
             .shutdown(std::net::Shutdown::Write)
             .map_err(IngressClientError::Transport)?;
-        set_remaining_timeout(&stream, deadline)?;
-        let mut input = DeadlineReader::new(&mut stream, deadline);
-        match read_response(&mut input)? {
+        match read_response_until(&mut stream, deadline)? {
             IngressResponse::Status { response, .. }
                 if response.request_id() == expected_request_id =>
             {
@@ -354,10 +363,23 @@ fn write_header(
     output: &mut impl Write,
     request: &IngressRequest,
 ) -> Result<(), IngressClientError> {
-    serde_json::to_writer(&mut *output, request).map_err(IngressClientError::Json)?;
+    let header = serde_json::to_vec(request).map_err(IngressClientError::Json)?;
+    if header.len().saturating_add(1) as u64 > MAXIMUM_HEADER_BYTES {
+        return Err(IngressClientError::RequestHeaderTooLarge);
+    }
     output
-        .write_all(b"\n")
+        .write_all(&header)
+        .and_then(|()| output.write_all(b"\n"))
         .map_err(IngressClientError::Transport)
+}
+
+fn read_response_until(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> Result<IngressResponse, IngressClientError> {
+    set_remaining_timeout(stream, deadline)?;
+    let mut input = DeadlineReader::new(stream, deadline);
+    read_response(&mut input)
 }
 
 fn read_response(input: &mut impl Read) -> Result<IngressResponse, IngressClientError> {
@@ -520,6 +542,7 @@ pub enum IngressClientError {
     Transport(io::Error),
     Json(serde_json::Error),
     DeadlineExceeded,
+    RequestHeaderTooLarge,
     UnsupportedVersion,
     UnexpectedResponse,
     Broker(ErrorCode),
@@ -531,9 +554,10 @@ impl IngressClientError {
         match self {
             Self::Broker(code) => *code,
             Self::DeadlineExceeded | Self::Transport(_) => ErrorCode::TemporaryFailure,
-            Self::Json(_) | Self::UnsupportedVersion | Self::UnexpectedResponse => {
-                ErrorCode::InternalError
-            }
+            Self::Json(_)
+            | Self::RequestHeaderTooLarge
+            | Self::UnsupportedVersion
+            | Self::UnexpectedResponse => ErrorCode::InternalError,
         }
     }
 }
@@ -544,6 +568,9 @@ impl fmt::Display for IngressClientError {
             Self::Transport(error) => write!(formatter, "queue ingress transport failed: {error}"),
             Self::Json(error) => write!(formatter, "queue ingress JSON failed: {error}"),
             Self::DeadlineExceeded => formatter.write_str("queue ingress deadline expired"),
+            Self::RequestHeaderTooLarge => {
+                formatter.write_str("queue ingress request header exceeded its internal bound")
+            }
             Self::UnsupportedVersion => {
                 formatter.write_str("queue ingress returned an unsupported protocol version")
             }
@@ -719,6 +746,32 @@ Fictional ingress body.\n";
             .unwrap_or_else(|error| panic!("ingress tar fixture must finish: {error}"))
     }
 
+    fn early_invalid_archive() -> Vec<u8> {
+        let mut builder = Builder::new(Vec::new());
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Symlink);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_size(0);
+        header
+            .set_path("invalid-link")
+            .unwrap_or_else(|error| panic!("invalid archive path fixture must encode: {error}"));
+        header
+            .set_link_name("fictional-target")
+            .unwrap_or_else(|error| panic!("invalid archive link fixture must encode: {error}"));
+        header.set_cksum();
+        builder
+            .append(&header, Cursor::new(Vec::<u8>::new()))
+            .unwrap_or_else(|error| panic!("invalid archive fixture must append: {error}"));
+        let mut archive = builder
+            .into_inner()
+            .unwrap_or_else(|error| panic!("invalid archive fixture must finish: {error}"));
+        archive.resize(8 * 1024 * 1024, 0x5a);
+        archive
+    }
+
     fn append(builder: &mut Builder<Vec<u8>>, path: &str, bytes: &[u8]) {
         let mut header = Header::new_gnu();
         header.set_entry_type(EntryType::Regular);
@@ -827,6 +880,79 @@ Fictional ingress body.\n";
         server
             .join()
             .unwrap_or_else(|_| panic!("ingress fixture server must join"));
+    }
+
+    #[test]
+    fn early_broker_rejection_takes_precedence_over_a_broken_submit_write() {
+        let root = TestDirectory::create();
+        let queue = root.path().join("queue");
+        let socket = root.path().join("ingress.sock");
+        let listener = UnixListener::bind(&socket)
+            .unwrap_or_else(|error| panic!("ingress socket fixture must bind: {error}"));
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener
+                .accept()
+                .unwrap_or_else(|error| panic!("ingress fixture must accept: {error}"));
+            let input = stream
+                .try_clone()
+                .unwrap_or_else(|error| panic!("ingress stream must clone: {error}"));
+            assert!(serve(&queue, input, stream).is_err());
+        });
+        let client_id: ClientId = "fictional-node-a"
+            .parse()
+            .unwrap_or_else(|error| panic!("client fixture must parse: {error}"));
+        let error = match IngressClient::new(&socket).submit(
+            client_id,
+            Cursor::new(early_invalid_archive()),
+            Duration::from_secs(5),
+        ) {
+            Ok(_) => panic!("early invalid archive must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, IngressClientError::Broker(ErrorCode::InvalidPath)),
+            "unexpected ingress error: {error:?}"
+        );
+        server
+            .join()
+            .unwrap_or_else(|_| panic!("ingress fixture server must join"));
+    }
+
+    #[test]
+    fn request_header_socket_failures_are_transport_errors() {
+        struct BrokenWriter;
+
+        impl Write for BrokenWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "fictional disconnected broker",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let request_id = "01K00000000000000000000000"
+            .parse()
+            .unwrap_or_else(|error| panic!("request fixture must parse: {error}"));
+        let error = match super::write_header(
+            &mut BrokenWriter,
+            &super::IngressRequest::Status {
+                protocol_version: super::CURRENT_INGRESS_PROTOCOL_VERSION,
+                request_id,
+            },
+        ) {
+            Ok(()) => panic!("disconnected header writer must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            IngressClientError::Transport(error)
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
     }
 
     #[test]
