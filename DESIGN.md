@@ -146,17 +146,20 @@ program path and integration directory. The package contains no credentials,
 host keys, client keys, deployment-specific Worker or Gateway configuration,
 or Quartz content.
 
-The flake also publishes a reproducible, Docker-compatible Worker image archive
-for `amd64` and `arm64`. Its entrypoint fixes the wrapped executable and the
-`worker run` role so deployment arguments cannot accidentally start another
-role with Worker authority. The image resolves the non-root Worker account to
-`10003:10003`, includes queue GID `10002` as a supplementary group, and provides
-an immutable CA bundle through `SSL_CERT_FILE` for HTTPS Git replication.
-Deployments mount configuration, secrets, durable storage, and a writable Worker
-home. No conventional shell path, role-specific configuration, credentials,
-keys, or content is included. Gateway and queue ingress images must similarly
-bind their entrypoints to their least-privilege identities when Kubernetes
-packaging is added.
+The flake also publishes reproducible, Docker-compatible Worker and Queue
+Ingress image archives for `amd64` and `arm64`. Their entrypoints fix the
+executable and exact `worker run` or `queue-ingress listen` role so deployment
+arguments cannot start another role with the mounted authority. The Worker
+image resolves its non-root account to `10003:10003`, includes queue GID
+`10002` as a supplementary group, retains the Git/OpenSSH runtime wrapper, and
+provides an immutable CA bundle through `SSL_CERT_FILE` for HTTPS Git
+replication. The Queue Ingress image resolves its account to `10002:10002`,
+includes Gateway connector GID `10001`, and uses the raw Rust executable
+closure without Git, OpenSSH, or a CA bundle. Deployments mount configuration,
+secrets, durable storage, runtime socket storage, and writable homes as needed.
+No conventional shell path, role-specific configuration, credentials, keys,
+or content is included. The future Gateway image must similarly fix its
+entrypoint and least-privilege identity.
 
 The same executable can be used with different entry-point arguments in a
 service or container. Separate binaries may be produced from the same
@@ -1705,9 +1708,9 @@ Implementation proceeds in these increments:
    - reproducible Linux package output (implemented);
    - conventional Linux Worker service integration (implemented); and
    - reproducible Worker container packaging (implemented); and
-   - native queue-ingress listener for supervisors without socket activation
-     (implemented); and
-   - role-specific Gateway and queue ingress containers plus optional
+   - native queue-ingress listener and role-specific container for supervisors
+     without socket activation (implemented); and
+   - role-specific Gateway container plus optional
      single-replica Kubernetes packaging.
 10. Production Gateway privilege separation through the systemd-activated
     local queue-ingress broker, verified with distinct-UID integration tests
