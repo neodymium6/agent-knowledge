@@ -94,15 +94,43 @@ while IFS= read -r layer_path; do
   tar --absolute-names -tf "$work_directory/$layer_path" >>"$layer_contents"
 done <<<"$layer_paths"
 
+validate_normalized_path() {
+  local target_path=$1
+
+  if [[ -z $target_path ||
+    $target_path == -* ||
+    $target_path == /* ||
+    $target_path == */ ||
+    $target_path == *//* ]] ||
+    grep -Eq '(^|/)\.\.?(/|$)' <<<"$target_path"; then
+    echo "container image contains an unsafe or noncanonical path: ${target_path}" >&2
+    return 1
+  fi
+}
+
 normalized_layer_contents="$work_directory/normalized-layer-contents"
-sed -e 's#^\./##' -e 's#^/##' -e 's#/$##' \
-  "$layer_contents" >"$normalized_layer_contents"
+while IFS= read -r member; do
+  if [[ $member == / || $member == ./ ]]; then
+    continue
+  fi
+  normalized=$member
+  case $normalized in
+    ./*)
+      normalized=${normalized#./}
+      ;;
+    /*)
+      normalized=${normalized#/}
+      ;;
+  esac
+  if [[ $normalized == */ ]]; then
+    normalized=${normalized%/}
+  fi
+  validate_normalized_path "$normalized"
+  printf '%s\n' "$normalized" >>"$normalized_layer_contents"
+done <"$layer_contents"
+
 if grep -Eq '(^|/)\.wh\.' "$normalized_layer_contents"; then
   echo "container image must not contain whiteout entries" >&2
-  exit 1
-fi
-if grep -Eq '(^-|(^|/)\.\.?(/|$))' "$normalized_layer_contents"; then
-  echo "container image contains an unsafe layer path" >&2
   exit 1
 fi
 
@@ -144,16 +172,6 @@ validate_immutable_metadata() {
   fi
   if [[ ${mode:0:1} != l && (${mode:5:1} == w || ${mode:8:1} == w) ]]; then
     echo "container image path is writable by a non-root identity: ${target_path}" >&2
-    return 1
-  fi
-}
-
-validate_normalized_path() {
-  local target_path=$1
-
-  if [[ -z $target_path || $target_path == -* ]] ||
-    grep -Eq '(^|/)\.\.?(/|$)' <<<"$target_path"; then
-    echo "container image contains an unsafe link target: ${target_path}" >&2
     return 1
   fi
 }
