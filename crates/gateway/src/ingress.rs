@@ -126,13 +126,17 @@ impl IngressClient {
             client_id,
         };
         let mut stream = self.connect(deadline)?;
-        write_header(&mut stream, &request)?;
-        io::copy(&mut input, &mut stream).map_err(IngressClientError::Transport)?;
+        {
+            let mut output = DeadlineWriter::new(&mut stream, deadline);
+            write_header(&mut output, &request)?;
+            io::copy(&mut input, &mut output).map_err(IngressClientError::Transport)?;
+        }
         stream
             .shutdown(std::net::Shutdown::Write)
             .map_err(IngressClientError::Transport)?;
         set_remaining_timeout(&stream, deadline)?;
-        match read_response(&mut stream)? {
+        let mut input = DeadlineReader::new(&mut stream, deadline);
+        match read_response(&mut input)? {
             IngressResponse::Submit { response, .. } => Ok(response),
             IngressResponse::Error { error, .. } => {
                 Err(IngressClientError::Broker(error.error_code))
@@ -156,12 +160,16 @@ impl IngressClient {
             request_id: expected_request_id,
         };
         let mut stream = self.connect(deadline)?;
-        write_header(&mut stream, &request)?;
+        {
+            let mut output = DeadlineWriter::new(&mut stream, deadline);
+            write_header(&mut output, &request)?;
+        }
         stream
             .shutdown(std::net::Shutdown::Write)
             .map_err(IngressClientError::Transport)?;
         set_remaining_timeout(&stream, deadline)?;
-        match read_response(&mut stream)? {
+        let mut input = DeadlineReader::new(&mut stream, deadline);
+        match read_response(&mut input)? {
             IngressResponse::Status { response, .. }
                 if response.request_id() == expected_request_id =>
             {
@@ -249,6 +257,97 @@ fn set_remaining_timeout(stream: &UnixStream, deadline: Instant) -> Result<(), I
         .set_read_timeout(Some(remaining))
         .and_then(|()| stream.set_write_timeout(Some(remaining)))
         .map_err(IngressClientError::Transport)
+}
+
+struct DeadlineReader<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+
+impl<'a> DeadlineReader<'a> {
+    const fn new(stream: &'a mut UnixStream, deadline: Instant) -> Self {
+        Self { stream, deadline }
+    }
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let remaining = remaining_until(self.deadline)?;
+            self.stream.set_read_timeout(Some(remaining))?;
+            match self.stream.read(buffer) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if Instant::now() >= self.deadline {
+                        return Err(deadline_io_error());
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+struct DeadlineWriter<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+
+impl<'a> DeadlineWriter<'a> {
+    const fn new(stream: &'a mut UnixStream, deadline: Instant) -> Self {
+        Self { stream, deadline }
+    }
+}
+
+impl Write for DeadlineWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let remaining = remaining_until(self.deadline)?;
+            self.stream.set_write_timeout(Some(remaining))?;
+            match self.stream.write(buffer) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if Instant::now() >= self.deadline {
+                        return Err(deadline_io_error());
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn remaining_until(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(deadline_io_error)
+}
+
+fn deadline_io_error() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "queue ingress deadline expired")
 }
 
 fn write_header(
@@ -544,14 +643,16 @@ impl std::error::Error for IngressServeError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Write};
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use agent_knowledge_core::ErrorCode;
-    use agent_knowledge_protocol::{ClientId, RequestStatus, StatusRequest, SubmitOutcome};
+    use agent_knowledge_protocol::{
+        ClientId, RequestStatus, StatusRequest, StatusResponse, SubmitOutcome,
+    };
     use tar::{Builder, EntryType, Header};
 
     use super::{IngressClient, IngressClientError, IngressServeError, serve};
@@ -723,6 +824,83 @@ Fictional ingress body.\n";
             error,
             IngressClientError::Broker(ErrorCode::RequestNotFound)
         ));
+        server
+            .join()
+            .unwrap_or_else(|_| panic!("ingress fixture server must join"));
+    }
+
+    #[test]
+    fn submit_writes_stop_at_one_absolute_deadline() {
+        let root = TestDirectory::create();
+        let socket = root.path().join("ingress.sock");
+        let listener = UnixListener::bind(&socket)
+            .unwrap_or_else(|error| panic!("ingress socket fixture must bind: {error}"));
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener
+                .accept()
+                .unwrap_or_else(|error| panic!("ingress fixture must accept: {error}"));
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let client_id: ClientId = "fictional-node-a"
+            .parse()
+            .unwrap_or_else(|error| panic!("client fixture must parse: {error}"));
+        let started = Instant::now();
+        let result = IngressClient::new(&socket).submit(
+            client_id,
+            Cursor::new(vec![0_u8; 8 * 1024 * 1024]),
+            Duration::from_millis(25),
+        );
+        assert!(matches!(
+            result,
+            Err(IngressClientError::Transport(error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        server
+            .join()
+            .unwrap_or_else(|_| panic!("ingress fixture server must join"));
+    }
+
+    #[test]
+    fn response_reads_stop_at_one_absolute_deadline() {
+        let root = TestDirectory::create();
+        let socket = root.path().join("ingress.sock");
+        let listener = UnixListener::bind(&socket)
+            .unwrap_or_else(|error| panic!("ingress socket fixture must bind: {error}"));
+        let request_id = "01K00000000000000000000000"
+            .parse()
+            .unwrap_or_else(|error| panic!("request fixture must parse: {error}"));
+        let response = serde_json::to_vec(&super::IngressResponse::status(StatusResponse::new(
+            request_id,
+            RequestStatus::Pending,
+        )))
+        .unwrap_or_else(|error| panic!("ingress response fixture must encode: {error}"));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .unwrap_or_else(|error| panic!("ingress fixture must accept: {error}"));
+            let mut request = Vec::new();
+            stream
+                .read_to_end(&mut request)
+                .unwrap_or_else(|error| panic!("ingress fixture must read request: {error}"));
+            for byte in response {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let started = Instant::now();
+        let result = IngressClient::new(&socket)
+            .status(StatusRequest::new(request_id), Duration::from_millis(25));
+        assert!(matches!(
+            result,
+            Err(IngressClientError::Transport(error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
         server
             .join()
             .unwrap_or_else(|_| panic!("ingress fixture server must join"));
