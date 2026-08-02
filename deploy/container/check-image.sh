@@ -196,7 +196,7 @@ extract_image_file() {
       normalized=${normalized#/}
       normalized=${normalized%/}
       if [[ $normalized == "$target_path" ]]; then
-        listing=$(tar --absolute-names --numeric-owner -t -v \
+        listing=$(tar --absolute-names --numeric-owner --no-recursion -t -v \
           -f "$work_directory/$layer_path" -- "$member")
         validate_immutable_metadata "$listing" "$target_path"
         case ${listing:0:1} in
@@ -255,7 +255,7 @@ validate_image_directory() {
       normalized=${normalized#/}
       normalized=${normalized%/}
       if [[ $normalized == "$target_path" ]]; then
-        listing=$(tar --absolute-names --numeric-owner -t -v \
+        listing=$(tar --absolute-names --numeric-owner --no-recursion -t -v \
           -f "$work_directory/$layer_path" -- "$member")
         validate_immutable_metadata "$listing" "$target_path"
         case ${listing:0:1} in
@@ -312,7 +312,7 @@ validate_image_root() {
   while IFS= read -r layer_path; do
     while IFS= read -r member; do
       if [[ $member == / || $member == ./ || $member == . ]]; then
-        listing=$(tar --absolute-names --numeric-owner -t -v \
+        listing=$(tar --absolute-names --numeric-owner --no-recursion -t -v \
           -f "$work_directory/$layer_path" -- "$member")
         validate_immutable_metadata "$listing" /
         if [[ ${listing:0:1} != d || ${listing:9:1} != x ]]; then
