@@ -150,10 +150,15 @@ impl Fixture {
 #[test]
 fn snapshots_one_commit_and_queries_validated_documents() {
     let fixture = Fixture::create();
+    let current = fixture
+        .store()
+        .current_commit_until(None)
+        .unwrap_or_else(|error| panic!("current commit must validate: {error}"));
     let snapshot = fixture
         .store()
         .snapshot(ContentPolicy::default(), &PackagePolicy::default())
         .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    assert_eq!(current, snapshot.commit());
     let project = "fictional-project"
         .parse::<ProjectId>()
         .unwrap_or_else(|error| panic!("project fixture must parse: {error}"));
