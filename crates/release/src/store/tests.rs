@@ -14,15 +14,17 @@ use super::{
     BINDING_FILE, BuildDirectory, BuiltDirectory, CLEANUP_MARKER_FILE, LEGACY_BINDING_FILE,
     MANIFEST_FILE, MANIFEST_SCHEMA_VERSION, MANIFEST_TEMPORARY_FILE, MAXIMUM_CLEANUP_ACTIONS,
     MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH, MAXIMUM_RELEASE_TREE_DEPTH, ReleaseError, ReleaseManifest,
-    ReleasePolicy, ReleaseReader, ReleaseStore, cleanup_name, derived_reference_is_repairable,
-    ensure_cleanup_marker, ensure_manifest, read_manifest, release_id, validate_release_tree,
-    validate_release_tree_at,
+    ReleasePolicy, ReleaseReader, ReleaseRetentionPolicy, ReleaseStore, cleanup_name,
+    derived_reference_is_repairable, ensure_cleanup_marker, ensure_manifest, read_manifest,
+    release_id, validate_release_tree, validate_release_tree_at,
 };
 
 const FIRST_BATCH: &str = "01K00000000000000000000001";
 const SECOND_BATCH: &str = "01K00000000000000000000002";
+const THIRD_BATCH: &str = "01K00000000000000000000003";
 const FIRST_COMMIT: &str = "1111111111111111111111111111111111111111";
 const SECOND_COMMIT: &str = "2222222222222222222222222222222222222222";
+const THIRD_COMMIT: &str = "3333333333333333333333333333333333333333";
 
 struct TestDirectory(PathBuf);
 
@@ -70,6 +72,201 @@ fn build(store: &ReleaseStore, batch_id: BatchId, body: &str) -> BuiltDirectory 
 
 fn built(output: BuildDirectory) -> BuiltDirectory {
     BuiltDirectory::new(output)
+}
+
+fn prepare_release(
+    store: &ReleaseStore,
+    batch_id: &str,
+    commit: &str,
+    created_at: &str,
+) -> super::PreparedRelease {
+    let build = build(
+        store,
+        batch(batch_id),
+        "<p>fictional retained release</p>\n",
+    );
+    store
+        .prepare(build, commit, timestamp(created_at))
+        .unwrap_or_else(|error| panic!("release fixture must prepare: {error}"))
+}
+
+#[test]
+fn release_retention_policy_requires_positive_bounds() {
+    let policy = ReleaseRetentionPolicy::new(3, 100, 5)
+        .unwrap_or_else(|error| panic!("retention policy must validate: {error}"));
+    assert_eq!(policy.retained_releases().get(), 3);
+    assert_eq!(policy.maximum_scan_entries().get(), 100);
+    assert_eq!(policy.maximum_removals().get(), 5);
+    for values in [(0, 1, 1), (1, 0, 1), (1, 1, 0)] {
+        assert!(matches!(
+            ReleaseRetentionPolicy::new(values.0, values.1, values.2),
+            Err(ReleaseError::InvalidRetentionPolicy)
+        ));
+    }
+}
+
+#[test]
+fn retention_dry_run_preserves_the_active_release_and_all_files() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let first = prepare_release(&store, FIRST_BATCH, FIRST_COMMIT, "2026-07-31T04:00:00Z");
+    store
+        .activate(&first)
+        .unwrap_or_else(|error| panic!("oldest release must activate: {error}"));
+    let second = prepare_release(&store, SECOND_BATCH, SECOND_COMMIT, "2026-07-31T04:05:00Z");
+    let third = prepare_release(&store, THIRD_BATCH, THIRD_COMMIT, "2026-07-31T04:10:00Z");
+
+    let outcome = store
+        .retain_releases_until(
+            ReleaseRetentionPolicy::new(1, 10, 10)
+                .unwrap_or_else(|error| panic!("retention policy must validate: {error}")),
+            true,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("retention dry run must succeed: {error}"));
+
+    assert!(outcome.dry_run());
+    assert_eq!(outcome.releases_scanned(), 3);
+    assert_eq!(outcome.eligible_releases(), 1);
+    assert_eq!(outcome.planned_release_ids(), &[second.release_id()]);
+    assert!(outcome.removed_release_ids().is_empty());
+    assert!(outcome.cleanup_pending_release_ids().is_empty());
+    for release in [&first, &second, &third] {
+        assert!(releases.join("by-id").join(release.release_id()).is_dir());
+    }
+    assert_eq!(
+        store
+            .active_release()
+            .unwrap_or_else(|error| panic!("active release must remain valid: {error}"))
+            .unwrap_or_else(|| panic!("active release must remain selected"))
+            .release_id(),
+        first.release_id()
+    );
+}
+
+#[test]
+fn retention_removes_only_the_oldest_bounded_inactive_release() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let first = prepare_release(&store, FIRST_BATCH, FIRST_COMMIT, "2026-07-31T04:00:00Z");
+    let second = prepare_release(&store, SECOND_BATCH, SECOND_COMMIT, "2026-07-31T04:05:00Z");
+    let third = prepare_release(&store, THIRD_BATCH, THIRD_COMMIT, "2026-07-31T04:10:00Z");
+    store
+        .activate(&third)
+        .unwrap_or_else(|error| panic!("newest release must activate: {error}"));
+
+    let outcome = store
+        .retain_releases_until(
+            ReleaseRetentionPolicy::new(1, 10, 1)
+                .unwrap_or_else(|error| panic!("retention policy must validate: {error}")),
+            false,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("retention must succeed: {error}"));
+
+    assert_eq!(outcome.eligible_releases(), 2);
+    assert_eq!(outcome.planned_release_ids(), &[first.release_id()]);
+    assert_eq!(outcome.removed_release_ids(), &[first.release_id()]);
+    assert!(!releases.join("by-id").join(first.release_id()).exists());
+    assert!(!releases.join("by-commit").join(FIRST_COMMIT).exists());
+    assert!(releases.join("by-id").join(second.release_id()).is_dir());
+    assert!(releases.join("by-id").join(third.release_id()).is_dir());
+    assert_eq!(
+        store
+            .active_release()
+            .unwrap_or_else(|error| panic!("active release must remain valid: {error}"))
+            .unwrap_or_else(|| panic!("active release must remain selected"))
+            .release_id(),
+        third.release_id()
+    );
+}
+
+#[test]
+fn retention_resumes_a_large_private_tombstone() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let output = store
+        .begin_build(batch(FIRST_BATCH))
+        .unwrap_or_else(|error| panic!("large release build must begin: {error}"));
+    for index in 0..(MAXIMUM_CLEANUP_ACTIONS + 20) {
+        fs::write(
+            output.path().join(format!("file-{index:04}.html")),
+            b"fictional output\n",
+        )
+        .unwrap_or_else(|error| panic!("large release fixture must be written: {error}"));
+    }
+    let first = store
+        .prepare(
+            built(output),
+            FIRST_COMMIT,
+            timestamp("2026-07-31T04:00:00Z"),
+        )
+        .unwrap_or_else(|error| panic!("large release must prepare: {error}"));
+    let second = prepare_release(&store, SECOND_BATCH, SECOND_COMMIT, "2026-07-31T04:05:00Z");
+    store
+        .activate(&second)
+        .unwrap_or_else(|error| panic!("newest release must activate: {error}"));
+    let policy = ReleaseRetentionPolicy::new(1, 10, 1)
+        .unwrap_or_else(|error| panic!("retention policy must validate: {error}"));
+
+    let first_pass = store
+        .retain_releases_until(policy, false, None)
+        .unwrap_or_else(|error| panic!("first retention pass must succeed: {error}"));
+    assert!(first_pass.removed_release_ids().is_empty());
+    assert_eq!(
+        first_pass.cleanup_pending_release_ids(),
+        &[first.release_id()]
+    );
+    assert!(!releases.join("by-id").join(first.release_id()).exists());
+    assert!(
+        releases
+            .join(".staging")
+            .join(format!(".retention-{}", first.release_id()))
+            .is_dir()
+    );
+
+    let second_pass = store
+        .retain_releases_until(policy, false, None)
+        .unwrap_or_else(|error| panic!("resumed retention pass must succeed: {error}"));
+    assert_eq!(second_pass.removed_release_ids(), &[first.release_id()]);
+    assert!(second_pass.cleanup_pending_release_ids().is_empty());
+    assert!(
+        !releases
+            .join(".staging")
+            .join(format!(".retention-{}", first.release_id()))
+            .exists()
+    );
+}
+
+#[test]
+fn retention_enforces_its_shared_scan_bound_and_deadline() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    prepare_release(&store, FIRST_BATCH, FIRST_COMMIT, "2026-07-31T04:00:00Z");
+    prepare_release(&store, SECOND_BATCH, SECOND_COMMIT, "2026-07-31T04:05:00Z");
+    let policy = ReleaseRetentionPolicy::new(1, 1, 1)
+        .unwrap_or_else(|error| panic!("retention policy must validate: {error}"));
+
+    assert!(matches!(
+        store.retain_releases_until(policy, true, None),
+        Err(ReleaseError::RetentionScanLimitExceeded)
+    ));
+    assert!(matches!(
+        store.retain_releases_until(
+            ReleaseRetentionPolicy::default(),
+            true,
+            Some(std::time::Instant::now()),
+        ),
+        Err(ReleaseError::OperationDeadlineExceeded)
+    ));
 }
 
 #[test]

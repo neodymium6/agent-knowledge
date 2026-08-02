@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, UtcOffset};
 use ulid::Ulid;
 
+mod retention;
+
+pub use retention::{ReleaseRetentionOutcome, ReleaseRetentionPolicy};
+
 const BY_ID_DIRECTORY: &str = "by-id";
 const BY_COMMIT_DIRECTORY: &str = "by-commit";
 const BY_BATCH_DIRECTORY: &str = "by-batch";
@@ -215,6 +219,20 @@ impl ReleaseStore {
     /// Creates fixed release directories and binds them to this storage root.
     pub fn open(root: impl AsRef<Path>, policy: ReleasePolicy) -> Result<Self, ReleaseError> {
         Self::open_internal(root.as_ref(), policy, true)
+    }
+
+    /// Opens an existing release store for administrative mutation without
+    /// creating or repairing any storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store is absent, structurally invalid,
+    /// replaced while opening, or contains an invalid active release.
+    pub fn open_existing(
+        root: impl AsRef<Path>,
+        policy: ReleasePolicy,
+    ) -> Result<Self, ReleaseError> {
+        Self::open_internal(root.as_ref(), policy, false)
     }
 
     fn open_internal(
@@ -2246,6 +2264,7 @@ fn create_symlink(_target: &Path, _link: &Path) -> Result<(), ReleaseError> {
 #[derive(Debug)]
 pub enum ReleaseError {
     InvalidPolicy,
+    InvalidRetentionPolicy,
     InvalidDirectory(PathBuf),
     InvalidCommit,
     InvalidManifest,
@@ -2259,6 +2278,10 @@ pub enum ReleaseError {
     BuildInProgress,
     BuildRecoveryRequired,
     CleanupIncomplete,
+    RetentionScanLimitExceeded,
+    RetentionTombstoneConflict,
+    ActiveReleaseRetentionConflict,
+    OperationDeadlineExceeded,
     RecoveredBuildConflict,
     InvalidBatchIntent,
     InvalidCleanupIntent,
@@ -2278,6 +2301,9 @@ impl fmt::Display for ReleaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidPolicy => formatter.write_str("release limits are invalid"),
+            Self::InvalidRetentionPolicy => {
+                formatter.write_str("release retention limits are invalid")
+            }
             Self::InvalidDirectory(path) => {
                 write!(
                     formatter,
@@ -2304,6 +2330,18 @@ impl fmt::Display for ReleaseError {
             }
             Self::CleanupIncomplete => {
                 formatter.write_str("release cleanup requires another bounded pass")
+            }
+            Self::RetentionScanLimitExceeded => {
+                formatter.write_str("release retention scan limit was exceeded")
+            }
+            Self::RetentionTombstoneConflict => {
+                formatter.write_str("release retention tombstone already exists")
+            }
+            Self::ActiveReleaseRetentionConflict => {
+                formatter.write_str("the active release cannot be retired")
+            }
+            Self::OperationDeadlineExceeded => {
+                formatter.write_str("release operation deadline was exceeded")
             }
             Self::RecoveredBuildConflict => {
                 formatter.write_str("recovered release build conflicts with its prepared release")
