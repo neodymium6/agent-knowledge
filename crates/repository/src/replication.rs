@@ -18,7 +18,8 @@ use std::os::unix::ffi::OsStringExt;
 use crate::git::{
     GitRepository, GitTransactionError, open_stable_directory, run_git_for_read,
     run_git_for_read_controlled, run_git_until_controlled,
-    run_git_until_controlled_with_environment, same_metadata, validate_pinned_directory,
+    run_git_until_controlled_with_environment, same_metadata, validate_local_git_config_until,
+    validate_pinned_directory,
 };
 
 const REPLICATION_STATE_VERSION: u16 = 1;
@@ -116,6 +117,165 @@ pub enum RemoteReplicationOutcome {
     },
     /// Shutdown cancelled an in-flight push before it changed durable state.
     Cancelled,
+}
+
+/// Last durable result recorded by asynchronous Git replication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteReplicationStatus {
+    replicated_commit: Option<String>,
+    consecutive_failures: u32,
+    retry_at: Option<OffsetDateTime>,
+}
+
+impl RemoteReplicationStatus {
+    /// Returns the last commit confirmed at the configured destination.
+    #[must_use]
+    pub fn replicated_commit(&self) -> Option<&str> {
+        self.replicated_commit.as_deref()
+    }
+
+    /// Returns the number of consecutive remote failures.
+    #[must_use]
+    pub const fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// Returns the durable retry deadline after a remote failure.
+    #[must_use]
+    pub const fn retry_at(&self) -> Option<OffsetDateTime> {
+        self.retry_at
+    }
+}
+
+/// Reads durable replication state without contacting or modifying the remote.
+///
+/// Missing state, including state for an older configured destination, is
+/// reported as `None` because the current destination has not been confirmed.
+///
+/// # Errors
+///
+/// Returns an error when repository storage is unsafe or existing durable
+/// state is malformed.
+pub fn read_remote_replication_status(
+    git_directory: &Path,
+    policy: &RemoteReplicationPolicy,
+) -> Result<Option<RemoteReplicationStatus>, RemoteReplicationError> {
+    let deadline = Instant::now()
+        .checked_add(policy.timeout)
+        .ok_or(RemoteReplicationError::InvalidPolicy("timeout"))?;
+    read_remote_replication_status_until(git_directory, policy, Some(deadline))
+}
+
+/// Reads durable replication state within an optional absolute Git-inspection
+/// deadline, without contacting or modifying the remote.
+///
+/// # Errors
+///
+/// Returns an error when repository storage or local remote configuration is
+/// unsafe, existing durable state is malformed, or the deadline expires.
+pub fn read_remote_replication_status_until(
+    git_directory: &Path,
+    policy: &RemoteReplicationPolicy,
+    deadline: Option<Instant>,
+) -> Result<Option<RemoteReplicationStatus>, RemoteReplicationError> {
+    let configured_git_directory =
+        fs::canonicalize(git_directory).map_err(RemoteReplicationError::Io)?;
+    let (git_handle, stable_git_directory) =
+        open_stable_directory(git_directory).map_err(RemoteReplicationError::repository)?;
+    let configured_state_directory = configured_git_directory.join("agent-knowledge");
+    let stable_state_directory = stable_git_directory.join("agent-knowledge");
+    let state_metadata = match fs::symlink_metadata(&stable_state_directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let _fingerprint =
+                configured_remote_fingerprint(&stable_git_directory, policy, deadline)?;
+            validate_pinned_directory(&configured_git_directory, &git_handle)
+                .map_err(RemoteReplicationError::repository)?;
+            return Ok(None);
+        }
+        Err(error) => return Err(RemoteReplicationError::Io(error)),
+    };
+    if !state_metadata.file_type().is_dir() {
+        return Err(RemoteReplicationError::InvalidState);
+    }
+    let (state_handle, stable_state_directory) = open_stable_directory(&stable_state_directory)
+        .map_err(RemoteReplicationError::repository)?;
+    let state = read_state(&stable_state_directory.join(STATE_FILE_NAME))?;
+    validate_pinned_directory(&configured_state_directory, &state_handle)
+        .map_err(RemoteReplicationError::repository)?;
+    let remote_fingerprint =
+        configured_remote_fingerprint(&stable_git_directory, policy, deadline)?;
+    validate_pinned_directory(&configured_git_directory, &git_handle)
+        .map_err(RemoteReplicationError::repository)?;
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    if state.remote != policy.remote()
+        || state.branch != policy.branch()
+        || state.remote_fingerprint != remote_fingerprint
+    {
+        return Ok(None);
+    }
+    Ok(Some(RemoteReplicationStatus {
+        replicated_commit: state.replicated_commit,
+        consecutive_failures: state.consecutive_failures,
+        retry_at: state.retry_at,
+    }))
+}
+
+fn configured_remote_fingerprint(
+    git_directory: &Path,
+    policy: &RemoteReplicationPolicy,
+    deadline: Option<Instant>,
+) -> Result<Revision, RemoteReplicationError> {
+    validate_local_git_config_until(git_directory, deadline)
+        .map_err(RemoteReplicationError::repository)?;
+    configured_remote_destination(git_directory, policy, deadline, &|| false)
+        .map(|(fingerprint, _url)| fingerprint)
+}
+
+fn configured_remote_destination(
+    git_directory: &Path,
+    policy: &RemoteReplicationPolicy,
+    deadline: Option<Instant>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(Revision, OsString), RemoteReplicationError> {
+    let mirror_key = format!("remote.{}.mirror", policy.remote());
+    let mirror = run_git_for_read_controlled(
+        None,
+        Some(git_directory),
+        [
+            OsStr::new("config"),
+            OsStr::new("--local"),
+            OsStr::new("--type=bool"),
+            OsStr::new("--default=false"),
+            OsStr::new("--get"),
+            OsStr::new(&mirror_key),
+        ],
+        deadline,
+        cancelled,
+    )
+    .map_err(RemoteReplicationError::repository)?;
+    if mirror.stdout != b"false\n" {
+        return Err(RemoteReplicationError::InvalidPolicy("remote.mirror"));
+    }
+    let urls = run_git_for_read_controlled(
+        None,
+        Some(git_directory),
+        [
+            OsStr::new("remote"),
+            OsStr::new("get-url"),
+            OsStr::new("--push"),
+            OsStr::new("--all"),
+            OsStr::new(policy.remote()),
+        ],
+        deadline,
+        cancelled,
+    )
+    .map_err(remote_lookup_error)?;
+    let fingerprint = fingerprint_remote_urls(&urls.stdout)?;
+    let url = parse_single_push_url(&urls.stdout)?;
+    Ok((fingerprint, url))
 }
 
 /// Replicates the latest official local commit without participating in publication.
@@ -427,35 +587,12 @@ fn configured_remote_snapshot(
     repository
         .validate_replication_read(deadline, cancelled)
         .map_err(RemoteReplicationError::repository)?;
-    let mirror_key = format!("remote.{}.mirror", policy.remote());
-    let mirror = run_git_for_read_controlled(
-        None,
-        Some(repository.git_directory()),
-        [
-            "config",
-            "--local",
-            "--type=bool",
-            "--default=false",
-            "--get",
-            mirror_key.as_str(),
-        ],
+    let (fingerprint, url) = configured_remote_destination(
+        repository.git_directory(),
+        policy,
         Some(deadline),
         cancelled,
-    )
-    .map_err(RemoteReplicationError::repository)?;
-    if mirror.stdout != b"false\n" {
-        return Err(RemoteReplicationError::InvalidPolicy("remote.mirror"));
-    }
-    let urls = run_git_for_read_controlled(
-        None,
-        Some(repository.git_directory()),
-        ["remote", "get-url", "--push", "--all", policy.remote()],
-        Some(deadline),
-        cancelled,
-    )
-    .map_err(remote_lookup_error)?;
-    let fingerprint = fingerprint_remote_urls(&urls.stdout)?;
-    let url = parse_single_push_url(&urls.stdout)?;
+    )?;
     let object_format = run_git_until_controlled(
         None,
         Some(repository.git_directory()),
@@ -781,7 +918,7 @@ mod tests {
     use super::{
         GitTransactionError, LOCK_FILE_NAME, PushRepository, RemoteReplicationError,
         RemoteReplicationOutcome, RemoteReplicationPolicy, RemoteReplicator, STATE_FILE_NAME,
-        configured_remote_snapshot, finish_replication,
+        configured_remote_snapshot, finish_replication, read_remote_replication_status,
     };
     use crate::{GitIdentity, GitRepository};
 
@@ -1075,10 +1212,16 @@ mod tests {
     #[test]
     fn pushes_each_new_official_commit_and_records_success() {
         let fixture = Fixture::create();
-        let replicator = RemoteReplicator::open(fixture.repository(), fixture.policy())
+        let policy = fixture.policy();
+        let replicator = RemoteReplicator::open(fixture.repository(), policy.clone())
             .unwrap_or_else(|error| panic!("replicator must open: {error}"));
         let now = OffsetDateTime::UNIX_EPOCH;
         let initial = fixture.local_commit();
+        assert_eq!(
+            read_remote_replication_status(&fixture.repository, &policy)
+                .unwrap_or_else(|error| panic!("empty replication state must read: {error}")),
+            None
+        );
 
         assert_eq!(
             replicate(&replicator, now),
@@ -1087,6 +1230,12 @@ mod tests {
             }
         );
         assert_eq!(fixture.remote_commit(), initial);
+        let status = read_remote_replication_status(&fixture.repository, &policy)
+            .unwrap_or_else(|error| panic!("replication state must read: {error}"))
+            .unwrap_or_else(|| panic!("replication state must exist"));
+        assert_eq!(status.replicated_commit(), Some(initial.as_str()));
+        assert_eq!(status.consecutive_failures(), 0);
+        assert_eq!(status.retry_at(), None);
         assert_eq!(
             replicate(&replicator, now),
             RemoteReplicationOutcome::UpToDate {
@@ -1104,6 +1253,32 @@ mod tests {
             }
         );
         assert_eq!(fixture.remote_commit(), advanced);
+    }
+
+    #[test]
+    fn ignores_durable_state_for_a_different_destination() {
+        let fixture = Fixture::create();
+        let policy = fixture.policy();
+        let replicator = RemoteReplicator::open(fixture.repository(), policy)
+            .unwrap_or_else(|error| panic!("replicator must open: {error}"));
+        assert!(matches!(
+            replicate(&replicator, OffsetDateTime::UNIX_EPOCH),
+            RemoteReplicationOutcome::Pushed { .. }
+        ));
+        let changed_policy = RemoteReplicationPolicy::new(
+            "fictional-backup",
+            "next",
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            Duration::from_secs(40),
+        )
+        .unwrap_or_else(|error| panic!("changed policy must be valid: {error}"));
+
+        assert_eq!(
+            read_remote_replication_status(&fixture.repository, &changed_policy)
+                .unwrap_or_else(|error| panic!("replication state must read: {error}")),
+            None
+        );
     }
 
     #[test]
@@ -1126,7 +1301,8 @@ mod tests {
     fn repointed_remote_invalidates_the_confirmed_commit_cache() {
         let fixture = Fixture::create();
         let repository = fixture.repository();
-        let replicator = RemoteReplicator::open(repository, fixture.policy())
+        let policy = fixture.policy();
+        let replicator = RemoteReplicator::open(repository, policy.clone())
             .unwrap_or_else(|error| panic!("replicator must open: {error}"));
         let now = OffsetDateTime::UNIX_EPOCH;
         let commit = fixture.local_commit();
@@ -1151,6 +1327,12 @@ mod tests {
                 "fictional-backup",
             ],
             Some(&replacement),
+        );
+
+        assert_eq!(
+            read_remote_replication_status(&fixture.repository, &policy)
+                .unwrap_or_else(|error| panic!("repointed state must be readable: {error}")),
+            None
         );
 
         assert_eq!(

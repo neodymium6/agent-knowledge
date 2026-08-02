@@ -17,5 +17,8 @@ serde.workspace = true
 serde-saphyr.workspace = true
 time.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30.1", features = ["fs"] }

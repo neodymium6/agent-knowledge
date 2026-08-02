@@ -28,7 +28,7 @@ pub use worker::{
     WorkerResultRecord, WorkerResultStatus, WorkerSession,
 };
 mod status;
-pub use status::{QueueReader, QueueRequestStatus};
+pub use status::{QueueOverview, QueueReader, QueueRequestStatus};
 
 const REQUEST_FILE_NAME: &str = "request.json";
 const DIGEST_FILE_NAME: &str = "digest";
@@ -1798,6 +1798,13 @@ pub enum QueueError {
     InvalidSequenceState,
     /// A bounded read-only queue operation exceeded its deadline.
     OperationDeadlineExceeded,
+    /// An operational-status scan was configured with a zero entry bound.
+    InvalidStatusScanLimit,
+    /// An operational-status scan reached its entry bound before completion.
+    StatusScanLimitExceeded {
+        /// Maximum accepted request entries for one status scan.
+        maximum: usize,
+    },
     /// The immutable queue instance identity was missing, malformed, or changed.
     InvalidQueueIdentity,
     /// An in-process maintenance scanner mutex was poisoned.
@@ -1830,7 +1837,9 @@ impl QueueError {
             Self::RequestAlreadyWritten
             | Self::PayloadAlreadyWritten(_)
             | Self::PayloadPrefixCollision(_) => ErrorCode::InvalidRequest,
-            Self::LimitExceeded { .. } => ErrorCode::LimitExceeded,
+            Self::LimitExceeded { .. } | Self::StatusScanLimitExceeded { .. } => {
+                ErrorCode::LimitExceeded
+            }
             Self::RequestIdReused { .. } => ErrorCode::RequestIdReused,
             Self::CorruptState { .. } => ErrorCode::ContentValidationFailed,
             Self::InvalidStoragePath(_)
@@ -1840,6 +1849,7 @@ impl QueueError {
             | Self::SequenceExhausted
             | Self::InvalidSequenceState
             | Self::InvalidQueueIdentity
+            | Self::InvalidStatusScanLimit
             | Self::MaintenanceScannerPoisoned => ErrorCode::InternalError,
         }
     }
@@ -1905,6 +1915,13 @@ impl fmt::Display for QueueError {
             Self::OperationDeadlineExceeded => {
                 formatter.write_str("read-only queue operation deadline expired")
             }
+            Self::InvalidStatusScanLimit => {
+                formatter.write_str("operational-status queue scan limit must be positive")
+            }
+            Self::StatusScanLimitExceeded { maximum } => write!(
+                formatter,
+                "operational-status queue scan exceeded {maximum} request entries"
+            ),
             Self::InvalidQueueIdentity => {
                 formatter.write_str("durable queue instance identity is invalid")
             }

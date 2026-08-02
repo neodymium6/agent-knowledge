@@ -27,7 +27,7 @@ const RESULT_FILE_NAME: &str = "result.json";
 const DIGEST_DOMAIN: &[u8] = b"agent-knowledge-request-package-v1\0";
 const HASH_BUFFER_LENGTH: usize = 64 * 1024;
 const MAXIMUM_DIGEST_FILE_BYTES: u64 = 72;
-const MAXIMUM_ACCEPTANCE_FILE_BYTES: u64 = 256;
+pub(crate) const MAXIMUM_ACCEPTANCE_FILE_BYTES: u64 = 256;
 
 /// Immutable Gateway-owned ordering metadata for an accepted package.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -597,7 +597,7 @@ fn enforce_path_components(
     Ok(())
 }
 
-fn validate_regular_file(
+pub(crate) fn validate_regular_file(
     metadata: &fs::Metadata,
     relative_path: &Path,
 ) -> Result<(), PackageValidationError> {

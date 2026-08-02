@@ -134,6 +134,49 @@ impl CommittedStore {
         content_policy: ContentPolicy,
         package_policy: &PackagePolicy,
     ) -> Result<CommittedSnapshot, CommittedReadError> {
+        let deadline = content_policy.scan_deadline;
+        let (content_lock, official) = self.pin_current_commit(deadline)?;
+
+        let index = ContentIndex::build_from_pinned_root(
+            &self.content_root,
+            &self.content_root_handle,
+            content_policy,
+            package_policy,
+        )
+        .map_err(CommittedReadError::content)?;
+        let root = PinnedDirectory::try_clone_from(&self.content_root_handle)
+            .map_err(CommittedReadError::PinnedPath)?;
+        Ok(CommittedSnapshot {
+            commit: official,
+            index,
+            root,
+            maximum_markdown_bytes: content_policy.maximum_markdown_bytes,
+            deadline,
+            _content_lock: content_lock,
+        })
+    }
+
+    /// Returns the exact official commit checked out in canonical content.
+    ///
+    /// Unlike [`Self::snapshot`], this validates publication consistency
+    /// without building a Markdown index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for lock contention, replaced storage, a dirty or
+    /// stale worktree, deadline expiry, or Git and filesystem I/O.
+    pub fn current_commit_until(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<String, CommittedReadError> {
+        self.pin_current_commit(deadline)
+            .map(|(_lock, commit)| commit)
+    }
+
+    fn pin_current_commit(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<(File, String), CommittedReadError> {
         let content_lock = File::open(&self.content_root).map_err(CommittedReadError::Io)?;
         match content_lock.try_lock_shared() {
             Ok(()) => {}
@@ -142,7 +185,6 @@ impl CommittedStore {
         }
         validate_same_directory(&self.configured_git_directory, &self.git_root_handle)?;
         validate_same_directory(&self.configured_content_root, &self.content_root_handle)?;
-        let deadline = content_policy.scan_deadline;
         check_operation_deadline(deadline)?;
         validate_local_git_config_until(&self.git_directory, deadline)
             .map_err(CommittedReadError::repository)?;
@@ -186,24 +228,7 @@ impl CommittedStore {
                 checked_out,
             });
         }
-
-        let index = ContentIndex::build_from_pinned_root(
-            &self.content_root,
-            &self.content_root_handle,
-            content_policy,
-            package_policy,
-        )
-        .map_err(CommittedReadError::content)?;
-        let root = PinnedDirectory::try_clone_from(&self.content_root_handle)
-            .map_err(CommittedReadError::PinnedPath)?;
-        Ok(CommittedSnapshot {
-            commit: official,
-            index,
-            root,
-            maximum_markdown_bytes: content_policy.maximum_markdown_bytes,
-            deadline,
-            _content_lock: content_lock,
-        })
+        Ok((content_lock, official))
     }
 }
 

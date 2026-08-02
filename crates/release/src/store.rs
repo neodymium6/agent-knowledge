@@ -147,6 +147,45 @@ pub struct ReleaseStore {
     mutation_available: Arc<AtomicBool>,
 }
 
+/// Read-only view of an existing immutable release store.
+#[derive(Clone, Debug)]
+pub struct ReleaseReader {
+    store: ReleaseStore,
+}
+
+impl ReleaseReader {
+    /// Opens and validates an existing release store without creating or
+    /// repairing files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store is absent, structurally invalid,
+    /// replaced while opening, or contains an invalid active release.
+    pub fn open(root: impl AsRef<Path>, policy: ReleasePolicy) -> Result<Self, ReleaseError> {
+        ReleaseStore::open_internal(root.as_ref(), policy, false).map(|store| Self { store })
+    }
+
+    /// Attests the release root selected and pinned while opening.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured root no longer names the pinned
+    /// release object or its ancestry cannot be inspected.
+    pub fn storage_attestation(&self) -> Result<PathAttestation, PathAttestationError> {
+        self.store.storage_attestation()
+    }
+
+    /// Returns the validated active release, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage changed or active release metadata is
+    /// invalid.
+    pub fn active_release(&self) -> Result<Option<ActiveRelease>, ReleaseError> {
+        self.store.active_release()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PinnedDirectory {
     configured: PathBuf,
@@ -175,18 +214,30 @@ impl ReleaseStore {
 
     /// Creates fixed release directories and binds them to this storage root.
     pub fn open(root: impl AsRef<Path>, policy: ReleasePolicy) -> Result<Self, ReleaseError> {
+        Self::open_internal(root.as_ref(), policy, true)
+    }
+
+    fn open_internal(
+        root_path: &Path,
+        policy: ReleasePolicy,
+        initialize: bool,
+    ) -> Result<Self, ReleaseError> {
         let policy = policy.validate()?;
-        ensure_or_create_directory(root.as_ref())?;
-        let root_handle = Arc::new(open_directory(root.as_ref())?);
-        let configured_root = fs::canonicalize(root).map_err(ReleaseError::Io)?;
+        if initialize {
+            ensure_or_create_directory(root_path)?;
+        }
+        let root_handle = Arc::new(open_directory(root_path)?);
+        let configured_root = fs::canonicalize(root_path).map_err(ReleaseError::Io)?;
         validate_pinned_directory(&configured_root, &root_handle)?;
         let root = stable_directory_path(&root_handle, &configured_root)?;
-        ensure_or_create_directory(&root.join(BY_ID_DIRECTORY))?;
-        ensure_or_create_directory(&root.join(BY_COMMIT_DIRECTORY))?;
-        ensure_or_create_directory(&root.join(BY_BATCH_DIRECTORY))?;
-        ensure_or_create_directory(&root.join(CLEANUP_INTENT_DIRECTORY))?;
-        ensure_or_create_directory(&root.join(STAGING_DIRECTORY))?;
-        sync_directory(&root)?;
+        if initialize {
+            ensure_or_create_directory(&root.join(BY_ID_DIRECTORY))?;
+            ensure_or_create_directory(&root.join(BY_COMMIT_DIRECTORY))?;
+            ensure_or_create_directory(&root.join(BY_BATCH_DIRECTORY))?;
+            ensure_or_create_directory(&root.join(CLEANUP_INTENT_DIRECTORY))?;
+            ensure_or_create_directory(&root.join(STAGING_DIRECTORY))?;
+            sync_directory(&root)?;
+        }
         let by_id = pin_directory(
             configured_root.join(BY_ID_DIRECTORY),
             root.join(BY_ID_DIRECTORY),
@@ -223,7 +274,9 @@ impl ReleaseStore {
             policy,
             mutation_available: Arc::new(AtomicBool::new(true)),
         };
-        store.ensure_binding()?;
+        if initialize {
+            store.ensure_binding()?;
+        }
         store.validate_live_storage()?;
         store.active_release()?;
         Ok(store)

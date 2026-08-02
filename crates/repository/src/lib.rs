@@ -20,5 +20,7 @@ pub use read::{
     ReadFilter, SearchBackend, SearchMetadataFields, SearchPolicy,
 };
 pub use replication::{
-    RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicationPolicy, RemoteReplicator,
+    RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicationPolicy,
+    RemoteReplicationStatus, RemoteReplicator, read_remote_replication_status,
+    read_remote_replication_status_until,
 };

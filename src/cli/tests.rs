@@ -161,6 +161,49 @@ fn parses_the_worker_configuration_command() {
 }
 
 #[test]
+fn parses_and_bounds_the_local_operational_status_command() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "admin".into(),
+        "status".into(),
+        "--config".into(),
+        "/srv/fictional-knowledge/worker.yaml".into(),
+        "--maximum-queue-entries".into(),
+        "4242".into(),
+        "--timeout-seconds".into(),
+        "42".into(),
+    ])
+    .unwrap_or_else(|error| panic!("admin status command must parse: {error}"));
+
+    assert!(matches!(
+        command,
+        Command::AdminStatus { config, maximum_queue_entries: 4242, timeout }
+            if config == Path::new("/srv/fictional-knowledge/worker.yaml")
+                && timeout == std::time::Duration::from_secs(42)
+    ));
+
+    for (flag, value) in [
+        ("--maximum-queue-entries", "0"),
+        ("--maximum-queue-entries", "1000001"),
+        ("--timeout-seconds", "0"),
+        ("--timeout-seconds", "301"),
+    ] {
+        assert!(matches!(
+            parse_arguments([
+                "agent-knowledge".into(),
+                "admin".into(),
+                "status".into(),
+                "--config".into(),
+                "/srv/fictional-knowledge/worker.yaml".into(),
+                flag.into(),
+                value.into(),
+            ]),
+            Err(CliError::Usage)
+        ));
+    }
+}
+
+#[test]
 fn parses_the_forced_command_gateway_configuration() {
     let command = parse_arguments([
         "agent-knowledge".into(),

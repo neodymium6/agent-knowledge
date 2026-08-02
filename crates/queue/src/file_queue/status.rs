@@ -1,4 +1,5 @@
-use std::fs::{self, File};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, TryLockError};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,12 +12,16 @@ use agent_knowledge_core::{
 use time::OffsetDateTime;
 
 use super::{
-    LOCK_DIRECTORY_NAME, PinnedDirectory, QUEUE_IDENTITY_FILE_NAME, QUEUE_LOCK_FILE_NAME,
-    QueueBinding, QueueDirectories, QueueError, QueueState, WORKER_LOCK_FILE_NAME,
-    WORKER_TEMP_DIRECTORY_NAME, stable_file_path, validate_common_queue_mount,
-    validate_current_queue,
+    ACCEPTANCE_FILE_NAME, LOCK_DIRECTORY_NAME, PinnedDirectory, QUEUE_IDENTITY_FILE_NAME,
+    QUEUE_LOCK_FILE_NAME, QueueBinding, QueueDirectories, QueueError, QueueState,
+    WORKER_LOCK_FILE_NAME, WORKER_TEMP_DIRECTORY_NAME, stable_file_path,
+    validate_common_queue_mount, validate_current_queue,
 };
-use crate::{CURRENT_WORKER_RESULT_SCHEMA_VERSION, WorkerResultRecord, WorkerResultStatus};
+use crate::package::MAXIMUM_ACCEPTANCE_FILE_BYTES;
+use crate::{
+    AcceptanceMetadata, CURRENT_WORKER_RESULT_SCHEMA_VERSION, WorkerResultRecord,
+    WorkerResultStatus,
+};
 
 const RESULT_FILE_NAME: &str = "result.json";
 const MAXIMUM_RESULT_FILE_BYTES: u64 = 1_024;
@@ -48,6 +53,65 @@ pub enum QueueRequestStatus {
         /// Central-server time when the failure became durable.
         failed_at: OffsetDateTime,
     },
+}
+
+/// Bounded read-only summary of one durable queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueOverview {
+    pending: u64,
+    processing: u64,
+    completed: u64,
+    failed: u64,
+    oldest_pending_at: Option<OffsetDateTime>,
+    worker_active: bool,
+    snapshot_exact: bool,
+}
+
+impl QueueOverview {
+    /// Returns the number of accepted requests waiting for the Worker.
+    #[must_use]
+    pub const fn pending(self) -> u64 {
+        self.pending
+    }
+
+    /// Returns the number of requests currently owned by the Worker.
+    #[must_use]
+    pub const fn processing(self) -> u64 {
+        self.processing
+    }
+
+    /// Returns the number of locally committed and published requests.
+    #[must_use]
+    pub const fn completed(self) -> u64 {
+        self.completed
+    }
+
+    /// Returns the number of durably rejected requests.
+    #[must_use]
+    pub const fn failed(self) -> u64 {
+        self.failed
+    }
+
+    /// Returns the oldest pending acceptance time observed during the scan.
+    #[must_use]
+    pub const fn oldest_pending_at(self) -> Option<OffsetDateTime> {
+        self.oldest_pending_at
+    }
+
+    /// Reports whether another process held the Repository Worker lock.
+    #[must_use]
+    pub const fn worker_active(self) -> bool {
+        self.worker_active
+    }
+
+    /// Reports whether all queue fields form one atomic snapshot.
+    ///
+    /// Operational overview scans intentionally avoid blocking Gateway and
+    /// Worker mutations, so the current implementation returns `false`.
+    #[must_use]
+    pub const fn snapshot_exact(self) -> bool {
+        self.snapshot_exact
+    }
 }
 
 /// A pinned, read-only view of one initialized durable queue.
@@ -155,6 +219,121 @@ impl QueueReader {
         self.status_until_with_hook(request_id, deadline, &mut NoopStatusObservationHook)
     }
 
+    /// Scans accepted request states without changing the queue.
+    ///
+    /// At most `maximum_entries` request directories are inspected. Counts are
+    /// best-effort observations because the scan never blocks Gateway or
+    /// Worker mutations; duplicate observations during a forward transition
+    /// are counted once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero or exhausted scan bound, corrupt stable
+    /// entries, a replaced queue, lock inspection failure, or deadline expiry.
+    pub fn overview_until(
+        &self,
+        maximum_entries: usize,
+        deadline: Option<Instant>,
+    ) -> Result<QueueOverview, QueueError> {
+        if maximum_entries == 0 {
+            return Err(QueueError::InvalidStatusScanLimit);
+        }
+        ensure_deadline(deadline)?;
+        self.current_identity()?;
+        let mut scanned = 0_usize;
+        let mut observations = HashMap::new();
+        let mut duplicate_requests = HashSet::new();
+        for state in QueueState::ALL {
+            ensure_deadline(deadline)?;
+            let entries =
+                fs::read_dir(&self.directories.state(state).stable).map_err(QueueError::Io)?;
+            for entry in entries {
+                ensure_deadline(deadline)?;
+                if scanned == maximum_entries {
+                    return Err(QueueError::StatusScanLimitExceeded {
+                        maximum: maximum_entries,
+                    });
+                }
+                scanned += 1;
+                let entry = entry.map_err(QueueError::Io)?;
+                let path = entry.path();
+                let request_id = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse().ok())
+                    .ok_or_else(|| QueueError::InvalidStoragePath(path.clone()))?;
+                if observations.contains_key(&request_id) {
+                    duplicate_requests.insert(request_id);
+                    continue;
+                }
+                let directory = match SafeDirectory::open(&path) {
+                    Ok(directory) => directory,
+                    Err(PinnedPathError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                        continue;
+                    }
+                    Err(PinnedPathError::Io(error)) => return Err(QueueError::Io(error)),
+                    Err(_) => {
+                        return Err(QueueError::CorruptState {
+                            request_id,
+                            state,
+                            detail: "request entry is not a real directory",
+                        });
+                    }
+                };
+                let accepted_at = (state == QueueState::Pending)
+                    .then(|| read_pending_acceptance(&directory, request_id))
+                    .transpose()?;
+                observations.insert(request_id, (state, accepted_at));
+            }
+        }
+        for request_id in duplicate_requests {
+            let mut hook = NoopStatusObservationHook;
+            match self.observe_single_state_until(request_id, deadline, &mut hook)? {
+                Some((state, directory)) => {
+                    let accepted_at = (state == QueueState::Pending)
+                        .then(|| read_pending_acceptance(&directory, request_id))
+                        .transpose()?;
+                    observations.insert(request_id, (state, accepted_at));
+                }
+                None => {
+                    observations.remove(&request_id);
+                }
+            }
+        }
+        let mut counts = [0_u64; 4];
+        let mut oldest_pending_at = None;
+        for (state, accepted_at) in observations.values() {
+            counts[state.index()] = counts[state.index()].saturating_add(1);
+            if let Some(accepted_at) = accepted_at {
+                oldest_pending_at = Some(
+                    oldest_pending_at.map_or(*accepted_at, |oldest: OffsetDateTime| {
+                        oldest.min(*accepted_at)
+                    }),
+                );
+            }
+        }
+        let worker_lock = open_existing_regular(&self.worker_lock_file)?;
+        let worker_active = match worker_lock.try_lock_shared() {
+            Ok(()) => {
+                worker_lock.unlock().map_err(QueueError::Io)?;
+                false
+            }
+            Err(TryLockError::WouldBlock) => true,
+            Err(TryLockError::Error(error)) => return Err(QueueError::Io(error)),
+        };
+        self.current_identity()?;
+        ensure_deadline(deadline)?;
+        Ok(QueueOverview {
+            pending: counts[QueueState::Pending.index()],
+            processing: counts[QueueState::Processing.index()],
+            completed: counts[QueueState::Completed.index()],
+            failed: counts[QueueState::Failed.index()],
+            oldest_pending_at,
+            worker_active,
+            snapshot_exact: false,
+        })
+    }
+
     pub(super) fn status_until_with_hook(
         &self,
         request_id: RequestId,
@@ -163,26 +342,36 @@ impl QueueReader {
     ) -> Result<Option<QueueRequestStatus>, QueueError> {
         ensure_deadline(deadline)?;
         self.current_identity()?;
+        let Some((state, directory)) =
+            self.observe_single_state_until(request_id, deadline, hook)?
+        else {
+            self.current_identity()?;
+            ensure_deadline(deadline)?;
+            return Ok(None);
+        };
+        let status = match state {
+            QueueState::Pending => QueueRequestStatus::Pending,
+            QueueState::Processing => QueueRequestStatus::Processing,
+            QueueState::Completed => QueueRequestStatus::Completed,
+            QueueState::Failed => read_failed_status(&directory, request_id)?,
+        };
+        self.current_identity()?;
+        ensure_deadline(deadline)?;
+        Ok(Some(status))
+    }
+
+    fn observe_single_state_until(
+        &self,
+        request_id: RequestId,
+        deadline: Option<Instant>,
+        hook: &mut dyn StatusObservationHook,
+    ) -> Result<Option<(QueueState, SafeDirectory)>, QueueError> {
         for attempt in 0..MAXIMUM_STATE_OBSERVATION_ATTEMPTS {
-            let observed = self.observe_states(request_id, deadline, hook)?;
-            match observed.as_slice() {
-                [] if attempt + 1 == MAXIMUM_STATE_OBSERVATION_ATTEMPTS => {
-                    self.current_identity()?;
-                    ensure_deadline(deadline)?;
-                    return Ok(None);
-                }
-                [(state, directory)] => {
-                    let status = match state {
-                        QueueState::Pending => QueueRequestStatus::Pending,
-                        QueueState::Processing => QueueRequestStatus::Processing,
-                        QueueState::Completed => QueueRequestStatus::Completed,
-                        QueueState::Failed => read_failed_status(directory, request_id)?,
-                    };
-                    self.current_identity()?;
-                    ensure_deadline(deadline)?;
-                    return Ok(Some(status));
-                }
-                [] | [_, _, ..] => ensure_deadline(deadline)?,
+            let mut observed = self.observe_states(request_id, deadline, hook)?;
+            match observed.len() {
+                0 if attempt + 1 == MAXIMUM_STATE_OBSERVATION_ATTEMPTS => return Ok(None),
+                1 => return Ok(observed.pop()),
+                0 | 2.. => ensure_deadline(deadline)?,
             }
         }
         Err(QueueError::RequestInMultipleStates { request_id })
@@ -233,6 +422,60 @@ impl QueueReader {
             worker_lock_handle: &self.worker_lock_handle,
         })
     }
+}
+
+fn read_pending_acceptance(
+    directory: &SafeDirectory,
+    request_id: RequestId,
+) -> Result<OffsetDateTime, QueueError> {
+    let file = directory
+        .open_regular_beneath(ACCEPTANCE_FILE_NAME)
+        .map_err(|error| match error {
+            PinnedPathError::Io(error) if error.kind() != io::ErrorKind::NotFound => {
+                QueueError::Io(error)
+            }
+            _ => QueueError::CorruptState {
+                request_id,
+                state: QueueState::Pending,
+                detail: "pending request acceptance metadata is invalid",
+            },
+        })?;
+    let metadata = file
+        .try_clone_file()
+        .and_then(|file| file.metadata())
+        .map_err(QueueError::Io)?;
+    crate::package::validate_regular_file(&metadata, Path::new(ACCEPTANCE_FILE_NAME)).map_err(
+        |_| QueueError::CorruptState {
+            request_id,
+            state: QueueState::Pending,
+            detail: "pending request acceptance metadata is invalid",
+        },
+    )?;
+    if file.byte_length() > MAXIMUM_ACCEPTANCE_FILE_BYTES {
+        return Err(QueueError::CorruptState {
+            request_id,
+            state: QueueState::Pending,
+            detail: "pending request acceptance metadata is invalid",
+        });
+    }
+    let mut bytes = Vec::with_capacity(file.byte_length() as usize);
+    file.take(MAXIMUM_ACCEPTANCE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(QueueError::Io)?;
+    if bytes.len() as u64 > MAXIMUM_ACCEPTANCE_FILE_BYTES {
+        return Err(QueueError::CorruptState {
+            request_id,
+            state: QueueState::Pending,
+            detail: "pending request acceptance metadata is invalid",
+        });
+    }
+    let acceptance: AcceptanceMetadata =
+        serde_json::from_slice(&bytes).map_err(|_| QueueError::CorruptState {
+            request_id,
+            state: QueueState::Pending,
+            detail: "pending request acceptance metadata is invalid",
+        })?;
+    Ok(acceptance.accepted_at)
 }
 
 fn read_failed_status(

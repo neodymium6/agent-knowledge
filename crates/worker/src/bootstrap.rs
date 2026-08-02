@@ -132,14 +132,14 @@ impl WorkerBootstrap {
     }
 }
 
-struct ResolvedTopology {
-    queue_root: PathAttestation,
-    repository_root: PathAttestation,
-    content_root: PathAttestation,
-    work_root: PathAttestation,
-    release_root: PathAttestation,
-    quartz_program: PathAttestation,
-    quartz_integration_root: PathAttestation,
+pub(crate) struct ResolvedTopology {
+    pub(crate) queue_root: PathAttestation,
+    pub(crate) repository_root: PathAttestation,
+    pub(crate) content_root: PathAttestation,
+    pub(crate) work_root: PathAttestation,
+    pub(crate) release_root: PathAttestation,
+    pub(crate) quartz_program: PathAttestation,
+    pub(crate) quartz_integration_root: PathAttestation,
 }
 
 /// Failure while opening lifetime-pinned Worker components.
@@ -269,7 +269,7 @@ fn validate_opened_topology(
     Ok(())
 }
 
-fn validate_resolved_topology(
+pub(crate) fn validate_resolved_topology(
     settings: &WorkerSettings,
 ) -> Result<ResolvedTopology, WorkerOpenError> {
     let storage = [

@@ -10,14 +10,13 @@ restricted gateway; they do not synchronize the repository with Git.
 ## Status
 
 The architecture is defined, delivery increments 1 through 7 are implemented,
-and the request-status and Git-replication portions of increment 8 are complete. The current
-executable can accept requests locally or through an
+and the request-status, Git-replication, and operational-status portions of
+increment 8 are complete. The current executable can accept requests locally or through an
 OpenSSH forced command, process them through the single Writer, and publish
 immutable Quartz releases. Coding agents can list, retrieve, and search an
 exact committed content snapshot and inspect durable request state through the
 same Gateway. Git remote replication runs asynchronously with durable retry
-state. Bundle export, operational status, retention, and packaging remain future
-work.
+state. Bundle export, retention, and packaging remain future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -104,6 +103,29 @@ Git directory and the exact validated URL snapshot, so later changes to the
 main repository's local Git configuration cannot change that attempt's
 destination or behavior.
 
+Inspect the initialized local deployment through the same trusted Worker
+configuration:
+
+```sh
+agent-knowledge admin status \
+  --config /srv/agent-knowledge/worker.yaml \
+  --maximum-queue-entries 100000 \
+  --timeout-seconds 30
+```
+
+This local administrative command emits one versioned JSON object containing
+queue counts, the oldest pending timestamp, Worker-lock activity, the official
+commit, the active Quartz release, and remote-replication progress. It is
+read-only: it neither initializes nor repairs storage nor contacts the Git
+remote. The queue scan has an explicit entry bound and does not take the
+accepted-state lock, so it does not block submissions or Worker transitions.
+Queue fields are best-effort observations and `snapshot_exact` is currently
+always `false`. Its deadline covers bounded queue work and Git subprocesses;
+local filesystem calls remain subject to the host filesystem's I/O behavior.
+The command verifies the official commit again after inspecting release and
+replication state; a concurrent publication causes a transient failure instead
+of a mixed committed-content snapshot.
+
 Submit a validated request package through an SSH host alias:
 
 ```sh
@@ -143,7 +165,8 @@ read-operation deadline covers initialization, lookup or query work, response
 encoding, and delivery to the SSH channel. The response-byte limit includes
 the JSON Lines framing newline. Committed-content read processes open only the
 repository and content checkout. Status and submit processes open the durable
-queue, while status takes no queue locks and does not run maintenance.
+queue, while per-request status takes no queue locks and does not run
+maintenance.
 
 The client validates and snapshots at most 64 MiB of package data before
 network output. It then invokes the system `ssh` executable directly, uses

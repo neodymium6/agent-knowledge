@@ -14,7 +14,7 @@ use super::{
     BINDING_FILE, BuildDirectory, BuiltDirectory, CLEANUP_MARKER_FILE, LEGACY_BINDING_FILE,
     MANIFEST_FILE, MANIFEST_SCHEMA_VERSION, MANIFEST_TEMPORARY_FILE, MAXIMUM_CLEANUP_ACTIONS,
     MAXIMUM_CLEANUP_DESCRIPTOR_DEPTH, MAXIMUM_RELEASE_TREE_DEPTH, ReleaseError, ReleaseManifest,
-    ReleasePolicy, ReleaseStore, cleanup_name, derived_reference_is_repairable,
+    ReleasePolicy, ReleaseReader, ReleaseStore, cleanup_name, derived_reference_is_repairable,
     ensure_cleanup_marker, ensure_manifest, read_manifest, release_id, validate_release_tree,
     validate_release_tree_at,
 };
@@ -119,6 +119,16 @@ fn prepares_immutable_releases_and_atomically_changes_current() {
     store
         .activate(&second)
         .unwrap_or_else(|error| panic!("second release must activate: {error}"));
+    let reader = ReleaseReader::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("read-only release store must open: {error}"));
+    assert_eq!(
+        reader
+            .active_release()
+            .unwrap_or_else(|error| panic!("read-only active release must validate: {error}"))
+            .unwrap_or_else(|| panic!("read-only active release must exist"))
+            .commit(),
+        SECOND_COMMIT
+    );
     assert_eq!(
         store
             .active_release()
@@ -129,6 +139,18 @@ fn prepares_immutable_releases_and_atomically_changes_current() {
     );
     assert!(releases.join("by-id").join(first.release_id()).is_dir());
     assert!(releases.join("by-id").join(second.release_id()).is_dir());
+}
+
+#[test]
+fn read_only_open_does_not_initialize_a_missing_release_store() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("missing-releases");
+
+    assert!(matches!(
+        ReleaseReader::open(&releases, ReleasePolicy::default()),
+        Err(ReleaseError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+    ));
+    assert!(!releases.exists());
 }
 
 #[test]
