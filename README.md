@@ -129,8 +129,10 @@ migration takes both queue locks, requires empty `queue/incoming` and
 `queue/quarantine` directories, rejects links, special files, hard links,
 cross-mount traversal, and concurrent tree changes, changes existing queue data
 to the queue group, and grants the Gateway group read-only access to existing
-repository/content descendants. For the default storage root, upgrade and
-reload with:
+repository/content descendants. Before changing permissions, it preflights all
+three roots and rejects stores exceeding 1,000,000 filesystem objects or 512
+MiB of cumulative relative-path bytes. For the default storage root, upgrade
+and reload with:
 
 ```sh
 sudo systemctl stop agent-knowledge-worker.service

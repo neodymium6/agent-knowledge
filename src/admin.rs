@@ -37,6 +37,10 @@ use sha2::{Digest, Sha256};
 const MAXIMUM_MIGRATION_DEPTH: usize = 128;
 #[cfg(target_os = "linux")]
 const MAXIMUM_FD_INFO_BYTES: u64 = 16 * 1024;
+#[cfg(target_os = "linux")]
+const MAXIMUM_MIGRATION_ENTRIES: u64 = 1_000_000;
+#[cfg(target_os = "linux")]
+const MAXIMUM_MIGRATION_PATH_BYTES: u64 = 512 * 1024 * 1024;
 
 pub(crate) fn status<W>(
     config: &Path,
@@ -141,6 +145,10 @@ fn migrate_v1_storage_with_ids(
         .map_err(|_| StorageMigrationError::QueueBusy)?;
     require_empty_directory(&queue.file, Path::new("incoming"))?;
     require_empty_directory(&queue.file, Path::new("quarantine"))?;
+    let mut migration_budget = MigrationBudget::new();
+    preflight_directory(&queue.file, 0, Path::new(""), &mut migration_budget)?;
+    preflight_directory(&git.file, 0, Path::new(""), &mut migration_budget)?;
+    preflight_directory(&content.file, 0, Path::new(""), &mut migration_budget)?;
 
     let mut queue_fingerprint = TreeFingerprintBuilder::new();
     migrate_directory(
@@ -435,11 +443,50 @@ fn validate_relative_path(path: &Path) -> Result<(), StorageMigrationError> {
 #[cfg(target_os = "linux")]
 fn require_empty_directory(root: &File, path: &Path) -> Result<(), StorageMigrationError> {
     let directory = open_directory_beneath(root, path)?;
-    if directory_entries(&directory)?.is_empty() {
+    if directory_entries(&directory, path)?.is_empty() {
         Ok(())
     } else {
         Err(StorageMigrationError::DirectoryNotEmpty(path.to_path_buf()))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn preflight_directory(
+    directory: &File,
+    depth: usize,
+    relative: &Path,
+    budget: &mut MigrationBudget,
+) -> Result<(), StorageMigrationError> {
+    if depth > MAXIMUM_MIGRATION_DEPTH {
+        return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
+    }
+    budget.record(relative)?;
+    let cloned = directory.try_clone().map_err(StorageMigrationError::Io)?;
+    let mut entries = Dir::from_fd(cloned.into()).map_err(nix_io_error)?;
+    for entry in entries.iter() {
+        let entry = entry.map_err(nix_io_error)?;
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let name = CString::new(name.to_bytes())
+            .map_err(|_| StorageMigrationError::UnsafeEntry(relative.to_path_buf()))?;
+        let path = relative.join(OsStr::from_bytes(name.to_bytes()));
+        let pinned = open_child_path(directory, &name)?;
+        let identity = object_identity(&pinned)?;
+        if identity.file_type == nix::libc::S_IFDIR {
+            let child = open_child_directory(directory, &name)?;
+            if object_identity(&child)? != identity {
+                return Err(StorageMigrationError::TreeChanged(path));
+            }
+            preflight_directory(&child, depth + 1, &path, budget)?;
+        } else if identity.file_type == nix::libc::S_IFREG && identity.links == 1 {
+            budget.record(&path)?;
+        } else {
+            return Err(StorageMigrationError::UnsafeEntry(path));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -455,7 +502,7 @@ fn migrate_directory(
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
     }
-    let entries = directory_entries(directory)?;
+    let entries = directory_entries(directory, relative)?;
     for name in &entries {
         let path = relative.join(OsStr::from_bytes(name.to_bytes()));
         let pinned = open_child_path(directory, name)?;
@@ -485,7 +532,7 @@ fn migrate_directory(
             return Err(StorageMigrationError::UnsafeEntry(path));
         }
     }
-    if entries != directory_entries(directory)? {
+    if entries != directory_entries(directory, relative)? {
         return Err(StorageMigrationError::TreeChanged(relative.to_path_buf()));
     }
     set_identity_and_mode(directory, None, group, directory_mode)?;
@@ -494,7 +541,10 @@ fn migrate_directory(
 }
 
 #[cfg(target_os = "linux")]
-fn directory_entries(directory: &File) -> Result<Vec<CString>, StorageMigrationError> {
+fn directory_entries(
+    directory: &File,
+    relative: &Path,
+) -> Result<Vec<CString>, StorageMigrationError> {
     let cloned = directory.try_clone().map_err(StorageMigrationError::Io)?;
     let mut entries = Dir::from_fd(cloned.into()).map_err(nix_io_error)?;
     let mut names = Vec::new();
@@ -502,6 +552,11 @@ fn directory_entries(directory: &File) -> Result<Vec<CString>, StorageMigrationE
         let entry = entry.map_err(nix_io_error)?;
         let name = entry.file_name().to_bytes();
         if name != b"." && name != b".." {
+            if names.len() as u64 >= MAXIMUM_MIGRATION_ENTRIES {
+                return Err(StorageMigrationError::MigrationLimitExceeded(
+                    relative.to_path_buf(),
+                ));
+            }
             names.push(
                 CString::new(name)
                     .map_err(|_| StorageMigrationError::UnsafeEntry(PathBuf::new()))?,
@@ -588,7 +643,7 @@ fn fingerprint_directory(
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
     }
-    let entries = directory_entries(directory)?;
+    let entries = directory_entries(directory, relative)?;
     for name in &entries {
         let path = relative.join(OsStr::from_bytes(name.to_bytes()));
         let pinned = open_child_path(directory, name)?;
@@ -605,7 +660,7 @@ fn fingerprint_directory(
             fingerprint.record(&path, identity)?;
         }
     }
-    if entries != directory_entries(directory)? {
+    if entries != directory_entries(directory, relative)? {
         return Err(StorageMigrationError::TreeChanged(relative.to_path_buf()));
     }
     fingerprint.record(relative, object_identity(directory)?)?;
@@ -616,12 +671,14 @@ fn fingerprint_directory(
 #[derive(Debug, Eq, PartialEq)]
 struct TreeFingerprint {
     entries: u64,
+    path_bytes: u64,
     digest: [u8; 32],
 }
 
 #[cfg(target_os = "linux")]
 struct TreeFingerprintBuilder {
     entries: u64,
+    path_bytes: u64,
     digest: Sha256,
 }
 
@@ -630,6 +687,7 @@ impl TreeFingerprintBuilder {
     fn new() -> Self {
         Self {
             entries: 0,
+            path_bytes: 0,
             digest: Sha256::new(),
         }
     }
@@ -639,10 +697,7 @@ impl TreeFingerprintBuilder {
         path: &Path,
         identity: ObjectIdentity,
     ) -> Result<(), StorageMigrationError> {
-        self.entries = self
-            .entries
-            .checked_add(1)
-            .ok_or_else(|| StorageMigrationError::UnsafeEntry(path.to_path_buf()))?;
+        record_migration_object(&mut self.entries, &mut self.path_bytes, path)?;
         let path = path.as_os_str().as_bytes();
         self.digest.update((path.len() as u64).to_be_bytes());
         self.digest.update(path);
@@ -657,8 +712,52 @@ impl TreeFingerprintBuilder {
     fn finish(self) -> TreeFingerprint {
         TreeFingerprint {
             entries: self.entries,
+            path_bytes: self.path_bytes,
             digest: self.digest.finalize().into(),
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct MigrationBudget {
+    entries: u64,
+    path_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl MigrationBudget {
+    const fn new() -> Self {
+        Self {
+            entries: 0,
+            path_bytes: 0,
+        }
+    }
+
+    fn record(&mut self, path: &Path) -> Result<(), StorageMigrationError> {
+        record_migration_object(&mut self.entries, &mut self.path_bytes, path)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn record_migration_object(
+    entries: &mut u64,
+    path_bytes: &mut u64,
+    path: &Path,
+) -> Result<(), StorageMigrationError> {
+    let next_entries = entries.checked_add(1);
+    let next_path_bytes = path_bytes.checked_add(path.as_os_str().as_bytes().len() as u64);
+    match (next_entries, next_path_bytes) {
+        (Some(next_entries), Some(next_path_bytes))
+            if next_entries <= MAXIMUM_MIGRATION_ENTRIES
+                && next_path_bytes <= MAXIMUM_MIGRATION_PATH_BYTES =>
+        {
+            *entries = next_entries;
+            *path_bytes = next_path_bytes;
+            Ok(())
+        }
+        _ => Err(StorageMigrationError::MigrationLimitExceeded(
+            path.to_path_buf(),
+        )),
     }
 }
 
@@ -739,6 +838,7 @@ pub(crate) enum StorageMigrationError {
     DirectoryNotEmpty(PathBuf),
     UnsafeEntry(PathBuf),
     TreeChanged(PathBuf),
+    MigrationLimitExceeded(PathBuf),
     Attestation(PathAttestationError),
     InvalidMountInformation,
     Io(io::Error),
@@ -778,6 +878,11 @@ impl fmt::Display for StorageMigrationError {
             Self::TreeChanged(path) => write!(
                 formatter,
                 "storage migration tree changed while it was being processed: {}",
+                path.display()
+            ),
+            Self::MigrationLimitExceeded(path) => write!(
+                formatter,
+                "storage migration exceeds the supported limit of {MAXIMUM_MIGRATION_ENTRIES} objects or {MAXIMUM_MIGRATION_PATH_BYTES} relative-path bytes near: {}",
                 path.display()
             ),
             Self::Attestation(error) => {
@@ -883,7 +988,10 @@ mod migration_tests {
     use agent_knowledge_queue::{FileQueue, PackagePolicy};
     use nix::unistd::{Gid, Uid};
 
-    use super::migrate_v1_storage_with_ids;
+    use super::{
+        MAXIMUM_MIGRATION_ENTRIES, MAXIMUM_MIGRATION_PATH_BYTES, MigrationBudget,
+        StorageMigrationError, migrate_v1_storage_with_ids,
+    };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -914,6 +1022,27 @@ mod migration_tests {
                 panic!("migration test root must be removed: {error}");
             }
         }
+    }
+
+    #[test]
+    fn migration_budget_rejects_each_supported_bound() {
+        let mut entry_budget = MigrationBudget {
+            entries: MAXIMUM_MIGRATION_ENTRIES,
+            path_bytes: 0,
+        };
+        assert!(matches!(
+            entry_budget.record(Path::new("fictional-entry")),
+            Err(StorageMigrationError::MigrationLimitExceeded(_))
+        ));
+
+        let mut path_budget = MigrationBudget {
+            entries: 0,
+            path_bytes: MAXIMUM_MIGRATION_PATH_BYTES,
+        };
+        assert!(matches!(
+            path_budget.record(Path::new("x")),
+            Err(StorageMigrationError::MigrationLimitExceeded(_))
+        ));
     }
 
     #[test]
