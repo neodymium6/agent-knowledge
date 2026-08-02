@@ -17,13 +17,13 @@ use agent_knowledge_queue::{
 };
 use ulid::Ulid;
 
-#[cfg(target_os = "linux")]
-use super::run_git_until_controlled;
 use super::{
     BatchCommitOutcome, ClaimedBatch, GitIdentity, GitRepository, GitTransactionError,
     RepositoryTransaction, TransactionHooks, accept_trial_build, decode_journal, git_command,
     interrupt_publication, parse_git_version, parse_text, staged_stats, validate_journal_structure,
 };
+#[cfg(target_os = "linux")]
+use super::{run_git_for_read_with_output_limit, run_git_until_controlled};
 use crate::ContentPolicy;
 use crate::apply::AppliedMove;
 
@@ -77,6 +77,20 @@ fn terminates_descendants_that_retain_git_output_after_the_parent_exits() {
         Err(GitTransactionError::GitDeadlineExceeded)
     ));
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounds_read_only_git_output_without_a_deadline() {
+    let result = run_git_for_read_with_output_limit(
+        None,
+        None,
+        [OsStr::new("hash-object"), OsStr::new("--stdin")],
+        None,
+        4,
+    );
+
+    assert!(matches!(result, Err(GitTransactionError::InvalidGitOutput)));
 }
 
 #[cfg(target_os = "linux")]

@@ -2517,27 +2517,18 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    match deadline {
-        Some(deadline) => run_git_until_controlled_with_output_limits(
-            working_directory,
-            git_directory,
-            arguments,
-            deadline,
-            &|| false,
-            GitOutputLimits {
-                stdout: maximum_stdout_bytes,
-                stderr: MAXIMUM_TIMED_GIT_OUTPUT_BYTES,
-            },
-        ),
-        None => {
-            let output = run_git(working_directory, git_directory, arguments)?;
-            if output.stdout.len() > maximum_stdout_bytes {
-                Err(GitTransactionError::InvalidGitOutput)
-            } else {
-                Ok(output)
-            }
-        }
-    }
+    run_git_controlled_with_output_limits_and_environment(
+        working_directory,
+        git_directory,
+        arguments,
+        deadline,
+        &|| false,
+        GitOutputLimits {
+            stdout: maximum_stdout_bytes,
+            stderr: MAXIMUM_TIMED_GIT_OUTPUT_BYTES,
+        },
+        None,
+    )
 }
 
 pub(crate) fn run_git_for_read_controlled<I, S>(
@@ -2596,11 +2587,11 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_git_until_controlled_with_output_limits_and_environment(
+    run_git_controlled_with_output_limits_and_environment(
         working_directory,
         git_directory,
         arguments,
-        deadline,
+        Some(deadline),
         cancelled,
         GitOutputLimits {
             stdout: MAXIMUM_TIMED_GIT_OUTPUT_BYTES,
@@ -2610,34 +2601,11 @@ where
     )
 }
 
-fn run_git_until_controlled_with_output_limits<I, S>(
+fn run_git_controlled_with_output_limits_and_environment<I, S>(
     working_directory: Option<&Path>,
     git_directory: Option<&Path>,
     arguments: I,
-    deadline: Instant,
-    cancelled: &impl Fn() -> bool,
-    output_limits: GitOutputLimits,
-) -> Result<Output, GitTransactionError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    run_git_until_controlled_with_output_limits_and_environment(
-        working_directory,
-        git_directory,
-        arguments,
-        deadline,
-        cancelled,
-        output_limits,
-        None,
-    )
-}
-
-fn run_git_until_controlled_with_output_limits_and_environment<I, S>(
-    working_directory: Option<&Path>,
-    git_directory: Option<&Path>,
-    arguments: I,
-    deadline: Instant,
+    deadline: Option<Instant>,
     cancelled: &impl Fn() -> bool,
     output_limits: GitOutputLimits,
     environment: Option<(&OsStr, &OsStr)>,
@@ -2649,7 +2617,7 @@ where
     if cancelled() {
         return Err(GitTransactionError::GitCancelled);
     }
-    if Instant::now() >= deadline {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(GitTransactionError::GitDeadlineExceeded);
     }
     let mut command = git_command();
@@ -2726,7 +2694,7 @@ where
             return Err(GitTransactionError::GitCancelled);
         }
         let now = Instant::now();
-        if now >= deadline {
+        if deadline.is_some_and(|deadline| now >= deadline) {
             terminate_timed_git(&mut child, stdout_reader, stderr_reader);
             return Err(GitTransactionError::GitDeadlineExceeded);
         }
@@ -2741,7 +2709,14 @@ where
         }
         loop {
             match capture_receiver.try_recv() {
-                Ok((stream, result)) => captured[stream] = Some(result),
+                Ok((stream, result)) => {
+                    let exceeded = matches!(&result, Ok((_, true)));
+                    captured[stream] = Some(result);
+                    if exceeded {
+                        terminate_timed_git(&mut child, stdout_reader, stderr_reader);
+                        return Err(GitTransactionError::InvalidGitOutput);
+                    }
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if captured.iter().any(Option::is_none) {
@@ -2755,11 +2730,12 @@ where
         if status.is_some() && captured.iter().all(Option::is_some) {
             break;
         }
-        thread::sleep(
+        let poll_interval = deadline.map_or(Duration::from_millis(2), |deadline| {
             deadline
                 .saturating_duration_since(now)
-                .min(Duration::from_millis(2)),
-        );
+                .min(Duration::from_millis(2))
+        });
+        thread::sleep(poll_interval);
     }
     let stdout_join = stdout_reader.join();
     let stderr_join = stderr_reader.join();
@@ -2824,7 +2800,10 @@ fn capture_bounded_output(
         }
         let remaining = maximum_bytes.saturating_sub(captured.len());
         captured.extend_from_slice(&buffer[..count.min(remaining)]);
-        exceeded |= count > remaining;
+        if count > remaining {
+            exceeded = true;
+            break;
+        }
     }
     Ok((captured, exceeded))
 }
