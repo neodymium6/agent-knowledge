@@ -141,7 +141,8 @@ The flake publishes one wrapped production executable for `x86_64-linux` and
 `aarch64-linux`. Its runtime closure provides the Git and OpenSSH executables
 invoked by the application. Quartz remains an explicitly configured absolute
 program path and integration directory. The package contains no credentials,
-host keys, client keys, service configuration, or Quartz content.
+host keys, client keys, deployment-specific Worker or Gateway configuration,
+or Quartz content.
 
 The same executable can be used with different entry-point arguments in a
 service or container. Separate binaries may be produced from the same
@@ -648,16 +649,22 @@ account uses OpenSSH public-key authentication and per-key forced commands.
 A fictional `authorized_keys` entry has this form:
 
 ```text
-restrict,command="/usr/local/bin/agent-knowledge gateway --config /etc/agent-knowledge/gateway.yaml --client-id fictional-node-a" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFictionalKeyMaterialOnly
+restrict,command="/nix/var/nix/profiles/agent-knowledge/bin/agent-knowledge gateway --config /etc/agent-knowledge/gateway.yaml --client-id fictional-node-a" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFictionalKeyMaterialOnly
 ```
 
 Each key maps to one configured client ID. The Gateway overwrites or rejects
 any client-supplied identity that conflicts with the authenticated identity.
 
-The OpenSSH configuration also disables password authentication and all
-forwarding for the dedicated account. No interactive shell is available. The
-deployment applies per-account process/resource limits so authenticated
-connections cannot create an unbounded number of forced-command processes.
+The authorized-key file and all of its parent directories are controlled by
+root and are not writable by the service account. The OpenSSH `Match User`
+configuration requires public-key authentication and disables password and
+keyboard-interactive authentication, forwarding, PTYs, and user startup files.
+The operating-system account must permit public-key login under the selected
+PAM and `UsePAM` policy without having a usable password. This matters because
+some OpenSSH configurations reject a locked account before checking its public
+key. The deployment also applies SSH connection limits and per-account
+process/resource limits so authenticated connections cannot create an
+unbounded number of forced-command processes.
 
 ### 13.2 Operation selection
 

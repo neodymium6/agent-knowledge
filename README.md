@@ -59,8 +59,9 @@ nix run .#agent-knowledge -- client list --destination fictional-knowledge
 The package is available for `x86_64-linux` and `aarch64-linux`. Its runtime
 wrapper provides the pinned Git and OpenSSH executables used by Worker,
 Gateway, and client operations. Quartz remains a deployment-supplied absolute
-program path and integration directory. The package does not contain service
-configuration, credentials, host keys, client keys, or Quartz content.
+program path and integration directory. The package does not contain
+deployment-specific Worker or Gateway configuration, credentials, host keys,
+client keys, or Quartz content.
 
 ### systemd service
 
@@ -77,27 +78,89 @@ sudo install -d -m 0750 -o root -g agent-knowledge /etc/agent-knowledge
 sudo install -m 0640 -o root -g agent-knowledge \
   ./fictional-worker.yaml /etc/agent-knowledge/worker.yaml
 sudo systemctl link "$package_path/lib/systemd/system/agent-knowledge-worker.service"
-sudo systemctl enable --now agent-knowledge-worker.service
 ```
 
 The supplied storage layout uses sibling roots below
 `/var/lib/agent-knowledge/`. A matching Worker configuration uses `queue`,
 `repository`, `content`, `work`, and `releases` below that directory. The
-`agent-knowledge` account is shared by the Worker and the OpenSSH forced-command
-Gateway so durable queue entries remain accessible to both. Its password is
-disabled, but it has `/bin/sh` because OpenSSH executes forced commands through
-the login shell. Every authorized key must retain the documented `restrict` and
-per-key `command` options; never grant this account unrestricted SSH access.
+operator must initialize `repository` as a bare Git repository with the
+configured official branch, attach `content` as that branch's canonical
+worktree, and deploy the configured Quartz launcher and integration tree before
+starting the service. The Worker intentionally does not invent these
+deployment inputs. After validating them, enable and start the Worker:
+
+```sh
+sudo systemctl enable --now agent-knowledge-worker.service
+```
+
+The unit does not start without `/etc/agent-knowledge/worker.yaml`, and repeated
+startup failures are limited to five attempts in five minutes. Inspect a failed
+start with `systemctl status` and `journalctl -u agent-knowledge-worker` rather
+than repeatedly restarting an incompletely provisioned deployment.
+
+The `agent-knowledge` account is shared by the Worker and the OpenSSH
+forced-command Gateway so durable queue entries remain accessible to both.
+`sysusers.d` initially locks the account and assigns `/bin/sh`, which OpenSSH
+needs to execute a forced command. Before enabling Gateway access, provision an
+invalid but non-locked password hash according to the host's account policy;
+for shadow-utils hosts this can be done without creating a usable password:
+
+```sh
+sudo usermod --unlock agent-knowledge
+```
+
+This changes the generated `!*` hash to the still-invalid `*` hash, allowing
+public-key authentication even when OpenSSH uses `UsePAM no`. Password and
+keyboard-interactive authentication must remain disabled for this account.
+
+Store its authorized keys outside service-writable storage and make both the
+file and its parent root-controlled:
+
+```sh
+sudo install -d -m 0750 -o root -g agent-knowledge /etc/agent-knowledge
+sudo install -m 0644 -o root -g root \
+  ./fictional-authorized-keys /etc/agent-knowledge/authorized_keys
+```
+
+A corresponding OpenSSH account boundary is:
+
+```text
+Match User agent-knowledge
+    AuthorizedKeysFile /etc/agent-knowledge/authorized_keys
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    DisableForwarding yes
+    PermitTTY no
+    PermitUserRC no
+    MaxSessions 1
+```
+
+Every authorized key must also retain the documented `restrict` and per-key
+`command` options. Apply deployment-appropriate SSH connection limits and
+operating-system process/resource limits in addition to `MaxSessions`; never
+grant this account unrestricted SSH access.
 
 The dedicated system profile keeps the package output live across Nix garbage
 collection. The unit allows writes only below `/var/lib/agent-knowledge`, uses
 `KillMode=mixed`, and grants 15 minutes for transaction-boundary shutdown. A
 deployment using other durable roots must add them with a systemd drop-in. It
 must also increase `TimeoutStopSec` when its maximum expected Git or Quartz
-transaction can exceed 15 minutes. After upgrading the dedicated profile,
-relink the unit with `systemctl link --force`, then run `systemctl daemon-reload`
-and restart the Worker. Configuration, SSH keys, Git credentials, Quartz, and
-service enablement remain deployment inputs.
+transaction can exceed 15 minutes. Upgrade the dedicated profile and reload the
+unit with:
+
+```sh
+sudo nix profile upgrade \
+  --profile /nix/var/nix/profiles/agent-knowledge agent-knowledge
+package_path=/nix/var/nix/profiles/agent-knowledge
+sudo systemctl link --force \
+  "$package_path/lib/systemd/system/agent-knowledge-worker.service"
+sudo systemctl daemon-reload
+sudo systemctl restart agent-knowledge-worker.service
+```
+
+Configuration, SSH keys, Git credentials, Quartz, and service enablement remain
+deployment inputs.
 
 Run the Repository Worker with a validated deployment configuration:
 
@@ -308,7 +371,7 @@ transport:
 ```
 
 ```text
-restrict,command="/usr/local/bin/agent-knowledge gateway --config /etc/agent-knowledge/gateway.yaml --client-id fictional-node-a" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFictionalKeyMaterialOnly
+restrict,command="/nix/var/nix/profiles/agent-knowledge/bin/agent-knowledge gateway --config /etc/agent-knowledge/gateway.yaml --client-id fictional-node-a" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFictionalKeyMaterialOnly
 ```
 
 The Worker emits JSON Lines operational events. Every record includes
