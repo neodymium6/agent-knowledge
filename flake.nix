@@ -97,7 +97,7 @@
             platforms = linuxSystems;
           };
         };
-      containerImageFor =
+      workerContainerImageFor =
         system:
         let
           pkgs = import nixpkgs { inherit system; };
@@ -109,20 +109,28 @@
           '';
         in
         pkgs.dockerTools.buildLayeredImage {
-          name = "agent-knowledge";
+          name = "agent-knowledge-worker";
           tag = projectVersion;
           contents = [
             package
+            pkgs.cacert
             rootFilesystem
           ];
           config = {
-            User = "10003:10003";
+            User = "agent-knowledge";
             WorkingDir = "/var/lib/agent-knowledge";
-            Entrypoint = [ "${package}/bin/agent-knowledge" ];
-            Env = [ "HOME=/var/lib/agent-knowledge" ];
+            Entrypoint = [
+              "${package}/bin/agent-knowledge"
+              "worker"
+              "run"
+            ];
+            Env = [
+              "GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              "HOME=/var/lib/agent-knowledge"
+            ];
             StopSignal = "SIGTERM";
             Labels = {
-              "org.opencontainers.image.title" = "Agent Knowledge";
+              "org.opencontainers.image.title" = "Agent Knowledge Worker";
               "org.opencontainers.image.version" = projectVersion;
               "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
             };
@@ -158,7 +166,7 @@
 
       packages = forLinuxSystems (system: rec {
         agent-knowledge = packageFor system;
-        container-image = containerImageFor system;
+        worker-container-image = workerContainerImageFor system;
         default = agent-knowledge;
       });
 
@@ -176,7 +184,7 @@
         let
           pkgs = import nixpkgs { inherit system; };
           package = packageFor system;
-          containerImage = containerImageFor system;
+          workerContainerImage = workerContainerImageFor system;
         in
         {
           package = package;
@@ -191,10 +199,13 @@
               }
               ''
                 ${pkgs.bash}/bin/bash ${./deploy/container/check-image.sh} \
-                      ${containerImage} \
+                      ${workerContainerImage} \
                       ${containerArchitecture.${system}} \
                       ${package}/bin/agent-knowledge \
-                      ${projectVersion}
+                      ${projectVersion} \
+                      ${./deploy/container/passwd} \
+                      ${./deploy/container/group} \
+                      ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
                     touch "$out"
               '';
         }

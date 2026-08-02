@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-if [[ $# -ne 4 ]]; then
-  echo "usage: $0 <image-archive> <architecture> <entrypoint> <version>" >&2
+if [[ $# -ne 7 ]]; then
+  echo "usage: $0 <image-archive> <architecture> <entrypoint> <version> <passwd> <group> <ca-bundle>" >&2
   exit 2
 fi
 
@@ -11,6 +11,9 @@ image_archive=$1
 expected_architecture=$2
 expected_entrypoint=$3
 expected_version=$4
+expected_passwd=$5
+expected_group=$6
+expected_ca_bundle=$7
 
 archive_members=$(tar -tzf "$image_archive")
 if grep -Eqv '^(manifest\.json|[0-9a-f]{64}\.json|[0-9a-f]{64}/layer\.tar)$' \
@@ -54,22 +57,25 @@ jq -e \
     .created == "1970-01-01T00:00:01+00:00" and
     .architecture == $architecture and
     .os == "linux" and
-    .config.User == "10003:10003" and
+    .config.User == "agent-knowledge" and
     .config.WorkingDir == "/var/lib/agent-knowledge" and
-    .config.Entrypoint == [$entrypoint] and
+    .config.Entrypoint == [$entrypoint, "worker", "run"] and
     .config.Cmd == null and
-    .config.Env == ["HOME=/var/lib/agent-knowledge"] and
+    .config.Env == [
+      $ca_bundle,
+      "HOME=/var/lib/agent-knowledge"
+    ] and
     .config.StopSignal == "SIGTERM" and
     .config.Labels == {
       "org.opencontainers.image.source": "https://github.com/neodymium6/agent-knowledge",
-      "org.opencontainers.image.title": "Agent Knowledge",
+      "org.opencontainers.image.title": "Agent Knowledge Worker",
       "org.opencontainers.image.version": $version
     }
-  ' <<<"$config" >/dev/null
+  ' --arg ca_bundle "GIT_SSL_CAINFO=$expected_ca_bundle" <<<"$config" >/dev/null
 
 layer_paths=$(jq -er '
   if length == 1 and
-     .[0].RepoTags == ["agent-knowledge:" + $version] and
+     .[0].RepoTags == ["agent-knowledge-worker:" + $version] and
      (.[0].Layers | length > 0) and
      all(.[0].Layers[]; test("^[0-9a-f]{64}/layer\\.tar$"))
   then
@@ -88,15 +94,105 @@ while IFS= read -r layer_path; do
   tar --absolute-names -tf "$work_directory/$layer_path" >>"$layer_contents"
 done <<<"$layer_paths"
 
+normalized_layer_contents="$work_directory/normalized-layer-contents"
+sed -e 's#^\./##' -e 's#^/##' -e 's#/$##' \
+  "$layer_contents" >"$normalized_layer_contents"
+if grep -Eq '(^|/)\.wh\.' "$normalized_layer_contents"; then
+  echo "container image must not contain whiteout entries" >&2
+  exit 1
+fi
+
 entrypoint_path=${expected_entrypoint#/}
-for required_path in etc/passwd etc/group var/lib/agent-knowledge "$entrypoint_path"; do
-  if ! grep -Eq "^(\./|/)?${required_path}/?$" "$layer_contents"; then
+ca_bundle_path=${expected_ca_bundle#/}
+for required_path in \
+  etc/passwd \
+  etc/group \
+  var/lib/agent-knowledge \
+  "$entrypoint_path" \
+  "$ca_bundle_path"; do
+  if ! grep -Fxq "$required_path" "$normalized_layer_contents"; then
     echo "container image is missing ${required_path}" >&2
     exit 1
   fi
 done
 
-if grep -Eq '^(\./|/)?(bin/(ba)?sh|usr/bin/(ba)?sh)$' "$layer_contents"; then
+for unique_path in etc/passwd etc/group "$entrypoint_path" "$ca_bundle_path"; do
+  if [[ $(grep -Fxc "$unique_path" "$normalized_layer_contents") -ne 1 ]]; then
+    echo "container image path must occur in exactly one layer: ${unique_path}" >&2
+    exit 1
+  fi
+done
+
+extract_image_file() {
+  local target_path=$1
+  local destination=$2
+  local requirement=${3:-regular}
+  local depth=${4:-0}
+  local layer_path member normalized listing link_target
+
+  if [[ $depth -gt 4 ]]; then
+    echo "container image link chain is too deep: ${target_path}" >&2
+    return 1
+  fi
+
+  while IFS= read -r layer_path; do
+    while IFS= read -r member; do
+      normalized=${member#./}
+      normalized=${normalized#/}
+      normalized=${normalized%/}
+      if [[ $normalized == "$target_path" ]]; then
+        listing=$(tar --absolute-names -tvf "$work_directory/$layer_path" "$member")
+        case ${listing:0:1} in
+          -)
+            if [[ $requirement == executable && ${listing:9:1} != x ]]; then
+              echo "container image entrypoint is not executable: ${target_path}" >&2
+              return 1
+            fi
+            tar --absolute-names -xOf \
+              "$work_directory/$layer_path" "$member" >"$destination"
+            return 0
+            ;;
+          l)
+            link_target=${listing##* -> }
+            if [[ $link_target != /* ]]; then
+              echo "container image contains a relative link: ${target_path}" >&2
+              return 1
+            fi
+            link_target=${link_target#/}
+            extract_image_file \
+              "$link_target" "$destination" "$requirement" "$((depth + 1))"
+            return
+            ;;
+          *)
+            echo "container image path does not resolve to a regular file: ${target_path}" >&2
+            return 1
+            ;;
+        esac
+      fi
+    done < <(tar --absolute-names -tf "$work_directory/$layer_path")
+  done <<<"$layer_paths"
+
+  return 1
+}
+
+extract_image_file etc/passwd "$work_directory/passwd"
+extract_image_file etc/group "$work_directory/group"
+extract_image_file "$entrypoint_path" "$work_directory/entrypoint" executable
+extract_image_file "$ca_bundle_path" "$work_directory/ca-bundle"
+if ! cmp -s "$expected_passwd" "$work_directory/passwd"; then
+  echo "container passwd database does not match the packaged identities" >&2
+  exit 1
+fi
+if ! cmp -s "$expected_group" "$work_directory/group"; then
+  echo "container group database does not match the packaged identities" >&2
+  exit 1
+fi
+if [[ ! -s $work_directory/entrypoint || ! -s $work_directory/ca-bundle ]]; then
+  echo "container entrypoint and CA bundle must not be empty" >&2
+  exit 1
+fi
+
+if grep -Eq '^(bin/(ba)?sh|usr/bin/(ba)?sh)$' "$normalized_layer_contents"; then
   echo "container image must not expose a conventional shell path" >&2
   exit 1
 fi
