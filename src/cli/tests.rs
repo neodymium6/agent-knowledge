@@ -269,6 +269,24 @@ fn parses_the_forced_command_gateway_configuration() {
 }
 
 #[test]
+fn parses_the_systemd_activated_queue_ingress_command() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "queue-ingress".into(),
+        "serve".into(),
+        "--queue-root".into(),
+        "/srv/fictional-knowledge/queue".into(),
+    ])
+    .unwrap_or_else(|error| panic!("queue ingress command must parse: {error}"));
+
+    assert!(matches!(
+        command,
+        Command::ServeQueueIngress { queue_root }
+            if queue_root == Path::new("/srv/fictional-knowledge/queue")
+    ));
+}
+
+#[test]
 fn parses_the_ssh_client_submission_command() {
     let command = parse_arguments([
         "agent-knowledge".into(),

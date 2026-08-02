@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use agent_knowledge_gateway::IngressServeError;
 use agent_knowledge_protocol::{
     ExportRequest, GetRequest, LIST_COMMAND, ListRequest, ListResponse, RECENT_COMMAND,
     ReadFilterRequest, SEARCH_COMMAND, SearchRequest, StatusRequest,
@@ -31,6 +32,7 @@ const USAGE: &str = "usage:\n\
     agent-knowledge client status --destination <ssh-destination> --request-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge client search --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge gateway --config <path> --client-id <id>\n\
+    agent-knowledge queue-ingress serve --queue-root <path>\n\
     agent-knowledge worker run --config <path>";
 const DEFAULT_CLIENT_TIMEOUT_SECONDS: u64 = 300;
 const MAXIMUM_CLIENT_TIMEOUT_SECONDS: u64 = 3_600;
@@ -72,6 +74,10 @@ where
             std::env::var_os("SSH_ORIGINAL_COMMAND"),
         )
         .map_err(CliError::Gateway),
+        Command::ServeQueueIngress { queue_root } => {
+            agent_knowledge_gateway::serve_ingress(&queue_root, io::stdin().lock(), output)
+                .map_err(CliError::IngressServe)
+        }
         Command::ClientSubmit {
             destination,
             package_root,
@@ -142,6 +148,9 @@ enum Command {
         config: PathBuf,
         client_id: OsString,
     },
+    ServeQueueIngress {
+        queue_root: PathBuf,
+    },
     ClientSubmit {
         destination: OsString,
         package_root: PathBuf,
@@ -187,6 +196,12 @@ where
         return parse_gateway_arguments(action.into_iter().chain(arguments));
     }
     match (namespace.as_deref(), action.as_deref()) {
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("queue-ingress")
+                && action == std::ffi::OsStr::new("serve") =>
+        {
+            parse_queue_ingress_arguments(arguments)
+        }
         (Some(namespace), Some(action))
             if namespace == std::ffi::OsStr::new("client")
                 && action == std::ffi::OsStr::new("submit") =>
@@ -506,6 +521,25 @@ where
     })
 }
 
+fn parse_queue_ingress_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut queue_root = None;
+    while let Some(flag) = arguments.next() {
+        let value = arguments.next().ok_or(CliError::Usage)?;
+        match flag.to_str() {
+            Some("--queue-root") if queue_root.is_none() => {
+                queue_root = Some(PathBuf::from(value));
+            }
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(Command::ServeQueueIngress {
+        queue_root: queue_root.ok_or(CliError::Usage)?,
+    })
+}
+
 fn parse_submit_arguments<I>(mut arguments: I) -> Result<Command, CliError>
 where
     I: Iterator<Item = OsString>,
@@ -682,6 +716,7 @@ pub enum CliError {
     AdminRetention(AdminRetentionError),
     Worker(WorkerCommandError),
     Gateway(GatewayCommandError),
+    IngressServe(IngressServeError),
     Client(ClientCommandError),
     Json(serde_json::Error),
 }
@@ -709,6 +744,7 @@ impl fmt::Display for CliError {
             Self::AdminRetention(error) => error.fmt(formatter),
             Self::Worker(error) => error.fmt(formatter),
             Self::Gateway(error) => error.fmt(formatter),
+            Self::IngressServe(error) => error.fmt(formatter),
             Self::Client(error) => error.fmt(formatter),
             Self::Json(error) => write!(formatter, "JSON output encoding failed: {error}"),
         }
@@ -725,6 +761,7 @@ impl std::error::Error for CliError {
             Self::AdminRetention(error) => Some(error),
             Self::Worker(error) => Some(error),
             Self::Gateway(error) => Some(error),
+            Self::IngressServe(error) => Some(error),
             Self::Client(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Usage => None,

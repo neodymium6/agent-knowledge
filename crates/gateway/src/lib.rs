@@ -1,126 +1,94 @@
 //! Restricted forced-command Gateway for authenticated coding agents.
 
 mod config;
+mod ingress;
 mod read;
-mod status;
 mod submit;
-
-use std::fmt;
-use std::io::Read;
 
 use agent_knowledge_core::{ErrorCode, PathAttestation, PathAttestationError, RequestId};
 use agent_knowledge_protocol::{
-    ClientId, ExportRequest, GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest,
-    StatusRequest, StatusResponse, SubmitResponse,
+    ExportRequest, GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest,
 };
-use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueError, QueueReader};
+use agent_knowledge_queue::QueueError;
 use agent_knowledge_repository::{CommittedReadError, CommittedStore};
+use std::fmt;
 
 pub use config::{CURRENT_GATEWAY_CONFIG_VERSION, GatewayConfigError, GatewaySettings};
+pub use ingress::{IngressClient, IngressClientError, IngressServeError, serve as serve_ingress};
 pub use read::{PreparedExport, ReadRequestError};
 pub use submit::ArchiveError;
 
-/// Gateway state opened exclusively for accepting submissions.
+#[cfg(test)]
 #[derive(Debug)]
-pub struct SubmitGateway {
-    queue: FileQueue,
+struct SubmitGateway {
+    queue: agent_knowledge_queue::FileQueue,
 }
 
+#[cfg(test)]
 impl SubmitGateway {
-    /// Opens the durable queue using validated deployment settings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the queue cannot be initialized or pinned.
-    pub fn open(settings: &GatewaySettings) -> Result<Self, GatewayError> {
-        let resolved = [
-            PathAttestation::resolve_destination(settings.queue_root())
-                .map_err(GatewayError::Attestation)?,
-            PathAttestation::resolve_destination(settings.git_directory())
-                .map_err(GatewayError::Attestation)?,
-            PathAttestation::resolve_destination(settings.content_root())
-                .map_err(GatewayError::Attestation)?,
-        ];
-        validate_disjoint_storage(&resolved)?;
-        let queue = FileQueue::initialize(resolved[0].stable_path(), PackagePolicy::default())
-            .map_err(|error| GatewayError::Queue(Box::new(error)))?;
-        let queue_storage = queue
-            .storage_attestation()
-            .map_err(GatewayError::Attestation)?;
-        if !resolved[0].matches_destination(&queue_storage) {
-            return Err(GatewayError::Attestation(
-                PathAttestationError::BindingMismatch,
-            ));
-        }
+    fn open(queue_root: &std::path::Path) -> Result<Self, GatewayError> {
+        let queue = agent_knowledge_queue::FileQueue::initialize(
+            queue_root,
+            agent_knowledge_queue::PackagePolicy::default(),
+        )
+        .map_err(|error| GatewayError::Queue(Box::new(error)))?;
         Ok(Self { queue })
     }
 
-    /// Streams and durably accepts one authenticated tar submission.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for malformed archives, invalid packages, limits, or
-    /// durable queue failures. No unchecked archive entry is extracted.
-    pub fn submit(
+    fn submit(
         &self,
-        client_id: ClientId,
-        input: impl Read,
-    ) -> Result<SubmitResponse, GatewayError> {
+        client_id: agent_knowledge_protocol::ClientId,
+        input: impl std::io::Read,
+    ) -> Result<agent_knowledge_protocol::SubmitResponse, GatewayError> {
         submit::submit(&self.queue, client_id, input)
     }
 }
 
-/// Gateway state opened exclusively for durable request-status reads.
+#[cfg(test)]
 #[derive(Debug)]
-pub struct StatusGateway {
-    queue: QueueReader,
-    settings: GatewaySettings,
+struct StatusGateway {
+    queue: agent_knowledge_queue::QueueReader,
 }
 
+#[cfg(test)]
 impl StatusGateway {
-    /// Opens an existing durable queue without initializing or locking it.
-    ///
-    /// The repository and content paths are intentionally not opened because
-    /// request state is owned entirely by the durable queue.
-    pub fn open_until(
-        settings: &GatewaySettings,
-        deadline: Option<std::time::Instant>,
-    ) -> Result<Self, GatewayError> {
-        let resolved = PathAttestation::resolve_destination(settings.queue_root())
-            .map_err(GatewayError::Attestation)?;
-        let queue = QueueReader::open_until(resolved.stable_path(), deadline)
+    fn open(queue_root: &std::path::Path) -> Result<Self, GatewayError> {
+        let queue = agent_knowledge_queue::QueueReader::open_until(queue_root, None)
             .map_err(|error| GatewayError::Queue(Box::new(error)))?;
-        ensure_deadline(deadline)?;
-        let queue_storage = queue
-            .storage_attestation()
-            .map_err(GatewayError::Attestation)?;
-        if !resolved.matches_destination(&queue_storage) {
-            return Err(GatewayError::Attestation(
-                PathAttestationError::BindingMismatch,
-            ));
-        }
-        ensure_deadline(deadline)?;
-        Ok(Self {
-            queue,
-            settings: settings.clone(),
-        })
+        Ok(Self { queue })
     }
 
-    /// Retrieves one durable request state under the configured read budget.
-    pub fn status(&self, request: StatusRequest) -> Result<StatusResponse, GatewayError> {
-        let deadline = read::read_deadline(&self.settings)?;
-        status::status(&self.settings, &self.queue, request, deadline)
-            .map(|prepared| prepared.response)
-    }
-
-    /// Encodes one durable request-state response under an absolute deadline.
-    pub fn status_encoded_until(
+    fn status(
         &self,
-        request: StatusRequest,
-        deadline: std::time::Instant,
-    ) -> Result<Vec<u8>, GatewayError> {
-        status::status(&self.settings, &self.queue, request, deadline)
-            .map(|prepared| prepared.encoded)
+        request: agent_knowledge_protocol::StatusRequest,
+    ) -> Result<agent_knowledge_protocol::StatusResponse, GatewayError> {
+        let request_id = request.request_id;
+        let observed = self
+            .queue
+            .status_until(request_id, None)
+            .map_err(|error| GatewayError::Queue(Box::new(error)))?
+            .ok_or(GatewayError::RequestNotFound { request_id })?;
+        let status = match observed {
+            agent_knowledge_queue::QueueRequestStatus::Pending => {
+                agent_knowledge_protocol::RequestStatus::Pending
+            }
+            agent_knowledge_queue::QueueRequestStatus::Processing => {
+                agent_knowledge_protocol::RequestStatus::Processing
+            }
+            agent_knowledge_queue::QueueRequestStatus::Completed => {
+                agent_knowledge_protocol::RequestStatus::Completed
+            }
+            agent_knowledge_queue::QueueRequestStatus::Failed {
+                error_code,
+                failed_at,
+            } => agent_knowledge_protocol::RequestStatus::Failed {
+                error_code,
+                failed_at,
+            },
+        };
+        Ok(agent_knowledge_protocol::StatusResponse::new(
+            request_id, status,
+        ))
     }
 }
 

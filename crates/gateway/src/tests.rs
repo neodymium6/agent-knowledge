@@ -72,8 +72,7 @@ impl Drop for TestDirectory {
 }
 
 fn gateway(root: &TestDirectory) -> SubmitGateway {
-    let settings = settings(root);
-    SubmitGateway::open(&settings)
+    SubmitGateway::open(&root.path().join("queue"))
         .unwrap_or_else(|error| panic!("submit Gateway must open: {error}"))
 }
 
@@ -86,7 +85,7 @@ fn read_gateway(root: &TestDirectory) -> ReadGateway {
 
 fn settings(root: &TestDirectory) -> GatewaySettings {
     let yaml = format!(
-        "schema_version: 2\nstorage:\n  queue_root: {}\n  git_directory: {}\n  content_root: {}\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
+        "schema_version: 3\nstorage:\n  queue_socket: {}\n  git_directory: {}\n  content_root: {}\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
         root.path().join("queue").display(),
         root.path().join("repository").display(),
         root.path().join("content").display(),
@@ -297,7 +296,7 @@ fn request_status_reads_only_the_existing_queue() {
 
     let root = TestDirectory::create();
     let settings = settings(&root);
-    SubmitGateway::open(&settings)
+    SubmitGateway::open(&root.path().join("queue"))
         .unwrap_or_else(|error| panic!("submit Gateway fixture must open: {error}"))
         .submit(client_id(), Cursor::new(valid_archive()))
         .unwrap_or_else(|error| panic!("Gateway archive fixture must be accepted: {error}"));
@@ -306,7 +305,7 @@ fn request_status_reads_only_the_existing_queue() {
     let content_socket = UnixListener::bind(settings.content_root())
         .unwrap_or_else(|error| panic!("fictional content socket must bind: {error}"));
 
-    let gateway = StatusGateway::open_until(&settings, None)
+    let gateway = StatusGateway::open(&root.path().join("queue"))
         .unwrap_or_else(|error| panic!("status Gateway must ignore committed storage: {error}"));
     let request_id = REQUEST_ID
         .parse()
@@ -325,26 +324,6 @@ fn request_status_reads_only_the_existing_queue() {
         Err(GatewayError::RequestNotFound { request_id }) if request_id == missing
     ));
     drop((repository_socket, content_socket));
-}
-
-#[test]
-fn rejects_overlapping_storage_before_initializing_the_queue() {
-    let root = TestDirectory::create();
-    initialize_committed_content(&root);
-    let content = root.path().join("content");
-    let yaml = format!(
-        "schema_version: 2\nstorage:\n  queue_root: {}\n  git_directory: {}\n  content_root: {}\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
-        content.display(),
-        root.path().join("repository").display(),
-        content.display(),
-    );
-    let settings = GatewaySettings::decode(&yaml)
-        .unwrap_or_else(|error| panic!("overlap settings must decode: {error}"));
-    assert!(matches!(
-        SubmitGateway::open(&settings),
-        Err(GatewayError::OverlappingStorage)
-    ));
-    assert!(!content.join("queue-id").exists());
 }
 
 fn append_entry(builder: &mut Builder<Vec<u8>>, path: &str, kind: EntryType, contents: &[u8]) {
