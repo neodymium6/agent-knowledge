@@ -94,9 +94,9 @@ The Queue Ingress image fixes the non-root `agent-knowledge-queue` identity
 (`10002:10002`) and `queue-ingress listen` entrypoint. It contains the raw Rust
 executable closure rather than the Worker package's Git/OpenSSH wrapper, and it
 does not include a CA bundle. The deployment supplies the queue root, shared
-runtime directory, and listener arguments. The queue identity is a member of
-the Gateway connector group (`10001`) so a setgid runtime directory can publish
-the `0660` socket to Gateway without making the queue readable by Gateway.
+runtime directory, and listener arguments. A dedicated ingress-socket group
+(`10004`) grants the Gateway access to the `0660` socket without granting the
+broker the Gateway reader group or granting Gateway access to the queue.
 
 `just check-package` validates both image archives, architectures,
 deterministic timestamps, role-locked entrypoints, non-root metadata, identity
@@ -150,9 +150,10 @@ The packaged `agent-knowledge` and `agent-knowledge-queue` accounts are locked,
 non-login accounts for the Worker and queue ingress broker respectively. Never
 use either for OpenSSH. Create the deployment-specific SSH account according to
 the host's authentication policy and add only that account to the
-`agent-knowledge-gateway` group. That group can connect to the local ingress
-socket and read committed repository/content storage; it cannot open the
-durable queue. The broker owns the queue but cannot open Worker-owned storage.
+`agent-knowledge-gateway` and `agent-knowledge-ingress` groups. The first group
+can read committed repository/content storage; the second can connect to the
+local ingress socket. Neither can open the durable queue. The broker owns the
+queue but cannot open Worker-owned storage.
 The Worker receives the queue group as a supplementary group so it can perform
 state transitions without sharing either service UID. The durable storage root
 is `0751 root:agent-knowledge-queue`: the broker and Worker can open it for
@@ -227,11 +228,14 @@ agent-knowledge queue-ingress listen \
   --connection-timeout-seconds 3900
 ```
 
-The runtime directory must already exist, be writable by the queue-ingress
-identity, and use a setgid group accepted by the Gateway identity. The listener
-publishes the socket as `0660`, refuses to overwrite live or non-socket paths,
-recovers its own stale socket after a crash, bounds concurrent connections,
-and stops accepting and disconnects active clients on `SIGINT` or `SIGTERM`.
+The runtime directory must already exist, be owned and writable by the
+queue-ingress identity, use the setgid `agent-knowledge-ingress` group, and be
+writable by neither group nor other; mode `2750` is recommended. The container
+identity database assigns this group GID `10004`, and the Gateway joins it.
+The listener publishes the socket as `0660`, refuses to overwrite live,
+non-socket, or unowned stale paths, recovers a stale socket recorded by its own
+locked state file after a crash, bounds concurrent connections, and stops
+accepting and cancels active queue lock waits on `SIGINT` or `SIGTERM`.
 `queue-ingress serve` remains the one-connection entrypoint used by the
 packaged systemd units.
 
@@ -417,7 +421,8 @@ reached, including when a proxy descendant retains an output pipe.
 
 The forced-command account needs read access to this root-controlled
 configuration and membership in `agent-knowledge-gateway`, but no queue or
-Worker-account membership.
+Worker-account membership. It also joins `agent-knowledge-ingress` to connect
+to the local broker socket.
 
 The forced command requires a strict Gateway configuration such as:
 

@@ -5,9 +5,9 @@ Documentation=https://github.com/neodymium6/agent-knowledge
 [Socket]
 ListenStream=/run/agent-knowledge/queue-ingress.sock
 SocketUser=agent-knowledge-queue
-SocketGroup=agent-knowledge-gateway
+SocketGroup=agent-knowledge-ingress
 SocketMode=0660
-DirectoryMode=0750
+DirectoryMode=2750
 Accept=yes
 MaxConnections=64
 RemoveOnStop=yes

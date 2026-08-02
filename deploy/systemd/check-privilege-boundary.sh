@@ -29,6 +29,7 @@ trap cleanup EXIT
 
 gateway_uid=61100
 gateway_gid=61100
+ingress_gid=61103
 queue_uid=61101
 queue_gid=61101
 worker_uid=61102
@@ -45,7 +46,7 @@ sed \
   -e "s/ agent-knowledge-queue agent-knowledge-queue / $queue_uid $queue_gid /g" \
   -e "s/ agent-knowledge agent-knowledge-gateway / $worker_uid $gateway_gid /g" \
   -e "s/ agent-knowledge agent-knowledge / $worker_uid $worker_gid /g" \
-  -e "s/ agent-knowledge-queue agent-knowledge-gateway / $queue_uid $gateway_gid /g" \
+  -e "s/ agent-knowledge-queue agent-knowledge-ingress / $queue_uid $ingress_gid /g" \
   "$tmpfiles_config" >"$fresh_config"
 systemd-tmpfiles --create --root="$fresh_root" "$fresh_config"
 test "$(stat -c '%u:%g:%a' "$fresh_root/var/lib/agent-knowledge")" = \
@@ -65,7 +66,7 @@ install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
   "$test_root/storage/content"
 install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
   "$test_root/storage/work" "$test_root/storage/releases"
-install -d -m 0750 -o "$queue_uid" -g "$gateway_gid" "$test_root/run"
+install -d -m 2750 -o "$queue_uid" -g "$ingress_gid" "$test_root/run"
 install -d -m 0755 "$test_root/package/payload/run"
 
 cat >"$test_root/package/request.json" <<'EOF'
@@ -205,11 +206,11 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 test -S "$test_root/run/queue-ingress.sock"
-chown "$queue_uid":"$gateway_gid" "$test_root/run/queue-ingress.sock"
+chown "$queue_uid":"$ingress_gid" "$test_root/run/queue-ingress.sock"
 chmod 0660 "$test_root/run/queue-ingress.sock"
 
 submit_response=$(
-  setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
+  setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
     env SSH_ORIGINAL_COMMAND='akp-v1 submit' \
     "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
     --client-id fictional-node-a <"$test_root/request.tar"
@@ -217,7 +218,7 @@ submit_response=$(
 grep -Fq '"status":"existing"' <<<"$submit_response"
 
 new_submit_response=$(
-  setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
+  setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
     env SSH_ORIGINAL_COMMAND='akp-v1 submit' \
     "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
     --client-id fictional-node-a <"$test_root/request-two.tar"
@@ -226,7 +227,7 @@ grep -Fq '"status":"accepted"' <<<"$new_submit_response"
 
 status_response=$(
   printf '%s\n' '{"protocol_version":1,"request_id":"01K00000000000000000000000"}' |
-    setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
+    setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
       env SSH_ORIGINAL_COMMAND='akp-v1 status' \
       "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
       --client-id fictional-node-a
@@ -235,14 +236,14 @@ grep -Fq '"status":"pending"' <<<"$status_response"
 
 list_response=$(
   printf '%s\n' '{"protocol_version":1,"maximum_results":10}' |
-    setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
+    setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
       env SSH_ORIGINAL_COMMAND='akp-v1 list' \
       "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
       --client-id fictional-node-a
 )
 grep -Fq '01K00000000000000000000001' <<<"$list_response"
 
-if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
+if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
   test -r "$test_root/storage/queue/queue-id"; then
   echo "Gateway identity can read the durable queue" >&2
   exit 1
@@ -252,9 +253,9 @@ if setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
   echo "queue ingress identity can read the repository" >&2
   exit 1
 fi
-setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
+setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
   test -r "$test_root/storage/repository"
-if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
+if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
   touch "$test_root/storage/repository/gateway-write.fixture"; then
   echo "Gateway identity can write the repository" >&2
   exit 1

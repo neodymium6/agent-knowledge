@@ -154,8 +154,9 @@ image resolves its non-root account to `10003:10003`, includes queue GID
 `10002` as a supplementary group, retains the Git/OpenSSH runtime wrapper, and
 provides an immutable CA bundle through `SSL_CERT_FILE` for HTTPS Git
 replication. The Queue Ingress image resolves its account to `10002:10002`,
-includes Gateway connector GID `10001`, and uses the raw Rust executable
-closure without Git, OpenSSH, or a CA bundle. Deployments mount configuration,
+publishes its socket with dedicated ingress GID `10004`, and uses the raw Rust
+executable closure without Git, OpenSSH, or a CA bundle. The Gateway joins the
+ingress group; the broker does not join the Gateway reader group. Deployments mount configuration,
 secrets, durable storage, runtime socket storage, and writable homes as needed.
 No conventional shell path, role-specific configuration, credentials, keys,
 or content is included. The future Gateway image must similarly fix its
@@ -327,7 +328,7 @@ replication credentials. It:
 
 The conventional Linux deployment uses a systemd Unix socket with `Accept=yes`
 and an instantiated `queue-ingress serve` process for each connection.
-`SocketMode` and `SocketGroup` allow only the dedicated Gateway group to
+`SocketMode` and `SocketGroup` allow only the dedicated ingress group to
 connect. A bounded connection count and service runtime cap resource use.
 
 Supervisors without socket activation use `queue-ingress listen`. This native
@@ -335,10 +336,13 @@ listener owns the Unix socket for its complete lifetime, fixes its mode to
 `0660`, holds an exclusive lock, refuses to replace a live or non-socket
 target, and safely replaces a socket left by a crashed prior process. It uses a
 bounded thread per accepted connection, applies both inactivity timeouts and
-an absolute connection lifetime, and closes active sockets before joining
-their handlers on `SIGINT` or `SIGTERM`. The deployment creates the runtime
-directory in advance with its setgid group set to the Gateway connector group;
-the listener never creates or guesses deployment ownership.
+an absolute connection lifetime, and cancels queue lock waits before joining
+handlers on `SIGINT` or `SIGTERM`. The deployment creates the runtime directory
+in advance, owned by the broker with mode `2750` and dedicated ingress group
+(`10004` in the container identity database). Descriptor-relative mutation and
+a private ownership record constrain
+stale-socket recovery to the listener's pinned directory and prior socket. The
+listener never creates or guesses deployment ownership.
 
 The internal protocol is independent of the public SSH protocol. It begins
 with exactly one bounded newline-terminated JSON header:
@@ -714,8 +718,8 @@ account and cannot write the Git repository, canonical content, worktrees, or
 releases, or read Worker replication credentials. The local queue-ingress
 broker mediates queue submission and status operations; ordinary groups or
 ACLs never grant the Gateway direct queue access. The Gateway account belongs
-to a group which may connect to the broker socket and read the committed
-repository and content checkout, but not to the queue-owner group. The Worker
+to a dedicated group for the broker socket and a separate read-only group for
+the committed repository and content checkout, but not to the queue-owner group. The Worker
 belongs to the queue-owner group so it can transition queue entries, while the
 broker account has no access to Worker-owned storage.
 

@@ -1,5 +1,6 @@
-# The deployment-managed SSH account joins agent-knowledge-gateway only.
+# The deployment-managed SSH account joins both Gateway groups.
 g agent-knowledge-gateway - -
+g agent-knowledge-ingress - -
 u agent-knowledge - "Agent Knowledge Worker service account" /var/lib/agent-knowledge -
 u agent-knowledge-queue - "Agent Knowledge queue ingress account" /var/lib/agent-knowledge -
 m agent-knowledge agent-knowledge-queue
