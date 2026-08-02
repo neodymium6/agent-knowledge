@@ -19,8 +19,8 @@ asynchronously with durable retry state. Derived-release retention and
 document-bundle export are implemented. The flake provides reproducible Linux
 packaging, a conventional systemd Worker service, and a systemd-activated local
 queue-ingress broker that isolates the forced-command Gateway from durable queue
-access under distinct service identities. Container and Kubernetes packaging
-remain future work.
+access under distinct service identities. Reproducible container packaging is
+implemented; single-replica Kubernetes packaging remains future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -63,6 +63,29 @@ Gateway, and client operations. Quartz remains a deployment-supplied absolute
 program path and integration directory. The package does not contain
 deployment-specific Worker or Gateway configuration, credentials, host keys,
 client keys, or Quartz content.
+
+### Container image
+
+Build the Docker-compatible image archive without a container daemon:
+
+```sh
+nix build .#container-image
+docker load < result
+```
+
+The flake builds the image natively for both `x86_64-linux` (`amd64`) and
+`aarch64-linux` (`arm64`). Its direct entrypoint is the same wrapped executable
+as the Linux package; the required role and configuration path are supplied as
+arguments by the deployment. The image defaults to the non-root Worker identity
+`10003:10003` and defines separate numeric identities for the Gateway
+(`10001:10001`) and queue ingress broker (`10002:10002`) so a supervisor can run
+the roles with distinct privileges. It exposes no conventional shell path and
+contains no deployment configuration, credentials, keys, or Quartz content.
+
+`just check-package` validates the image archive, architecture, deterministic
+timestamp, entrypoint, non-root metadata, and required filesystem entries
+without Docker or Podman. Runtime storage, configuration, secrets, and a
+writable Worker home are deployment-supplied mounts.
 
 ### systemd service
 
