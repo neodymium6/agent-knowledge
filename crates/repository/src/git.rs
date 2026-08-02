@@ -2625,10 +2625,10 @@ where
         command.env(name, value);
     }
     if let Some(working_directory) = working_directory {
-        command.arg("-C").arg(working_directory);
+        select_working_directory(&mut command, working_directory);
     }
     if let Some(git_directory) = git_directory {
-        command.arg(git_directory_argument(git_directory));
+        select_git_directory(&mut command, git_directory);
     }
     let arguments = arguments
         .into_iter()
@@ -2833,10 +2833,10 @@ where
 {
     let mut command = git_command();
     if let Some(working_directory) = working_directory {
-        command.arg("-C").arg(working_directory);
+        select_working_directory(&mut command, working_directory);
     }
     if let Some(git_directory) = git_directory {
-        command.arg(git_directory_argument(git_directory));
+        select_git_directory(&mut command, git_directory);
     }
     let arguments = arguments
         .into_iter()
@@ -2874,6 +2874,22 @@ fn git_directory_argument(git_directory: &Path) -> OsString {
     let mut argument = OsString::from("--git-dir=");
     argument.push(git_directory.as_os_str());
     argument
+}
+
+fn select_working_directory(command: &mut Command, working_directory: &Path) {
+    add_safe_directory(command, working_directory);
+    command.arg("-C").arg(working_directory);
+}
+
+fn select_git_directory(command: &mut Command, git_directory: &Path) {
+    add_safe_directory(command, git_directory);
+    command.arg(git_directory_argument(git_directory));
+}
+
+fn add_safe_directory(command: &mut Command, directory: &Path) {
+    let mut safe_directory = OsString::from("safe.directory=");
+    safe_directory.push(directory.as_os_str());
+    command.arg("-c").arg(safe_directory);
 }
 
 fn git_command() -> Command {
