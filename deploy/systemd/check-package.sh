@@ -38,6 +38,10 @@ test_root=$(mktemp -d)
 trap 'rm -rf -- "$test_root"' EXIT
 systemd-sysusers --dry-run --root="$test_root" "$sysusers"
 systemd-tmpfiles --dry-run --create --graceful --root="$test_root" "$tmpfiles"
-test "$(grep -Ec '^u agent-knowledge - "Agent Knowledge service account" /var/lib/agent-knowledge /bin/sh$' "$sysusers")" -eq 1
+test "$(grep -Ec '^u agent-knowledge - "Agent Knowledge Worker service account" /var/lib/agent-knowledge -$' "$sysusers")" -eq 1
+if grep -Fq '/bin/sh' "$sysusers"; then
+  echo "Worker account must not have a login shell" >&2
+  exit 1
+fi
 test "$(grep -Ec '^d /var/lib/agent-knowledge 0750 root agent-knowledge -$' "$tmpfiles")" -eq 1
 test "$(grep -Ec '^d /var/lib/agent-knowledge/(queue|repository|content|work|releases) 0750 agent-knowledge agent-knowledge -$' "$tmpfiles")" -eq 5

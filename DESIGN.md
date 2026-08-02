@@ -643,8 +643,12 @@ Unicode and are not used as trusted paths.
 
 ### 13.1 OpenSSH
 
-The project does not implement an SSH server. A dedicated operating-system
-account uses OpenSSH public-key authentication and per-key forced commands.
+The project does not implement an SSH server. A dedicated Gateway
+operating-system account uses OpenSSH public-key authentication and per-key
+forced commands. It is distinct from the Worker account and cannot write the
+Git repository, canonical content, worktrees, or releases, or read Worker
+replication credentials. Deployment-specific groups or ACLs grant only queue
+and committed-read access required by the Gateway.
 
 A fictional `authorized_keys` entry has this form:
 
@@ -656,9 +660,13 @@ Each key maps to one configured client ID. The Gateway overwrites or rejects
 any client-supplied identity that conflicts with the authenticated identity.
 
 The authorized-key file and all of its parent directories are controlled by
-root and are not writable by the service account. The OpenSSH `Match User`
+root and are not writable by the Gateway account. The OpenSSH `Match User`
 configuration requires public-key authentication and disables password and
 keyboard-interactive authentication, forwarding, PTYs, and user startup files.
+It disables `AuthorizedKeysCommand` and `TrustedUserCAKeys` for the Gateway
+account so every accepted key is constrained by the root-controlled
+`authorized_keys` entry and its forced command.
+
 The operating-system account must permit public-key login under the selected
 PAM and `UsePAM` policy without having a usable password. This matters because
 some OpenSSH configurations reject a locked account before checking its public

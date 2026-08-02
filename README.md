@@ -74,7 +74,7 @@ sudo nix profile add --profile /nix/var/nix/profiles/agent-knowledge \
 package_path=/nix/var/nix/profiles/agent-knowledge
 sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
 sudo systemd-tmpfiles --create "$package_path/lib/tmpfiles.d/agent-knowledge.conf"
-sudo install -d -m 0750 -o root -g agent-knowledge /etc/agent-knowledge
+sudo install -d -m 0755 -o root -g root /etc/agent-knowledge
 sudo install -m 0640 -o root -g agent-knowledge \
   ./fictional-worker.yaml /etc/agent-knowledge/worker.yaml
 sudo systemctl link "$package_path/lib/systemd/system/agent-knowledge-worker.service"
@@ -98,15 +98,23 @@ startup failures are limited to five attempts in five minutes. Inspect a failed
 start with `systemctl status` and `journalctl -u agent-knowledge-worker` rather
 than repeatedly restarting an incompletely provisioned deployment.
 
-The `agent-knowledge` account is shared by the Worker and the OpenSSH
-forced-command Gateway so durable queue entries remain accessible to both.
-`sysusers.d` initially locks the account and assigns `/bin/sh`, which OpenSSH
-needs to execute a forced command. Before enabling Gateway access, provision an
-invalid but non-locked password hash according to the host's account policy;
-for shadow-utils hosts this can be done without creating a usable password:
+The packaged `agent-knowledge` account is a locked, non-login Worker account.
+Never use it for OpenSSH. Run the untrusted-facing Gateway under a separate
+deployment-managed account, such as the fictional `agent-knowledge-gateway`.
+Grant that account only the queue and committed-read access required by the
+Gateway, using deployment-specific groups or ACLs. It must not be able to write
+`repository`, `content`, `work`, or `releases`, or read Worker replication
+credentials. The Worker account remains the only account with authoritative
+write access.
+
+OpenSSH needs the separate Gateway account to have an executable login shell
+because it invokes forced commands through that shell. The account must have an
+invalid but non-locked password hash under the host's account policy. On a
+shadow-utils host where the provisioned Gateway hash is `!*`, this can be done
+without creating a usable password:
 
 ```sh
-sudo usermod --unlock agent-knowledge
+sudo usermod --unlock agent-knowledge-gateway
 ```
 
 This changes the generated `!*` hash to the still-invalid `*` hash, allowing
@@ -117,7 +125,7 @@ Store its authorized keys outside service-writable storage and make both the
 file and its parent root-controlled:
 
 ```sh
-sudo install -d -m 0750 -o root -g agent-knowledge /etc/agent-knowledge
+sudo install -d -m 0755 -o root -g root /etc/agent-knowledge
 sudo install -m 0644 -o root -g root \
   ./fictional-authorized-keys /etc/agent-knowledge/authorized_keys
 ```
@@ -125,9 +133,12 @@ sudo install -m 0644 -o root -g root \
 A corresponding OpenSSH account boundary is:
 
 ```text
-Match User agent-knowledge
+Match User agent-knowledge-gateway
     AuthorizedKeysFile /etc/agent-knowledge/authorized_keys
+    AuthorizedKeysCommand none
+    TrustedUserCAKeys none
     AuthenticationMethods publickey
+    PubkeyAuthentication yes
     PasswordAuthentication no
     KbdInteractiveAuthentication no
     DisableForwarding yes
@@ -153,6 +164,9 @@ unit with:
 sudo nix profile upgrade \
   --profile /nix/var/nix/profiles/agent-knowledge agent-knowledge
 package_path=/nix/var/nix/profiles/agent-knowledge
+sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
+sudo systemd-tmpfiles --create \
+  "$package_path/lib/tmpfiles.d/agent-knowledge.conf"
 sudo systemctl link --force \
   "$package_path/lib/systemd/system/agent-knowledge-worker.service"
 sudo systemctl daemon-reload
