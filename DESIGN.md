@@ -643,12 +643,17 @@ Unicode and are not used as trusted paths.
 
 ### 13.1 OpenSSH
 
-The project does not implement an SSH server. A dedicated Gateway
-operating-system account uses OpenSSH public-key authentication and per-key
-forced commands. It is distinct from the Worker account and cannot write the
-Git repository, canonical content, worktrees, or releases, or read Worker
-replication credentials. Deployment-specific groups or ACLs grant only queue
-and committed-read access required by the Gateway.
+The project does not implement an SSH server. The target production deployment
+uses a dedicated Gateway operating-system account with OpenSSH public-key
+authentication and per-key forced commands. It is distinct from the Worker
+account and cannot write the Git repository, canonical content, worktrees, or
+releases, or read Worker replication credentials. A local enqueue broker or
+equivalent durable ownership-handoff boundary mediates queue operations;
+ordinary groups or ACLs must not grant the Gateway direct queue mutation.
+
+The forced-command application and protocol are implemented, but production
+Gateway deployment remains unsupported until that handoff and distinct-UID
+integration tests in delivery increment 10 are implemented.
 
 A fictional `authorized_keys` entry has this form:
 
