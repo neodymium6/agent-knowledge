@@ -188,6 +188,8 @@ extract_image_file() {
     return 1
   fi
 
+  validate_image_ancestors "$target_path" "$depth"
+
   while IFS= read -r layer_path; do
     while IFS= read -r member; do
       normalized=${member#./}
@@ -237,8 +239,10 @@ extract_image_file() {
 
 validate_image_directory() {
   local target_path=$1
-  local depth=${2:-0}
+  local requirement=${2:-optional}
+  local depth=${3:-0}
   local layer_path member normalized listing link_target
+  local found=false
 
   if [[ $depth -gt 4 ]]; then
     echo "container image directory link chain is too deep: ${target_path}" >&2
@@ -257,10 +261,10 @@ validate_image_directory() {
         case ${listing:0:1} in
           d)
             if [[ ${listing:9:1} != x ]]; then
-              echo "container image working directory is not traversable: ${target_path}" >&2
+              echo "container image directory is not traversable: ${target_path}" >&2
               return 1
             fi
-            return 0
+            found=true
             ;;
           l)
             link_target=${listing##* -> }
@@ -270,11 +274,13 @@ validate_image_directory() {
             fi
             link_target=${link_target#/}
             validate_normalized_path "$link_target"
-            validate_image_directory "$link_target" "$((depth + 1))"
-            return
+            validate_image_ancestors "$link_target" "$((depth + 1))"
+            validate_image_directory \
+              "$link_target" required "$((depth + 1))"
+            found=true
             ;;
           *)
-            echo "container image working directory is not a directory: ${target_path}" >&2
+            echo "container image path is not a directory: ${target_path}" >&2
             return 1
             ;;
         esac
@@ -282,14 +288,30 @@ validate_image_directory() {
     done < <(tar --absolute-names -tf "$work_directory/$layer_path")
   done <<<"$layer_paths"
 
-  return 1
+  if [[ $found == false && $requirement == required ]]; then
+    echo "container image is missing a required directory: ${target_path}" >&2
+    return 1
+  fi
+}
+
+validate_image_ancestors() {
+  local target_path=$1
+  local depth=${2:-0}
+  local ancestor=${target_path%/*}
+
+  while [[ $ancestor != "$target_path" && -n $ancestor ]]; do
+    validate_image_directory "$ancestor" optional "$depth"
+    target_path=$ancestor
+    ancestor=${target_path%/*}
+  done
 }
 
 extract_image_file etc/passwd "$work_directory/passwd"
 extract_image_file etc/group "$work_directory/group"
 extract_image_file "$entrypoint_path" "$work_directory/entrypoint" executable
 extract_image_file "$ca_bundle_path" "$work_directory/ca-bundle"
-validate_image_directory var/lib/agent-knowledge
+validate_image_ancestors var/lib/agent-knowledge
+validate_image_directory var/lib/agent-knowledge required
 if ! cmp -s "$expected_passwd" "$work_directory/passwd"; then
   echo "container passwd database does not match the packaged identities" >&2
   exit 1
