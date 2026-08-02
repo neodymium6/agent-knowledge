@@ -1627,8 +1627,11 @@ Implementation proceeds in these increments:
    (implemented).
 9. Deployment packaging:
    - reproducible Linux package output (implemented);
-   - conventional Linux service integration (implemented); and
+   - conventional Linux Worker service integration (implemented); and
    - optional container and single-replica Kubernetes packaging.
+10. Production Gateway privilege separation through a local enqueue broker or
+    equivalent durable ownership handoff, verified with distinct-UID
+    integration tests.
 
 Every increment keeps `just check` passing and preserves the invariants in this
 document.

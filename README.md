@@ -18,8 +18,8 @@ exact committed content snapshot and inspect durable request state through the
 same Gateway. Git remote replication runs asynchronously with durable retry
 state. Derived-release retention is available as a bounded local maintenance
 operation. Document-bundle export is implemented. Reproducible Linux package
-output and conventional systemd service integration are available through the
-flake; container and Kubernetes packaging remain future work.
+output and conventional systemd Worker service integration are available
+through the flake; container and Kubernetes packaging remain future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -99,58 +99,14 @@ start with `systemctl status` and `journalctl -u agent-knowledge-worker` rather
 than repeatedly restarting an incompletely provisioned deployment.
 
 The packaged `agent-knowledge` account is a locked, non-login Worker account.
-Never use it for OpenSSH. Run the untrusted-facing Gateway under a separate
-deployment-managed account, such as the fictional `agent-knowledge-gateway`.
-Grant that account only the queue and committed-read access required by the
-Gateway, using deployment-specific groups or ACLs. It must not be able to write
-`repository`, `content`, `work`, or `releases`, or read Worker replication
-credentials. The Worker account remains the only account with authoritative
-write access.
-
-OpenSSH needs the separate Gateway account to have an executable login shell
-because it invokes forced commands through that shell. The account must have an
-invalid but non-locked password hash under the host's account policy. On a
-shadow-utils host where the provisioned Gateway hash is `!*`, this can be done
-without creating a usable password:
-
-```sh
-sudo usermod --unlock agent-knowledge-gateway
-```
-
-This changes the generated `!*` hash to the still-invalid `*` hash, allowing
-public-key authentication even when OpenSSH uses `UsePAM no`. Password and
-keyboard-interactive authentication must remain disabled for this account.
-
-Store its authorized keys outside service-writable storage and make both the
-file and its parent root-controlled:
-
-```sh
-sudo install -d -m 0755 -o root -g root /etc/agent-knowledge
-sudo install -m 0644 -o root -g root \
-  ./fictional-authorized-keys /etc/agent-knowledge/authorized_keys
-```
-
-A corresponding OpenSSH account boundary is:
-
-```text
-Match User agent-knowledge-gateway
-    AuthorizedKeysFile /etc/agent-knowledge/authorized_keys
-    AuthorizedKeysCommand none
-    TrustedUserCAKeys none
-    AuthenticationMethods publickey
-    PubkeyAuthentication yes
-    PasswordAuthentication no
-    KbdInteractiveAuthentication no
-    DisableForwarding yes
-    PermitTTY no
-    PermitUserRC no
-    MaxSessions 1
-```
-
-Every authorized key must also retain the documented `restrict` and per-key
-`command` options. Apply deployment-appropriate SSH connection limits and
-operating-system process/resource limits in addition to `MaxSessions`; never
-grant this account unrestricted SSH access.
+Never use it for OpenSSH. This package does not yet provide a production
+Gateway service or account. The current filesystem queue requires the Gateway
+to mutate shared lock, sequence, and package state, so a separate Gateway UID
+cannot be granted a narrow ingress capability with ordinary groups or ACLs.
+Do not work around this by sharing the Worker UID or by granting broad queue or
+Worker-state permissions. Production Gateway deployment remains blocked on a
+local enqueue broker or equivalent durable ownership-handoff boundary, plus an
+integration test that exercises distinct Gateway and Worker UIDs.
 
 The dedicated system profile keeps the package output live across Nix garbage
 collection. The unit allows writes only below `/var/lib/agent-knowledge`, uses
@@ -355,6 +311,11 @@ seconds. The client resolves payloads beneath a pinned package directory
 without following symbolic-link components. It runs SSH in a dedicated process
 group and terminates that group when the deadline or a stream-size limit is
 reached, including when a proxy descendant retains an output pipe.
+
+The forced-command examples below document the implemented protocol and
+configuration boundary; they are not a production deployment recipe. A
+production OpenSSH Gateway must wait for the separate-UID queue handoff
+described in the systemd section above.
 
 The forced command requires a strict Gateway configuration such as:
 
