@@ -1,6 +1,6 @@
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,23 +11,32 @@ use agent_knowledge_worker::{
 use time::OffsetDateTime;
 
 #[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, OsStr};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+
+#[cfg(target_os = "linux")]
+use agent_knowledge_core::{PathAttestation, PathAttestationError};
 
 #[cfg(target_os = "linux")]
 use nix::dir::Dir;
 #[cfg(target_os = "linux")]
-use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
+use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat, openat2};
 #[cfg(target_os = "linux")]
 use nix::sys::stat::{Mode, fchmod};
 #[cfg(target_os = "linux")]
-use nix::unistd::{Gid, Group, Uid, User, fchown};
+use nix::unistd::{Gid, Group, Uid, User, dup, fchown};
 
 #[cfg(target_os = "linux")]
 const MAXIMUM_MIGRATION_DEPTH: usize = 128;
+#[cfg(target_os = "linux")]
+const MAXIMUM_FD_INFO_BYTES: u64 = 16 * 1024;
 
 pub(crate) fn status<W>(
     config: &Path,
@@ -116,48 +125,52 @@ fn migrate_v1_storage_with_ids(
     gateway_group: Gid,
     mut output: impl Write,
 ) -> Result<(), StorageMigrationError> {
-    let queue_path = canonical_root(queue_root)?;
-    let git_path = canonical_root(git_directory)?;
-    let content_path = canonical_root(content_root)?;
-    ensure_disjoint_roots([&queue_path, &git_path, &content_path])?;
-    let queue = open_root(&queue_path)?;
-    let git = open_root(&git_path)?;
-    let content = open_root(&content_path)?;
+    let queue = MigrationRoot::open(queue_root)?;
+    let git = MigrationRoot::open(git_directory)?;
+    let content = MigrationRoot::open(content_root)?;
+    ensure_disjoint_roots([&queue, &git, &content])?;
 
-    let queue_lock = open_regular_beneath(&queue, Path::new(".locks/queue.lock"))?;
-    let worker_lock = open_regular_beneath(&queue, Path::new(".locks/repository-writer.lock"))?;
+    let queue_lock = open_regular_beneath(&queue.file, Path::new(".locks/queue.lock"))?;
+    let worker_lock =
+        open_regular_beneath(&queue.file, Path::new(".locks/repository-writer.lock"))?;
     queue_lock
         .try_lock()
         .map_err(|_| StorageMigrationError::QueueBusy)?;
     worker_lock
         .try_lock()
         .map_err(|_| StorageMigrationError::QueueBusy)?;
-    require_empty_directory(&queue, Path::new("incoming"))?;
-    require_empty_directory(&queue, Path::new("quarantine"))?;
+    require_empty_directory(&queue.file, Path::new("incoming"))?;
+    require_empty_directory(&queue.file, Path::new("quarantine"))?;
 
+    let mut queue_snapshot = BTreeMap::new();
     migrate_directory(
-        &queue,
+        &queue.file,
         queue_group,
         Mode::from_bits_truncate(0o2770),
         Mode::from_bits_truncate(0o660),
         0,
         Path::new(""),
+        &mut queue_snapshot,
     )?;
+    let mut git_snapshot = BTreeMap::new();
     migrate_directory(
-        &git,
+        &git.file,
         gateway_group,
         Mode::from_bits_truncate(0o2750),
         Mode::from_bits_truncate(0o640),
         0,
         Path::new(""),
+        &mut git_snapshot,
     )?;
+    let mut content_snapshot = BTreeMap::new();
     migrate_directory(
-        &content,
+        &content.file,
         gateway_group,
         Mode::from_bits_truncate(0o2750),
         Mode::from_bits_truncate(0o640),
         0,
         Path::new(""),
+        &mut content_snapshot,
     )?;
 
     for relative in [
@@ -172,9 +185,9 @@ fn migrate_v1_storage_with_ids(
         "failed",
     ] {
         let directory = if relative.is_empty() {
-            queue.try_clone().map_err(StorageMigrationError::Io)?
+            queue.file.try_clone().map_err(StorageMigrationError::Io)?
         } else {
-            open_directory_beneath(&queue, Path::new(relative))?
+            open_directory_beneath(&queue.file, Path::new(relative))?
         };
         set_identity_and_mode(
             &directory,
@@ -195,9 +208,15 @@ fn migrate_v1_storage_with_ids(
         queue_group,
         Mode::from_bits_truncate(0o660),
     )?;
-    queue.sync_all().map_err(StorageMigrationError::Io)?;
-    git.sync_all().map_err(StorageMigrationError::Io)?;
-    content.sync_all().map_err(StorageMigrationError::Io)?;
+    verify_snapshot(&queue.file, &queue_snapshot)?;
+    verify_snapshot(&git.file, &git_snapshot)?;
+    verify_snapshot(&content.file, &content_snapshot)?;
+    queue.file.sync_all().map_err(StorageMigrationError::Io)?;
+    git.file.sync_all().map_err(StorageMigrationError::Io)?;
+    content.file.sync_all().map_err(StorageMigrationError::Io)?;
+    queue.revalidate()?;
+    git.revalidate()?;
+    content.revalidate()?;
     output
         .write_all(b"{\"status\":\"completed\"}\n")
         .map_err(StorageMigrationError::Io)
@@ -232,25 +251,77 @@ fn resolve_group(value: &OsStr) -> Result<Gid, StorageMigrationError> {
 }
 
 #[cfg(target_os = "linux")]
-fn canonical_root(path: &Path) -> Result<PathBuf, StorageMigrationError> {
-    if !path.is_absolute() || path == Path::new("/") {
-        return Err(StorageMigrationError::InvalidRoot(path.to_path_buf()));
-    }
-    let canonical = fs::canonicalize(path).map_err(StorageMigrationError::Io)?;
-    if canonical != path {
-        return Err(StorageMigrationError::InvalidRoot(path.to_path_buf()));
-    }
-    Ok(canonical)
+struct MigrationRoot {
+    configured: PathBuf,
+    file: File,
+    attestation: PathAttestation,
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_disjoint_roots(roots: [&Path; 3]) -> Result<(), StorageMigrationError> {
+impl MigrationRoot {
+    fn open(path: &Path) -> Result<Self, StorageMigrationError> {
+        let relative = normalized_absolute_suffix(path)?;
+        let filesystem_root = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open("/")
+            .map_err(StorageMigrationError::Io)?;
+        let file = open_relative(
+            &filesystem_root,
+            &relative,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            false,
+        )?;
+        let attestation =
+            PathAttestation::capture(path, &file).map_err(StorageMigrationError::Attestation)?;
+        if attestation.path() != path {
+            return Err(StorageMigrationError::InvalidRoot(path.to_path_buf()));
+        }
+        Ok(Self {
+            configured: path.to_path_buf(),
+            file,
+            attestation,
+        })
+    }
+
+    fn revalidate(&self) -> Result<(), StorageMigrationError> {
+        let observed = PathAttestation::capture(&self.configured, &self.file)
+            .map_err(StorageMigrationError::Attestation)?;
+        if observed.path() == self.configured && self.attestation.matches_destination(&observed) {
+            Ok(())
+        } else {
+            Err(StorageMigrationError::TreeChanged(self.configured.clone()))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn normalized_absolute_suffix(path: &Path) -> Result<PathBuf, StorageMigrationError> {
+    let mut components = path.components();
+    if components.next() != Some(std::path::Component::RootDir) {
+        return Err(StorageMigrationError::InvalidRoot(path.to_path_buf()));
+    }
+    let mut relative = PathBuf::new();
+    for component in components {
+        let std::path::Component::Normal(name) = component else {
+            return Err(StorageMigrationError::InvalidRoot(path.to_path_buf()));
+        };
+        relative.push(name);
+    }
+    if relative.as_os_str().is_empty() || Path::new("/").join(&relative) != path {
+        return Err(StorageMigrationError::InvalidRoot(path.to_path_buf()));
+    }
+    Ok(relative)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_disjoint_roots(roots: [&MigrationRoot; 3]) -> Result<(), StorageMigrationError> {
     for (index, root) in roots.iter().enumerate() {
-        if roots
-            .iter()
-            .enumerate()
-            .any(|(other_index, other)| index != other_index && root.starts_with(other))
-        {
+        if roots.iter().enumerate().any(|(other_index, other)| {
+            index != other_index
+                && (root.attestation.is_within(&other.attestation)
+                    || other.attestation.is_within(&root.attestation))
+        }) {
             return Err(StorageMigrationError::OverlappingRoots);
         }
     }
@@ -258,42 +329,104 @@ fn ensure_disjoint_roots(roots: [&Path; 3]) -> Result<(), StorageMigrationError>
 }
 
 #[cfg(target_os = "linux")]
-fn open_root(path: &Path) -> Result<File, StorageMigrationError> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
-        .open(path)
-        .map_err(StorageMigrationError::Io)
-}
-
-#[cfg(target_os = "linux")]
 fn open_directory_beneath(root: &File, path: &Path) -> Result<File, StorageMigrationError> {
-    let how = OpenHow::new()
-        .flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
-        .resolve(
-            ResolveFlag::RESOLVE_BENEATH
-                | ResolveFlag::RESOLVE_NO_SYMLINKS
-                | ResolveFlag::RESOLVE_NO_XDEV,
-        );
-    openat2(root, path, how)
-        .map(File::from)
-        .map_err(nix_io_error)
+    open_relative(
+        root,
+        path,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        true,
+    )
 }
 
 #[cfg(target_os = "linux")]
 fn open_regular_beneath(root: &File, path: &Path) -> Result<File, StorageMigrationError> {
-    let how = OpenHow::new()
-        .flags(OFlag::O_RDWR | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC)
-        .resolve(
-            ResolveFlag::RESOLVE_BENEATH
-                | ResolveFlag::RESOLVE_NO_SYMLINKS
-                | ResolveFlag::RESOLVE_NO_XDEV,
-        );
-    let file = openat2(root, path, how)
-        .map(File::from)
-        .map_err(nix_io_error)?;
-    require_regular(&file, path)?;
+    let pinned = open_relative(
+        root,
+        path,
+        OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        true,
+    )?;
+    let identity = require_regular(&pinned, path)?;
+    let file = open_relative(
+        root,
+        path,
+        OFlag::O_RDWR | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        true,
+    )?;
+    if object_identity(&file)? != identity {
+        return Err(StorageMigrationError::TreeChanged(path.to_path_buf()));
+    }
     Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn open_relative(
+    root: &File,
+    path: &Path,
+    flags: OFlag,
+    no_xdev: bool,
+) -> Result<File, StorageMigrationError> {
+    validate_relative_path(path)?;
+    let resolve = ResolveFlag::RESOLVE_BENEATH
+        | ResolveFlag::RESOLVE_NO_SYMLINKS
+        | if no_xdev {
+            ResolveFlag::RESOLVE_NO_XDEV
+        } else {
+            ResolveFlag::empty()
+        };
+    let how = OpenHow::new().flags(flags).resolve(resolve);
+    match openat2(root, path, how) {
+        Ok(file) => Ok(File::from(file)),
+        Err(nix::errno::Errno::ENOSYS | nix::errno::Errno::EPERM) => {
+            open_relative_with_openat(root, path, flags, no_xdev)
+        }
+        Err(error) => Err(nix_io_error(error)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_relative_with_openat(
+    root: &File,
+    path: &Path,
+    final_flags: OFlag,
+    no_xdev: bool,
+) -> Result<File, StorageMigrationError> {
+    let expected_mount = no_xdev.then(|| linux_mount_id(root)).transpose()?;
+    let mut directory = dup(root).map(File::from).map_err(nix_io_error)?;
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(StorageMigrationError::UnsafeEntry(path.to_path_buf()));
+        };
+        let flags = if components.peek().is_some() {
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC
+        } else {
+            final_flags | OFlag::O_NOFOLLOW
+        };
+        let opened = openat(&directory, name, flags, Mode::empty())
+            .map(File::from)
+            .map_err(nix_io_error)?;
+        if let Some(expected) = expected_mount
+            && linux_mount_id(&opened)? != expected
+        {
+            return Err(StorageMigrationError::UnsafeEntry(path.to_path_buf()));
+        }
+        directory = opened;
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_relative_path(path: &Path) -> Result<(), StorageMigrationError> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        Err(StorageMigrationError::UnsafeEntry(path.to_path_buf()))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -314,6 +447,7 @@ fn migrate_directory(
     file_mode: Mode,
     depth: usize,
     relative: &Path,
+    snapshot: &mut BTreeMap<PathBuf, ObjectIdentity>,
 ) -> Result<(), StorageMigrationError> {
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
@@ -321,22 +455,39 @@ fn migrate_directory(
     let entries = directory_entries(directory)?;
     for name in &entries {
         let path = relative.join(OsStr::from_bytes(name.to_bytes()));
-        match open_child_directory(directory, name) {
-            Ok(child) => {
-                migrate_directory(&child, group, directory_mode, file_mode, depth + 1, &path)?
+        let pinned = open_child_path(directory, name)?;
+        let identity = object_identity(&pinned)?;
+        if identity.file_type == nix::libc::S_IFDIR {
+            let child = open_child_directory(directory, name)?;
+            if object_identity(&child)? != identity {
+                return Err(StorageMigrationError::TreeChanged(path));
             }
-            Err(nix::errno::Errno::ENOTDIR) => {
-                let child = open_child_file(directory, name).map_err(nix_io_error)?;
-                require_regular(&child, &path)?;
-                set_identity_and_mode(&child, None, group, file_mode)?;
+            migrate_directory(
+                &child,
+                group,
+                directory_mode,
+                file_mode,
+                depth + 1,
+                &path,
+                snapshot,
+            )?;
+        } else if identity.file_type == nix::libc::S_IFREG && identity.links == 1 {
+            let child = open_child_regular(directory, name)?;
+            if object_identity(&child)? != identity {
+                return Err(StorageMigrationError::TreeChanged(path));
             }
-            Err(error) => return Err(nix_io_error(error)),
+            set_regular_identity_and_mode(&child, group, file_mode, &path)?;
+            snapshot.insert(path, object_identity(&child)?);
+        } else {
+            return Err(StorageMigrationError::UnsafeEntry(path));
         }
     }
     if entries != directory_entries(directory)? {
         return Err(StorageMigrationError::TreeChanged(relative.to_path_buf()));
     }
-    set_identity_and_mode(directory, None, group, directory_mode)
+    set_identity_and_mode(directory, None, group, directory_mode)?;
+    snapshot.insert(relative.to_path_buf(), object_identity(directory)?);
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -359,29 +510,144 @@ fn directory_entries(directory: &File) -> Result<Vec<CString>, StorageMigrationE
 }
 
 #[cfg(target_os = "linux")]
-fn open_child_directory(parent: &File, name: &CStr) -> Result<File, nix::errno::Errno> {
-    let how = OpenHow::new()
-        .flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
-        .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS | ResolveFlag::RESOLVE_NO_XDEV);
-    openat2(parent, name, how).map(File::from)
+fn open_child_path(parent: &File, name: &CStr) -> Result<File, StorageMigrationError> {
+    open_relative(
+        parent,
+        Path::new(OsStr::from_bytes(name.to_bytes())),
+        OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        true,
+    )
 }
 
 #[cfg(target_os = "linux")]
-fn open_child_file(parent: &File, name: &CStr) -> Result<File, nix::errno::Errno> {
-    let how = OpenHow::new()
-        .flags(OFlag::O_RDWR | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC)
-        .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS | ResolveFlag::RESOLVE_NO_XDEV);
-    openat2(parent, name, how).map(File::from)
+fn open_child_directory(parent: &File, name: &CStr) -> Result<File, StorageMigrationError> {
+    open_relative(
+        parent,
+        Path::new(OsStr::from_bytes(name.to_bytes())),
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        true,
+    )
 }
 
 #[cfg(target_os = "linux")]
-fn require_regular(file: &File, path: &Path) -> Result<(), StorageMigrationError> {
-    let metadata = file.metadata().map_err(StorageMigrationError::Io)?;
-    if metadata.is_file() && metadata.nlink() == 1 {
-        Ok(())
+fn open_child_regular(parent: &File, name: &CStr) -> Result<File, StorageMigrationError> {
+    open_relative(
+        parent,
+        Path::new(OsStr::from_bytes(name.to_bytes())),
+        OFlag::O_RDWR | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        true,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn require_regular(file: &File, path: &Path) -> Result<ObjectIdentity, StorageMigrationError> {
+    let identity = object_identity(file)?;
+    if identity.file_type == nix::libc::S_IFREG && identity.links == 1 {
+        Ok(identity)
     } else {
         Err(StorageMigrationError::UnsafeEntry(path.to_path_buf()))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn set_regular_identity_and_mode(
+    file: &File,
+    group: Gid,
+    mode: Mode,
+    path: &Path,
+) -> Result<(), StorageMigrationError> {
+    require_regular(file, path)?;
+    set_identity_and_mode(file, None, group, mode)?;
+    require_regular(file, path).map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_snapshot(
+    root: &File,
+    expected: &BTreeMap<PathBuf, ObjectIdentity>,
+) -> Result<(), StorageMigrationError> {
+    let mut observed = BTreeMap::new();
+    snapshot_directory(root, 0, Path::new(""), &mut observed)?;
+    if &observed == expected {
+        Ok(())
+    } else {
+        Err(StorageMigrationError::TreeChanged(PathBuf::new()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_directory(
+    directory: &File,
+    depth: usize,
+    relative: &Path,
+    snapshot: &mut BTreeMap<PathBuf, ObjectIdentity>,
+) -> Result<(), StorageMigrationError> {
+    if depth > MAXIMUM_MIGRATION_DEPTH {
+        return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
+    }
+    for name in directory_entries(directory)? {
+        let path = relative.join(OsStr::from_bytes(name.to_bytes()));
+        let pinned = open_child_path(directory, &name)?;
+        let identity = object_identity(&pinned)?;
+        if identity.file_type == nix::libc::S_IFDIR {
+            let child = open_child_directory(directory, &name)?;
+            if object_identity(&child)? != identity {
+                return Err(StorageMigrationError::TreeChanged(path));
+            }
+            snapshot_directory(&child, depth + 1, &path, snapshot)?;
+        } else if identity.file_type != nix::libc::S_IFREG || identity.links != 1 {
+            return Err(StorageMigrationError::UnsafeEntry(path));
+        } else {
+            snapshot.insert(path, identity);
+        }
+    }
+    snapshot.insert(relative.to_path_buf(), object_identity(directory)?);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ObjectIdentity {
+    mount: u64,
+    device: u64,
+    inode: u64,
+    file_type: u32,
+    links: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn object_identity(file: &File) -> Result<ObjectIdentity, StorageMigrationError> {
+    let metadata = file.metadata().map_err(StorageMigrationError::Io)?;
+    Ok(ObjectIdentity {
+        mount: linux_mount_id(file)?,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        file_type: metadata.mode() & nix::libc::S_IFMT,
+        links: metadata.nlink(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_id(file: &File) -> Result<u64, StorageMigrationError> {
+    let mut bytes = Vec::with_capacity(MAXIMUM_FD_INFO_BYTES as usize);
+    File::open(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
+        .and_then(|input| {
+            input
+                .take(MAXIMUM_FD_INFO_BYTES + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(StorageMigrationError::Io)?;
+    if bytes.len() as u64 > MAXIMUM_FD_INFO_BYTES {
+        return Err(StorageMigrationError::InvalidMountInformation);
+    }
+    let contents =
+        std::str::from_utf8(&bytes).map_err(|_| StorageMigrationError::InvalidMountInformation)?;
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))
+        .ok_or(StorageMigrationError::InvalidMountInformation)?
+        .parse()
+        .map_err(|_| StorageMigrationError::InvalidMountInformation)
 }
 
 #[cfg(target_os = "linux")]
@@ -416,6 +682,8 @@ pub(crate) enum StorageMigrationError {
     DirectoryNotEmpty(PathBuf),
     UnsafeEntry(PathBuf),
     TreeChanged(PathBuf),
+    Attestation(PathAttestationError),
+    InvalidMountInformation,
     Io(io::Error),
 }
 
@@ -455,6 +723,15 @@ impl fmt::Display for StorageMigrationError {
                 "storage migration tree changed while it was being processed: {}",
                 path.display()
             ),
+            Self::Attestation(error) => {
+                write!(
+                    formatter,
+                    "storage migration root attestation failed: {error}"
+                )
+            }
+            Self::InvalidMountInformation => {
+                formatter.write_str("storage migration could not verify a mount identity")
+            }
             Self::Io(error) => write!(formatter, "storage migration I/O failed: {error}"),
         }
     }
@@ -464,6 +741,7 @@ impl fmt::Display for StorageMigrationError {
 impl std::error::Error for StorageMigrationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Attestation(error) => Some(error),
             Self::Io(error) => Some(error),
             _ => None,
         }
