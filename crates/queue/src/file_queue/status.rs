@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File, TryLockError};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -16,8 +17,9 @@ use super::{
     WORKER_LOCK_FILE_NAME, WORKER_TEMP_DIRECTORY_NAME, stable_file_path,
     validate_common_queue_mount, validate_current_queue,
 };
+use crate::package::MAXIMUM_ACCEPTANCE_FILE_BYTES;
 use crate::{
-    CURRENT_WORKER_RESULT_SCHEMA_VERSION, PackageValidationError, WorkerResultRecord,
+    AcceptanceMetadata, CURRENT_WORKER_RESULT_SCHEMA_VERSION, WorkerResultRecord,
     WorkerResultStatus,
 };
 
@@ -209,14 +211,16 @@ impl QueueReader {
 
     /// Scans accepted request states without changing the queue.
     ///
-    /// At most `maximum_entries` request directories are inspected. Counts are
-    /// exact only when the scan succeeds; a concurrent state transition may be
-    /// observed on either side of its atomic rename.
+    /// At most `maximum_entries` request directories are inspected. A
+    /// short-lived shared queue lock makes successful counts exact relative to
+    /// accepted queue mutations while allowing the Worker process itself to
+    /// remain active.
     ///
     /// # Errors
     ///
-    /// Returns an error for a zero or exhausted scan bound, corrupt queue
-    /// entries, a replaced queue, lock inspection failure, or deadline expiry.
+    /// Returns an error for lock contention, a zero or exhausted scan bound,
+    /// corrupt queue entries, a replaced queue, lock inspection failure, or
+    /// deadline expiry.
     pub fn overview_until(
         &self,
         maximum_entries: usize,
@@ -226,10 +230,28 @@ impl QueueReader {
             return Err(QueueError::InvalidStatusScanLimit);
         }
         ensure_deadline(deadline)?;
+        let queue_lock = open_existing_regular(&self.lock_file)?;
+        match queue_lock.try_lock_shared() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(QueueError::StatusBusy),
+            Err(TryLockError::Error(error)) => return Err(QueueError::Io(error)),
+        }
+        let result = self.overview_locked(maximum_entries, deadline);
+        let unlock = queue_lock.unlock().map_err(QueueError::Io);
+        unlock?;
+        result
+    }
+
+    fn overview_locked(
+        &self,
+        maximum_entries: usize,
+        deadline: Option<Instant>,
+    ) -> Result<QueueOverview, QueueError> {
         self.current_identity()?;
         let mut counts = [0_u64; 4];
         let mut scanned = 0_usize;
         let mut oldest_pending_at = None;
+        let mut observed_requests = HashSet::new();
         for state in QueueState::ALL {
             ensure_deadline(deadline)?;
             let entries =
@@ -249,16 +271,20 @@ impl QueueReader {
                     .to_str()
                     .and_then(|name| name.parse().ok())
                     .ok_or_else(|| QueueError::InvalidStoragePath(path.clone()))?;
-                if !entry.file_type().map_err(QueueError::Io)?.is_dir() {
-                    return Err(QueueError::CorruptState {
+                if !observed_requests.insert(request_id) {
+                    return Err(QueueError::RequestInMultipleStates { request_id });
+                }
+                let directory = SafeDirectory::open(&path).map_err(|error| match error {
+                    PinnedPathError::Io(error) => QueueError::Io(error),
+                    _ => QueueError::CorruptState {
                         request_id,
                         state,
-                        detail: "request entry is not a directory",
-                    });
-                }
+                        detail: "request entry is not a real directory",
+                    },
+                })?;
                 counts[state.index()] = counts[state.index()].saturating_add(1);
                 if state == QueueState::Pending {
-                    let accepted_at = read_pending_acceptance(&path, request_id)?;
+                    let accepted_at = read_pending_acceptance(&directory, request_id)?;
                     oldest_pending_at = Some(
                         oldest_pending_at.map_or(accepted_at, |oldest: OffsetDateTime| {
                             oldest.min(accepted_at)
@@ -267,9 +293,10 @@ impl QueueReader {
                 }
             }
         }
-        let worker_active = match self.worker_lock_handle.try_lock_shared() {
+        let worker_lock = open_existing_regular(&self.worker_lock_file)?;
+        let worker_active = match worker_lock.try_lock_shared() {
             Ok(()) => {
-                self.worker_lock_handle.unlock().map_err(QueueError::Io)?;
+                worker_lock.unlock().map_err(QueueError::Io)?;
                 false
             }
             Err(TryLockError::WouldBlock) => true,
@@ -368,20 +395,39 @@ impl QueueReader {
 }
 
 fn read_pending_acceptance(
-    package_root: &Path,
+    directory: &SafeDirectory,
     request_id: RequestId,
 ) -> Result<OffsetDateTime, QueueError> {
-    match crate::package::read_acceptance_file(&package_root.join(ACCEPTANCE_FILE_NAME)) {
-        Ok(acceptance) => Ok(acceptance.accepted_at),
-        Err(PackageValidationError::Io(error)) if error.kind() != io::ErrorKind::NotFound => {
-            Err(QueueError::Io(error))
-        }
-        Err(_) => Err(QueueError::CorruptState {
+    let file = directory
+        .open_regular_beneath(ACCEPTANCE_FILE_NAME)
+        .map_err(|error| match error {
+            PinnedPathError::Io(error) if error.kind() != io::ErrorKind::NotFound => {
+                QueueError::Io(error)
+            }
+            _ => QueueError::CorruptState {
+                request_id,
+                state: QueueState::Pending,
+                detail: "pending request acceptance metadata is invalid",
+            },
+        })?;
+    if file.byte_length() > MAXIMUM_ACCEPTANCE_FILE_BYTES {
+        return Err(QueueError::CorruptState {
             request_id,
             state: QueueState::Pending,
             detail: "pending request acceptance metadata is invalid",
-        }),
+        });
     }
+    let mut bytes = Vec::with_capacity(file.byte_length() as usize);
+    file.take(MAXIMUM_ACCEPTANCE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(QueueError::Io)?;
+    let acceptance: AcceptanceMetadata =
+        serde_json::from_slice(&bytes).map_err(|_| QueueError::CorruptState {
+            request_id,
+            state: QueueState::Pending,
+            detail: "pending request acceptance metadata is invalid",
+        })?;
+    Ok(acceptance.accepted_at)
 }
 
 fn read_failed_status(

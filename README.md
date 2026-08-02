@@ -117,10 +117,12 @@ This local administrative command emits one versioned JSON object containing
 queue counts, the oldest pending timestamp, Worker-lock activity, the official
 commit, the active Quartz release, and remote-replication progress. It is
 read-only: it neither initializes nor repairs storage nor contacts the Git
-remote. The queue scan has an explicit entry bound. Its deadline covers bounded
-queue work and Git subprocesses; local filesystem calls remain subject to the
-host filesystem's I/O behavior. A publishing Worker may cause the command to
-fail transiently instead of returning a mixed committed-content snapshot.
+remote. The queue scan has an explicit entry bound and briefly holds the shared
+accepted-state lock; concurrent submissions or transitions cause a transient
+failure instead of an inconsistent count. Its deadline covers bounded queue
+work and Git subprocesses; local filesystem calls remain subject to the host
+filesystem's I/O behavior. A publishing Worker may likewise cause the command
+to fail transiently instead of returning a mixed committed-content snapshot.
 
 Submit a validated request package through an SSH host alias:
 
@@ -161,7 +163,8 @@ read-operation deadline covers initialization, lookup or query work, response
 encoding, and delivery to the SSH channel. The response-byte limit includes
 the JSON Lines framing newline. Committed-content read processes open only the
 repository and content checkout. Status and submit processes open the durable
-queue, while status takes no queue locks and does not run maintenance.
+queue, while per-request status takes no queue locks and does not run
+maintenance.
 
 The client validates and snapshots at most 64 MiB of package data before
 network output. It then invokes the system `ssh` executable directly, uses

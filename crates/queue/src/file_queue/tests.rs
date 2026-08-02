@@ -358,12 +358,74 @@ fn operational_overview_rejects_invalid_bounds_and_pending_metadata() {
         reader.overview_until(0, None),
         Err(QueueError::InvalidStatusScanLimit)
     ));
+    let mutation = queue
+        .open_queue_lock()
+        .unwrap_or_else(|error| panic!("queue lock fixture must open: {error}"));
+    mutation
+        .lock()
+        .unwrap_or_else(|error| panic!("queue mutation fixture must lock: {error}"));
+    assert!(matches!(
+        reader.overview_until(1, None),
+        Err(QueueError::StatusBusy)
+    ));
+    drop(mutation);
     fs::write(
         root.path()
             .join("queue/pending/01K00000000000000000000000/acceptance.json"),
         b"{not-json}\n",
     )
     .unwrap_or_else(|error| panic!("acceptance fixture must be corrupted: {error}"));
+    assert!(matches!(
+        reader.overview_until(1, None),
+        Err(QueueError::CorruptState {
+            state: QueueState::Pending,
+            detail: "pending request acceptance metadata is invalid",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn operational_overview_rejects_a_request_in_multiple_states() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    let duplicated = root
+        .path()
+        .join("queue/completed/01K00000000000000000000000");
+    fs::create_dir(&duplicated)
+        .unwrap_or_else(|error| panic!("duplicate state fixture must be created: {error}"));
+    let reader = QueueReader::open_until(root.path().join("queue"), None)
+        .unwrap_or_else(|error| panic!("read-only queue fixture must open: {error}"));
+
+    assert!(matches!(
+        reader.overview_until(2, None),
+        Err(QueueError::RequestInMultipleStates { request_id })
+            if request_id.to_string() == "01K00000000000000000000000"
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn operational_overview_rejects_a_fifo_acceptance_file_without_blocking() {
+    use std::process::Command;
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    let acceptance = root
+        .path()
+        .join("queue/pending/01K00000000000000000000000/acceptance.json");
+    fs::remove_file(&acceptance)
+        .unwrap_or_else(|error| panic!("acceptance fixture must be removed: {error}"));
+    let created = Command::new("mkfifo")
+        .arg(&acceptance)
+        .status()
+        .unwrap_or_else(|error| panic!("mkfifo fixture command must run: {error}"));
+    assert!(created.success(), "FIFO fixture must be created");
+    let reader = QueueReader::open_until(root.path().join("queue"), None)
+        .unwrap_or_else(|error| panic!("read-only queue fixture must open: {error}"));
+
     assert!(matches!(
         reader.overview_until(1, None),
         Err(QueueError::CorruptState {

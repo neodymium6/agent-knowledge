@@ -1800,6 +1800,8 @@ pub enum QueueError {
     OperationDeadlineExceeded,
     /// An operational-status scan was configured with a zero entry bound.
     InvalidStatusScanLimit,
+    /// Another accepted-state mutation owns the short-lived queue lock.
+    StatusBusy,
     /// An operational-status scan reached its entry bound before completion.
     StatusScanLimitExceeded {
         /// Maximum accepted request entries for one status scan.
@@ -1830,9 +1832,10 @@ impl QueueError {
     #[must_use]
     pub const fn error_code(&self) -> ErrorCode {
         match self {
-            Self::Io(_) | Self::StagingNameExhausted | Self::OperationDeadlineExceeded => {
-                ErrorCode::TemporaryFailure
-            }
+            Self::Io(_)
+            | Self::StagingNameExhausted
+            | Self::OperationDeadlineExceeded
+            | Self::StatusBusy => ErrorCode::TemporaryFailure,
             Self::Package(error) => error.error_code(),
             Self::RequestAlreadyWritten
             | Self::PayloadAlreadyWritten(_)
@@ -1917,6 +1920,9 @@ impl fmt::Display for QueueError {
             }
             Self::InvalidStatusScanLimit => {
                 formatter.write_str("operational-status queue scan limit must be positive")
+            }
+            Self::StatusBusy => {
+                formatter.write_str("an accepted-state queue mutation is in progress")
             }
             Self::StatusScanLimitExceeded { maximum } => write!(
                 formatter,

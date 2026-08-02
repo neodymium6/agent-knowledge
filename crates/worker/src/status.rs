@@ -6,7 +6,7 @@ use agent_knowledge_queue::{QueueError, QueueOverview, QueueReader};
 use agent_knowledge_release::{ActiveRelease, ReleaseError, ReleasePolicy, ReleaseReader};
 use agent_knowledge_repository::{
     CommittedReadError, CommittedStore, RemoteReplicationError,
-    RemoteReplicationStatus as DurableReplicationStatus, read_remote_replication_status,
+    RemoteReplicationStatus as DurableReplicationStatus, read_remote_replication_status_until,
 };
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -212,13 +212,14 @@ pub fn inspect_operational_status(
     let queue_overview = queue
         .overview_until(maximum_queue_entries, deadline)
         .map_err(OperationalStatusError::queue)?;
-    let official_commit = repository
-        .current_commit_until(deadline)
+    let pinned_commit = repository
+        .pinned_commit_until(deadline)
         .map_err(OperationalStatusError::repository)?;
+    let official_commit = pinned_commit.commit().to_owned();
     let active_release = releases
         .active_release()
         .map_err(OperationalStatusError::release)?;
-    let replication = replication_status(settings, &topology, &official_commit)?;
+    let replication = replication_status(settings, &topology, &official_commit, deadline)?;
 
     queue
         .storage_attestation()
@@ -229,6 +230,7 @@ pub fn inspect_operational_status(
     releases
         .storage_attestation()
         .map_err(|source| OperationalStatusError::attestation("release storage", source))?;
+    drop(pinned_commit);
 
     let queue = queue_status(queue_overview)?;
     let publication = publication_status(official_commit, active_release);
@@ -277,14 +279,19 @@ fn replication_status(
     settings: &WorkerSettings,
     topology: &crate::bootstrap::ResolvedTopology,
     official_commit: &str,
+    deadline: Option<Instant>,
 ) -> Result<ReplicationStatus, OperationalStatusError> {
     let Some(policy) = settings.replication() else {
         return Ok(ReplicationStatus::Disabled);
     };
     let remote = policy.remote().to_owned();
     let branch = policy.branch().to_owned();
-    let durable = read_remote_replication_status(topology.repository_root.stable_path(), policy)
-        .map_err(OperationalStatusError::replication)?;
+    let durable = read_remote_replication_status_until(
+        topology.repository_root.stable_path(),
+        policy,
+        deadline,
+    )
+    .map_err(OperationalStatusError::replication)?;
     let Some(durable) = durable else {
         return Ok(ReplicationStatus::NotAttempted { remote, branch });
     };
