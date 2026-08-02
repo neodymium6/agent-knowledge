@@ -17,6 +17,7 @@ fmt:
 # Run code checks and build any checks available for the current system.
 check: check-code
   nix flake check .
+  if [ "$(uname -s)" = Linux ]; then just check-package; fi
 
 # Run source, test, and flake-schema checks without building a package.
 check-code:
@@ -26,9 +27,9 @@ check-code:
   cargo test --workspace --all-features --locked
   nix flake check --no-build --all-systems .
 
-# Build and install-check the production package for the current system.
+# Build and validate the production package for the current Linux system.
 check-package:
-  nix build .#agent-knowledge --no-link
+  package_path="$(nix build .#agent-knowledge --no-link --print-out-paths)" && deploy/systemd/check-package.sh "$package_path"
 
 # CI source-check alias; package jobs build each supported architecture.
 ci: check-code

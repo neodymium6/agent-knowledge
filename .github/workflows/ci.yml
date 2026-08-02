@@ -60,5 +60,5 @@ jobs:
         with:
           determinate: false
 
-      - name: Build production package
-        run: nix build .#checks.${{ matrix.system }}.package --no-link
+      - name: Build production package and validate systemd integration
+        run: nix develop --command just check-package
