@@ -14,8 +14,9 @@ fmt:
   nix fmt -- flake.nix
   cargo fmt --all
 
-# Run code checks and build the package for the current system.
-check: check-code check-package
+# Run code checks and build any checks available for the current system.
+check: check-code
+  nix flake check .
 
 # Run source, test, and flake-schema checks without building a package.
 check-code:
