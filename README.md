@@ -186,6 +186,9 @@ sudo nix profile upgrade \
   --profile /nix/var/nix/profiles/agent-knowledge agent-knowledge
 package_path=/nix/var/nix/profiles/agent-knowledge
 sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
+# Replace this fictional name with the existing forced-command SSH account.
+gateway_account=fictional-agent-knowledge-gateway
+sudo usermod --append --groups agent-knowledge-ingress "$gateway_account"
 sudo "$package_path/bin/agent-knowledge" admin migrate-v1-storage \
   --queue-root /var/lib/agent-knowledge/queue \
   --git-directory /var/lib/agent-knowledge/repository \

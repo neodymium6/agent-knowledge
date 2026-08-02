@@ -93,3 +93,4 @@ test "$(grep -Ec '^d /var/lib/agent-knowledge/(repository|content) 2750 agent-kn
 test "$(grep -Ec '^z /var/lib/agent-knowledge/(repository|content) 2750 - - -$' "$tmpfiles")" -eq 2
 test "$(grep -Ec '^d /var/lib/agent-knowledge/(work|releases) 0750 agent-knowledge agent-knowledge -$' "$tmpfiles")" -eq 2
 test "$(grep -Ec '^d /run/agent-knowledge 2750 agent-knowledge-queue agent-knowledge-ingress -$' "$tmpfiles")" -eq 1
+test "$(grep -Ec '^z /run/agent-knowledge 2750 - - -$' "$tmpfiles")" -eq 1

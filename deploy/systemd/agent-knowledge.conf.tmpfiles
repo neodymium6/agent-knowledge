@@ -26,3 +26,4 @@ z /var/lib/agent-knowledge/content 2750 - - -
 d /var/lib/agent-knowledge/work 0750 agent-knowledge agent-knowledge -
 d /var/lib/agent-knowledge/releases 0750 agent-knowledge agent-knowledge -
 d /run/agent-knowledge 2750 agent-knowledge-queue agent-knowledge-ingress -
+z /run/agent-knowledge 2750 - - -
