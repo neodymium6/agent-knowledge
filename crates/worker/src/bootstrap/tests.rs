@@ -88,7 +88,7 @@ fn inspects_initialized_components_without_starting_the_worker() {
     assert_eq!(status.queue().failed(), 0);
     assert_eq!(status.queue().oldest_pending_at(), None);
     assert!(!status.queue().worker_active());
-    assert!(!status.queue().counts_exact());
+    assert!(!status.queue().snapshot_exact());
     assert!(status.publication().active_release().is_none());
     assert!(!status.publication().synchronized());
     assert!(matches!(status.replication(), ReplicationStatus::Disabled));
@@ -97,7 +97,7 @@ fn inspects_initialized_components_without_starting_the_worker() {
     assert_eq!(wire["schema_version"], 1);
     assert_eq!(wire["observed_at"], "2026-07-31T04:00:00Z");
     assert_eq!(wire["queue"]["worker_active"], false);
-    assert_eq!(wire["queue"]["counts_exact"], false);
+    assert_eq!(wire["queue"]["snapshot_exact"], false);
     assert_eq!(
         wire["publication"]["active_release"],
         serde_json::Value::Null

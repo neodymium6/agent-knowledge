@@ -59,7 +59,7 @@ pub struct QueueStatus {
     failed: u64,
     oldest_pending_at: Option<String>,
     worker_active: bool,
-    counts_exact: bool,
+    snapshot_exact: bool,
 }
 
 impl QueueStatus {
@@ -87,7 +87,7 @@ impl QueueStatus {
         self.failed
     }
 
-    /// Returns the oldest pending acceptance timestamp as RFC 3339 text.
+    /// Returns the oldest pending acceptance timestamp observed by the scan.
     #[must_use]
     pub fn oldest_pending_at(&self) -> Option<&str> {
         self.oldest_pending_at.as_deref()
@@ -99,10 +99,10 @@ impl QueueStatus {
         self.worker_active
     }
 
-    /// Reports whether the counts form one atomic queue snapshot.
+    /// Reports whether all queue fields form one atomic snapshot.
     #[must_use]
-    pub const fn counts_exact(&self) -> bool {
-        self.counts_exact
+    pub const fn snapshot_exact(&self) -> bool {
+        self.snapshot_exact
     }
 }
 
@@ -282,7 +282,7 @@ fn queue_status(overview: QueueOverview) -> Result<QueueStatus, OperationalStatu
             .map(format_timestamp)
             .transpose()?,
         worker_active: overview.worker_active(),
-        counts_exact: overview.counts_exact(),
+        snapshot_exact: overview.snapshot_exact(),
     })
 }
 

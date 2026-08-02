@@ -1528,8 +1528,8 @@ The versioned local administrative status report includes:
 
 Queue enumeration has an operator-selected upper bound and does not take the
 accepted-state lock, so it does not block submissions or Worker transitions.
-Counts are best-effort observations and `counts_exact` is currently always
-`false`. Corrupt or replaced storage fails the command as appropriate. The
+Queue fields are best-effort observations and `snapshot_exact` is currently
+always `false`. Corrupt or replaced storage fails the command as appropriate. The
 official commit is read before and after release and replication inspection; a
 concurrent publication causes a transient failure rather than a mixed
 committed-content snapshot. It never infers state by scraping process logs. A

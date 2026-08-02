@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, TryLockError};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -64,7 +64,7 @@ pub struct QueueOverview {
     failed: u64,
     oldest_pending_at: Option<OffsetDateTime>,
     worker_active: bool,
-    counts_exact: bool,
+    snapshot_exact: bool,
 }
 
 impl QueueOverview {
@@ -92,7 +92,7 @@ impl QueueOverview {
         self.failed
     }
 
-    /// Returns the oldest durable acceptance time still awaiting processing.
+    /// Returns the oldest pending acceptance time observed during the scan.
     #[must_use]
     pub const fn oldest_pending_at(self) -> Option<OffsetDateTime> {
         self.oldest_pending_at
@@ -104,13 +104,13 @@ impl QueueOverview {
         self.worker_active
     }
 
-    /// Reports whether the counts form an atomic queue snapshot.
+    /// Reports whether all queue fields form one atomic snapshot.
     ///
     /// Operational overview scans intentionally avoid blocking Gateway and
     /// Worker mutations, so the current implementation returns `false`.
     #[must_use]
-    pub const fn counts_exact(self) -> bool {
-        self.counts_exact
+    pub const fn snapshot_exact(self) -> bool {
+        self.snapshot_exact
     }
 }
 
@@ -240,10 +240,9 @@ impl QueueReader {
         }
         ensure_deadline(deadline)?;
         self.current_identity()?;
-        let mut counts = [0_u64; 4];
         let mut scanned = 0_usize;
-        let mut oldest_pending_at = None;
-        let mut observed_requests = HashSet::new();
+        let mut observations = HashMap::new();
+        let mut duplicate_requests = HashSet::new();
         for state in QueueState::ALL {
             ensure_deadline(deadline)?;
             let entries =
@@ -263,7 +262,8 @@ impl QueueReader {
                     .to_str()
                     .and_then(|name| name.parse().ok())
                     .ok_or_else(|| QueueError::InvalidStoragePath(path.clone()))?;
-                if observed_requests.contains(&request_id) {
+                if observations.contains_key(&request_id) {
+                    duplicate_requests.insert(request_id);
                     continue;
                 }
                 let directory = match SafeDirectory::open(&path) {
@@ -280,16 +280,36 @@ impl QueueReader {
                         });
                     }
                 };
-                observed_requests.insert(request_id);
-                counts[state.index()] = counts[state.index()].saturating_add(1);
-                if state == QueueState::Pending {
-                    let accepted_at = read_pending_acceptance(&directory, request_id)?;
-                    oldest_pending_at = Some(
-                        oldest_pending_at.map_or(accepted_at, |oldest: OffsetDateTime| {
-                            oldest.min(accepted_at)
-                        }),
-                    );
+                let accepted_at = (state == QueueState::Pending)
+                    .then(|| read_pending_acceptance(&directory, request_id))
+                    .transpose()?;
+                observations.insert(request_id, (state, accepted_at));
+            }
+        }
+        for request_id in duplicate_requests {
+            let mut hook = NoopStatusObservationHook;
+            match self.observe_single_state_until(request_id, deadline, &mut hook)? {
+                Some((state, directory)) => {
+                    let accepted_at = (state == QueueState::Pending)
+                        .then(|| read_pending_acceptance(&directory, request_id))
+                        .transpose()?;
+                    observations.insert(request_id, (state, accepted_at));
                 }
+                None => {
+                    observations.remove(&request_id);
+                }
+            }
+        }
+        let mut counts = [0_u64; 4];
+        let mut oldest_pending_at = None;
+        for (state, accepted_at) in observations.values() {
+            counts[state.index()] = counts[state.index()].saturating_add(1);
+            if let Some(accepted_at) = accepted_at {
+                oldest_pending_at = Some(
+                    oldest_pending_at.map_or(*accepted_at, |oldest: OffsetDateTime| {
+                        oldest.min(*accepted_at)
+                    }),
+                );
             }
         }
         let worker_lock = open_existing_regular(&self.worker_lock_file)?;
@@ -310,7 +330,7 @@ impl QueueReader {
             failed: counts[QueueState::Failed.index()],
             oldest_pending_at,
             worker_active,
-            counts_exact: false,
+            snapshot_exact: false,
         })
     }
 
@@ -322,26 +342,36 @@ impl QueueReader {
     ) -> Result<Option<QueueRequestStatus>, QueueError> {
         ensure_deadline(deadline)?;
         self.current_identity()?;
+        let Some((state, directory)) =
+            self.observe_single_state_until(request_id, deadline, hook)?
+        else {
+            self.current_identity()?;
+            ensure_deadline(deadline)?;
+            return Ok(None);
+        };
+        let status = match state {
+            QueueState::Pending => QueueRequestStatus::Pending,
+            QueueState::Processing => QueueRequestStatus::Processing,
+            QueueState::Completed => QueueRequestStatus::Completed,
+            QueueState::Failed => read_failed_status(&directory, request_id)?,
+        };
+        self.current_identity()?;
+        ensure_deadline(deadline)?;
+        Ok(Some(status))
+    }
+
+    fn observe_single_state_until(
+        &self,
+        request_id: RequestId,
+        deadline: Option<Instant>,
+        hook: &mut dyn StatusObservationHook,
+    ) -> Result<Option<(QueueState, SafeDirectory)>, QueueError> {
         for attempt in 0..MAXIMUM_STATE_OBSERVATION_ATTEMPTS {
-            let observed = self.observe_states(request_id, deadline, hook)?;
-            match observed.as_slice() {
-                [] if attempt + 1 == MAXIMUM_STATE_OBSERVATION_ATTEMPTS => {
-                    self.current_identity()?;
-                    ensure_deadline(deadline)?;
-                    return Ok(None);
-                }
-                [(state, directory)] => {
-                    let status = match state {
-                        QueueState::Pending => QueueRequestStatus::Pending,
-                        QueueState::Processing => QueueRequestStatus::Processing,
-                        QueueState::Completed => QueueRequestStatus::Completed,
-                        QueueState::Failed => read_failed_status(directory, request_id)?,
-                    };
-                    self.current_identity()?;
-                    ensure_deadline(deadline)?;
-                    return Ok(Some(status));
-                }
-                [] | [_, _, ..] => ensure_deadline(deadline)?,
+            let mut observed = self.observe_states(request_id, deadline, hook)?;
+            match observed.len() {
+                0 if attempt + 1 == MAXIMUM_STATE_OBSERVATION_ATTEMPTS => return Ok(None),
+                1 => return Ok(observed.pop()),
+                0 | 2.. => ensure_deadline(deadline)?,
             }
         }
         Err(QueueError::RequestInMultipleStates { request_id })

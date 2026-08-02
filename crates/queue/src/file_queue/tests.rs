@@ -334,7 +334,7 @@ fn operational_overview_counts_states_and_observes_the_worker_lock() {
     assert_eq!(overview.failed(), 1);
     assert!(overview.oldest_pending_at().is_some());
     assert!(overview.worker_active());
-    assert!(!overview.counts_exact());
+    assert!(!overview.snapshot_exact());
     assert!(matches!(
         reader.overview_until(2, None),
         Err(QueueError::StatusScanLimitExceeded { maximum: 2 })
@@ -387,7 +387,7 @@ fn operational_overview_rejects_invalid_bounds_and_pending_metadata() {
 }
 
 #[test]
-fn operational_overview_deduplicates_a_request_observed_in_multiple_states() {
+fn operational_overview_rejects_a_stable_request_in_multiple_states() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path(), PackagePolicy::default());
     accept(stage_package(&queue, RESULTS));
@@ -399,12 +399,11 @@ fn operational_overview_deduplicates_a_request_observed_in_multiple_states() {
     let reader = QueueReader::open_until(root.path().join("queue"), None)
         .unwrap_or_else(|error| panic!("read-only queue fixture must open: {error}"));
 
-    let overview = reader
-        .overview_until(2, None)
-        .unwrap_or_else(|error| panic!("best-effort overview must deduplicate: {error}"));
-    assert_eq!(overview.pending(), 1);
-    assert_eq!(overview.completed(), 0);
-    assert!(!overview.counts_exact());
+    assert!(matches!(
+        reader.overview_until(2, None),
+        Err(QueueError::RequestInMultipleStates { request_id })
+            if request_id.to_string() == "01K00000000000000000000000"
+    ));
 }
 
 #[cfg(unix)]

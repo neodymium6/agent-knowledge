@@ -119,7 +119,7 @@ commit, the active Quartz release, and remote-replication progress. It is
 read-only: it neither initializes nor repairs storage nor contacts the Git
 remote. The queue scan has an explicit entry bound and does not take the
 accepted-state lock, so it does not block submissions or Worker transitions.
-Queue counts are best-effort observations and `counts_exact` is currently
+Queue fields are best-effort observations and `snapshot_exact` is currently
 always `false`. Its deadline covers bounded queue work and Git subprocesses;
 local filesystem calls remain subject to the host filesystem's I/O behavior.
 The command verifies the official commit again after inspecting release and
