@@ -1612,7 +1612,7 @@ Implementation proceeds in these increments:
    (implemented).
 9. Deployment packaging:
    - reproducible Linux package output (implemented);
-   - conventional Linux service integration; and
+   - conventional Linux service integration (implemented); and
    - optional container and single-replica Kubernetes packaging.
 
 Every increment keeps `just check` passing and preserves the invariants in this

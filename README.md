@@ -18,8 +18,8 @@ exact committed content snapshot and inspect durable request state through the
 same Gateway. Git remote replication runs asynchronously with durable retry
 state. Derived-release retention is available as a bounded local maintenance
 operation. Document-bundle export is implemented. Reproducible Linux package
-output is available through the flake; service, container, and Kubernetes
-packaging remain future work.
+output and conventional systemd service integration are available through the
+flake; container and Kubernetes packaging remain future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -61,6 +61,43 @@ wrapper provides the pinned Git and OpenSSH executables used by Worker,
 Gateway, and client operations. Quartz remains a deployment-supplied absolute
 program path and integration directory. The package does not contain service
 configuration, credentials, host keys, client keys, or Quartz content.
+
+### systemd service
+
+The Linux package contains a hardened Worker unit plus `sysusers.d` and
+`tmpfiles.d` definitions. Install them from the immutable package output:
+
+```sh
+sudo nix profile add --profile /nix/var/nix/profiles/agent-knowledge \
+  .#agent-knowledge
+package_path=/nix/var/nix/profiles/agent-knowledge
+sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
+sudo systemd-tmpfiles --create "$package_path/lib/tmpfiles.d/agent-knowledge.conf"
+sudo install -d -m 0750 -o root -g agent-knowledge /etc/agent-knowledge
+sudo install -m 0640 -o root -g agent-knowledge \
+  ./fictional-worker.yaml /etc/agent-knowledge/worker.yaml
+sudo systemctl link "$package_path/lib/systemd/system/agent-knowledge-worker.service"
+sudo systemctl enable --now agent-knowledge-worker.service
+```
+
+The supplied storage layout uses sibling roots below
+`/var/lib/agent-knowledge/`. A matching Worker configuration uses `queue`,
+`repository`, `content`, `work`, and `releases` below that directory. The
+`agent-knowledge` account is shared by the Worker and the OpenSSH forced-command
+Gateway so durable queue entries remain accessible to both. Its password is
+disabled, but it has `/bin/sh` because OpenSSH executes forced commands through
+the login shell. Every authorized key must retain the documented `restrict` and
+per-key `command` options; never grant this account unrestricted SSH access.
+
+The dedicated system profile keeps the package output live across Nix garbage
+collection. The unit allows writes only below `/var/lib/agent-knowledge`, uses
+`KillMode=mixed`, and grants 15 minutes for transaction-boundary shutdown. A
+deployment using other durable roots must add them with a systemd drop-in. It
+must also increase `TimeoutStopSec` when its maximum expected Git or Quartz
+transaction can exceed 15 minutes. After upgrading the dedicated profile,
+relink the unit with `systemctl link --force`, then run `systemctl daemon-reload`
+and restart the Worker. Configuration, SSH keys, Git credentials, Quartz, and
+service enablement remain deployment inputs.
 
 Run the Repository Worker with a validated deployment configuration:
 
