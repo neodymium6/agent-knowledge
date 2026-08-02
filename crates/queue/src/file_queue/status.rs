@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,12 +11,15 @@ use agent_knowledge_core::{
 use time::OffsetDateTime;
 
 use super::{
-    LOCK_DIRECTORY_NAME, PinnedDirectory, QUEUE_IDENTITY_FILE_NAME, QUEUE_LOCK_FILE_NAME,
-    QueueBinding, QueueDirectories, QueueError, QueueState, WORKER_LOCK_FILE_NAME,
-    WORKER_TEMP_DIRECTORY_NAME, stable_file_path, validate_common_queue_mount,
-    validate_current_queue,
+    ACCEPTANCE_FILE_NAME, LOCK_DIRECTORY_NAME, PinnedDirectory, QUEUE_IDENTITY_FILE_NAME,
+    QUEUE_LOCK_FILE_NAME, QueueBinding, QueueDirectories, QueueError, QueueState,
+    WORKER_LOCK_FILE_NAME, WORKER_TEMP_DIRECTORY_NAME, stable_file_path,
+    validate_common_queue_mount, validate_current_queue,
 };
-use crate::{CURRENT_WORKER_RESULT_SCHEMA_VERSION, WorkerResultRecord, WorkerResultStatus};
+use crate::{
+    CURRENT_WORKER_RESULT_SCHEMA_VERSION, PackageValidationError, WorkerResultRecord,
+    WorkerResultStatus,
+};
 
 const RESULT_FILE_NAME: &str = "result.json";
 const MAXIMUM_RESULT_FILE_BYTES: u64 = 1_024;
@@ -48,6 +51,55 @@ pub enum QueueRequestStatus {
         /// Central-server time when the failure became durable.
         failed_at: OffsetDateTime,
     },
+}
+
+/// Bounded read-only summary of one durable queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueOverview {
+    pending: u64,
+    processing: u64,
+    completed: u64,
+    failed: u64,
+    oldest_pending_at: Option<OffsetDateTime>,
+    worker_active: bool,
+}
+
+impl QueueOverview {
+    /// Returns the number of accepted requests waiting for the Worker.
+    #[must_use]
+    pub const fn pending(self) -> u64 {
+        self.pending
+    }
+
+    /// Returns the number of requests currently owned by the Worker.
+    #[must_use]
+    pub const fn processing(self) -> u64 {
+        self.processing
+    }
+
+    /// Returns the number of locally committed and published requests.
+    #[must_use]
+    pub const fn completed(self) -> u64 {
+        self.completed
+    }
+
+    /// Returns the number of durably rejected requests.
+    #[must_use]
+    pub const fn failed(self) -> u64 {
+        self.failed
+    }
+
+    /// Returns the oldest durable acceptance time still awaiting processing.
+    #[must_use]
+    pub const fn oldest_pending_at(self) -> Option<OffsetDateTime> {
+        self.oldest_pending_at
+    }
+
+    /// Reports whether another process held the Repository Worker lock.
+    #[must_use]
+    pub const fn worker_active(self) -> bool {
+        self.worker_active
+    }
 }
 
 /// A pinned, read-only view of one initialized durable queue.
@@ -155,6 +207,86 @@ impl QueueReader {
         self.status_until_with_hook(request_id, deadline, &mut NoopStatusObservationHook)
     }
 
+    /// Scans accepted request states without changing the queue.
+    ///
+    /// At most `maximum_entries` request directories are inspected. Counts are
+    /// exact only when the scan succeeds; a concurrent state transition may be
+    /// observed on either side of its atomic rename.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero or exhausted scan bound, corrupt queue
+    /// entries, a replaced queue, lock inspection failure, or deadline expiry.
+    pub fn overview_until(
+        &self,
+        maximum_entries: usize,
+        deadline: Option<Instant>,
+    ) -> Result<QueueOverview, QueueError> {
+        if maximum_entries == 0 {
+            return Err(QueueError::InvalidStatusScanLimit);
+        }
+        ensure_deadline(deadline)?;
+        self.current_identity()?;
+        let mut counts = [0_u64; 4];
+        let mut scanned = 0_usize;
+        let mut oldest_pending_at = None;
+        for state in QueueState::ALL {
+            ensure_deadline(deadline)?;
+            let entries =
+                fs::read_dir(&self.directories.state(state).stable).map_err(QueueError::Io)?;
+            for entry in entries {
+                ensure_deadline(deadline)?;
+                if scanned == maximum_entries {
+                    return Err(QueueError::StatusScanLimitExceeded {
+                        maximum: maximum_entries,
+                    });
+                }
+                scanned += 1;
+                let entry = entry.map_err(QueueError::Io)?;
+                let path = entry.path();
+                let request_id = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse().ok())
+                    .ok_or_else(|| QueueError::InvalidStoragePath(path.clone()))?;
+                if !entry.file_type().map_err(QueueError::Io)?.is_dir() {
+                    return Err(QueueError::CorruptState {
+                        request_id,
+                        state,
+                        detail: "request entry is not a directory",
+                    });
+                }
+                counts[state.index()] = counts[state.index()].saturating_add(1);
+                if state == QueueState::Pending {
+                    let accepted_at = read_pending_acceptance(&path, request_id)?;
+                    oldest_pending_at = Some(
+                        oldest_pending_at.map_or(accepted_at, |oldest: OffsetDateTime| {
+                            oldest.min(accepted_at)
+                        }),
+                    );
+                }
+            }
+        }
+        let worker_active = match self.worker_lock_handle.try_lock_shared() {
+            Ok(()) => {
+                self.worker_lock_handle.unlock().map_err(QueueError::Io)?;
+                false
+            }
+            Err(TryLockError::WouldBlock) => true,
+            Err(TryLockError::Error(error)) => return Err(QueueError::Io(error)),
+        };
+        self.current_identity()?;
+        ensure_deadline(deadline)?;
+        Ok(QueueOverview {
+            pending: counts[QueueState::Pending.index()],
+            processing: counts[QueueState::Processing.index()],
+            completed: counts[QueueState::Completed.index()],
+            failed: counts[QueueState::Failed.index()],
+            oldest_pending_at,
+            worker_active,
+        })
+    }
+
     pub(super) fn status_until_with_hook(
         &self,
         request_id: RequestId,
@@ -232,6 +364,23 @@ impl QueueReader {
             worker_lock_file: &self.worker_lock_file,
             worker_lock_handle: &self.worker_lock_handle,
         })
+    }
+}
+
+fn read_pending_acceptance(
+    package_root: &Path,
+    request_id: RequestId,
+) -> Result<OffsetDateTime, QueueError> {
+    match crate::package::read_acceptance_file(&package_root.join(ACCEPTANCE_FILE_NAME)) {
+        Ok(acceptance) => Ok(acceptance.accepted_at),
+        Err(PackageValidationError::Io(error)) if error.kind() != io::ErrorKind::NotFound => {
+            Err(QueueError::Io(error))
+        }
+        Err(_) => Err(QueueError::CorruptState {
+            request_id,
+            state: QueueState::Pending,
+            detail: "pending request acceptance metadata is invalid",
+        }),
     }
 }
 

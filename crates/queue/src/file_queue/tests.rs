@@ -275,6 +275,106 @@ fn read_only_status_observes_every_request_state_without_taking_queue_locks() {
 }
 
 #[test]
+fn operational_overview_counts_states_and_observes_the_worker_lock() {
+    const SECOND_REQUEST_ID: &str = "01K00000000000000000000010";
+    const THIRD_REQUEST_ID: &str = "01K00000000000000000000011";
+    const FIRST_BATCH_ID: &str = "01K00000000000000000000020";
+    const SECOND_BATCH_ID: &str = "01K00000000000000000000021";
+
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    accept(stage_package_with_request_id(
+        &queue,
+        RESULTS,
+        SECOND_REQUEST_ID,
+    ));
+    accept(stage_package_with_request_id(
+        &queue,
+        RESULTS,
+        THIRD_REQUEST_ID,
+    ));
+    let mut worker = queue
+        .try_worker_session()
+        .unwrap_or_else(|error| panic!("Worker fixture must open: {error}"));
+    assert!(matches!(
+        worker.scan_processing(16),
+        Ok(ProcessingScanOutcome::Complete { ref claims, .. }) if claims.is_empty()
+    ));
+    let completed = worker
+        .claim(
+            request_id("01K00000000000000000000000"),
+            batch_id(FIRST_BATCH_ID),
+        )
+        .unwrap_or_else(|error| panic!("first request must be claimed: {error}"))
+        .token();
+    worker
+        .reconcile_batch(batch_id(FIRST_BATCH_ID), &[completed], &[])
+        .unwrap_or_else(|error| panic!("first request must complete: {error}"));
+    let failed = worker
+        .claim(request_id(SECOND_REQUEST_ID), batch_id(SECOND_BATCH_ID))
+        .unwrap_or_else(|error| panic!("second request must be claimed: {error}"))
+        .token();
+    worker
+        .reconcile_batch(
+            batch_id(SECOND_BATCH_ID),
+            &[],
+            &[(failed, ErrorCode::RevisionConflict)],
+        )
+        .unwrap_or_else(|error| panic!("second request must fail: {error}"));
+
+    let reader = QueueReader::open_until(root.path().join("queue"), None)
+        .unwrap_or_else(|error| panic!("read-only queue fixture must open: {error}"));
+    let overview = reader
+        .overview_until(3, None)
+        .unwrap_or_else(|error| panic!("bounded overview must succeed: {error}"));
+    assert_eq!(overview.pending(), 1);
+    assert_eq!(overview.processing(), 0);
+    assert_eq!(overview.completed(), 1);
+    assert_eq!(overview.failed(), 1);
+    assert!(overview.oldest_pending_at().is_some());
+    assert!(overview.worker_active());
+    assert!(matches!(
+        reader.overview_until(2, None),
+        Err(QueueError::StatusScanLimitExceeded { maximum: 2 })
+    ));
+
+    drop(worker);
+    let overview = reader
+        .overview_until(3, None)
+        .unwrap_or_else(|error| panic!("unlocked overview must succeed: {error}"));
+    assert!(!overview.worker_active());
+}
+
+#[test]
+fn operational_overview_rejects_invalid_bounds_and_pending_metadata() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    let reader = QueueReader::open_until(root.path().join("queue"), None)
+        .unwrap_or_else(|error| panic!("read-only queue fixture must open: {error}"));
+
+    assert!(matches!(
+        reader.overview_until(0, None),
+        Err(QueueError::InvalidStatusScanLimit)
+    ));
+    fs::write(
+        root.path()
+            .join("queue/pending/01K00000000000000000000000/acceptance.json"),
+        b"{not-json}\n",
+    )
+    .unwrap_or_else(|error| panic!("acceptance fixture must be corrupted: {error}"));
+    assert!(matches!(
+        reader.overview_until(1, None),
+        Err(QueueError::CorruptState {
+            state: QueueState::Pending,
+            detail: "pending request acceptance metadata is invalid",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn read_only_status_requires_an_existing_queue_and_honors_deadlines() {
     let root = TestDirectory::create();
     let queue_root = root.path().join("queue");
