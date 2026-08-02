@@ -70,7 +70,7 @@
           meta = {
             description = "Centralized file-based knowledge management for coding agents";
             mainProgram = "agent-knowledge";
-            platforms = pkgs.lib.platforms.linux;
+            platforms = linuxSystems;
           };
         };
     in
