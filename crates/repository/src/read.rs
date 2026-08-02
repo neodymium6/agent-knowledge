@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::git::{
     ensure_canonical_worktree_clean_until, ensure_real_directory, ensure_supported_git_until,
-    open_stable_directory, parse_object_id, run_git_for_read, validate_local_git_config_until,
-    validate_repository_layout_until,
+    open_stable_directory, parse_object_id, run_git_for_read, run_git_for_read_with_output_limit,
+    validate_local_git_config_until, validate_repository_layout_until,
 };
 use crate::{
     AttachmentRecord, ContentIndex, ContentIndexError, ContentPolicy, DocumentRecord,
@@ -151,12 +151,14 @@ impl CommittedStore {
             .map_err(CommittedReadError::PinnedPath)?;
         Ok(CommittedSnapshot {
             commit: official,
+            git_directory: self.git_directory.clone(),
             index,
             root,
             maximum_markdown_bytes: content_policy.maximum_markdown_bytes,
             maximum_bundle_bytes: package_policy.limits().maximum_total_bytes,
             maximum_bundle_entries: package_policy.limits().maximum_file_count,
             deadline,
+            _git_root_handle: Arc::clone(&self.git_root_handle),
             _content_lock: content_lock,
         })
     }
@@ -262,12 +264,14 @@ fn same_directory_metadata(_left: &fs::Metadata, _right: &fs::Metadata) -> bool 
 #[derive(Debug)]
 pub struct CommittedSnapshot {
     commit: String,
+    git_directory: PathBuf,
     index: ContentIndex,
     root: PinnedDirectory,
     maximum_markdown_bytes: u64,
     maximum_bundle_bytes: u64,
     maximum_bundle_entries: usize,
     deadline: Option<Instant>,
+    _git_root_handle: Arc<File>,
     _content_lock: File,
 }
 
@@ -405,15 +409,7 @@ impl CommittedSnapshot {
             bytes: self.read_markdown(record)?,
         });
         for attachment in attachment_records {
-            let first = self.read_attachment(record, attachment)?;
-            let first_revision = Revision::from_bytes(Sha256::digest(&first.bytes).into());
-            drop(first);
-            let second = self.read_attachment(record, attachment)?;
-            let second_revision = Revision::from_bytes(Sha256::digest(&second.bytes).into());
-            if first_revision != second_revision {
-                return Err(CommittedReadError::ContentChanged { document_id });
-            }
-            entries.push(second);
+            entries.push(self.read_attachment(record, attachment)?);
         }
         check_operation_deadline(self.deadline)?;
         Ok(CommittedBundle { record, entries })
@@ -490,6 +486,15 @@ impl CommittedSnapshot {
                 document_id: document.metadata().document_id,
             });
         }
+        let committed =
+            self.read_committed_attachment(document.metadata().document_id, attachment)?;
+        let actual_revision = Revision::from_bytes(Sha256::digest(&bytes).into());
+        let committed_revision = Revision::from_bytes(Sha256::digest(&committed).into());
+        if bytes.len() != committed.len() || actual_revision != committed_revision {
+            return Err(CommittedReadError::ContentChanged {
+                document_id: document.metadata().document_id,
+            });
+        }
         let name = attachment
             .relative_path()
             .file_name()
@@ -498,6 +503,39 @@ impl CommittedSnapshot {
                 document_id: document.metadata().document_id,
             })?;
         Ok(CommittedBundleEntry { name, bytes })
+    }
+
+    fn read_committed_attachment(
+        &self,
+        document_id: DocumentId,
+        attachment: &AttachmentRecord,
+    ) -> Result<Vec<u8>, CommittedReadError> {
+        check_operation_deadline(self.deadline)?;
+        let path = attachment
+            .relative_path()
+            .to_str()
+            .ok_or(CommittedReadError::ContentChanged { document_id })?;
+        let object = format!("{}:{path}", self.commit);
+        let maximum = usize::try_from(attachment.byte_length())
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let output = run_git_for_read_with_output_limit(
+            None,
+            Some(&self.git_directory),
+            [
+                OsStr::new("cat-file"),
+                OsStr::new("blob"),
+                OsStr::new(&object),
+            ],
+            self.deadline,
+            maximum,
+        )
+        .map_err(CommittedReadError::repository)?;
+        check_operation_deadline(self.deadline)?;
+        if output.stdout.len() as u64 != attachment.byte_length() {
+            return Err(CommittedReadError::ContentChanged { document_id });
+        }
+        Ok(output.stdout)
     }
 }
 

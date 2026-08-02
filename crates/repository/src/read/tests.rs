@@ -399,3 +399,25 @@ fn bundle_export_rejects_an_attachment_replaced_by_a_hard_link() {
         Err(CommittedReadError::Io(_))
     ));
 }
+
+#[test]
+fn bundle_export_rejects_same_length_uncommitted_attachment_bytes() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let attachment = fixture
+        .content
+        .join("projects/fictional-project/runbooks")
+        .join(format!("2026-07-31-{RUNBOOK_ID}/procedure.json"));
+    fs::write(&attachment, b"{\"fictional\":null}\n")
+        .unwrap_or_else(|error| panic!("attachment mutation must be written: {error}"));
+    let document_id = RUNBOOK_ID
+        .parse()
+        .unwrap_or_else(|error| panic!("document fixture must parse: {error}"));
+    match snapshot.bundle(document_id) {
+        Err(CommittedReadError::ContentChanged { document_id: found }) if found == document_id => {}
+        other => panic!("same-length mutation must be rejected as changed content: {other:?}"),
+    }
+}
