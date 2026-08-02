@@ -1676,7 +1676,7 @@ fn clear_cleanup_directory(directory: &File, _batch_id: BatchId) -> Result<(), R
     use nix::errno::Errno;
     use nix::unistd::{UnlinkatFlags, unlinkat};
 
-    clear_directory_at(directory, Some(CLEANUP_MARKER_FILE.as_bytes()))?;
+    clear_directory_at(directory, Some(CLEANUP_MARKER_FILE.as_bytes()), None)?;
     match unlinkat(directory, CLEANUP_MARKER_FILE, UnlinkatFlags::NoRemoveDir) {
         Ok(()) | Err(Errno::ENOENT) => {}
         Err(error) => return Err(nix_io_error(error)),
@@ -1696,7 +1696,11 @@ fn clear_cleanup_directory(directory: &File, _batch_id: BatchId) -> Result<(), R
 }
 
 #[cfg(unix)]
-fn clear_directory_at(directory: &File, preserved_name: Option<&[u8]>) -> Result<(), ReleaseError> {
+fn clear_directory_at(
+    directory: &File,
+    preserved_name: Option<&[u8]>,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), ReleaseError> {
     use nix::fcntl::{AtFlags, OFlag, openat, renameat};
     use nix::sys::stat::{Mode, fstat, fstatat};
     use nix::unistd::{UnlinkatFlags, unlinkat};
@@ -1714,6 +1718,12 @@ fn clear_directory_at(directory: &File, preserved_name: Option<&[u8]>) -> Result
     }];
     let mut actions = 0_usize;
     loop {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            for frame in &frames {
+                frame.directory.sync_all().map_err(ReleaseError::Io)?;
+            }
+            return Err(ReleaseError::OperationDeadlineExceeded);
+        }
         let is_root = frames.len() == 1;
         let entry_name = next_cleanup_entry(
             &frames
@@ -2285,6 +2295,8 @@ pub enum ReleaseError {
     RecoveredBuildConflict,
     InvalidBatchIntent,
     InvalidCleanupIntent,
+    InvalidRetentionIntent,
+    RetentionUnsupported,
     MissingRecoveryState,
     BuildAlreadyExists(BatchId),
     OutputTooLarge,
@@ -2348,6 +2360,12 @@ impl fmt::Display for ReleaseError {
             }
             Self::InvalidBatchIntent => formatter.write_str("release batch intent is invalid"),
             Self::InvalidCleanupIntent => formatter.write_str("release cleanup intent is invalid"),
+            Self::InvalidRetentionIntent => {
+                formatter.write_str("release retention intent is invalid")
+            }
+            Self::RetentionUnsupported => {
+                formatter.write_str("release retention is unsupported on this platform")
+            }
             Self::MissingRecoveryState => formatter.write_str("release recovery state is missing"),
             Self::BuildAlreadyExists(batch_id) => {
                 write!(

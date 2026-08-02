@@ -148,8 +148,10 @@ active release, even when it is older. `maximum_scan_entries` bounds all
 release-store directory entries inspected, and `maximum_removals` bounds the
 release trees selected per invocation. The command takes the release-store
 maintenance lock, does not initialize missing storage, and emits versioned
-JSON. A non-dry-run pass atomically moves each selected derived tree into a
-private tombstone before descriptor-relative deletion. Large trees may report
+JSON. Dry-run output identifies both newly selected releases and existing
+cleanup-pending tombstones. On Unix, a non-dry-run pass records an inode-bound
+durable intent and atomically moves each selected derived tree into a private
+tombstone before descriptor-relative deletion. Large trees may report
 `cleanup_pending_release_ids` and complete on a later invocation. Canonical
 content, Git history, accepted requests, and the active release are never
 removed.

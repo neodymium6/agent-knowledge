@@ -6,18 +6,21 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
+use time::OffsetDateTime;
 
 use super::{
-    MANIFEST_FILE, ReleaseError, ReleaseManifest, ReleaseStore, open_directory, read_manifest_file,
+    BY_ID_DIRECTORY, CURRENT_ENTRY, MANIFEST_FILE, ReleaseError, ReleaseManifest, ReleaseStore,
+    cleanup_identity, open_directory, read_bounded_regular_file, read_manifest_file,
     release_id as canonical_release_id, release_id_from_commit_target, remove_empty_directory_at,
-    stable_directory_path, sync_directory, validate_commit, validate_pinned_directory,
-    validate_release_id_component, validate_same_mount,
+    replace_regular_file, replace_symlink, stable_directory_path, sync_directory, validate_commit,
+    validate_pinned_directory, validate_release_id_component, validate_same_mount,
 };
 
 #[cfg(unix)]
 use super::clear_directory_at;
 
 const RETENTION_TOMBSTONE_PREFIX: &str = ".retention-";
+const RETENTION_INTENT_PREFIX: &str = "retention-";
 const CURRENT_RETENTION_OUTCOME_VERSION: u16 = 1;
 const DEFAULT_RETAINED_RELEASES: NonZeroUsize = match NonZeroUsize::new(10) {
     Some(value) => value,
@@ -145,11 +148,18 @@ impl ReleaseRetentionOutcome {
 struct PinnedRelease {
     release_id: String,
     commit: String,
+    created_at: Option<OffsetDateTime>,
     manifest: Option<ReleaseManifest>,
     configured: PathBuf,
     stable: PathBuf,
     handle: Arc<File>,
     retired: bool,
+}
+
+#[derive(Clone, Debug)]
+struct KnownRelease {
+    manifest: ReleaseManifest,
+    handle: Arc<File>,
 }
 
 impl ReleaseStore {
@@ -171,15 +181,31 @@ impl ReleaseStore {
         dry_run: bool,
         deadline: Option<Instant>,
     ) -> Result<ReleaseRetentionOutcome, ReleaseError> {
+        ensure_retention_supported()?;
         ensure_deadline(deadline)?;
         let _mutation = self.lock_mutation()?;
         self.validate_live_storage()?;
-        let active_release_id = self.active_release()?.map(|release| release.release_id);
+        let active_release_id = self.retention_active_release_id(deadline)?;
         let mut scan_budget = policy.maximum_scan_entries.get();
-        let mut tombstones = self.retention_tombstones(&mut scan_budget, deadline)?;
+        let mut tombstones =
+            self.retention_tombstones(&mut scan_budget, deadline, active_release_id.as_deref())?;
         let mut releases = self.retention_releases(&mut scan_budget, deadline)?;
         let releases_scanned = releases.len();
-        releases.sort_by(|left, right| right.release_id.cmp(&left.release_id));
+        let known_releases = releases
+            .iter()
+            .filter_map(|release| {
+                release.manifest.clone().map(|manifest| KnownRelease {
+                    manifest,
+                    handle: Arc::clone(&release.handle),
+                })
+            })
+            .collect::<Vec<_>>();
+        releases.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.release_id.cmp(&left.release_id))
+        });
         let retained = policy.retained_releases.get().min(releases.len());
         let mut eligible = releases.split_off(retained);
         if let Some(active) = active_release_id.as_deref() {
@@ -197,6 +223,11 @@ impl ReleaseStore {
             .map(|target| target.release_id.clone())
             .collect();
         if dry_run {
+            let cleanup_pending_release_ids = targets
+                .iter()
+                .filter(|target| target.retired)
+                .map(|target| target.release_id.clone())
+                .collect();
             return Ok(ReleaseRetentionOutcome {
                 schema_version: CURRENT_RETENTION_OUTCOME_VERSION,
                 dry_run,
@@ -204,7 +235,7 @@ impl ReleaseStore {
                 eligible_releases,
                 planned_release_ids,
                 removed_release_ids: Vec::new(),
-                cleanup_pending_release_ids: Vec::new(),
+                cleanup_pending_release_ids,
             });
         }
 
@@ -213,9 +244,15 @@ impl ReleaseStore {
         for mut target in targets {
             ensure_deadline(deadline)?;
             if !target.retired {
-                target = self.retire_release(target, active_release_id.as_deref())?;
+                target =
+                    self.retire_release(target, active_release_id.as_deref(), &known_releases)?;
             }
-            match self.clear_retention_tombstone(&target) {
+            match self.clear_retention_tombstone(
+                &target,
+                active_release_id.as_deref(),
+                &known_releases,
+                deadline,
+            ) {
                 Ok(()) => removed_release_ids.push(target.release_id),
                 Err(ReleaseError::CleanupIncomplete) => {
                     cleanup_pending_release_ids.push(target.release_id);
@@ -262,6 +299,7 @@ impl ReleaseStore {
             validate_commit(&manifest.commit)?;
             releases.push(PinnedRelease {
                 commit: manifest.commit.clone(),
+                created_at: Some(manifest.created_at),
                 manifest: Some(manifest),
                 ..pinned
             });
@@ -273,6 +311,7 @@ impl ReleaseStore {
         &self,
         scan_budget: &mut usize,
         deadline: Option<Instant>,
+        active_release_id: Option<&str>,
     ) -> Result<Vec<PinnedRelease>, ReleaseError> {
         let mut tombstones = Vec::new();
         for entry in fs::read_dir(&self.staging.stable).map_err(ReleaseError::Io)? {
@@ -287,13 +326,19 @@ impl ReleaseStore {
                 continue;
             };
             validate_release_id_component(release_id)?;
+            if active_release_id == Some(release_id) {
+                return Err(ReleaseError::ActiveReleaseRetentionConflict);
+            }
             let commit = commit_from_release_id(release_id)?.to_owned();
             let pinned = pin_release(entry.path(), release_id.to_owned(), true)?;
-            tombstones.push(PinnedRelease {
+            let pinned = PinnedRelease {
                 commit,
+                created_at: None,
                 manifest: None,
                 ..pinned
-            });
+            };
+            self.validate_retention_intent(&pinned)?;
+            tombstones.push(pinned);
         }
         Ok(tombstones)
     }
@@ -302,6 +347,7 @@ impl ReleaseStore {
         &self,
         release: PinnedRelease,
         active_release_id: Option<&str>,
+        known_releases: &[KnownRelease],
     ) -> Result<PinnedRelease, ReleaseError> {
         if active_release_id == Some(release.release_id.as_str()) {
             return Err(ReleaseError::ActiveReleaseRetentionConflict);
@@ -324,24 +370,39 @@ impl ReleaseStore {
         let manifest = release
             .manifest
             .as_ref()
-            .ok_or(ReleaseError::InvalidManifest)?;
-        self.remove_retired_commit_reference(&release.commit, &release.release_id)?;
-        if let Err(error) = fs::rename(&release.configured, &tombstone_path) {
-            self.ensure_commit_reference(manifest)?;
-            return Err(ReleaseError::Io(error));
-        }
+            .ok_or(ReleaseError::InvalidManifest)?
+            .clone();
+        self.ensure_retention_intent(&release)?;
+        fs::rename(&release.configured, &tombstone_path).map_err(ReleaseError::Io)?;
         sync_directory(&self.by_id.stable)?;
         sync_directory(&self.staging.stable)?;
         validate_pinned_directory(&tombstone_path, &release.handle)?;
-        Ok(PinnedRelease {
+        let retired = PinnedRelease {
             configured: tombstone_path.clone(),
             stable: stable_directory_path(&release.handle, &tombstone_path)?,
             retired: true,
             ..release
-        })
+        };
+        self.validate_retention_intent(&retired)?;
+        self.repoint_retired_commit_reference(
+            &manifest.commit,
+            &manifest.release_id,
+            known_releases,
+        )?;
+        Ok(retired)
     }
 
-    fn clear_retention_tombstone(&self, release: &PinnedRelease) -> Result<(), ReleaseError> {
+    fn clear_retention_tombstone(
+        &self,
+        release: &PinnedRelease,
+        active_release_id: Option<&str>,
+        known_releases: &[KnownRelease],
+        deadline: Option<Instant>,
+    ) -> Result<(), ReleaseError> {
+        if active_release_id == Some(release.release_id.as_str()) {
+            return Err(ReleaseError::ActiveReleaseRetentionConflict);
+        }
+        self.validate_retention_intent(release)?;
         validate_pinned_directory(
             &self
                 .staging
@@ -350,36 +411,182 @@ impl ReleaseStore {
             &release.handle,
         )?;
         validate_same_mount(&self.staging.handle, &release.handle)?;
-        self.remove_retired_commit_reference(&release.commit, &release.release_id)?;
-        clear_retired_directory(&release.handle)?;
+        self.repoint_retired_commit_reference(
+            &release.commit,
+            &release.release_id,
+            known_releases,
+        )?;
+        clear_retired_directory(&release.handle, deadline)?;
+        ensure_deadline(deadline)?;
         remove_retired_manifest(&release.stable)?;
         let tombstone_name = retention_tombstone_name(&release.release_id);
         let tombstone = self.staging.stable.join(&tombstone_name);
         validate_pinned_directory(&tombstone, &release.handle)?;
         remove_empty_directory_at(&self.staging.handle, &tombstone_name, &tombstone)?;
-        sync_directory(&self.staging.stable)
+        sync_directory(&self.staging.stable)?;
+        self.remove_retention_intent(&release.release_id)
     }
 
-    fn remove_retired_commit_reference(
+    fn repoint_retired_commit_reference(
         &self,
         commit: &str,
-        release_id: &str,
+        retired_release_id: &str,
+        known_releases: &[KnownRelease],
     ) -> Result<(), ReleaseError> {
         let reference = self.by_commit.stable.join(commit);
-        let metadata = match fs::symlink_metadata(&reference) {
+        let replacement = self.newest_surviving_release(commit, known_releases)?;
+        if let Some(manifest) = replacement {
+            let target = PathBuf::from("..")
+                .join(BY_ID_DIRECTORY)
+                .join(&manifest.release_id);
+            match fs::symlink_metadata(&reference) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    if fs::read_link(&reference).map_err(ReleaseError::Io)? == target {
+                        return sync_directory(&self.by_commit.stable);
+                    }
+                }
+                Ok(_) => return Err(ReleaseError::InvalidCommitReference),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ReleaseError::Io(error)),
+            }
+            return replace_symlink(&self.by_commit.stable, &reference, &target, "commit");
+        }
+
+        match fs::symlink_metadata(&reference) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = fs::read_link(&reference).map_err(ReleaseError::Io)?;
+                if release_id_from_commit_target(&target)? != retired_release_id {
+                    return Err(ReleaseError::InvalidCommitReference);
+                }
+                fs::remove_file(&reference).map_err(ReleaseError::Io)?;
+                sync_directory(&self.by_commit.stable)?;
+            }
+            Ok(_) => return Err(ReleaseError::InvalidCommitReference),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ReleaseError::Io(error)),
+        }
+        Ok(())
+    }
+
+    fn newest_surviving_release(
+        &self,
+        commit: &str,
+        known_releases: &[KnownRelease],
+    ) -> Result<Option<ReleaseManifest>, ReleaseError> {
+        let mut candidates = known_releases
+            .iter()
+            .filter(|release| release.manifest.commit == commit)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .manifest
+                .created_at
+                .cmp(&left.manifest.created_at)
+                .then_with(|| right.manifest.release_id.cmp(&left.manifest.release_id))
+        });
+        for candidate in candidates {
+            let path = self.by_id.stable.join(&candidate.manifest.release_id);
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(ReleaseError::Io(error)),
+                Ok(metadata) if !metadata.file_type().is_dir() => {
+                    return Err(ReleaseError::InvalidManifest);
+                }
+                Ok(_) => {}
+            }
+            validate_pinned_directory(&path, &candidate.handle)?;
+            if read_manifest_file(&path.join(MANIFEST_FILE))? != candidate.manifest {
+                return Err(ReleaseError::InvalidManifest);
+            }
+            return Ok(Some(candidate.manifest.clone()));
+        }
+        Ok(None)
+    }
+
+    fn retention_active_release_id(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<Option<String>, ReleaseError> {
+        ensure_deadline(deadline)?;
+        let current = self.root.join(CURRENT_ENTRY);
+        let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(ReleaseError::Io(error)),
         };
         if !metadata.file_type().is_symlink() {
-            return Err(ReleaseError::InvalidCommitReference);
+            return Err(ReleaseError::InvalidCurrentEntry);
         }
-        let target = fs::read_link(&reference).map_err(ReleaseError::Io)?;
-        if release_id_from_commit_target(&target)? == release_id {
-            fs::remove_file(&reference).map_err(ReleaseError::Io)?;
-            sync_directory(&self.by_commit.stable)?;
+        let target = fs::read_link(&current).map_err(ReleaseError::Io)?;
+        let mut components = target.components();
+        if components.next().and_then(|part| part.as_os_str().to_str()) != Some(BY_ID_DIRECTORY) {
+            return Err(ReleaseError::InvalidCurrentEntry);
         }
-        Ok(())
+        let release_id = components
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+            .filter(|_| components.next().is_none())
+            .ok_or(ReleaseError::InvalidCurrentEntry)?;
+        validate_release_id_component(release_id)?;
+        let manifest = read_manifest_file(&self.by_id.stable.join(release_id).join(MANIFEST_FILE))?;
+        if manifest.release_id != release_id
+            || canonical_release_id(manifest.created_at, &manifest.commit) != release_id
+        {
+            return Err(ReleaseError::InvalidManifest);
+        }
+        ensure_deadline(deadline)?;
+        Ok(Some(release_id.to_owned()))
+    }
+
+    fn ensure_retention_intent(&self, release: &PinnedRelease) -> Result<(), ReleaseError> {
+        let path = self
+            .cleanup_intent
+            .stable
+            .join(retention_intent_name(&release.release_id));
+        let expected = retention_identity(release)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => self.validate_retention_intent(release),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                replace_regular_file(
+                    &self.cleanup_intent.stable,
+                    &path,
+                    &expected,
+                    "retention-intent",
+                )?;
+                self.validate_retention_intent(release)
+            }
+            Err(error) => Err(ReleaseError::Io(error)),
+        }
+    }
+
+    fn validate_retention_intent(&self, release: &PinnedRelease) -> Result<(), ReleaseError> {
+        let path = self
+            .cleanup_intent
+            .stable
+            .join(retention_intent_name(&release.release_id));
+        let actual = read_bounded_regular_file(&path, 512)
+            .map_err(|_| ReleaseError::InvalidRetentionIntent)?;
+        if actual == retention_identity(release)? {
+            Ok(())
+        } else {
+            Err(ReleaseError::InvalidRetentionIntent)
+        }
+    }
+
+    fn remove_retention_intent(&self, release_id: &str) -> Result<(), ReleaseError> {
+        let path = self
+            .cleanup_intent
+            .stable
+            .join(retention_intent_name(release_id));
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                fs::remove_file(path).map_err(ReleaseError::Io)?;
+            }
+            Ok(_) => return Err(ReleaseError::InvalidRetentionIntent),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ReleaseError::Io(error)),
+        }
+        sync_directory(&self.cleanup_intent.stable)
     }
 }
 
@@ -394,6 +601,7 @@ fn pin_release(
     Ok(PinnedRelease {
         release_id,
         commit: String::new(),
+        created_at: None,
         manifest: None,
         configured: path,
         stable,
@@ -404,6 +612,30 @@ fn pin_release(
 
 fn retention_tombstone_name(release_id: &str) -> String {
     format!("{RETENTION_TOMBSTONE_PREFIX}{release_id}")
+}
+
+fn retention_intent_name(release_id: &str) -> String {
+    format!("{RETENTION_INTENT_PREFIX}{release_id}")
+}
+
+fn retention_identity(release: &PinnedRelease) -> Result<Vec<u8>, ReleaseError> {
+    let mut identity = b"agent-knowledge-release-retention-intent-v1\0".to_vec();
+    identity.extend_from_slice(release.release_id.as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(release.commit.as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(&cleanup_identity(&release.handle)?);
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn ensure_retention_supported() -> Result<(), ReleaseError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_retention_supported() -> Result<(), ReleaseError> {
+    Err(ReleaseError::RetentionUnsupported)
 }
 
 fn commit_from_release_id(release_id: &str) -> Result<&str, ReleaseError> {
@@ -439,31 +671,19 @@ fn same_file(left: &File, right: &File) -> Result<bool, ReleaseError> {
 }
 
 #[cfg(unix)]
-fn clear_retired_directory(directory: &File) -> Result<(), ReleaseError> {
-    clear_directory_at(directory, Some(MANIFEST_FILE.as_bytes()))
+fn clear_retired_directory(
+    directory: &File,
+    deadline: Option<Instant>,
+) -> Result<(), ReleaseError> {
+    clear_directory_at(directory, Some(MANIFEST_FILE.as_bytes()), deadline)
 }
 
 #[cfg(not(unix))]
-fn clear_retired_directory(directory: &File) -> Result<(), ReleaseError> {
-    let stable = stable_directory_path(directory, Path::new(""))?;
-    let mut actions = 0_usize;
-    for entry in fs::read_dir(&stable).map_err(ReleaseError::Io)? {
-        let entry = entry.map_err(ReleaseError::Io)?;
-        if entry.file_name().as_os_str() == MANIFEST_FILE {
-            continue;
-        }
-        if actions == super::MAXIMUM_CLEANUP_ACTIONS {
-            return Err(ReleaseError::CleanupIncomplete);
-        }
-        let metadata = entry.file_type().map_err(ReleaseError::Io)?;
-        if metadata.is_dir() {
-            fs::remove_dir_all(entry.path()).map_err(ReleaseError::Io)?;
-        } else {
-            fs::remove_file(entry.path()).map_err(ReleaseError::Io)?;
-        }
-        actions += 1;
-    }
-    directory.sync_all().map_err(ReleaseError::Io)
+fn clear_retired_directory(
+    _directory: &File,
+    _deadline: Option<Instant>,
+) -> Result<(), ReleaseError> {
+    Err(ReleaseError::RetentionUnsupported)
 }
 
 fn remove_retired_manifest(release: &Path) -> Result<(), ReleaseError> {

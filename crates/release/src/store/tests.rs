@@ -22,9 +22,12 @@ use super::{
 const FIRST_BATCH: &str = "01K00000000000000000000001";
 const SECOND_BATCH: &str = "01K00000000000000000000002";
 const THIRD_BATCH: &str = "01K00000000000000000000003";
+const FOURTH_BATCH: &str = "01K00000000000000000000004";
 const FIRST_COMMIT: &str = "1111111111111111111111111111111111111111";
 const SECOND_COMMIT: &str = "2222222222222222222222222222222222222222";
 const THIRD_COMMIT: &str = "3333333333333333333333333333333333333333";
+const LOW_COMMIT: &str = "0000000000000000000000000000000000000000";
+const HIGH_COMMIT: &str = "ffffffffffffffffffffffffffffffffffffffff";
 
 struct TestDirectory(PathBuf);
 
@@ -186,6 +189,87 @@ fn retention_removes_only_the_oldest_bounded_inactive_release() {
 }
 
 #[test]
+fn retention_orders_releases_by_precise_creation_time() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let older = prepare_release(&store, FIRST_BATCH, HIGH_COMMIT, "2026-07-31T04:00:00.100Z");
+    let newer = prepare_release(&store, SECOND_BATCH, LOW_COMMIT, "2026-07-31T04:00:00.900Z");
+    store
+        .activate(&newer)
+        .unwrap_or_else(|error| panic!("newer release must activate: {error}"));
+
+    let outcome = store
+        .retain_releases_until(
+            ReleaseRetentionPolicy::new(1, 10, 1)
+                .unwrap_or_else(|error| panic!("retention policy must validate: {error}")),
+            false,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("retention must succeed: {error}"));
+
+    assert_eq!(outcome.removed_release_ids(), &[older.release_id()]);
+    assert!(releases.join("by-id").join(newer.release_id()).is_dir());
+}
+
+#[test]
+fn retention_repoints_a_commit_to_its_newest_surviving_release() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let active = prepare_release(&store, FIRST_BATCH, FIRST_COMMIT, "2026-07-31T04:00:00Z");
+    store
+        .activate(&active)
+        .unwrap_or_else(|error| panic!("oldest release must activate: {error}"));
+    let superseding = prepare_release(&store, SECOND_BATCH, FIRST_COMMIT, "2026-07-31T04:05:00Z");
+    prepare_release(&store, THIRD_BATCH, SECOND_COMMIT, "2026-07-31T04:10:00Z");
+    prepare_release(&store, FOURTH_BATCH, THIRD_COMMIT, "2026-07-31T04:15:00Z");
+
+    let outcome = store
+        .retain_releases_until(
+            ReleaseRetentionPolicy::new(2, 10, 1)
+                .unwrap_or_else(|error| panic!("retention policy must validate: {error}")),
+            false,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("retention must succeed: {error}"));
+
+    assert_eq!(outcome.removed_release_ids(), &[superseding.release_id()]);
+    assert_eq!(
+        store
+            .prepared_for_commit(FIRST_COMMIT)
+            .unwrap_or_else(|error| panic!("surviving commit reference must validate: {error}"))
+            .unwrap_or_else(|| panic!("surviving commit reference must exist"))
+            .release_id(),
+        active.release_id()
+    );
+}
+
+#[test]
+fn retention_rejects_an_unauthorized_private_tombstone() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    let store = ReleaseStore::open(&releases, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store must open: {error}"));
+    let release_id = format!("20260731T040000Z-{FIRST_COMMIT}");
+    let tombstone = releases
+        .join(".staging")
+        .join(format!(".retention-{release_id}"));
+    fs::create_dir(&tombstone)
+        .unwrap_or_else(|error| panic!("fictional tombstone must be created: {error}"));
+    fs::write(tombstone.join("sentinel.txt"), b"must remain\n")
+        .unwrap_or_else(|error| panic!("fictional sentinel must be written: {error}"));
+
+    assert!(matches!(
+        store.retain_releases_until(ReleaseRetentionPolicy::default(), false, None),
+        Err(ReleaseError::InvalidRetentionIntent)
+    ));
+    assert!(tombstone.join("sentinel.txt").is_file());
+}
+
+#[test]
 fn retention_resumes_a_large_private_tombstone() {
     let root = TestDirectory::new();
     let releases = root.0.join("releases");
@@ -230,6 +314,19 @@ fn retention_resumes_a_large_private_tombstone() {
             .join(format!(".retention-{}", first.release_id()))
             .is_dir()
     );
+    assert!(
+        releases
+            .join("cleanup-intent")
+            .join(format!("retention-{}", first.release_id()))
+            .is_file()
+    );
+
+    let dry_run = store
+        .retain_releases_until(policy, true, None)
+        .unwrap_or_else(|error| panic!("retention dry run must succeed: {error}"));
+    assert_eq!(dry_run.planned_release_ids(), &[first.release_id()]);
+    assert_eq!(dry_run.cleanup_pending_release_ids(), &[first.release_id()]);
+    assert!(dry_run.removed_release_ids().is_empty());
 
     let second_pass = store
         .retain_releases_until(policy, false, None)
@@ -240,6 +337,12 @@ fn retention_resumes_a_large_private_tombstone() {
         !releases
             .join(".staging")
             .join(format!(".retention-{}", first.release_id()))
+            .exists()
+    );
+    assert!(
+        !releases
+            .join("cleanup-intent")
+            .join(format!("retention-{}", first.release_id()))
             .exists()
     );
 }

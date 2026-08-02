@@ -1310,13 +1310,19 @@ not performed by the publication path or the Gateway.
 
 A retention pass acquires the exclusive release-store mutation lease, validates
 the resolved Worker storage topology, and selects oldest inactive releases
-only after a complete bounded scan. Dry runs do not mutate storage. A mutating
-pass removes a matching derived `by-commit/` reference and atomically renames
-the selected `by-id/` tree into a deterministic private tombstone under
-`.staging/` before recursive cleanup. Cleanup uses the same descriptor-relative,
-same-mount, bounded-action traversal as abandoned build cleanup and preserves
-the release manifest until finalization. If the action budget is exhausted,
-the command reports the release ID as cleanup-pending and a later invocation
+only after a complete bounded scan. Precise manifest creation times determine
+newest ordering; the release ID is only the deterministic tie-breaker. Dry runs
+do not mutate storage and separately report already pending cleanup. A mutating
+pass first records a durable retention intent bound to the selected directory's
+identity, then atomically renames the `by-id/` tree into a deterministic private
+tombstone under `.staging/`. Only an intent-authenticated tombstone may be
+deleted. The derived `by-commit/` reference is then removed or atomically
+repointed to the newest surviving release for that commit. Cleanup uses the
+same Unix descriptor-relative, same-mount, bounded-action traversal as
+abandoned build cleanup, checks the operation deadline between actions, and
+preserves the release manifest until finalization. Retention is rejected on
+platforms without that Unix traversal. If the action budget is exhausted, the
+command reports the release ID as cleanup-pending and a later invocation
 resumes it. This maintenance operation never removes content, repository
 history, queue entries, or the active release.
 
