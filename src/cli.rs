@@ -58,7 +58,7 @@ const MAXIMUM_INGRESS_CONNECTION_TIMEOUT_SECONDS: u64 = 3_900;
 pub fn run<I, W>(arguments: I, output: W) -> Result<(), CliError>
 where
     I: IntoIterator<Item = OsString>,
-    W: Write,
+    W: Write + Send + 'static,
 {
     match parse_arguments(arguments)? {
         Command::Submit {

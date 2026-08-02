@@ -1,13 +1,14 @@
 use std::fs;
-use std::io::Cursor;
+use std::io::{self, Cursor, Write};
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,50 @@ use super::{
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory(PathBuf);
+
+#[derive(Clone, Default)]
+struct SharedDiagnosticOutput(Arc<Mutex<Vec<u8>>>);
+
+impl SharedDiagnosticOutput {
+    fn contents(&self) -> Vec<u8> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| panic!("diagnostic output must not be poisoned: {error}"))
+            .clone()
+    }
+}
+
+impl Write for SharedDiagnosticOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("diagnostic output lock poisoned"))?
+            .write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct BlockingDiagnosticOutput {
+    blocker: Arc<(std::sync::Barrier, std::sync::Barrier)>,
+    blocked: Arc<AtomicBool>,
+}
+
+impl Write for BlockingDiagnosticOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if !self.blocked.swap(true, Ordering::AcqRel) {
+            self.blocker.0.wait();
+            self.blocker.1.wait();
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 impl TestDirectory {
     fn create() -> Self {
@@ -139,12 +184,13 @@ fn serves_clients_until_shutdown_and_removes_the_socket() {
     let socket_path = settings.socket_path.clone();
     let stopping = Arc::new(AtomicBool::new(false));
     let listener_stopping = Arc::clone(&stopping);
+    let diagnostic_output = SharedDiagnosticOutput::default();
+    let captured_output = diagnostic_output.clone();
     let listener = thread::spawn(move || {
-        let mut output = Vec::new();
-        let result = listen_until(settings, &mut output, || {
+        let result = listen_until(settings, diagnostic_output, || {
             listener_stopping.load(Ordering::Relaxed)
         });
-        (result, output)
+        (result, captured_output.contents())
     });
 
     wait_for_socket(&socket_path);
@@ -358,6 +404,53 @@ fn shutdown_detaches_a_handler_that_cannot_observe_cancellation() {
 }
 
 #[test]
+fn blocking_diagnostics_do_not_block_listener_shutdown() {
+    let root = TestDirectory::create();
+    fs::create_dir(root.path().join("run"))
+        .unwrap_or_else(|error| panic!("runtime directory must be created: {error}"));
+    fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o2750))
+        .unwrap_or_else(|error| panic!("runtime directory mode must be set: {error}"));
+    let settings = settings(root.path());
+    let socket_path = settings.socket_path.clone();
+    let blocker = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+    let output = BlockingDiagnosticOutput {
+        blocker: Arc::clone(&blocker),
+        blocked: Arc::new(AtomicBool::new(false)),
+    };
+    let stopping = Arc::new(AtomicBool::new(false));
+    let listener_stopping = Arc::clone(&stopping);
+    let listener = thread::spawn(move || {
+        listen_until(settings, output, || {
+            listener_stopping.load(Ordering::Relaxed)
+        })
+    });
+    wait_for_socket(&socket_path);
+    let failing = UnixStream::connect(&socket_path)
+        .unwrap_or_else(|error| panic!("failing diagnostic connection must open: {error}"));
+    drop(failing);
+    blocker.0.wait();
+    let request = StatusRequest::new(
+        "01K00000000000000000000000"
+            .parse()
+            .unwrap_or_else(|error| panic!("request ID must parse: {error}")),
+    );
+    let error = match IngressClient::new(&socket_path).status(request, Duration::from_secs(2)) {
+        Ok(_) => panic!("unknown request must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, IngressClientError::Broker(_)));
+
+    let shutdown_started = Instant::now();
+    stopping.store(true, Ordering::Relaxed);
+    listener
+        .join()
+        .unwrap_or_else(|_| panic!("listener thread must not panic"))
+        .unwrap_or_else(|error| panic!("listener must detach a blocked diagnostic: {error}"));
+    assert!(shutdown_started.elapsed() < Duration::from_secs(2));
+    blocker.1.wait();
+}
+
+#[test]
 fn refuses_to_replace_a_non_socket_target() {
     let root = TestDirectory::create();
     let socket_path = root.path().join("queue-ingress.sock");
@@ -409,6 +502,29 @@ fn publishes_a_socket_in_a_nested_runtime_directory() {
     assert!(socket_path.exists());
     drop(published);
     assert!(!socket_path.exists());
+}
+
+#[test]
+fn rejects_a_socket_parent_reached_through_a_symbolic_link() {
+    let root = TestDirectory::create();
+    let runtime = root.path().join("r");
+    fs::create_dir(&runtime)
+        .unwrap_or_else(|error| panic!("runtime directory must be created: {error}"));
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o2750))
+        .unwrap_or_else(|error| panic!("runtime directory mode must be set: {error}"));
+    let linked_runtime = root.path().join("l");
+    symlink(&runtime, &linked_runtime)
+        .unwrap_or_else(|error| panic!("runtime symlink must be created: {error}"));
+
+    let error = match PublishedSocket::bind(&linked_runtime.join("s")) {
+        Ok(_) => panic!("symbolic-link socket parent must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        QueueIngressListenerError::NonCanonicalSocketParent
+    ));
+    assert!(!runtime.join(super::SOCKET_STATE_FILE).exists());
 }
 
 #[test]
@@ -550,7 +666,10 @@ fn replaces_a_stale_socket_recorded_by_a_prior_listener() {
         .unwrap_or_else(|error| panic!("stale socket must be inspectable: {error}"));
     write_socket_state(
         root.path(),
-        &SocketState::Owned(SocketIdentity::from_metadata(&metadata)),
+        &SocketState::Owned {
+            public: b"queue-ingress.sock".to_vec(),
+            identity: SocketIdentity::from_metadata(&metadata),
+        },
     )
     .unwrap_or_else(|error| panic!("prior listener state must be recorded: {error}"));
 
@@ -562,6 +681,37 @@ fn replaces_a_stale_socket_recorded_by_a_prior_listener() {
 }
 
 #[test]
+fn refuses_a_socket_name_change_while_the_prior_publication_exists() {
+    let root = TestDirectory::create();
+    let prior_socket_path = root.path().join("prior.sock");
+    let stale = UnixListener::bind(&prior_socket_path)
+        .unwrap_or_else(|error| panic!("prior listener fixture must bind: {error}"));
+    drop(stale);
+    let metadata = fs::symlink_metadata(&prior_socket_path)
+        .unwrap_or_else(|error| panic!("prior socket must be inspectable: {error}"));
+    write_socket_state(
+        root.path(),
+        &SocketState::Owned {
+            public: b"prior.sock".to_vec(),
+            identity: SocketIdentity::from_metadata(&metadata),
+        },
+    )
+    .unwrap_or_else(|error| panic!("prior listener state must be recorded: {error}"));
+
+    let replacement_socket_path = root.path().join("replacement.sock");
+    let error = match PublishedSocket::bind(&replacement_socket_path) {
+        Ok(_) => panic!("a socket name change must not orphan the prior publication"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        QueueIngressListenerError::SocketConfigurationChanged { .. }
+    ));
+    assert!(prior_socket_path.exists());
+    assert!(!replacement_socket_path.exists());
+}
+
+#[test]
 fn preparing_state_does_not_authorize_an_unrelated_public_socket() {
     let root = TestDirectory::create();
     let socket_path = root.path().join("queue-ingress.sock");
@@ -570,8 +720,14 @@ fn preparing_state_does_not_authorize_an_unrelated_public_socket() {
         super::TEMPORARY_SOCKET_PREFIX,
         ulid::Ulid::generate()
     );
-    write_socket_state(root.path(), &SocketState::Preparing { temporary })
-        .unwrap_or_else(|error| panic!("preparing state must be durable: {error}"));
+    write_socket_state(
+        root.path(),
+        &SocketState::Preparing {
+            public: b"queue-ingress.sock".to_vec(),
+            temporary,
+        },
+    )
+    .unwrap_or_else(|error| panic!("preparing state must be durable: {error}"));
     let stale = UnixListener::bind(&socket_path)
         .unwrap_or_else(|error| panic!("unrelated stale listener must bind: {error}"));
     drop(stale);
@@ -590,7 +746,7 @@ fn preparing_state_does_not_authorize_an_unrelated_public_socket() {
 #[test]
 fn legacy_preparing_state_is_read_without_claiming_the_public_socket() {
     let empty = TestDirectory::create();
-    let legacy_state = format!("{} preparing\n", super::SOCKET_STATE_FORMAT);
+    let legacy_state = format!("{} preparing\n", super::LEGACY_SOCKET_STATE_FORMAT);
     let empty_state_path = empty.path().join(super::SOCKET_STATE_FILE);
     fs::write(&empty_state_path, &legacy_state)
         .unwrap_or_else(|error| panic!("legacy state must be written: {error}"));
@@ -623,6 +779,33 @@ fn legacy_preparing_state_is_read_without_claiming_the_public_socket() {
 }
 
 #[test]
+fn legacy_owned_state_recovers_the_configured_public_socket() {
+    let root = TestDirectory::create();
+    let socket_path = root.path().join("queue-ingress.sock");
+    let stale = UnixListener::bind(&socket_path)
+        .unwrap_or_else(|error| panic!("legacy stale listener fixture must bind: {error}"));
+    drop(stale);
+    let metadata = fs::symlink_metadata(&socket_path)
+        .unwrap_or_else(|error| panic!("legacy stale socket must be inspectable: {error}"));
+    let legacy_state = format!(
+        "{} owned {} {}\n",
+        super::LEGACY_SOCKET_STATE_FORMAT,
+        metadata.dev(),
+        metadata.ino()
+    );
+    let state_path = root.path().join(super::SOCKET_STATE_FILE);
+    fs::write(&state_path, legacy_state)
+        .unwrap_or_else(|error| panic!("legacy owned state must be written: {error}"));
+    fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600))
+        .unwrap_or_else(|error| panic!("legacy state mode must be set: {error}"));
+
+    let published = PublishedSocket::bind(&socket_path)
+        .unwrap_or_else(|error| panic!("legacy owned socket must be recovered: {error}"));
+    drop(published);
+    assert!(!socket_path.exists());
+}
+
+#[test]
 fn preparing_state_recovers_its_unique_temporary_socket() {
     let root = TestDirectory::create();
     let temporary = format!(
@@ -634,8 +817,14 @@ fn preparing_state_recovers_its_unique_temporary_socket() {
     let stale = UnixListener::bind(&temporary_path)
         .unwrap_or_else(|error| panic!("temporary socket fixture must bind: {error}"));
     drop(stale);
-    write_socket_state(root.path(), &SocketState::Preparing { temporary })
-        .unwrap_or_else(|error| panic!("preparing state must be durable: {error}"));
+    write_socket_state(
+        root.path(),
+        &SocketState::Preparing {
+            public: b"queue-ingress.sock".to_vec(),
+            temporary,
+        },
+    )
+    .unwrap_or_else(|error| panic!("preparing state must be durable: {error}"));
 
     let socket_path = root.path().join("queue-ingress.sock");
     let published = PublishedSocket::bind(&socket_path)
@@ -661,6 +850,7 @@ fn prepared_state_recovers_a_socket_renamed_before_final_state() {
     write_socket_state(
         root.path(),
         &SocketState::Prepared {
+            public: b"queue-ingress.sock".to_vec(),
             temporary,
             identity: SocketIdentity::from_metadata(&metadata),
         },

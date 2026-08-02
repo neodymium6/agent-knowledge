@@ -341,17 +341,24 @@ handler that cannot finish within the bounded shutdown grace period on
 `SIGINT` or `SIGTERM`. If an expired handler cannot stop within that grace
 period during normal operation, the listener fails instead of releasing its
 slot and accumulating unbounded threads; the supervisor then replaces the
-process. The deployment creates the runtime directory
-in advance, owned by the broker with mode `2750` and dedicated ingress group
+process. Connection diagnostics are emitted on a best-effort basis by the
+bounded handler path, not the listener control loop, so a blocked diagnostic
+sink cannot stop accepts, deadline enforcement, or signal handling. The
+deployment creates the runtime directory in advance, owned by the broker with
+mode `2750` and dedicated ingress group
 (`10004` in the container identity database). The parent namespace must be
 owned by root or the broker at every ancestor; group/other-writable ancestors
-must also be protected by the sticky bit. Mutations other than the Linux
-pathname-only socket bind use the pinned directory. The listener binds a unique
-temporary socket, records its identity, and atomically renames it to the public
-path. Atomically published
+must also be protected by the sticky bit. The configured parent path must
+already be canonical and cannot traverse symbolic links. Mutations other than
+the Linux pathname-only socket bind use the pinned directory. The listener
+binds a unique temporary socket, records its identity, and atomically renames
+it to the public path. Atomically published
 `preparing`/`prepared`/`owned` state makes stale-socket recovery
-crash-consistent and constrains it to the listener's prior publication. Socket
-probes are nonblocking so a saturated listener backlog cannot stall startup.
+crash-consistent, records the public socket basename, and constrains recovery
+to the listener's prior publication. A changed basename is rejected while the
+recorded public or temporary socket still exists. Socket probes use the
+preflighted canonical path and are nonblocking so a saturated listener backlog
+cannot stall startup.
 The listener never creates or guesses deployment ownership.
 
 The internal protocol is independent of the public SSH protocol. It begins
