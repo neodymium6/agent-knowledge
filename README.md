@@ -79,8 +79,9 @@ The flake builds the image natively for both `x86_64-linux` (`amd64`) and
 `worker run` role; the configuration path is supplied as an argument by the
 deployment. The image resolves the non-root `agent-knowledge` account to
 `10003:10003` and its queue supplementary group to `10002`, and includes the CA
-bundle needed for HTTPS Git replication. It exposes no conventional shell path
-and contains no deployment configuration, credentials, keys, or Quartz content.
+bundle and `SSL_CERT_FILE` setting needed for HTTPS Git replication. It exposes
+no conventional shell path and contains no deployment configuration,
+credentials, keys, or Quartz content.
 
 `just check-package` validates the image archive, architecture, deterministic
 timestamp, role-locked entrypoint, non-root metadata, identity database, CA

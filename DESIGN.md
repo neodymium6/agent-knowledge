@@ -150,12 +150,12 @@ for `amd64` and `arm64`. Its entrypoint fixes the wrapped executable and the
 `worker run` role so deployment arguments cannot accidentally start another
 role with Worker authority. The image resolves the non-root Worker account to
 `10003:10003`, includes queue GID `10002` as a supplementary group, and provides
-an immutable CA bundle for HTTPS Git replication. Deployments mount
-configuration, secrets, durable storage, and a writable Worker home. No
-conventional shell path, role-specific configuration, credentials, keys, or
-content is included. Gateway and queue ingress images must similarly bind their
-entrypoints to their least-privilege identities when Kubernetes packaging is
-added.
+an immutable CA bundle through `SSL_CERT_FILE` for HTTPS Git replication.
+Deployments mount configuration, secrets, durable storage, and a writable Worker
+home. No conventional shell path, role-specific configuration, credentials,
+keys, or content is included. Gateway and queue ingress images must similarly
+bind their entrypoints to their least-privilege identities when Kubernetes
+packaging is added.
 
 The same executable can be used with different entry-point arguments in a
 service or container. Separate binaries may be produced from the same
