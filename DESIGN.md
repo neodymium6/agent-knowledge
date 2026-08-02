@@ -338,7 +338,10 @@ target, and safely replaces a socket left by a crashed prior process. It uses a
 bounded thread per accepted connection, applies both inactivity timeouts and
 an absolute connection lifetime, cancels queue lock waits, and detaches a
 handler that cannot finish within the bounded shutdown grace period on
-`SIGINT` or `SIGTERM`. The deployment creates the runtime directory
+`SIGINT` or `SIGTERM`. If an expired handler cannot stop within that grace
+period during normal operation, the listener fails instead of releasing its
+slot and accumulating unbounded threads; the supervisor then replaces the
+process. The deployment creates the runtime directory
 in advance, owned by the broker with mode `2750` and dedicated ingress group
 (`10004` in the container identity database). The parent namespace must be
 owned by root or the broker at every ancestor; group/other-writable ancestors

@@ -77,7 +77,12 @@ where
             terminal_error = Some(error);
             break;
         }
-        expire_connections(&active, Instant::now());
+        if let Some(connection_id) = expire_connections(&mut active, Instant::now()) {
+            terminal_error = Some(QueueIngressListenerError::ConnectionCancellationTimedOut(
+                connection_id,
+            ));
+            break;
+        }
         if active.len() >= settings.maximum_connections.get() {
             thread::sleep(ACCEPT_POLL_INTERVAL);
             continue;
@@ -199,17 +204,24 @@ fn start_connection(
     Ok(ActiveConnection {
         control,
         deadline,
+        cancellation_started: None,
         thread,
     })
 }
 
-fn expire_connections(active: &HashMap<u64, ActiveConnection>, now: Instant) {
-    for connection in active.values() {
+fn expire_connections(active: &mut HashMap<u64, ActiveConnection>, now: Instant) -> Option<u64> {
+    let mut stalled = None;
+    for (connection_id, connection) in active.iter_mut() {
         if now >= connection.deadline.expires_at() {
             connection.deadline.cancel();
             let _ = connection.control.shutdown(std::net::Shutdown::Both);
+            let cancelled_at = connection.cancellation_started.get_or_insert(now);
+            if now.duration_since(*cancelled_at) >= HANDLER_CANCELLATION_GRACE {
+                stalled.get_or_insert(*connection_id);
+            }
         }
     }
+    stalled
 }
 
 fn drain_completions<W>(
@@ -262,6 +274,7 @@ where
 struct ActiveConnection {
     control: UnixStream,
     deadline: QueueOperationDeadline,
+    cancellation_started: Option<Instant>,
     thread: JoinHandle<()>,
 }
 
@@ -288,6 +301,12 @@ impl PublishedSocket {
         if !socket_path.is_absolute() || socket_path.file_name().is_none() {
             return Err(QueueIngressListenerError::InvalidSocketPath);
         }
+        UnixAddr::new(socket_path)
+            .map_err(errno_io)
+            .map_err(|source| QueueIngressListenerError::SocketAddressPath {
+                path: socket_path.to_path_buf(),
+                source,
+            })?;
         let parent_path = socket_path
             .parent()
             .ok_or(QueueIngressListenerError::InvalidSocketPath)?;
@@ -307,6 +326,17 @@ impl PublishedSocket {
             return Err(QueueIngressListenerError::UnsafeSocketParent);
         }
         validate_socket_namespace(parent.path())?;
+        let socket_name = socket_path
+            .file_name()
+            .ok_or(QueueIngressListenerError::InvalidSocketPath)?;
+        let temporary_name = format!("{TEMPORARY_SOCKET_PREFIX}{}", Ulid::generate());
+        let configured_temporary = parent.path().join(&temporary_name);
+        UnixAddr::new(&configured_temporary)
+            .map_err(errno_io)
+            .map_err(|source| QueueIngressListenerError::TemporarySocketPath {
+                path: configured_temporary.clone(),
+                source,
+            })?;
 
         let lock_path = parent.stable_path().join(LISTENER_LOCK_FILE);
         let lock_file = OpenOptions::new()
@@ -337,9 +367,6 @@ impl PublishedSocket {
         let previous_state = read_socket_state(parent.stable_path())?;
         recover_recorded_temporary(parent.stable_path(), &previous_state)?;
 
-        let socket_name = socket_path
-            .file_name()
-            .ok_or(QueueIngressListenerError::InvalidSocketPath)?;
         let stable_socket_path = parent.stable_path().join(socket_name);
         match fs::symlink_metadata(&stable_socket_path) {
             Ok(metadata) if metadata.file_type().is_socket() => {
@@ -368,14 +395,12 @@ impl PublishedSocket {
             Err(error) => return Err(QueueIngressListenerError::SocketInspection(error)),
         }
 
-        let temporary_name = format!("{TEMPORARY_SOCKET_PREFIX}{}", Ulid::generate());
         write_socket_state(
             parent.stable_path(),
             &SocketState::Preparing {
                 temporary: temporary_name.clone(),
             },
         )?;
-        let configured_temporary = parent.path().join(&temporary_name);
         let stable_temporary = parent.stable_path().join(&temporary_name);
         let listener = UnixListener::bind(&configured_temporary).map_err(|source| {
             QueueIngressListenerError::Bind {
@@ -569,6 +594,9 @@ fn read_socket_state(stable_parent: &Path) -> Result<SocketState, QueueIngressLi
     file.take(MAXIMUM_SOCKET_STATE_BYTES)
         .read_to_string(&mut contents)
         .map_err(QueueIngressListenerError::StateContents)?;
+    if contents == format!("{SOCKET_STATE_FORMAT} preparing\n") {
+        return Ok(SocketState::Absent);
+    }
     let mut fields = contents.trim_end().split(' ');
     let format = fields.next();
     let status = fields.next();
@@ -739,11 +767,13 @@ impl std::error::Error for QueueIngressCommandError {
 #[derive(Debug)]
 pub(crate) enum QueueIngressListenerError {
     InvalidSocketPath,
+    SocketAddressPath { path: PathBuf, source: io::Error },
     ParentAttestation(PathAttestationError),
     ParentInspection(io::Error),
     InvalidSocketParent,
     UnsafeSocketParent,
     UnsafeSocketNamespace,
+    TemporarySocketPath { path: PathBuf, source: io::Error },
     LockOpen(io::Error),
     LockInspection(io::Error),
     InvalidLockFile,
@@ -774,6 +804,7 @@ pub(crate) enum QueueIngressListenerError {
     Diagnostic(io::Error),
     CompletionChannelClosed,
     UnknownConnection,
+    ConnectionCancellationTimedOut(u64),
     ConnectionPanicked,
 }
 
@@ -783,6 +814,11 @@ impl fmt::Display for QueueIngressListenerError {
             Self::InvalidSocketPath => {
                 formatter.write_str("queue ingress socket path must be an absolute file path")
             }
+            Self::SocketAddressPath { path, source } => write!(
+                formatter,
+                "queue ingress socket path {} is not addressable: {source}",
+                path.display()
+            ),
             Self::ParentAttestation(error) => {
                 write!(
                     formatter,
@@ -802,7 +838,12 @@ impl fmt::Display for QueueIngressListenerError {
                 "queue ingress socket parent must be owner-writable, setgid, and not writable by group or other",
             ),
             Self::UnsafeSocketNamespace => formatter.write_str(
-                "queue ingress socket parent namespace must not be writable by untrusted identities",
+                "queue ingress socket ancestors must be owned by root or the listener identity, with sticky protection for writable namespaces",
+            ),
+            Self::TemporarySocketPath { path, source } => write!(
+                formatter,
+                "queue ingress runtime path leaves no room for temporary socket {}: {source}",
+                path.display()
             ),
             Self::LockOpen(error) => {
                 write!(
@@ -931,6 +972,10 @@ impl fmt::Display for QueueIngressListenerError {
             Self::UnknownConnection => {
                 formatter.write_str("queue ingress completed an unknown connection")
             }
+            Self::ConnectionCancellationTimedOut(connection_id) => write!(
+                formatter,
+                "queue ingress connection {connection_id} did not stop after cancellation"
+            ),
             Self::ConnectionPanicked => {
                 formatter.write_str("queue ingress connection thread panicked")
             }
@@ -942,7 +987,9 @@ impl std::error::Error for QueueIngressListenerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ParentAttestation(error) => Some(error),
-            Self::ParentInspection(error)
+            Self::SocketAddressPath { source: error, .. }
+            | Self::ParentInspection(error)
+            | Self::TemporarySocketPath { source: error, .. }
             | Self::LockOpen(error)
             | Self::LockInspection(error)
             | Self::LockPermissions(error)
@@ -977,6 +1024,7 @@ impl std::error::Error for QueueIngressListenerError {
             | Self::InvalidConnectionTimeout
             | Self::CompletionChannelClosed
             | Self::UnknownConnection
+            | Self::ConnectionCancellationTimedOut(_)
             | Self::ConnectionPanicked => None,
         }
     }

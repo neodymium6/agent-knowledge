@@ -244,11 +244,16 @@ The runtime directory must already exist, be owned and writable by the
 queue-ingress identity, use the setgid `agent-knowledge-ingress` group, and be
 writable by neither group nor other; mode `2750` is recommended. The container
 identity database assigns this group GID `10004`, and the Gateway joins it.
+Its absolute path must leave room within Linux `sun_path` for the listener's
+30-byte `.ak-<ULID>` temporary socket name; this is checked before listener
+state is changed.
 The listener publishes the socket as `0660`, refuses to overwrite live,
 non-socket, or unowned stale paths, recovers a stale socket recorded by its own
 locked state file after a crash, bounds concurrent connections and handler
 shutdown, and stops accepting and cancels active queue lock waits on `SIGINT`
-or `SIGTERM`.
+or `SIGTERM`. A handler that ignores cancellation past the grace period makes
+the listener exit with failure so its supervisor can replace the process
+without accumulating detached threads.
 `queue-ingress serve` remains the one-connection entrypoint used by the
 packaged systemd units.
 

@@ -2,6 +2,7 @@ use std::fs;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -223,6 +224,42 @@ fn absolute_connection_timeout_releases_the_concurrency_slot() {
 }
 
 #[test]
+fn unresponsive_expired_handler_terminates_the_listener() {
+    let root = TestDirectory::create();
+    fs::create_dir(root.path().join("run"))
+        .unwrap_or_else(|error| panic!("runtime directory must be created: {error}"));
+    fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o2750))
+        .unwrap_or_else(|error| panic!("runtime directory mode must be set: {error}"));
+    let mut settings = settings(root.path());
+    settings.connection_timeout = Duration::from_millis(50);
+    let blocker = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+    settings.handler_blocker = Some(Arc::clone(&blocker));
+    let socket_path = settings.socket_path.clone();
+    let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+    let listener = thread::spawn(move || {
+        let _ = result_sender.send(listen_until(settings, Vec::new(), || false));
+    });
+    wait_for_socket(&socket_path);
+    let stalled = UnixStream::connect(&socket_path)
+        .unwrap_or_else(|error| panic!("blocked handler connection must open: {error}"));
+    blocker.0.wait();
+
+    let result = result_receiver
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap_or_else(|error| panic!("stalled listener must fail within its bound: {error}"));
+    assert!(matches!(
+        result,
+        Err(QueueIngressListenerError::ConnectionCancellationTimedOut(_))
+    ));
+    assert!(!socket_path.exists());
+    blocker.1.wait();
+    drop(stalled);
+    listener
+        .join()
+        .unwrap_or_else(|_| panic!("listener thread must not panic"));
+}
+
+#[test]
 fn shutdown_cancels_a_handler_waiting_for_the_queue_lock() {
     let root = TestDirectory::create();
     fs::create_dir(root.path().join("run"))
@@ -375,6 +412,49 @@ fn publishes_a_socket_in_a_nested_runtime_directory() {
 }
 
 #[test]
+fn rejects_a_runtime_path_without_room_for_atomic_publication() {
+    let root = TestDirectory::create();
+    let root_length = root.path().as_os_str().as_bytes().len();
+    let padding_length = 77_usize.saturating_sub(root_length + 1).max(1);
+    let runtime = root.path().join("r".repeat(padding_length));
+    fs::create_dir(&runtime)
+        .unwrap_or_else(|error| panic!("long runtime directory must be created: {error}"));
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o2750))
+        .unwrap_or_else(|error| panic!("long runtime directory mode must be set: {error}"));
+    let socket_path = runtime.join("s");
+    UnixAddr::new(&socket_path)
+        .unwrap_or_else(|error| panic!("configured public socket path must fit: {error}"));
+
+    let error = match PublishedSocket::bind(&socket_path) {
+        Ok(_) => panic!("runtime path without temporary-name space must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        QueueIngressListenerError::TemporarySocketPath { .. }
+    ));
+    assert!(!root.path().join(super::SOCKET_STATE_FILE).exists());
+}
+
+#[test]
+fn rejects_an_unaddressable_public_socket_path() {
+    let root = TestDirectory::create();
+    let root_length = root.path().as_os_str().as_bytes().len();
+    let socket_name_length = 108_usize.saturating_sub(root_length + 1).max(1);
+    let socket_path = root.path().join("s".repeat(socket_name_length));
+
+    let error = match PublishedSocket::bind(&socket_path) {
+        Ok(_) => panic!("unaddressable public socket path must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        QueueIngressListenerError::SocketAddressPath { .. }
+    ));
+    assert!(!root.path().join(super::SOCKET_STATE_FILE).exists());
+}
+
+#[test]
 fn refuses_to_replace_a_live_socket_without_the_listener_lock() {
     let root = TestDirectory::create();
     let socket_path = root.path().join("queue-ingress.sock");
@@ -508,6 +588,41 @@ fn preparing_state_does_not_authorize_an_unrelated_public_socket() {
 }
 
 #[test]
+fn legacy_preparing_state_is_read_without_claiming_the_public_socket() {
+    let empty = TestDirectory::create();
+    let legacy_state = format!("{} preparing\n", super::SOCKET_STATE_FORMAT);
+    let empty_state_path = empty.path().join(super::SOCKET_STATE_FILE);
+    fs::write(&empty_state_path, &legacy_state)
+        .unwrap_or_else(|error| panic!("legacy state must be written: {error}"));
+    fs::set_permissions(&empty_state_path, fs::Permissions::from_mode(0o600))
+        .unwrap_or_else(|error| panic!("legacy state mode must be set: {error}"));
+    let empty_socket_path = empty.path().join("queue-ingress.sock");
+    let published = PublishedSocket::bind(&empty_socket_path)
+        .unwrap_or_else(|error| panic!("legacy state without a socket must recover: {error}"));
+    drop(published);
+
+    let occupied = TestDirectory::create();
+    let occupied_state_path = occupied.path().join(super::SOCKET_STATE_FILE);
+    fs::write(&occupied_state_path, legacy_state)
+        .unwrap_or_else(|error| panic!("legacy state must be written: {error}"));
+    fs::set_permissions(&occupied_state_path, fs::Permissions::from_mode(0o600))
+        .unwrap_or_else(|error| panic!("legacy state mode must be set: {error}"));
+    let occupied_socket_path = occupied.path().join("queue-ingress.sock");
+    let stale = UnixListener::bind(&occupied_socket_path)
+        .unwrap_or_else(|error| panic!("unrelated stale socket must bind: {error}"));
+    drop(stale);
+
+    let error = match PublishedSocket::bind(&occupied_socket_path) {
+        Ok(_) => panic!("legacy preparing state must not claim a public socket"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        QueueIngressListenerError::UnownedStaleSocket
+    ));
+}
+
+#[test]
 fn preparing_state_recovers_its_unique_temporary_socket() {
     let root = TestDirectory::create();
     let temporary = format!(
@@ -566,9 +681,9 @@ fn prepared_state_recovers_a_socket_renamed_before_final_state() {
 #[test]
 fn refuses_a_runtime_directory_in_an_unprotected_namespace() {
     let root = TestDirectory::create();
-    let namespace = root.path().join("namespace");
-    let protected_child = namespace.join("protected-child");
-    let runtime = protected_child.join("run");
+    let namespace = root.path().join("n");
+    let protected_child = namespace.join("p");
+    let runtime = protected_child.join("r");
     fs::create_dir(&namespace)
         .unwrap_or_else(|error| panic!("namespace directory must be created: {error}"));
     fs::set_permissions(&namespace, fs::Permissions::from_mode(0o0770))
@@ -582,7 +697,7 @@ fn refuses_a_runtime_directory_in_an_unprotected_namespace() {
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o2750))
         .unwrap_or_else(|error| panic!("runtime directory mode must be set: {error}"));
 
-    let error = match PublishedSocket::bind(&runtime.join("queue-ingress.sock")) {
+    let error = match PublishedSocket::bind(&runtime.join("s")) {
         Ok(_) => panic!("an unprotected namespace must be rejected"),
         Err(error) => error,
     };
