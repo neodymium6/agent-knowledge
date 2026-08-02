@@ -237,8 +237,9 @@ writable by neither group nor other; mode `2750` is recommended. The container
 identity database assigns this group GID `10004`, and the Gateway joins it.
 The listener publishes the socket as `0660`, refuses to overwrite live,
 non-socket, or unowned stale paths, recovers a stale socket recorded by its own
-locked state file after a crash, bounds concurrent connections, and stops
-accepting and cancels active queue lock waits on `SIGINT` or `SIGTERM`.
+locked state file after a crash, bounds concurrent connections and handler
+shutdown, and stops accepting and cancels active queue lock waits on `SIGINT`
+or `SIGTERM`.
 `queue-ingress serve` remains the one-connection entrypoint used by the
 packaged systemd units.
 

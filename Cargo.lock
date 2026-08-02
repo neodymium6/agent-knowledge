@@ -18,6 +18,7 @@ dependencies = [
  "signal-hook",
  "tar",
  "time",
+ "ulid",
 ]
 
 [[package]]

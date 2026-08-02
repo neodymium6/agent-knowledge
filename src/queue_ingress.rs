@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -16,15 +17,19 @@ use agent_knowledge_core::{PathAttestation, PathAttestationError};
 use agent_knowledge_gateway::IngressServeError;
 use agent_knowledge_queue::QueueOperationDeadline;
 use nix::errno::Errno;
-use nix::fcntl::{Flock, FlockArg};
+use nix::fcntl::{Flock, FlockArg, RenameFlags, renameat2};
+use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
 use nix::unistd::Uid;
 use signal_hook::consts::{SIGINT, SIGTERM};
+use ulid::Ulid;
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const HANDLER_CANCELLATION_GRACE: Duration = Duration::from_secs(1);
 const LISTENER_LOCK_FILE: &str = ".agent-knowledge-queue-ingress.lock";
 const SOCKET_STATE_FILE: &str = ".agent-knowledge-queue-ingress.socket-state";
 const SOCKET_STATE_TEMPORARY_FILE: &str = ".agent-knowledge-queue-ingress.socket-state.tmp";
 const SOCKET_STATE_FORMAT: &str = "agent-knowledge-queue-ingress-v1";
+const TEMPORARY_SOCKET_PREFIX: &str = ".ak-";
 const MAXIMUM_SOCKET_STATE_BYTES: u64 = 256;
 const SOCKET_MODE: u32 = 0o660;
 
@@ -36,6 +41,8 @@ pub(crate) struct ListenSettings {
     pub(crate) connection_timeout: Duration,
     #[cfg(test)]
     pub(crate) deadline_observer: Option<Sender<QueueOperationDeadline>>,
+    #[cfg(test)]
+    pub(crate) handler_blocker: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
 }
 
 pub(crate) fn run<W>(settings: ListenSettings, output: W) -> Result<(), QueueIngressCommandError>
@@ -106,8 +113,12 @@ where
         let _ = connection.control.shutdown(std::net::Shutdown::Both);
     }
     drop(completion_sender);
-    while !active.is_empty() {
-        match completion_receiver.recv() {
+    let shutdown_deadline = Instant::now()
+        .checked_add(HANDLER_CANCELLATION_GRACE)
+        .unwrap_or_else(Instant::now);
+    while !active.is_empty() && Instant::now() < shutdown_deadline {
+        let remaining = shutdown_deadline.saturating_duration_since(Instant::now());
+        match completion_receiver.recv_timeout(remaining.min(ACCEPT_POLL_INTERVAL)) {
             Ok(completion) => {
                 if let Err(error) = finish_connection(completion, &mut active, &mut output, false)
                     && terminal_error.is_none()
@@ -115,7 +126,8 @@ where
                     terminal_error = Some(error);
                 }
             }
-            Err(_) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if terminal_error.is_none() {
                     terminal_error = Some(QueueIngressListenerError::CompletionChannelClosed);
                 }
@@ -154,11 +166,18 @@ fn start_connection(
         let _ = observer.send(deadline.clone());
     }
     let handler_deadline = deadline.clone();
+    #[cfg(test)]
+    let handler_blocker = settings.handler_blocker.clone();
     let queue_root = settings.queue_root.clone();
     let sender = completion_sender.clone();
     let thread = thread::Builder::new()
         .name(format!("queue-ingress-{connection_id}"))
         .spawn(move || {
+            #[cfg(test)]
+            if let Some(blocker) = handler_blocker {
+                blocker.0.wait();
+                blocker.1.wait();
+            }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 agent_knowledge_gateway::serve_ingress_until(
                     &queue_root,
@@ -287,16 +306,7 @@ impl PublishedSocket {
         {
             return Err(QueueIngressListenerError::UnsafeSocketParent);
         }
-        let namespace_parent = parent
-            .path()
-            .parent()
-            .ok_or(QueueIngressListenerError::InvalidSocketPath)?;
-        let namespace_metadata =
-            fs::metadata(namespace_parent).map_err(QueueIngressListenerError::ParentInspection)?;
-        let namespace_mode = namespace_metadata.mode();
-        if namespace_mode & 0o022 != 0 && namespace_mode & 0o1000 == 0 {
-            return Err(QueueIngressListenerError::UnsafeSocketNamespace);
-        }
+        validate_socket_namespace(parent.path())?;
 
         let lock_path = parent.stable_path().join(LISTENER_LOCK_FILE);
         let lock_file = OpenOptions::new()
@@ -325,6 +335,7 @@ impl PublishedSocket {
                 }
             })?;
         let previous_state = read_socket_state(parent.stable_path())?;
+        recover_recorded_temporary(parent.stable_path(), &previous_state)?;
 
         let socket_name = socket_path
             .file_name()
@@ -332,11 +343,11 @@ impl PublishedSocket {
         let stable_socket_path = parent.stable_path().join(socket_name);
         match fs::symlink_metadata(&stable_socket_path) {
             Ok(metadata) if metadata.file_type().is_socket() => {
-                match UnixStream::connect(&stable_socket_path) {
-                    Ok(_) => return Err(QueueIngressListenerError::AlreadyRunning),
-                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                match probe_socket(&stable_socket_path)? {
+                    SocketProbe::Live => return Err(QueueIngressListenerError::AlreadyRunning),
+                    SocketProbe::Stale => {
                         let observed = SocketIdentity::from_metadata(&metadata);
-                        if !previous_state.owns(observed) {
+                        if !previous_state.owns_public(observed) {
                             return Err(QueueIngressListenerError::UnownedStaleSocket);
                         }
                         let current = fs::symlink_metadata(&stable_socket_path)
@@ -349,8 +360,7 @@ impl PublishedSocket {
                         fs::remove_file(&stable_socket_path)
                             .map_err(QueueIngressListenerError::StaleSocketRemoval)?;
                     }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(QueueIngressListenerError::SocketProbe(error)),
+                    SocketProbe::Missing => {}
                 }
             }
             Ok(_) => return Err(QueueIngressListenerError::InvalidSocketTarget),
@@ -358,16 +368,50 @@ impl PublishedSocket {
             Err(error) => return Err(QueueIngressListenerError::SocketInspection(error)),
         }
 
-        write_socket_state(parent.stable_path(), SocketState::Preparing)?;
-        let configured_socket_path = parent.path().join(socket_name);
-        let listener =
-            UnixListener::bind(&configured_socket_path).map_err(QueueIngressListenerError::Bind)?;
-        let socket_node = OwnedSocketNode::capture(stable_socket_path.clone())?;
-        fs::set_permissions(&stable_socket_path, fs::Permissions::from_mode(SOCKET_MODE))
+        let temporary_name = format!("{TEMPORARY_SOCKET_PREFIX}{}", Ulid::generate());
+        write_socket_state(
+            parent.stable_path(),
+            &SocketState::Preparing {
+                temporary: temporary_name.clone(),
+            },
+        )?;
+        let configured_temporary = parent.path().join(&temporary_name);
+        let stable_temporary = parent.stable_path().join(&temporary_name);
+        let listener = UnixListener::bind(&configured_temporary).map_err(|source| {
+            QueueIngressListenerError::Bind {
+                path: configured_temporary.clone(),
+                source,
+            }
+        })?;
+        let temporary_node = OwnedSocketNode::capture(stable_temporary.clone())?;
+        fs::set_permissions(&stable_temporary, fs::Permissions::from_mode(SOCKET_MODE))
             .map_err(QueueIngressListenerError::SocketPermissions)?;
         write_socket_state(
             parent.stable_path(),
-            SocketState::Owned(socket_node.identity()),
+            &SocketState::Prepared {
+                temporary: temporary_name.clone(),
+                identity: temporary_node.identity(),
+            },
+        )?;
+        let stable_parent = File::open(parent.stable_path())
+            .map_err(QueueIngressListenerError::SocketPublication)?;
+        renameat2(
+            &stable_parent,
+            temporary_name.as_str(),
+            &stable_parent,
+            socket_name,
+            RenameFlags::RENAME_NOREPLACE,
+        )
+        .map_err(errno_io)
+        .map_err(QueueIngressListenerError::SocketPublication)?;
+        stable_parent
+            .sync_all()
+            .map_err(QueueIngressListenerError::SocketPublication)?;
+        drop(temporary_node);
+        let socket_node = OwnedSocketNode::capture(stable_socket_path.clone())?;
+        write_socket_state(
+            parent.stable_path(),
+            &SocketState::Owned(socket_node.identity()),
         )?;
         listener
             .set_nonblocking(true)
@@ -379,6 +423,53 @@ impl PublishedSocket {
             _lock: lock,
         })
     }
+}
+
+fn validate_socket_namespace(parent: &Path) -> Result<(), QueueIngressListenerError> {
+    let effective_uid = Uid::effective().as_raw();
+    for ancestor in parent.ancestors().skip(1) {
+        let metadata =
+            fs::metadata(ancestor).map_err(QueueIngressListenerError::ParentInspection)?;
+        let mode = metadata.mode();
+        if (metadata.uid() != 0 && metadata.uid() != effective_uid)
+            || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+        {
+            return Err(QueueIngressListenerError::UnsafeSocketNamespace);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SocketProbe {
+    Live,
+    Stale,
+    Missing,
+}
+
+fn probe_socket(path: &Path) -> Result<SocketProbe, QueueIngressListenerError> {
+    let descriptor = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        None,
+    )
+    .map_err(errno_io)
+    .map_err(QueueIngressListenerError::SocketProbe)?;
+    let address = UnixAddr::new(path)
+        .map_err(errno_io)
+        .map_err(QueueIngressListenerError::SocketProbe)?;
+    match connect(descriptor.as_raw_fd(), &address) {
+        Ok(()) => Ok(SocketProbe::Live),
+        Err(Errno::ECONNREFUSED) => Ok(SocketProbe::Stale),
+        Err(Errno::ENOENT) => Ok(SocketProbe::Missing),
+        Err(Errno::EAGAIN | Errno::EINPROGRESS | Errno::EALREADY) => Ok(SocketProbe::Live),
+        Err(error) => Err(QueueIngressListenerError::SocketProbe(errno_io(error))),
+    }
+}
+
+fn errno_io(error: Errno) -> io::Error {
+    io::Error::from_raw_os_error(error as i32)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -396,18 +487,65 @@ impl SocketIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum SocketState {
     Absent,
-    Preparing,
+    Preparing {
+        temporary: String,
+    },
+    Prepared {
+        temporary: String,
+        identity: SocketIdentity,
+    },
     Owned(SocketIdentity),
 }
 
 impl SocketState {
-    const fn owns(self, identity: SocketIdentity) -> bool {
-        matches!(self, Self::Preparing)
-            || matches!(self, Self::Owned(owned) if owned.device == identity.device && owned.inode == identity.inode)
+    fn owns_public(&self, identity: SocketIdentity) -> bool {
+        matches!(self, Self::Prepared { identity: owned, .. } | Self::Owned(owned) if *owned == identity)
     }
+
+    fn temporary(&self) -> Option<(&str, Option<SocketIdentity>)> {
+        match self {
+            Self::Preparing { temporary } => Some((temporary, None)),
+            Self::Prepared {
+                temporary,
+                identity,
+            } => Some((temporary, Some(*identity))),
+            Self::Absent | Self::Owned(_) => None,
+        }
+    }
+}
+
+fn recover_recorded_temporary(
+    stable_parent: &Path,
+    state: &SocketState,
+) -> Result<(), QueueIngressListenerError> {
+    let Some((temporary, expected_identity)) = state.temporary() else {
+        return Ok(());
+    };
+    let path = stable_parent.join(temporary);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(QueueIngressListenerError::SocketInspection(error)),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(QueueIngressListenerError::InvalidSocketTarget);
+    }
+    let observed = SocketIdentity::from_metadata(&metadata);
+    if expected_identity.is_some_and(|expected| expected != observed) {
+        return Err(QueueIngressListenerError::SocketIdentityChanged);
+    }
+    if probe_socket(&path)? == SocketProbe::Live {
+        return Err(QueueIngressListenerError::AlreadyRunning);
+    }
+    let current =
+        fs::symlink_metadata(&path).map_err(QueueIngressListenerError::SocketInspection)?;
+    if !current.file_type().is_socket() || SocketIdentity::from_metadata(&current) != observed {
+        return Err(QueueIngressListenerError::SocketIdentityChanged);
+    }
+    fs::remove_file(path).map_err(QueueIngressListenerError::StaleSocketRemoval)
 }
 
 fn read_socket_state(stable_parent: &Path) -> Result<SocketState, QueueIngressListenerError> {
@@ -431,32 +569,53 @@ fn read_socket_state(stable_parent: &Path) -> Result<SocketState, QueueIngressLi
     file.take(MAXIMUM_SOCKET_STATE_BYTES)
         .read_to_string(&mut contents)
         .map_err(QueueIngressListenerError::StateContents)?;
-    if contents == format!("{SOCKET_STATE_FORMAT} preparing\n") {
-        return Ok(SocketState::Preparing);
-    }
     let mut fields = contents.trim_end().split(' ');
     let format = fields.next();
     let status = fields.next();
-    let device = fields.next().and_then(|value| value.parse().ok());
-    let inode = fields.next().and_then(|value| value.parse().ok());
-    if !contents.ends_with('\n')
-        || format != Some(SOCKET_STATE_FORMAT)
-        || status != Some("owned")
-        || device.is_none()
-        || inode.is_none()
-        || fields.next().is_some()
-    {
+    if !contents.ends_with('\n') || format != Some(SOCKET_STATE_FORMAT) {
         return Err(QueueIngressListenerError::InvalidStateContents);
     }
-    Ok(SocketState::Owned(SocketIdentity {
-        device: device.unwrap_or_default(),
-        inode: inode.unwrap_or_default(),
-    }))
+    let parse_identity = |device: Option<&str>, inode: Option<&str>| {
+        Some(SocketIdentity {
+            device: device?.parse().ok()?,
+            inode: inode?.parse().ok()?,
+        })
+    };
+    let state = match status {
+        Some("preparing") => SocketState::Preparing {
+            temporary: validate_temporary_name(fields.next())?,
+        },
+        Some("prepared") => SocketState::Prepared {
+            temporary: validate_temporary_name(fields.next())?,
+            identity: parse_identity(fields.next(), fields.next())
+                .ok_or(QueueIngressListenerError::InvalidStateContents)?,
+        },
+        Some("owned") => SocketState::Owned(
+            parse_identity(fields.next(), fields.next())
+                .ok_or(QueueIngressListenerError::InvalidStateContents)?,
+        ),
+        _ => return Err(QueueIngressListenerError::InvalidStateContents),
+    };
+    if fields.next().is_some() {
+        return Err(QueueIngressListenerError::InvalidStateContents);
+    }
+    Ok(state)
+}
+
+fn validate_temporary_name(value: Option<&str>) -> Result<String, QueueIngressListenerError> {
+    let value = value.ok_or(QueueIngressListenerError::InvalidStateContents)?;
+    let token = value
+        .strip_prefix(TEMPORARY_SOCKET_PREFIX)
+        .ok_or(QueueIngressListenerError::InvalidStateContents)?;
+    token
+        .parse::<Ulid>()
+        .map_err(|_| QueueIngressListenerError::InvalidStateContents)?;
+    Ok(value.into())
 }
 
 fn write_socket_state(
     stable_parent: &Path,
-    state: SocketState,
+    state: &SocketState,
 ) -> Result<(), QueueIngressListenerError> {
     let temporary = stable_parent.join(SOCKET_STATE_TEMPORARY_FILE);
     let final_path = stable_parent.join(SOCKET_STATE_FILE);
@@ -477,7 +636,17 @@ fn write_socket_state(
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(QueueIngressListenerError::StatePermissions)?;
     match state {
-        SocketState::Preparing => writeln!(file, "{SOCKET_STATE_FORMAT} preparing"),
+        SocketState::Preparing { temporary } => {
+            writeln!(file, "{SOCKET_STATE_FORMAT} preparing {temporary}")
+        }
+        SocketState::Prepared {
+            temporary,
+            identity,
+        } => writeln!(
+            file,
+            "{SOCKET_STATE_FORMAT} prepared {temporary} {} {}",
+            identity.device, identity.inode
+        ),
         SocketState::Owned(identity) => writeln!(
             file,
             "{SOCKET_STATE_FORMAT} owned {} {}",
@@ -594,7 +763,8 @@ pub(crate) enum QueueIngressListenerError {
     UnownedStaleSocket,
     SocketIdentityChanged,
     StaleSocketRemoval(io::Error),
-    Bind(io::Error),
+    SocketPublication(io::Error),
+    Bind { path: PathBuf, source: io::Error },
     SocketPermissions(io::Error),
     Nonblocking(io::Error),
     Accept(io::Error),
@@ -710,7 +880,12 @@ impl fmt::Display for QueueIngressListenerError {
                     "could not remove stale queue ingress socket: {error}"
                 )
             }
-            Self::Bind(error) => write!(formatter, "could not bind queue ingress socket: {error}"),
+            Self::SocketPublication(error) => {
+                write!(formatter, "could not publish queue ingress socket: {error}")
+            }
+            Self::Bind { path, source } => {
+                write!(formatter, "could not bind queue ingress socket {}: {source}", path.display())
+            }
             Self::SocketPermissions(error) => {
                 write!(
                     formatter,
@@ -780,7 +955,8 @@ impl std::error::Error for QueueIngressListenerError {
             | Self::SocketInspection(error)
             | Self::SocketProbe(error)
             | Self::StaleSocketRemoval(error)
-            | Self::Bind(error)
+            | Self::SocketPublication(error)
+            | Self::Bind { source: error, .. }
             | Self::SocketPermissions(error)
             | Self::Nonblocking(error)
             | Self::Accept(error)

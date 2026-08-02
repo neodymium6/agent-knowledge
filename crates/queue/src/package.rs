@@ -289,7 +289,18 @@ pub(crate) fn validate_package_until(
     deadline: Option<&QueueOperationDeadline>,
 ) -> Result<ValidatedPackage, PackageValidationError> {
     validate_package_root(package_root, false, deadline)?;
-    validate_package_contents(package_root, policy, deadline)
+    validate_package_contents(package_root, policy, deadline, None)
+}
+
+#[cfg(test)]
+fn validate_package_until_with_digest_observer(
+    package_root: &Path,
+    policy: &PackagePolicy,
+    deadline: Option<&QueueOperationDeadline>,
+    digest_observer: &mut dyn FnMut(),
+) -> Result<ValidatedPackage, PackageValidationError> {
+    validate_package_root(package_root, false, deadline)?;
+    validate_package_contents(package_root, policy, deadline, Some(digest_observer))
 }
 
 /// Revalidates an accepted package and its stored digest.
@@ -305,7 +316,7 @@ pub fn validate_accepted_package(
     validate_package_root(package_root, true, None)?;
     let stored_digest = read_digest_file(&package_root.join(DIGEST_FILE_NAME))?;
     let acceptance = read_acceptance_file(&package_root.join(ACCEPTANCE_FILE_NAME))?;
-    let mut package = validate_package_contents(package_root, policy, None)?;
+    let mut package = validate_package_contents(package_root, policy, None, None)?;
     if stored_digest != package.digest {
         return Err(PackageValidationError::StoredDigestMismatch {
             stored: stored_digest,
@@ -320,6 +331,7 @@ fn validate_package_contents(
     package_root: &Path,
     policy: &PackagePolicy,
     deadline: Option<&QueueOperationDeadline>,
+    digest_observer: Option<&mut dyn FnMut()>,
 ) -> Result<ValidatedPackage, PackageValidationError> {
     ensure_operation_active(deadline)?;
     let request_path = package_root.join(REQUEST_FILE_NAME);
@@ -366,6 +378,7 @@ fn validate_package_contents(
         &payload_root,
         &mut payload_files,
         deadline,
+        digest_observer,
     )?;
 
     Ok(ValidatedPackage {
@@ -836,6 +849,7 @@ fn calculate_digest(
     payload_root: &Path,
     payload: &mut [PayloadMetadata],
     deadline: Option<&QueueOperationDeadline>,
+    mut digest_observer: Option<&mut dyn FnMut()>,
 ) -> Result<PackageDigest, PackageValidationError> {
     ensure_operation_active(deadline)?;
     let mut hasher = Sha256::new();
@@ -860,6 +874,9 @@ fn calculate_digest(
                 .map_err(PackageValidationError::Io)?;
             if read == 0 {
                 break;
+            }
+            if let Some(observer) = digest_observer.as_deref_mut() {
+                observer();
             }
             observed_length = observed_length.checked_add(read as u64).ok_or(
                 PackageValidationError::FileChangedDuringValidation(file.path.clone()),

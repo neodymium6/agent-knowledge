@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -12,11 +13,16 @@ use std::time::{Duration, Instant};
 use agent_knowledge_gateway::{IngressClient, IngressClientError};
 use agent_knowledge_protocol::{ClientId, StatusRequest};
 use agent_knowledge_queue::{FileQueue, PackagePolicy};
+use nix::errno::Errno;
+use nix::sys::socket::{
+    AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind as socket_bind, connect,
+    listen as socket_listen, socket,
+};
 use tar::{Builder, EntryType, Header};
 
 use super::{
     ListenSettings, PublishedSocket, QueueIngressListenerError, SOCKET_MODE, SocketIdentity,
-    SocketState, listen_until, write_socket_state,
+    SocketProbe, SocketState, listen_until, probe_socket, write_socket_state,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -62,6 +68,7 @@ fn settings(root: &Path) -> ListenSettings {
         maximum_connections: NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
         connection_timeout: Duration::from_secs(5),
         deadline_observer: None,
+        handler_blocker: None,
     }
 }
 
@@ -279,6 +286,41 @@ fn shutdown_cancels_a_handler_waiting_for_the_queue_lock() {
 }
 
 #[test]
+fn shutdown_detaches_a_handler_that_cannot_observe_cancellation() {
+    let root = TestDirectory::create();
+    fs::create_dir(root.path().join("run"))
+        .unwrap_or_else(|error| panic!("runtime directory must be created: {error}"));
+    fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o2750))
+        .unwrap_or_else(|error| panic!("runtime directory mode must be set: {error}"));
+    let mut settings = settings(root.path());
+    settings.connection_timeout = Duration::from_secs(30);
+    let blocker = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+    settings.handler_blocker = Some(Arc::clone(&blocker));
+    let socket_path = settings.socket_path.clone();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let listener_stopping = Arc::clone(&stopping);
+    let listener = thread::spawn(move || {
+        listen_until(settings, Vec::new(), || {
+            listener_stopping.load(Ordering::Relaxed)
+        })
+    });
+    wait_for_socket(&socket_path);
+    let stalled = UnixStream::connect(&socket_path)
+        .unwrap_or_else(|error| panic!("blocked handler connection must open: {error}"));
+    blocker.0.wait();
+
+    let shutdown_started = Instant::now();
+    stopping.store(true, Ordering::Relaxed);
+    listener
+        .join()
+        .unwrap_or_else(|_| panic!("listener thread must not panic"))
+        .unwrap_or_else(|error| panic!("listener must stop after its grace period: {error}"));
+    assert!(shutdown_started.elapsed() < Duration::from_secs(2));
+    blocker.1.wait();
+    drop(stalled);
+}
+
+#[test]
 fn refuses_to_replace_a_non_socket_target() {
     let root = TestDirectory::create();
     let socket_path = root.path().join("queue-ingress.sock");
@@ -316,6 +358,23 @@ fn listener_lock_prevents_a_second_owner() {
 }
 
 #[test]
+fn publishes_a_socket_in_a_nested_runtime_directory() {
+    let root = TestDirectory::create();
+    let runtime = root.path().join("run");
+    fs::create_dir(&runtime)
+        .unwrap_or_else(|error| panic!("runtime directory must be created: {error}"));
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o2750))
+        .unwrap_or_else(|error| panic!("runtime directory mode must be set: {error}"));
+    let socket_path = runtime.join("queue-ingress.sock");
+
+    let published = PublishedSocket::bind(&socket_path)
+        .unwrap_or_else(|error| panic!("nested runtime socket must be published: {error}"));
+    assert!(socket_path.exists());
+    drop(published);
+    assert!(!socket_path.exists());
+}
+
+#[test]
 fn refuses_to_replace_a_live_socket_without_the_listener_lock() {
     let root = TestDirectory::create();
     let socket_path = root.path().join("queue-ingress.sock");
@@ -329,6 +388,56 @@ fn refuses_to_replace_a_live_socket_without_the_listener_lock() {
     assert!(matches!(error, QueueIngressListenerError::AlreadyRunning));
     assert!(socket_path.exists());
     drop(live);
+}
+
+#[test]
+fn socket_probe_remains_nonblocking_when_the_listener_backlog_is_full() {
+    let root = TestDirectory::create();
+    let socket_path = root.path().join("queue-ingress.sock");
+    let address = UnixAddr::new(&socket_path)
+        .unwrap_or_else(|error| panic!("backlog fixture address must be valid: {error}"));
+    let listener = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .unwrap_or_else(|error| panic!("backlog listener socket must open: {error}"));
+    socket_bind(listener.as_raw_fd(), &address)
+        .unwrap_or_else(|error| panic!("backlog fixture must bind: {error}"));
+    socket_listen(
+        &listener,
+        Backlog::new(1).unwrap_or_else(|error| panic!("backlog must be valid: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("backlog fixture must listen: {error}"));
+    let mut clients = Vec::new();
+    let mut saturated = false;
+    for _ in 0..16 {
+        let client = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("backlog client socket must open: {error}"));
+        match connect(client.as_raw_fd(), &address) {
+            Ok(()) | Err(Errno::EINPROGRESS | Errno::EALREADY) => clients.push(client),
+            Err(Errno::EAGAIN) => {
+                saturated = true;
+                break;
+            }
+            Err(error) => panic!("backlog fill must have a predictable result: {error}"),
+        }
+    }
+    assert!(saturated, "test must saturate the listener backlog");
+
+    let started = Instant::now();
+    assert_eq!(
+        probe_socket(&socket_path)
+            .unwrap_or_else(|error| panic!("saturated listener must be probed: {error}")),
+        SocketProbe::Live
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 #[test]
@@ -361,7 +470,7 @@ fn replaces_a_stale_socket_recorded_by_a_prior_listener() {
         .unwrap_or_else(|error| panic!("stale socket must be inspectable: {error}"));
     write_socket_state(
         root.path(),
-        SocketState::Owned(SocketIdentity::from_metadata(&metadata)),
+        &SocketState::Owned(SocketIdentity::from_metadata(&metadata)),
     )
     .unwrap_or_else(|error| panic!("prior listener state must be recorded: {error}"));
 
@@ -373,22 +482,83 @@ fn replaces_a_stale_socket_recorded_by_a_prior_listener() {
 }
 
 #[test]
-fn recovers_a_socket_left_after_preparing_state_was_published() {
+fn preparing_state_does_not_authorize_an_unrelated_public_socket() {
     let root = TestDirectory::create();
     let socket_path = root.path().join("queue-ingress.sock");
-    write_socket_state(root.path(), SocketState::Preparing)
+    let temporary = format!(
+        "{}{}",
+        super::TEMPORARY_SOCKET_PREFIX,
+        ulid::Ulid::generate()
+    );
+    write_socket_state(root.path(), &SocketState::Preparing { temporary })
         .unwrap_or_else(|error| panic!("preparing state must be durable: {error}"));
+    let stale = UnixListener::bind(&socket_path)
+        .unwrap_or_else(|error| panic!("unrelated stale listener must bind: {error}"));
+    drop(stale);
+
+    let error = match PublishedSocket::bind(&socket_path) {
+        Ok(_) => panic!("preparing state must not authorize the public socket"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        QueueIngressListenerError::UnownedStaleSocket
+    ));
+    assert!(socket_path.exists());
+}
+
+#[test]
+fn preparing_state_recovers_its_unique_temporary_socket() {
+    let root = TestDirectory::create();
+    let temporary = format!(
+        "{}{}",
+        super::TEMPORARY_SOCKET_PREFIX,
+        ulid::Ulid::generate()
+    );
+    let temporary_path = root.path().join(&temporary);
+    let stale = UnixListener::bind(&temporary_path)
+        .unwrap_or_else(|error| panic!("temporary socket fixture must bind: {error}"));
+    drop(stale);
+    write_socket_state(root.path(), &SocketState::Preparing { temporary })
+        .unwrap_or_else(|error| panic!("preparing state must be durable: {error}"));
+
+    let socket_path = root.path().join("queue-ingress.sock");
+    let published = PublishedSocket::bind(&socket_path)
+        .unwrap_or_else(|error| panic!("recorded temporary socket must be recovered: {error}"));
+    assert!(!temporary_path.exists());
+    drop(published);
+}
+
+#[test]
+fn prepared_state_recovers_a_socket_renamed_before_final_state() {
+    let root = TestDirectory::create();
+    let socket_path = root.path().join("queue-ingress.sock");
+    let stale = UnixListener::bind(&socket_path)
+        .unwrap_or_else(|error| panic!("renamed socket fixture must bind: {error}"));
+    drop(stale);
+    let metadata = fs::symlink_metadata(&socket_path)
+        .unwrap_or_else(|error| panic!("renamed socket must be inspectable: {error}"));
+    let temporary = format!(
+        "{}{}",
+        super::TEMPORARY_SOCKET_PREFIX,
+        ulid::Ulid::generate()
+    );
+    write_socket_state(
+        root.path(),
+        &SocketState::Prepared {
+            temporary,
+            identity: SocketIdentity::from_metadata(&metadata),
+        },
+    )
+    .unwrap_or_else(|error| panic!("prepared state must be durable: {error}"));
     fs::write(
         root.path().join(super::SOCKET_STATE_TEMPORARY_FILE),
         b"fictional interrupted replacement",
     )
     .unwrap_or_else(|error| panic!("interrupted temporary state must be written: {error}"));
-    let stale = UnixListener::bind(&socket_path)
-        .unwrap_or_else(|error| panic!("interrupted listener fixture must bind: {error}"));
-    drop(stale);
 
     let published = PublishedSocket::bind(&socket_path)
-        .unwrap_or_else(|error| panic!("preparing state must authorize recovery: {error}"));
+        .unwrap_or_else(|error| panic!("prepared state must authorize recovery: {error}"));
     drop(published);
     assert!(!socket_path.exists());
 }
@@ -397,11 +567,16 @@ fn recovers_a_socket_left_after_preparing_state_was_published() {
 fn refuses_a_runtime_directory_in_an_unprotected_namespace() {
     let root = TestDirectory::create();
     let namespace = root.path().join("namespace");
-    let runtime = namespace.join("run");
+    let protected_child = namespace.join("protected-child");
+    let runtime = protected_child.join("run");
     fs::create_dir(&namespace)
         .unwrap_or_else(|error| panic!("namespace directory must be created: {error}"));
     fs::set_permissions(&namespace, fs::Permissions::from_mode(0o0770))
         .unwrap_or_else(|error| panic!("unsafe namespace mode must be set: {error}"));
+    fs::create_dir(&protected_child)
+        .unwrap_or_else(|error| panic!("protected child must be created: {error}"));
+    fs::set_permissions(&protected_child, fs::Permissions::from_mode(0o0750))
+        .unwrap_or_else(|error| panic!("protected child mode must be set: {error}"));
     fs::create_dir(&runtime)
         .unwrap_or_else(|error| panic!("runtime directory must be created: {error}"));
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o2750))

@@ -627,6 +627,8 @@ where
             ),
             #[cfg(test)]
             deadline_observer: None,
+            #[cfg(test)]
+            handler_blocker: None,
         },
     })
 }

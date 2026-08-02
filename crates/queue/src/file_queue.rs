@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -58,7 +58,6 @@ pub struct QueueOperationDeadline {
     expires_at: Instant,
     cancelled: Arc<AtomicBool>,
     lock_wait_observed: Arc<AtomicBool>,
-    checkpoints: Arc<AtomicU64>,
 }
 
 impl QueueOperationDeadline {
@@ -69,7 +68,6 @@ impl QueueOperationDeadline {
             expires_at,
             cancelled: Arc::new(AtomicBool::new(false)),
             lock_wait_observed: Arc::new(AtomicBool::new(false)),
-            checkpoints: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -91,15 +89,7 @@ impl QueueOperationDeadline {
         self.lock_wait_observed.load(Ordering::Acquire)
     }
 
-    /// Returns the number of cooperative cancellation checkpoints observed.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn checkpoint_count(&self) -> u64 {
-        self.checkpoints.load(Ordering::Acquire)
-    }
-
     pub(crate) fn ensure_active(&self) -> Result<(), QueueError> {
-        self.checkpoints.fetch_add(1, Ordering::Release);
         if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.expires_at {
             Err(QueueError::OperationDeadlineExceeded)
         } else {
