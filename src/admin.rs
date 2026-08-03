@@ -20,7 +20,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 
 #[cfg(target_os = "linux")]
-use agent_knowledge_core::{PathAttestation, PathAttestationError};
+use agent_knowledge_core::{PathAttestation, PathAttestationError, RequestId};
 
 #[cfg(target_os = "linux")]
 use nix::dir::Dir;
@@ -32,6 +32,8 @@ use nix::sys::stat::{Mode, fchmod};
 use nix::unistd::{Gid, Group, Uid, User, dup, fchown};
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
+use ulid::Ulid;
 
 #[cfg(target_os = "linux")]
 const MAXIMUM_MIGRATION_DEPTH: usize = 128;
@@ -964,10 +966,40 @@ fn require_file_metadata(
 
 #[cfg(target_os = "linux")]
 fn worker_owned_queue_file(path: &Path) -> bool {
-    path.starts_with("worker-tmp")
-        || path
-            .file_name()
-            .is_some_and(|name| matches!(name.as_encoded_bytes(), b"phase.json" | b"result.json"))
+    let mut components = path.iter();
+    let Some(first) = components.next() else {
+        return false;
+    };
+    if first == "worker-tmp" {
+        let Some(name) = components.next().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        return components.next().is_none() && valid_worker_temporary_name(name);
+    }
+    if !matches!(
+        first.as_encoded_bytes(),
+        b"pending" | b"processing" | b"completed" | b"failed"
+    ) {
+        return false;
+    }
+    let Some(request_id) = components.next().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(sidecar) = components.next() else {
+        return false;
+    };
+    components.next().is_none()
+        && request_id.parse::<RequestId>().is_ok()
+        && matches!(sidecar.as_encoded_bytes(), b"phase.json" | b"result.json")
+}
+
+#[cfg(target_os = "linux")]
+fn valid_worker_temporary_name(name: &str) -> bool {
+    [".phase-", ".result-"].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .and_then(|value| value.parse::<Ulid>().ok().map(|id| (value, id)))
+            .is_some_and(|(value, id)| id.to_string() == value)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1456,10 +1488,31 @@ mod migration_tests {
 
     use super::{
         MAXIMUM_MIGRATION_ENTRIES, MAXIMUM_MIGRATION_PATH_BYTES, MigrationBudget,
-        StorageMigrationError, migrate_v1_storage_with_ids,
+        StorageMigrationError, migrate_v1_storage_with_ids, worker_owned_queue_file,
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn worker_queue_metadata_is_limited_to_exact_sidecar_paths() {
+        assert!(worker_owned_queue_file(Path::new(
+            "processing/01K00000000000000000000000/phase.json"
+        )));
+        assert!(worker_owned_queue_file(Path::new(
+            "failed/01K00000000000000000000000/result.json"
+        )));
+        assert!(worker_owned_queue_file(Path::new(
+            "worker-tmp/.phase-01K00000000000000000000000"
+        )));
+        assert!(!worker_owned_queue_file(Path::new("phase.json")));
+        assert!(!worker_owned_queue_file(Path::new(
+            "pending/01K00000000000000000000000/payload/phase.json"
+        )));
+        assert!(!worker_owned_queue_file(Path::new(
+            "pending/not-a-request/result.json"
+        )));
+        assert!(!worker_owned_queue_file(Path::new("worker-tmp/unexpected")));
+    }
 
     struct TestDirectory(PathBuf);
 

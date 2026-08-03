@@ -176,7 +176,11 @@ types. The ephemeral runtime path is not recorded in the durable marker and
 may be recreated or reconfigured after a Pod restart. Nonempty
 durable storage without that marker, a mismatched marker, a partially populated
 runtime directory, unexpected links, special files, or inconsistent component bindings
-fail closed; the command never guesses how to repair or remove them. The five
+fail closed; the command never guesses how to repair or remove them. The one
+fresh-filesystem exception is an empty, root-owned, mode-`0700` `lost+found`
+directory on the same mount. Bootstrap enforces umask `0077`, validates existing
+unmarked roots and child mounts before changing ownership or modes, and rejects
+writable or populated preexisting paths. The five
 configured durable paths must be direct children on the same mount beneath one
 non-root directory. Their configured parent paths and the runtime parent must
 have canonical root-owned ancestry with no group- or world-writable component.

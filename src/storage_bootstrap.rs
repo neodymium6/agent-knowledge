@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,6 +27,8 @@ const MARKER_NAME: &str = ".agent-knowledge-bootstrap-v1.json";
 const MARKER_VERSION: u16 = 1;
 const MAXIMUM_MARKER_BYTES: u64 = 64 * 1024;
 const MAXIMUM_GIT_OUTPUT_BYTES: usize = 64 * 1024;
+#[cfg(not(test))]
+const STORAGE_BOOTSTRAP_UMASK: u32 = 0o077;
 
 #[derive(Debug)]
 pub(crate) struct StorageBootstrap {
@@ -83,6 +86,8 @@ pub(crate) fn bootstrap_storage(
     if !Uid::effective().is_root() {
         return Err(StorageBootstrapError::RootRequired);
     }
+    #[cfg(not(test))]
+    nix::sys::stat::umask(Mode::from_bits_truncate(STORAGE_BOOTSTRAP_UMASK));
     let identities = StorageIdentities {
         administrative_owner: Uid::effective(),
         administrative_group: Gid::effective(),
@@ -144,6 +149,16 @@ fn bootstrap_storage_with_ids(
         return write_output(&mut output, "already_initialized");
     }
 
+    validate_unmarked_storage_root(&storage_root, &settings, identities)?;
+    for path in storage_paths(&settings) {
+        require_safe_empty_or_absent(path, identities.administrative_owner)?;
+    }
+    for path in storage_paths(&settings) {
+        ensure_directory(path)?;
+    }
+    revalidate_storage_lock(&storage_root, &storage_lock)?;
+    validate_same_storage_mount(&storage_root, &storage_paths(&settings))
+        .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
     normalize_storage_directory(
         &storage_root,
         identities.administrative_owner,
@@ -152,12 +167,7 @@ fn bootstrap_storage_with_ids(
     )
     .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
     revalidate_storage_lock(&storage_root, &storage_lock)?;
-    validate_fresh_storage_root(&storage_root, &settings)?;
     for path in storage_paths(&settings) {
-        require_absent_or_empty(path)?;
-    }
-    for path in storage_paths(&settings) {
-        ensure_directory(path)?;
         normalize_storage_directory(
             path,
             identities.administrative_owner,
@@ -166,8 +176,6 @@ fn bootstrap_storage_with_ids(
         )
         .map_err(|error| StorageBootstrapError::Permissions(path.into(), error))?;
     }
-    validate_same_storage_mount(&storage_root, &storage_paths(&settings))
-        .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
     initialize_runtime_directory(&request.runtime_directory, identities)?;
 
     FileQueue::initialize(settings.queue_root(), PackagePolicy::default()).map_err(|error| {
@@ -323,20 +331,60 @@ fn validate_trusted_parent(path: &Path, owner: Uid) -> Result<(), StorageBootstr
     Ok(())
 }
 
-fn validate_fresh_storage_root(
+fn validate_unmarked_storage_root(
     storage_root: &Path,
     settings: &WorkerSettings,
+    identities: StorageIdentities,
 ) -> Result<(), StorageBootstrapError> {
+    let metadata = fs::symlink_metadata(storage_root).map_err(StorageBootstrapError::Io)?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != identities.administrative_owner.as_raw()
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(StorageBootstrapError::UnsafePath(
+            storage_root.to_path_buf(),
+        ));
+    }
     let expected = storage_paths(settings);
+    let mut lost_and_found = None;
     for entry in fs::read_dir(storage_root).map_err(StorageBootstrapError::Io)? {
         let entry = entry.map_err(StorageBootstrapError::Io)?;
-        if !expected.iter().any(|path| *path == entry.path()) {
+        let path = entry.path();
+        if expected.iter().any(|expected_path| *expected_path == path) {
+            continue;
+        }
+        if entry.file_name() == "lost+found"
+            && valid_empty_lost_and_found(&path, identities.administrative_owner)?
+        {
+            lost_and_found = Some(path);
+        } else {
             return Err(StorageBootstrapError::PartialInitialization(
                 storage_root.to_path_buf(),
             ));
         }
     }
+    if let Some(path) = lost_and_found {
+        validate_same_storage_mount(storage_root, &[path.as_path()]).map_err(|error| {
+            StorageBootstrapError::Permissions(storage_root.to_path_buf(), error)
+        })?;
+    }
     Ok(())
+}
+
+fn valid_empty_lost_and_found(path: &Path, owner: Uid) -> Result<bool, StorageBootstrapError> {
+    let metadata = fs::symlink_metadata(path).map_err(StorageBootstrapError::Io)?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != owner.as_raw()
+        || metadata.permissions().mode() & 0o7777 != 0o700
+    {
+        return Ok(false);
+    }
+    let mut entries = fs::read_dir(path).map_err(StorageBootstrapError::Io)?;
+    Ok(entries
+        .next()
+        .transpose()
+        .map_err(StorageBootstrapError::Io)?
+        .is_none())
 }
 
 fn storage_paths(settings: &WorkerSettings) -> [&Path; 5] {
@@ -400,8 +448,23 @@ fn require_absent_or_empty(path: &Path) -> Result<(), StorageBootstrapError> {
     }
 }
 
+fn require_safe_empty_or_absent(path: &Path, owner: Uid) -> Result<(), StorageBootstrapError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.file_type().is_dir()
+                && metadata.uid() == owner.as_raw()
+                && metadata.permissions().mode() & 0o022 == 0 =>
+        {
+            require_absent_or_empty(path)
+        }
+        Ok(_) => Err(StorageBootstrapError::UnsafePath(path.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StorageBootstrapError::Io(error)),
+    }
+}
+
 fn ensure_directory(path: &Path) -> Result<(), StorageBootstrapError> {
-    match fs::create_dir(path) {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => sync_parent(path),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let metadata = fs::symlink_metadata(path).map_err(StorageBootstrapError::Io)?;

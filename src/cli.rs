@@ -1,8 +1,10 @@
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,6 +16,8 @@ use agent_knowledge_protocol::{
 use agent_knowledge_queue::{
     EnqueueOutcome, FileQueue, PackagePolicy, PackageValidationError, QueueError, validate_package,
 };
+#[cfg(unix)]
+use nix::unistd::Uid;
 use serde::Serialize;
 
 use crate::admin::{self, AdminRetentionError, AdminStatusError};
@@ -115,6 +119,7 @@ where
         )
         .map_err(CliError::Gateway),
         Command::ServeQueueIngress { queue_root } => {
+            queue_ingress::enforce_writer_umask();
             agent_knowledge_gateway::serve_ingress(&queue_root, io::stdin().lock(), output)
                 .map_err(CliError::IngressServe)
         }
@@ -843,9 +848,12 @@ fn submit_directory<W>(
 where
     W: Write,
 {
+    queue_ingress::enforce_writer_umask();
+    require_local_queue_owner(queue_root)?;
     let policy = PackagePolicy::default();
     let validated = validate_package(package_root, &policy).map_err(CliError::PackageValidation)?;
     let queue = FileQueue::initialize(queue_root, policy).map_err(CliError::Queue)?;
+    require_local_queue_owner(queue_root)?;
     let mut incoming = queue.begin().map_err(CliError::Queue)?;
 
     let mut request = File::open(package_root.join("request.json")).map_err(CliError::Io)?;
@@ -863,6 +871,25 @@ where
     let response = SubmitResponse::from(incoming.accept().map_err(CliError::Queue)?);
     serde_json::to_writer(&mut output, &response).map_err(CliError::Json)?;
     output.write_all(b"\n").map_err(CliError::Io)
+}
+
+#[cfg(unix)]
+fn require_local_queue_owner(queue_root: &Path) -> Result<(), CliError> {
+    match fs::symlink_metadata(queue_root) {
+        Ok(metadata)
+            if metadata.file_type().is_dir() && metadata.uid() == Uid::effective().as_raw() =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(CliError::LocalQueueOwner(queue_root.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CliError::Io(error)),
+    }
+}
+
+#[cfg(not(unix))]
+fn require_local_queue_owner(_queue_root: &Path) -> Result<(), CliError> {
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -905,6 +932,7 @@ pub enum CliError {
     Io(io::Error),
     PackageValidation(PackageValidationError),
     Queue(QueueError),
+    LocalQueueOwner(PathBuf),
     AdminStatus(AdminStatusError),
     AdminRetention(AdminRetentionError),
     #[cfg(target_os = "linux")]
@@ -943,6 +971,11 @@ impl fmt::Display for CliError {
                 write!(formatter, "local package validation failed: {error}")
             }
             Self::Queue(error) => write!(formatter, "durable queue submission failed: {error}"),
+            Self::LocalQueueOwner(path) => write!(
+                formatter,
+                "local queue submission must run as the owner of {}",
+                path.display()
+            ),
             Self::AdminStatus(error) => error.fmt(formatter),
             Self::AdminRetention(error) => error.fmt(formatter),
             #[cfg(target_os = "linux")]
@@ -965,6 +998,7 @@ impl std::error::Error for CliError {
             Self::Io(error) => Some(error),
             Self::PackageValidation(error) => Some(error),
             Self::Queue(error) => Some(error),
+            Self::LocalQueueOwner(_) => None,
             Self::AdminStatus(error) => Some(error),
             Self::AdminRetention(error) => Some(error),
             #[cfg(target_os = "linux")]

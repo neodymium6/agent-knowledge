@@ -39,6 +39,13 @@ const SOCKET_MODE: u32 = 0o660;
 #[cfg(not(test))]
 const QUEUE_INGRESS_UMASK: u32 = 0o007;
 
+pub(crate) fn enforce_writer_umask() {
+    #[cfg(not(test))]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(
+        QUEUE_INGRESS_UMASK,
+    ));
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ListenSettings {
     pub(crate) queue_root: PathBuf,
@@ -55,10 +62,7 @@ pub(crate) fn run<W>(settings: ListenSettings, output: W) -> Result<(), QueueIng
 where
     W: Write + Send + 'static,
 {
-    #[cfg(not(test))]
-    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(
-        QUEUE_INGRESS_UMASK,
-    ));
+    enforce_writer_umask();
     let stopping = Arc::new(AtomicBool::new(false));
     let _sigint = signal_hook::flag::register(SIGINT, Arc::clone(&stopping))
         .map_err(QueueIngressCommandError::SignalRegistration)?;

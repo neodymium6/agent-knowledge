@@ -118,6 +118,13 @@ fn refuses_nonempty_unmarked_storage() {
     let queue = root.path().join("storage/queue");
     fs::create_dir_all(&queue)
         .unwrap_or_else(|error| panic!("partial queue must be created: {error}"));
+    fs::set_permissions(
+        root.path().join("storage"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap_or_else(|error| panic!("storage root mode must be set: {error}"));
+    fs::set_permissions(&queue, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("partial queue mode must be set: {error}"));
     fs::write(queue.join("unexpected"), b"partial")
         .unwrap_or_else(|error| panic!("partial state must be written: {error}"));
 
@@ -227,8 +234,96 @@ fn rejects_an_unknown_unmarked_storage_sibling() {
     let storage = root.path().join("storage");
     fs::create_dir(&storage)
         .unwrap_or_else(|error| panic!("storage root must be created: {error}"));
+    fs::set_permissions(&storage, fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("storage root mode must be set: {error}"));
     fs::write(storage.join("unexpected"), b"partial")
         .unwrap_or_else(|error| panic!("unexpected sibling must be written: {error}"));
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::PartialInitialization(path)) if path == storage
+    ));
+    assert_eq!(
+        fs::metadata(&storage)
+            .unwrap_or_else(|error| panic!("rejected root metadata must be readable: {error}"))
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o755
+    );
+}
+
+#[test]
+fn rejects_writable_unmarked_children_without_mutating_them() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    let storage = root.path().join("storage");
+    let queue = storage.join("queue");
+    fs::create_dir(&storage)
+        .unwrap_or_else(|error| panic!("storage root must be created: {error}"));
+    fs::set_permissions(&storage, fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("storage root mode must be set: {error}"));
+    fs::create_dir(&queue).unwrap_or_else(|error| panic!("queue root must be created: {error}"));
+    fs::set_permissions(&queue, fs::Permissions::from_mode(0o777))
+        .unwrap_or_else(|error| panic!("queue root mode must be set: {error}"));
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::UnsafePath(path)) if path == queue
+    ));
+    assert_eq!(
+        fs::metadata(&queue)
+            .unwrap_or_else(|error| panic!("rejected queue metadata must be readable: {error}"))
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o777
+    );
+}
+
+#[test]
+fn accepts_an_empty_filesystem_lost_and_found_directory() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    let storage = root.path().join("storage");
+    let lost_and_found = storage.join("lost+found");
+    fs::create_dir(&storage)
+        .unwrap_or_else(|error| panic!("storage root must be created: {error}"));
+    fs::set_permissions(&storage, fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("storage root mode must be set: {error}"));
+    fs::create_dir(&lost_and_found)
+        .unwrap_or_else(|error| panic!("lost+found fixture must be created: {error}"));
+    fs::set_permissions(&lost_and_found, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("lost+found fixture mode must be set: {error}"));
+
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("empty lost+found must be accepted: {error}"));
+    assert_eq!(
+        fs::metadata(&lost_and_found)
+            .unwrap_or_else(|error| panic!("lost+found metadata must be readable: {error}"))
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o700
+    );
+}
+
+#[test]
+fn rejects_a_populated_filesystem_lost_and_found_directory() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    let storage = root.path().join("storage");
+    let lost_and_found = storage.join("lost+found");
+    fs::create_dir(&storage)
+        .unwrap_or_else(|error| panic!("storage root must be created: {error}"));
+    fs::set_permissions(&storage, fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("storage root mode must be set: {error}"));
+    fs::create_dir(&lost_and_found)
+        .unwrap_or_else(|error| panic!("lost+found fixture must be created: {error}"));
+    fs::set_permissions(&lost_and_found, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("lost+found fixture mode must be set: {error}"));
+    fs::write(lost_and_found.join("recovered-fictional"), b"fictional")
+        .unwrap_or_else(|error| panic!("recovered fixture must be written: {error}"));
 
     assert!(matches!(
         bootstrap_storage_with_ids(&request, identities, Vec::new()),
@@ -284,7 +379,7 @@ fn marked_storage_accepts_worker_queue_metadata() {
     let worker_temporary = root.path().join("storage/queue/worker-tmp");
     fs::set_permissions(&worker_temporary, fs::Permissions::from_mode(0o2770))
         .unwrap_or_else(|error| panic!("Worker temporary directory mode must be set: {error}"));
-    let temporary = worker_temporary.join(".phase-fictional");
+    let temporary = worker_temporary.join(".phase-01K00000000000000000000000");
     fs::write(&temporary, b"fictional phase")
         .unwrap_or_else(|error| panic!("Worker metadata fixture must be written: {error}"));
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o640))

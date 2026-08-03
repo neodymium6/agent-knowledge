@@ -117,7 +117,10 @@ agent-knowledge admin submit \
 `package-root` contains extracted `request.json` and `payload/` entries. The
 command validates that directory, restreams every permitted file through the
 same `FileQueue` limits as the queue ingress broker, and prints one JSON acceptance
-result. It never copies an unchecked directory into an accepted queue state.
+result. It must run as the owner of the queue root and enforces the queue-writer
+umask `0007`; this keeps local intake compatible with the same ownership and
+mode contract as the broker. It never copies an unchecked directory into an
+accepted queue state.
 
 Operators inspect an initialized deployment with the same trusted Worker
 configuration:
@@ -291,6 +294,12 @@ must resolve through canonical root-owned ancestry with no group- or
 world-writable component. The bootstrap process retains and repeatedly
 revalidates its locked durable-parent descriptor so pathname replacement cannot
 redirect later phases.
+The bootstrap process sets umask `0077` before creating any path. Existing
+unmarked roots and children must be root-owned and not group- or world-writable,
+and every child mount is checked before ownership or mode normalization. An
+empty root-owned mode-`0700` `lost+found` on the durable filesystem is the only
+permitted non-application entry in a fresh volume; any recovered content fails
+closed.
 Quartz remains an independently supplied immutable deployment input and is not
 bundled into the init image.
 
