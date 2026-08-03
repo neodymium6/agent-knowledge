@@ -171,8 +171,9 @@ mount `sshd_config`, host keys, authorized keys, and the Gateway configuration,
 and must grant the Gateway supplemental GID `10004`. None of those inputs is
 included in the image.
 
-The Storage Bootstrap image fixes the `admin bootstrap-storage` entrypoint and
-runs as root only during Pod initialization. Given the same Worker
+The Storage Bootstrap image fixes the `admin bootstrap-storage` entrypoint,
+includes the standard `install` utility for credential-staging init containers,
+and runs as root only during Pod initialization. Given the same Worker
 configuration later used by the Worker, it creates the durable queue, bare Git
 repository, empty initial commit, canonical content worktree, transaction and
 release stores, and the ephemeral queue-ingress runtime directory with the
@@ -276,14 +277,20 @@ applying it, create an overlay that:
   carry the forced command `akg-v1 /etc/agent-knowledge/gateway.yaml
   <client-id>`.
 
-Kustomize gives the generated configuration ConfigMap a content-hashed name,
-so changing any file below `deploy/kubernetes/config` changes the Pod template
-and triggers a rollout. Treat the external Secret and Quartz claim as immutable
-inputs: set `immutable: true` on the Secret, never replace claim contents in
-place, and use a new versioned name for every rotation or Quartz release. Patch
-the corresponding volume reference in the overlay; that Pod-template change
-rolls all processes together instead of exposing a mixture of old and new
-startup inputs.
+Kustomize makes the generated configuration ConfigMap immutable and gives it a
+content-hashed name, so changing any file below `deploy/kubernetes/config`
+changes the Pod template and triggers a rollout. Treat the external Secret and
+Quartz claim as immutable inputs: set `immutable: true` on the Secret, never
+replace claim contents in place, and use a new versioned name for every rotation
+or Quartz release. Patch the corresponding volume reference in the overlay;
+that Pod-template change rolls all processes together instead of exposing a
+mixture of old and new startup inputs.
+
+The projected Secret is mounted only by short-lived staging init containers.
+They copy the host key and authorized keys with fixed modes into a
+root-controlled `emptyDir`; OpenSSH mounts only that staged directory. This
+preserves `StrictModes yes` despite the writable-mode AtomicWriter directories
+used by projected Kubernetes volumes.
 
 Do not place Secret data, host keys, client keys, Git credentials, or private
 infrastructure values in the overlay repository. The default StorageClass must

@@ -78,6 +78,93 @@ spec:
           type: RuntimeDefault
         supplementalGroupsPolicy: Merge
       initContainers:
+        - name: prepare-ssh-directory
+          image: example.invalid/agent-knowledge-storage-bootstrap:0.1.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/install
+          args:
+            - --directory
+            - --mode=0755
+            - /staged
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 0
+            runAsUser: 0
+          volumeMounts:
+            - name: ssh-credentials
+              mountPath: /staged
+        - name: stage-ssh-host-key
+          image: example.invalid/agent-knowledge-storage-bootstrap:0.1.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/install
+          args:
+            - --mode=0400
+            - /projected/ssh_host_ed25519_key
+            - /staged/ssh_host_ed25519_key
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 0
+            runAsUser: 0
+          volumeMounts:
+            - name: ssh-credentials-source
+              mountPath: /projected
+              readOnly: true
+            - name: ssh-credentials
+              mountPath: /staged
+        - name: stage-ssh-authorized-keys
+          image: example.invalid/agent-knowledge-storage-bootstrap:0.1.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/install
+          args:
+            - --mode=0444
+            - /projected/authorized_keys
+            - /staged/authorized_keys
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 0
+            runAsUser: 0
+          volumeMounts:
+            - name: ssh-credentials-source
+              mountPath: /projected
+              readOnly: true
+            - name: ssh-credentials
+              mountPath: /staged
         - name: storage-bootstrap
           image: example.invalid/agent-knowledge-storage-bootstrap:0.1.0
           imagePullPolicy: IfNotPresent
@@ -260,6 +347,9 @@ spec:
           emptyDir:
             sizeLimit: 16Mi
         - name: ssh-credentials
+          emptyDir:
+            sizeLimit: 1Mi
+        - name: ssh-credentials-source
           secret:
             secretName: agent-knowledge-ssh-v1
             defaultMode: 0400

@@ -345,11 +345,15 @@ the image account database and would remove the two required container-specific
 memberships.
 
 All containers in the Pod must consume one coherent set of startup inputs.
-Generated configuration uses a content-addressed ConfigMap name, while SSH
-credentials and Quartz content use immutable, versioned deployment-owned
-objects. Rotating either external input requires a new object name in the Pod
-template so Kubernetes rolls the complete Pod; updating a projected object or
-mounted claim in place is not supported.
+Generated configuration uses an immutable, content-addressed ConfigMap name,
+while SSH credentials and Quartz content use immutable, versioned
+deployment-owned objects. Rotating either external input requires a new object
+name in the Pod template so Kubernetes rolls the complete Pod; updating a
+projected object or mounted claim in place is not supported. Secret projection
+is visible only to root init containers that copy the host key and authorized
+keys into a mode-controlled ephemeral volume. The OpenSSH container mounts only
+that staged volume, allowing `StrictModes` to remain enabled without trusting
+the writable-mode directories used by Kubernetes AtomicWriter projection.
 
 The Kubernetes API does not expose a per-Pod PID limit in the Pod
 specification. Eligible nodes must therefore enforce a finite kubelet

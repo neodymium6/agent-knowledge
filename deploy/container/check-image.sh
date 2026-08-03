@@ -437,6 +437,10 @@ if [[ $expected_namespace == admin ]]; then
     echo "Storage Bootstrap image is missing the Git executable" >&2
     exit 1
   fi
+  if ! grep -Eq '(^|/)bin/install$' "$normalized_layer_contents"; then
+    echo "Storage Bootstrap image is missing the credential staging utility" >&2
+    exit 1
+  fi
   if grep -Eq '(^|/)(bin/ssh|bin/sshd|etc/ssl/certs/ca-bundle\.crt|authorized_keys|ssh_host_[^/]*)$|^etc/agent-knowledge($|/)' \
     "$normalized_layer_contents"; then
     echo "Storage Bootstrap image contains transport, credential, CA, or deployment configuration" >&2

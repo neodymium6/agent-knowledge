@@ -33,6 +33,7 @@ jq -e '
     ($resources | length == 6)
     and (resources("ServiceAccount") | length == 1)
     and (resources("ConfigMap") | length == 1)
+    and (resources("ConfigMap")[0].immutable == true)
     and (resources("Service") | length == 2)
     and (resources("NetworkPolicy") | length == 1)
     and (resources("StatefulSet") | length == 1)
@@ -69,7 +70,7 @@ jq -e '
     and ((pod_spec.hostNetwork // false) == false)
     and ((pod_spec.hostPID // false) == false)
     and ((pod_spec.hostIPC // false) == false)
-    and (init_containers | length == 1)
+    and (init_containers | length == 4)
     and (containers | length == 3)
     and ([init_containers[], containers[]]
       | all(.[]; .securityContext.allowPrivilegeEscalation == false))
@@ -79,7 +80,28 @@ jq -e '
       | all(.[]; .securityContext.capabilities.drop == ["ALL"]))
     and ([init_containers[], containers[]]
       | map(select(.securityContext.runAsUser == 0) | .name) | sort
-      == ["openssh-gateway", "storage-bootstrap"])
+      == [
+        "openssh-gateway",
+        "prepare-ssh-directory",
+        "stage-ssh-authorized-keys",
+        "stage-ssh-host-key",
+        "storage-bootstrap"
+      ])
+    and (init_container("prepare-ssh-directory").command == ["/bin/install"])
+    and (init_container("prepare-ssh-directory").args
+      == ["--directory", "--mode=0755", "/staged"])
+    and (init_container("stage-ssh-host-key").command == ["/bin/install"])
+    and (init_container("stage-ssh-host-key").args == [
+      "--mode=0400",
+      "/projected/ssh_host_ed25519_key",
+      "/staged/ssh_host_ed25519_key"
+    ])
+    and (init_container("stage-ssh-authorized-keys").command == ["/bin/install"])
+    and (init_container("stage-ssh-authorized-keys").args == [
+      "--mode=0444",
+      "/projected/authorized_keys",
+      "/staged/authorized_keys"
+    ])
     and (init_container("storage-bootstrap").securityContext.capabilities.add | sort
       == ["CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID"])
     and (container("openssh-gateway").securityContext.capabilities.add | sort
@@ -99,11 +121,15 @@ jq -e '
     and (mount(container("worker"); "quartz").readOnly == true)
     and (volume("runtime") | has("emptyDir"))
     and (volume("sshd-runtime") | has("emptyDir"))
-    and (volume("ssh-credentials").secret.secretName
+    and (volume("ssh-credentials") | has("emptyDir"))
+    and (mount(container("openssh-gateway"); "ssh-credentials").readOnly == true)
+    and (container("openssh-gateway").volumeMounts
+      | any(.[]; .name == "ssh-credentials-source") | not)
+    and (volume("ssh-credentials-source").secret.secretName
       == "agent-knowledge-ssh-v1")
-    and (volume("ssh-credentials").secret.items
+    and (volume("ssh-credentials-source").secret.items
       | map(select(.key == "ssh_host_ed25519_key"))[0].mode == 256)
-    and (volume("ssh-credentials").secret.items
+    and (volume("ssh-credentials-source").secret.items
       | map(select(.key == "authorized_keys"))[0].mode == 292)
     and (volume("quartz").persistentVolumeClaim.claimName
       == "agent-knowledge-quartz-v1")

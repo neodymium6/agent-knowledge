@@ -358,6 +358,7 @@
           tag = projectVersion;
           contents = [
             package
+            pkgs.coreutils
             rootFilesystem
           ];
           config = {
