@@ -1,13 +1,15 @@
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use nix::unistd::{Gid, Uid};
 use ulid::Ulid;
+use xattr::FileExt as _;
 
 use super::{
-    StorageBootstrap, StorageBootstrapError, StorageIdentities, bootstrap_storage_with_ids,
+    StorageBootstrap, StorageBootstrapError, StorageIdentities, StorageMigrationError,
+    bootstrap_storage_with_ids,
 };
 
 struct TestDirectory {
@@ -78,6 +80,34 @@ fn fixture(root: &Path) -> (StorageBootstrap, StorageIdentities) {
     )
 }
 
+fn set_extended_posix_acl(path: &Path, name: &str) {
+    // Linux POSIX ACL xattrs use a version header followed by tag, permission,
+    // and ID entries. A named user entry plus the mask keeps the ACL extended
+    // instead of allowing the kernel to reduce it to mode bits.
+    let named_uid = Uid::effective().as_raw();
+    let mut value = 2_u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in [
+        (0x01_u16, 0o7_u16, u32::MAX),
+        (0x02_u16, 0o7_u16, named_uid),
+        (0x04_u16, 0o5_u16, u32::MAX),
+        (0x10_u16, 0o7_u16, u32::MAX),
+        (0x20_u16, 0o5_u16, u32::MAX),
+    ] {
+        value.extend_from_slice(&tag.to_le_bytes());
+        value.extend_from_slice(&permissions.to_le_bytes());
+        value.extend_from_slice(&id.to_le_bytes());
+    }
+    let file =
+        File::open(path).unwrap_or_else(|error| panic!("ACL fixture must be opened: {error}"));
+    file.set_xattr(name, &value)
+        .unwrap_or_else(|error| panic!("ACL fixture must be written: {error}"));
+    assert!(
+        file.get_xattr(name)
+            .unwrap_or_else(|error| panic!("ACL fixture must be readable: {error}"))
+            .is_some()
+    );
+}
+
 #[test]
 fn initializes_fresh_storage_and_is_idempotent() {
     let root = TestDirectory::new();
@@ -109,6 +139,72 @@ fn initializes_fresh_storage_and_is_idempotent() {
         .unwrap_or_else(|error| panic!("ephemeral runtime must be recreated: {error}"));
     assert_eq!(after_restart, b"{\"status\":\"already_initialized\"}\n");
     assert!(request.runtime_directory.is_dir());
+}
+
+#[test]
+fn rejects_inherited_posix_acl_before_mutating_fresh_storage() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    let storage = root.path().join("storage");
+    fs::create_dir(&storage)
+        .unwrap_or_else(|error| panic!("storage fixture must be created: {error}"));
+    set_extended_posix_acl(&storage, "system.posix_acl_default");
+    let mode_before = fs::symlink_metadata(&storage)
+        .unwrap_or_else(|error| panic!("storage fixture metadata must be readable: {error}"))
+        .permissions()
+        .mode();
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::Permissions(path, StorageMigrationError::PosixAcl(acl_path)))
+            if path == storage && acl_path.as_os_str().is_empty()
+    ));
+    assert_eq!(
+        fs::symlink_metadata(&storage)
+            .unwrap_or_else(|error| panic!(
+                "storage fixture metadata must remain readable: {error}"
+            ))
+            .permissions()
+            .mode(),
+        mode_before
+    );
+    assert!(
+        fs::read_dir(&storage)
+            .unwrap_or_else(|error| panic!("storage fixture must remain readable: {error}"))
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn rejects_posix_acl_added_to_ephemeral_runtime() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("fresh bootstrap must succeed: {error}"));
+    set_extended_posix_acl(&request.runtime_directory, "system.posix_acl_access");
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::Permissions(path, StorageMigrationError::PosixAcl(acl_path)))
+            if path == request.runtime_directory && acl_path.as_os_str().is_empty()
+    ));
+}
+
+#[test]
+fn rejects_posix_acl_added_to_initialized_storage_file() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("fresh bootstrap must succeed: {error}"));
+    let repository = root.path().join("storage/repository");
+    set_extended_posix_acl(&repository.join("HEAD"), "system.posix_acl_access");
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::Permissions(path, StorageMigrationError::PosixAcl(acl_path)))
+            if path == repository && acl_path == Path::new("HEAD")
+    ));
 }
 
 #[test]

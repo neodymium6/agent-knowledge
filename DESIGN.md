@@ -299,7 +299,9 @@ unmarked roots and children must be root-owned and not group- or world-writable,
 and every child mount is checked before ownership or mode normalization. An
 empty root-owned mode-`0700` `lost+found` on the durable filesystem is the only
 permitted non-application entry in a fresh volume; any recovered content fails
-closed.
+closed. POSIX access and default ACLs are rejected during preflight and final
+validation across the durable and ephemeral runtime trees; ownership and mode
+bits alone are not treated as a complete authorization description.
 Quartz remains an independently supplied immutable deployment input and is not
 bundled into the init image.
 

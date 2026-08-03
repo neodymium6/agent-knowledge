@@ -34,6 +34,8 @@ use nix::unistd::{Gid, Group, Uid, User, dup, fchown};
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use ulid::Ulid;
+#[cfg(target_os = "linux")]
+use xattr::FileExt as _;
 
 #[cfg(target_os = "linux")]
 const MAXIMUM_MIGRATION_DEPTH: usize = 128;
@@ -43,6 +45,8 @@ const MAXIMUM_FD_INFO_BYTES: u64 = 16 * 1024;
 const MAXIMUM_MIGRATION_ENTRIES: u64 = 1_000_000;
 #[cfg(target_os = "linux")]
 const MAXIMUM_MIGRATION_PATH_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const POSIX_ACL_XATTRS: [&str; 2] = ["system.posix_acl_access", "system.posix_acl_default"];
 
 pub(crate) fn status<W>(
     config: &Path,
@@ -275,6 +279,23 @@ pub(crate) fn normalize_storage_tree(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn validate_bootstrap_source_tree(root: &Path) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let mut budget = MigrationBudget::new();
+    preflight_directory(&root.file, 0, Path::new(""), &mut budget)?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_storage_directory_no_posix_acl(
+    path: &Path,
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(path)?;
+    require_no_posix_acl(&root.file, Path::new(""))?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn validate_storage_tree(
     root: &Path,
     owner: Uid,
@@ -436,6 +457,7 @@ pub(crate) fn validate_storage_file_mount(
     if linux_mount_id(&pinned)? != linux_mount_id(&root.file)? {
         return Err(StorageMigrationError::UnsafeEntry(file.to_path_buf()));
     }
+    require_no_posix_acl(&pinned, relative)?;
     root.revalidate()
 }
 
@@ -457,7 +479,9 @@ pub(crate) fn normalize_storage_directory(
     if attestation.path() != path {
         return Err(StorageMigrationError::InvalidRoot(path.to_path_buf()));
     }
+    require_no_posix_acl(&file, Path::new(""))?;
     set_identity_and_mode(&file, Some(owner), group, mode)?;
+    require_no_posix_acl(&file, Path::new(""))?;
     file.sync_all().map_err(StorageMigrationError::Io)?;
     let observed =
         PathAttestation::capture(path, &file).map_err(StorageMigrationError::Attestation)?;
@@ -695,6 +719,7 @@ fn preflight_directory(
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
     }
+    require_no_posix_acl(directory, relative)?;
     budget.record(relative)?;
     let cloned = directory.try_clone().map_err(StorageMigrationError::Io)?;
     let mut entries = Dir::from_fd(cloned.into()).map_err(nix_io_error)?;
@@ -716,6 +741,11 @@ fn preflight_directory(
             }
             preflight_directory(&child, depth + 1, &path, budget)?;
         } else if identity.file_type == nix::libc::S_IFREG && identity.links == 1 {
+            let child = open_child_regular(directory, &name)?;
+            if object_identity(&child)? != identity {
+                return Err(StorageMigrationError::TreeChanged(path));
+            }
+            require_no_posix_acl(&child, &path)?;
             budget.record(&path)?;
         } else {
             return Err(StorageMigrationError::UnsafeEntry(path));
@@ -734,6 +764,7 @@ fn preflight_release_directory(
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
     }
+    require_no_posix_acl(directory, relative)?;
     budget.record(relative)?;
     let cloned = directory.try_clone().map_err(StorageMigrationError::Io)?;
     let mut entries = Dir::from_fd(cloned.into()).map_err(nix_io_error)?;
@@ -757,6 +788,13 @@ fn preflight_release_directory(
         } else if matches!(identity.file_type, nix::libc::S_IFREG | nix::libc::S_IFLNK)
             && identity.links == 1
         {
+            if identity.file_type == nix::libc::S_IFREG {
+                let child = open_child_regular(directory, &name)?;
+                if object_identity(&child)? != identity {
+                    return Err(StorageMigrationError::TreeChanged(path));
+                }
+                require_no_posix_acl(&child, &path)?;
+            }
             budget.record(&path)?;
         } else {
             return Err(StorageMigrationError::UnsafeEntry(path));
@@ -882,6 +920,7 @@ fn validate_directory_permissions(
             if object_identity(&child)? != identity {
                 return Err(StorageMigrationError::TreeChanged(path));
             }
+            require_no_posix_acl(&child, &path)?;
             require_file_metadata(
                 &child,
                 permissions.owner,
@@ -912,6 +951,7 @@ fn validate_directory_permissions(
     if entries != directory_entries(directory, relative)? {
         return Err(StorageMigrationError::TreeChanged(relative.to_path_buf()));
     }
+    require_no_posix_acl(directory, relative)?;
     require_metadata(
         directory,
         permissions.owner,
@@ -921,6 +961,20 @@ fn validate_directory_permissions(
         false,
     )?;
     fingerprint.record(relative, object_identity(directory)?)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn require_no_posix_acl(file: &File, path: &Path) -> Result<(), StorageMigrationError> {
+    for name in POSIX_ACL_XATTRS {
+        if file
+            .get_xattr(name)
+            .map_err(StorageMigrationError::Io)?
+            .is_some()
+        {
+            return Err(StorageMigrationError::PosixAcl(path.to_path_buf()));
+        }
+    }
     Ok(())
 }
 
@@ -1334,6 +1388,7 @@ pub(crate) enum StorageMigrationError {
     UnknownIdentity(std::ffi::OsString),
     QueueBusy,
     DirectoryNotEmpty(PathBuf),
+    PosixAcl(PathBuf),
     UnsafeEntry(PathBuf),
     TreeChanged(PathBuf),
     MigrationLimitExceeded(PathBuf),
@@ -1366,6 +1421,11 @@ impl fmt::Display for StorageMigrationError {
             Self::DirectoryNotEmpty(path) => write!(
                 formatter,
                 "storage migration requires an empty directory: {}",
+                path.display()
+            ),
+            Self::PosixAcl(path) => write!(
+                formatter,
+                "storage migration rejected a POSIX ACL: {}",
                 path.display()
             ),
             Self::UnsafeEntry(path) => write!(

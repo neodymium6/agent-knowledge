@@ -19,8 +19,9 @@ use ulid::Ulid;
 
 use crate::admin::{
     StorageMigrationError, normalize_storage_directory, normalize_storage_tree, resolve_group,
-    resolve_user, validate_queue_tree, validate_release_tree, validate_repository_tree,
-    validate_same_storage_mount, validate_storage_file_mount, validate_storage_tree,
+    resolve_user, validate_bootstrap_source_tree, validate_queue_tree, validate_release_tree,
+    validate_repository_tree, validate_same_storage_mount, validate_storage_directory_no_posix_acl,
+    validate_storage_file_mount, validate_storage_tree,
 };
 
 const MARKER_NAME: &str = ".agent-knowledge-bootstrap-v1.json";
@@ -122,6 +123,8 @@ fn bootstrap_storage_with_ids(
     ensure_directory(&storage_root)?;
     let storage_lock = lock_storage_root(&storage_root)?;
     revalidate_storage_lock(&storage_root, &storage_lock)?;
+    validate_storage_directory_no_posix_acl(&storage_root)
+        .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
 
     if path_exists(&marker_path)? {
         require_directory_metadata(
@@ -149,6 +152,8 @@ fn bootstrap_storage_with_ids(
         return write_output(&mut output, "already_initialized");
     }
 
+    validate_bootstrap_source_tree(&storage_root)
+        .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
     validate_unmarked_storage_root(&storage_root, &settings, identities)?;
     for path in storage_paths(&settings) {
         require_safe_empty_or_absent(path, identities.administrative_owner)?;
@@ -638,6 +643,8 @@ fn validate_initialized(
     ids: StorageIdentities,
 ) -> Result<(), StorageBootstrapError> {
     let storage_root = common_storage_root(settings)?;
+    validate_storage_directory_no_posix_acl(&storage_root)
+        .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
     require_directory_metadata(
         &storage_root,
         ids.administrative_owner,
@@ -680,6 +687,14 @@ fn validate_initialized(
         ids.ingress_group,
         0o2750,
     )?;
+    validate_storage_tree(
+        runtime_directory,
+        ids.queue_owner,
+        ids.ingress_group,
+        Mode::from_bits_truncate(0o2750),
+        Mode::from_bits_truncate(0o640),
+    )
+    .map_err(|error| StorageBootstrapError::Permissions(runtime_directory.into(), error))?;
     validate_queue_tree(
         settings.queue_root(),
         ids.queue_owner,

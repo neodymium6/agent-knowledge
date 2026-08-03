@@ -172,7 +172,9 @@ roots only after every component has initialized and permissions have been
 normalized, validated, and durably flushed on their shared filesystem. A
 matching marker makes later runs idempotent only after a bounded read-only
 validation of component bindings, descendant ownership, modes, and entry
-types. The ephemeral runtime path is not recorded in the durable marker and
+types. POSIX access and default ACLs are rejected throughout the managed trees
+because mode-bit validation cannot prove the effective permissions of those
+ACLs. The ephemeral runtime path is not recorded in the durable marker and
 may be recreated or reconfigured after a Pod restart. Nonempty
 durable storage without that marker, a mismatched marker, a partially populated
 runtime directory, unexpected links, special files, or inconsistent component bindings
