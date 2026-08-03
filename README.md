@@ -242,9 +242,15 @@ sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
 sudo install -d -m 0755 -o root -g root /etc/agent-knowledge
 sudo install -m 0640 -o root -g agent-knowledge \
   ./fictional-worker.yaml /etc/agent-knowledge/worker.yaml
-# Replace this fictional name with a dedicated account whose primary group is
-# agent-knowledge-gateway and whose only supplementary group is agent-knowledge-ingress.
+# Replace this fictional name when the account is provisioned centrally.
 gateway_account=fictional-agent-knowledge-gateway
+sudo install -d -m 0755 -o root -g root /var/empty
+sudo useradd --system \
+  --gid agent-knowledge-gateway \
+  --groups agent-knowledge-ingress \
+  --home-dir /var/empty \
+  --shell "$package_path/bin/agent-knowledge-ssh-shell" \
+  "$gateway_account"
 sudo "$package_path/bin/agent-knowledge" admin bootstrap-storage \
   --config /etc/agent-knowledge/worker.yaml \
   --gateway-owner "$gateway_account"
@@ -258,6 +264,10 @@ sudo systemctl link \
 sudo systemctl link \
   "$package_path/lib/systemd/system/agent-knowledge-queue-ingress@.service"
 ```
+
+Sites with centrally managed accounts replace the `useradd` step with their
+provisioning mechanism, preserving the same dedicated primary group, sole
+supplementary group, and restricted login shell.
 
 The `/etc/tmpfiles.d` link points through the stable system profile, so boot
 recreates the volatile runtime directory and profile upgrades select the new
