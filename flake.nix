@@ -395,12 +395,15 @@
                 clippy
                 gh
                 git
+                jq
                 just
+                kube-linter
                 kustomize
                 nixfmt-tree
                 pre-commit
                 rustc
                 rustfmt
+                yq-go
               ]
               ++ lib.optionals stdenv.isLinux [
                 openssh

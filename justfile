@@ -37,7 +37,7 @@ ci: check-code check-kubernetes
 
 # Render and validate the single-replica Kubernetes deployment.
 check-kubernetes:
-  system="$(nix eval --impure --raw --expr builtins.currentSystem)" && nix build ".#checks.$system.kubernetes-manifests" --no-link
+  nix develop . --command bash deploy/kubernetes/check-manifests.sh deploy/kubernetes
 
 # Update pinned development-environment inputs.
 update:
