@@ -36,12 +36,15 @@ jobs:
       - name: Run repository checks
         run: nix develop --command just ci
 
-      - name: Exercise distinct Gateway, queue, and Worker identities
+      - name: Exercise OpenSSH and distinct service identities
         run: |
           nix develop --command cargo build --locked
+          openssh_binary=$(nix develop --command which sshd)
+          openssh_bin=${openssh_binary%/sshd}
           sudo deploy/systemd/check-privilege-boundary.sh \
             "$PWD/target/debug/agent-knowledge" \
-            "$PWD/deploy/systemd/agent-knowledge.conf.tmpfiles"
+            "$PWD/deploy/systemd/agent-knowledge.conf.tmpfiles" \
+            "$openssh_bin"
 
   packages:
     name: Package (${{ matrix.system }})

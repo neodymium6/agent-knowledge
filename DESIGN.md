@@ -1721,8 +1721,8 @@ The implementation requires:
 - recovery tests for every processing phase;
 - batching tests with a mixture of valid, conflicting, and invalid requests;
 - protocol compatibility fixtures; and
-- end-to-end tests through a restricted OpenSSH configuration where the test
-  environment permits it.
+- end-to-end tests through a restricted OpenSSH configuration with ephemeral
+  fictional accounts, host keys, and client keys on Linux (implemented).
 
 Tests and examples use clearly fictional identities and infrastructure values.
 

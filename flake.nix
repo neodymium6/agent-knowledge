@@ -262,7 +262,10 @@
                 rustc
                 rustfmt
               ]
-              ++ lib.optionals stdenv.isLinux [ systemd ];
+              ++ lib.optionals stdenv.isLinux [
+                openssh
+                systemd
+              ];
           };
         }
       );
