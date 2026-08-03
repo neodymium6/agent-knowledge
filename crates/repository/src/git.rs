@@ -10,6 +10,8 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 
@@ -27,6 +29,63 @@ use agent_knowledge_queue::{
 use agent_knowledge_release::{ReleaseError, ReleaseStore};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
+
+const GIT_PROGRAM: &str = match option_env!("AGENT_KNOWLEDGE_GIT_PROGRAM") {
+    Some(program) => program,
+    None => "git",
+};
+
+/// Resolves Git to an absolute executable below a non-writable, root-owned
+/// path on Unix.
+#[must_use]
+pub fn trusted_git_program() -> Option<PathBuf> {
+    let configured = Path::new(GIT_PROGRAM);
+    let candidates = if configured.is_absolute() {
+        vec![configured.to_path_buf()]
+    } else {
+        std::env::var_os("PATH")
+            .map(|path| {
+                std::env::split_paths(&path)
+                    .filter(|directory| directory.is_absolute())
+                    .map(|directory| directory.join(configured))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    candidates.into_iter().find_map(|candidate| {
+        let canonical = fs::canonicalize(candidate).ok()?;
+        trusted_executable(&canonical).then_some(canonical)
+    })
+}
+
+#[cfg(unix)]
+fn trusted_executable(path: &Path) -> bool {
+    let Ok(root_owner) = fs::symlink_metadata("/").map(|metadata| metadata.uid()) else {
+        return false;
+    };
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != root_owner
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        return false;
+    }
+    path.ancestors().skip(1).all(|ancestor| {
+        fs::symlink_metadata(ancestor).is_ok_and(|metadata| {
+            metadata.file_type().is_dir()
+                && metadata.uid() == root_owner
+                && metadata.permissions().mode() & 0o022 == 0
+        })
+    })
+}
+
+#[cfg(not(unix))]
+fn trusted_executable(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
 
 use crate::apply::{AppliedMove, apply_claimed};
 use crate::{ApplyError, ContentPolicy};
@@ -351,6 +410,48 @@ impl GitRepository {
         official_branch: &str,
         identity: GitIdentity,
     ) -> Result<Self, GitTransactionError> {
+        Self::open_with_mode(
+            git_directory,
+            canonical_worktree,
+            work_root,
+            official_branch,
+            identity,
+            true,
+        )
+    }
+
+    /// Opens an existing repository transaction boundary without creating or
+    /// repairing repository state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any required directory or binding is absent or
+    /// does not match the configured repository topology.
+    pub fn open_existing(
+        git_directory: &Path,
+        canonical_worktree: &Path,
+        work_root: &Path,
+        official_branch: &str,
+        identity: GitIdentity,
+    ) -> Result<Self, GitTransactionError> {
+        Self::open_with_mode(
+            git_directory,
+            canonical_worktree,
+            work_root,
+            official_branch,
+            identity,
+            false,
+        )
+    }
+
+    fn open_with_mode(
+        git_directory: &Path,
+        canonical_worktree: &Path,
+        work_root: &Path,
+        official_branch: &str,
+        identity: GitIdentity,
+        initialize: bool,
+    ) -> Result<Self, GitTransactionError> {
         ensure_supported_git()?;
         ensure_real_directory(git_directory)?;
         let configured_git_directory =
@@ -368,7 +469,11 @@ impl GitRepository {
         ensure_real_directory(canonical_worktree)?;
         let configured_canonical_worktree =
             fs::canonicalize(canonical_worktree).map_err(GitTransactionError::Io)?;
-        ensure_or_create_real_directory(work_root)?;
+        if initialize {
+            ensure_or_create_real_directory(work_root)?;
+        } else {
+            ensure_real_directory(work_root)?;
+        }
         let configured_work_root = fs::canonicalize(work_root).map_err(GitTransactionError::Io)?;
         validate_repository_layout(
             &configured_git_directory,
@@ -386,13 +491,22 @@ impl GitRepository {
         let (work_root_handle, work_root) = open_stable_directory(&configured_work_root)?;
         let configured_journal_root = configured_work_root.join("transactions");
         let configured_worktree_root = configured_work_root.join("worktrees");
-        ensure_or_create_real_directory(&work_root.join("transactions"))?;
-        ensure_or_create_real_directory(&work_root.join("worktrees"))?;
+        for path in [work_root.join("transactions"), work_root.join("worktrees")] {
+            if initialize {
+                ensure_or_create_real_directory(&path)?;
+            } else {
+                ensure_real_directory(&path)?;
+            }
+        }
         let (journal_root_handle, journal_root) = open_stable_directory(&configured_journal_root)?;
         let (worktree_root_handle, worktree_root) =
             open_stable_directory(&configured_worktree_root)?;
         let repository_state = git_directory.join("agent-knowledge");
-        ensure_or_create_real_directory(&repository_state)?;
+        if initialize {
+            ensure_or_create_real_directory(&repository_state)?;
+        } else {
+            ensure_real_directory(&repository_state)?;
+        }
         let writer = lock_root_paths(
             &git_directory,
             &configured_git_directory,
@@ -417,9 +531,17 @@ impl GitRepository {
         ];
         let expected_binding = repository_binding(&binding_directories, &official_ref)?;
         let binding_file = repository_state.join("binding-v2");
-        ensure_binding(&binding_file, &expected_binding)?;
+        if initialize {
+            ensure_binding(&binding_file, &expected_binding)?;
+        } else {
+            validate_binding(&binding_file, &expected_binding)?;
+        }
         let work_root_binding_file = work_root.join(".agent-knowledge-repository-binding-v2");
-        ensure_binding(&work_root_binding_file, &expected_binding)?;
+        if initialize {
+            ensure_binding(&work_root_binding_file, &expected_binding)?;
+        } else {
+            validate_binding(&work_root_binding_file, &expected_binding)?;
+        }
         drop(writer);
         sync_directory(&repository_state).map_err(GitTransactionError::Io)?;
         sync_directory(&work_root).map_err(GitTransactionError::Io)?;
@@ -2905,7 +3027,9 @@ fn add_safe_directory(command: &mut Command, directory: &Path) {
 }
 
 fn git_command() -> Command {
-    let mut command = Command::new("git");
+    let program =
+        trusted_git_program().unwrap_or_else(|| PathBuf::from("/agent-knowledge-unavailable-git"));
+    let mut command = Command::new(program);
     for (name, _) in std::env::vars_os() {
         if name.as_encoded_bytes().starts_with(b"GIT_") {
             command.env_remove(name);

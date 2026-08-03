@@ -432,6 +432,17 @@ if [[ $expected_namespace == gateway ]]; then
     exit 1
   fi
 fi
+if [[ $expected_namespace == admin ]]; then
+  if ! grep -Eq '(^|/)bin/git$' "$normalized_layer_contents"; then
+    echo "Storage Bootstrap image is missing the Git executable" >&2
+    exit 1
+  fi
+  if grep -Eq '(^|/)(bin/ssh|bin/sshd|etc/ssl/certs/ca-bundle\.crt|authorized_keys|ssh_host_[^/]*)$|^etc/agent-knowledge($|/)' \
+    "$normalized_layer_contents"; then
+    echo "Storage Bootstrap image contains transport, credential, CA, or deployment configuration" >&2
+    exit 1
+  fi
+fi
 if [[ $expected_namespace == openssh-gateway ]]; then
   for required_executable in bin/sshd bin/agent-knowledge bin/agent-knowledge-ssh-shell; do
     if ! grep -Fxq "$required_executable" "$normalized_layer_contents"; then

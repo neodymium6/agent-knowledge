@@ -67,6 +67,7 @@ fn fixture(root: &Path) -> (StorageBootstrap, StorageIdentities) {
         },
         StorageIdentities {
             administrative_owner: uid,
+            administrative_group: gid,
             worker_owner: uid,
             worker_group: gid,
             queue_owner: uid,
@@ -158,6 +159,141 @@ fn refuses_a_marker_for_different_identities() {
 
     assert!(matches!(
         bootstrap_storage_with_ids(&request, different, Vec::new()),
+        Err(StorageBootstrapError::MarkerMismatch)
+    ));
+}
+
+#[test]
+fn accepts_an_option_looking_official_branch() {
+    for branch in ["--detach", "HEAD"] {
+        let root = TestDirectory::new();
+        let (request, identities) = fixture(root.path());
+        let config = fs::read_to_string(&request.config)
+            .unwrap_or_else(|error| panic!("Worker config must be readable: {error}"));
+        fs::write(
+            &request.config,
+            config.replace(
+                "official_branch: main",
+                &format!("official_branch: {branch}"),
+            ),
+        )
+        .unwrap_or_else(|error| panic!("branch fixture must be written: {error}"));
+
+        bootstrap_storage_with_ids(&request, identities, Vec::new()).unwrap_or_else(|error| {
+            panic!("ambiguous-looking branch {branch} must initialize safely: {error}")
+        });
+        assert!(
+            root.path()
+                .join(format!("storage/repository/refs/heads/{branch}"))
+                .is_file()
+        );
+    }
+}
+
+#[test]
+fn runtime_path_is_not_part_of_the_durable_marker() {
+    let root = TestDirectory::new();
+    let (mut request, identities) = fixture(root.path());
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("fresh bootstrap must succeed: {error}"));
+    fs::remove_dir(&request.runtime_directory)
+        .unwrap_or_else(|error| panic!("old runtime directory must be removable: {error}"));
+    request.runtime_directory = root.path().join("run/reconfigured");
+
+    let mut output = Vec::new();
+    bootstrap_storage_with_ids(&request, identities, &mut output)
+        .unwrap_or_else(|error| panic!("new ephemeral runtime must be accepted: {error}"));
+    assert_eq!(output, b"{\"status\":\"already_initialized\"}\n");
+    assert!(request.runtime_directory.is_dir());
+}
+
+#[test]
+fn rejects_a_runtime_path_inside_the_durable_parent() {
+    let root = TestDirectory::new();
+    let (mut request, identities) = fixture(root.path());
+    request.runtime_directory = root.path().join("storage/runtime");
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::InvalidRuntimeDirectory)
+    ));
+    assert!(!root.path().join("storage").exists());
+}
+
+#[test]
+fn rejects_an_unknown_unmarked_storage_sibling() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    let storage = root.path().join("storage");
+    fs::create_dir(&storage)
+        .unwrap_or_else(|error| panic!("storage root must be created: {error}"));
+    fs::write(storage.join("unexpected"), b"partial")
+        .unwrap_or_else(|error| panic!("unexpected sibling must be written: {error}"));
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::PartialInitialization(path)) if path == storage
+    ));
+}
+
+#[test]
+fn marked_storage_rejects_a_corrupt_repository_binding() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("fresh bootstrap must succeed: {error}"));
+    fs::write(
+        root.path()
+            .join("storage/work/.agent-knowledge-repository-binding-v2"),
+        b"corrupt",
+    )
+    .unwrap_or_else(|error| panic!("binding must be replaceable in the fixture: {error}"));
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::Component(
+            "repository binding validation",
+            _
+        ))
+    ));
+}
+
+#[test]
+fn marked_storage_rejects_descendant_permission_drift() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("fresh bootstrap must succeed: {error}"));
+    let head = root.path().join("storage/repository/HEAD");
+    fs::set_permissions(&head, fs::Permissions::from_mode(0o600))
+        .unwrap_or_else(|error| panic!("fixture permissions must change: {error}"));
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::Permissions(path, _))
+            if path == root.path().join("storage/repository")
+    ));
+}
+
+#[test]
+fn marker_covers_the_initial_commit_identity() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("fresh bootstrap must succeed: {error}"));
+    let config = fs::read_to_string(&request.config)
+        .unwrap_or_else(|error| panic!("Worker config must be readable: {error}"));
+    fs::write(
+        &request.config,
+        config.replace(
+            "author_email: worker@example.invalid",
+            "author_email: replacement@example.invalid",
+        ),
+    )
+    .unwrap_or_else(|error| panic!("identity fixture must be written: {error}"));
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
         Err(StorageBootstrapError::MarkerMismatch)
     ));
 }

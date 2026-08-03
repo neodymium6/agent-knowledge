@@ -27,54 +27,69 @@
         x86_64-linux = "amd64";
         aarch64-linux = "arm64";
       };
-      unwrappedPackageFor =
-        system:
+      unwrappedPackageForWith =
+        {
+          system,
+          gitProgram ? null,
+        }:
         let
           pkgs = pkgsFor.${system};
         in
-        pkgs.rustPlatform.buildRustPackage {
-          pname = "agent-knowledge";
-          version = projectVersion;
+        pkgs.rustPlatform.buildRustPackage (
+          {
+            pname = "agent-knowledge";
+            version = projectVersion;
 
-          src = pkgs.lib.fileset.toSource {
-            root = ./.;
-            fileset = pkgs.lib.fileset.unions [
-              ./Cargo.lock
-              ./Cargo.toml
-              ./crates
-              ./deploy/systemd/agent-knowledge-worker.service
-              ./deploy/systemd/agent-knowledge-queue-ingress.socket
-              (./deploy/systemd + "/agent-knowledge-queue-ingress@.service")
-              ./deploy/systemd/agent-knowledge.conf.sysusers
-              ./deploy/systemd/agent-knowledge.conf.tmpfiles
-              ./src
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                ./Cargo.lock
+                ./Cargo.toml
+                ./crates
+                ./deploy/systemd/agent-knowledge-worker.service
+                ./deploy/systemd/agent-knowledge-queue-ingress.socket
+                (./deploy/systemd + "/agent-knowledge-queue-ingress@.service")
+                ./deploy/systemd/agent-knowledge.conf.sysusers
+                ./deploy/systemd/agent-knowledge.conf.tmpfiles
+                ./src
+              ];
+            };
+            cargoLock.lockFile = ./Cargo.lock;
+
+            cargoBuildFlags = [
+              "--workspace"
+              "--all-features"
             ];
-          };
-          cargoLock.lockFile = ./Cargo.lock;
+            doCheck = false;
+            doInstallCheck = true;
 
-          cargoBuildFlags = [
-            "--workspace"
-            "--all-features"
-          ];
-          doCheck = false;
-          doInstallCheck = true;
+            installCheckPhase = ''
+              runHook preInstallCheck
+              set +e
+              "$out/bin/agent-knowledge" >command-output 2>&1
+              status=$?
+              set -e
+              test "$status" -eq 2
+              grep -F "usage:" command-output
+              runHook postInstallCheck
+            '';
 
-          installCheckPhase = ''
-            runHook preInstallCheck
-            set +e
-            "$out/bin/agent-knowledge" >command-output 2>&1
-            status=$?
-            set -e
-            test "$status" -eq 2
-            grep -F "usage:" command-output
-            runHook postInstallCheck
-          '';
-
-          meta = {
-            description = "Centralized file-based knowledge management for coding agents";
-            mainProgram = "agent-knowledge";
-            platforms = linuxSystems;
-          };
+            meta = {
+              description = "Centralized file-based knowledge management for coding agents";
+              mainProgram = "agent-knowledge";
+              platforms = linuxSystems;
+            };
+          }
+          // pkgs.lib.optionalAttrs (gitProgram != null) {
+            AGENT_KNOWLEDGE_GIT_PROGRAM = gitProgram;
+          }
+        );
+      unwrappedPackageFor = system: unwrappedPackageForWith { inherit system; };
+      storageBootstrapUnwrappedPackageFor =
+        system:
+        unwrappedPackageForWith {
+          inherit system;
+          gitProgram = "${pkgsFor.${system}.gitMinimal}/bin/git";
         };
       packageFor =
         system:
@@ -159,7 +174,7 @@
         system:
         let
           pkgs = pkgsFor.${system};
-          unwrappedPackage = unwrappedPackageFor system;
+          unwrappedPackage = storageBootstrapUnwrappedPackageFor system;
         in
         pkgs.runCommand "agent-knowledge-storage-bootstrap-${projectVersion}"
           {

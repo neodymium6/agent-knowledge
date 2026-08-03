@@ -167,12 +167,17 @@ sibling storage roots plus a separate runtime `emptyDir`.
 
 The command writes a root-owned completion marker beside the five durable
 roots only after every component has initialized and permissions have been
-normalized. A matching marker makes later runs idempotent and allows the
-ephemeral runtime directory to be recreated after a Pod restart. Nonempty
+normalized, validated, and durably flushed on their shared filesystem. A
+matching marker makes later runs idempotent only after a bounded read-only
+validation of component bindings, descendant ownership, modes, and entry
+types. The ephemeral runtime path is not recorded in the durable marker and
+may be recreated or reconfigured after a Pod restart. Nonempty
 durable storage without that marker, a mismatched marker, a partially populated
-runtime directory, links, special files, or inconsistent component bindings
+runtime directory, unexpected links, special files, or inconsistent component bindings
 fail closed; the command never guesses how to repair or remove them. The five
-configured durable paths must be direct children of one non-root directory.
+configured durable paths must be direct children on the same mount beneath one
+non-root directory. Concurrent bootstrap attempts are serialized on that
+directory, and the runtime path must resolve outside it.
 For the fixed container identities, an init container invocation is:
 
 ```sh
