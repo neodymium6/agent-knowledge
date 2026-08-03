@@ -343,6 +343,7 @@
       packages = forLinuxSystems (system: rec {
         agent-knowledge = packageFor system;
         gateway-container-image = gatewayContainerImageFor system;
+        openssh-gateway-package = opensshGatewayPackageFor system;
         openssh-gateway-container-image = opensshGatewayContainerImageFor system;
         queue-ingress-container-image = queueIngressContainerImageFor system;
         worker-container-image = workerContainerImageFor system;

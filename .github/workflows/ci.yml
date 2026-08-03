@@ -38,12 +38,12 @@ jobs:
 
       - name: Exercise OpenSSH and distinct service identities
         run: |
-          nix develop --command cargo build --locked
+          openssh_gateway_package=$(nix build .#openssh-gateway-package --no-link --print-out-paths)
           openssh_binary=$(nix develop --command which sshd)
           openssh_bin=${openssh_binary%/sshd}
           sudo deploy/systemd/check-privilege-boundary.sh \
-            "$PWD/target/debug/agent-knowledge" \
-            "$PWD/target/debug/agent-knowledge-ssh-shell" \
+            "$openssh_gateway_package/bin/agent-knowledge" \
+            "$openssh_gateway_package/bin/agent-knowledge-ssh-shell" \
             "$PWD/deploy/systemd/agent-knowledge.conf.tmpfiles" \
             "$openssh_bin"
 
