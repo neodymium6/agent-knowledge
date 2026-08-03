@@ -351,6 +351,15 @@ objects. Rotating either external input requires a new object name in the Pod
 template so Kubernetes rolls the complete Pod; updating a projected object or
 mounted claim in place is not supported.
 
+The Kubernetes API does not expose a per-Pod PID limit in the Pod
+specification. Eligible nodes must therefore enforce a finite kubelet
+`podPidsLimit` no greater than the deployment's documented bound and carry the
+matching node label required by the Pod. Without that operator attestation the
+Pod remains unscheduled. This cgroup boundary limits the combined OpenSSH,
+Gateway, Worker, Queue Ingress, and Quartz process count; OpenSSH's
+`MaxStartups` and `MaxSessions` are not treated as an aggregate authenticated
+connection limit.
+
 Each socket-activated Queue Ingress process additionally compares its accepted
 standard-input socket's local Unix address with the root-controlled configured
 path and validates the socket file's queue-owner UID, ingress-client GID, and

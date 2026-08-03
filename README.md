@@ -289,9 +289,20 @@ Do not place Secret data, host keys, client keys, Git credentials, or private
 infrastructure values in the overlay repository. The default StorageClass must
 support `ReadWriteOncePod`, atomic rename, durable synchronization, stable inode
 identity, and exclusive `flock`; incompatible network filesystems are not
-supported. Kubernetes 1.33 or newer with node support for
-`supplementalGroupsPolicy` is required. The base explicitly selects `Merge` so
-the role-specific image group databases remain effective.
+supported.
+
+Kubernetes cannot express a PID limit in a Pod specification. Configure every
+eligible node's kubelet `podPidsLimit` to `512` or lower, then add the node label
+`agent-knowledge.io/pod-pids-limit=512`. The base requires that label, so it
+remains unscheduled when the operator has not attested the hard per-Pod cgroup
+limit. Do not add the label to a node with a higher or disabled limit. This
+bounds the total number of OpenSSH and forced-command Gateway processes even
+though `MaxStartups` covers only unauthenticated connections and `MaxSessions`
+covers sessions within one connection.
+
+Kubernetes 1.33 or newer with node support for `supplementalGroupsPolicy` is
+required. The base explicitly selects `Merge` so the role-specific image group
+databases remain effective.
 
 The SSH Service is internal `ClusterIP` port `2222`; external exposure remains
 an operator policy. The included NetworkPolicy permits Pod ingress only on that

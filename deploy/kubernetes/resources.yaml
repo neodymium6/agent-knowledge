@@ -71,6 +71,8 @@ spec:
       automountServiceAccountToken: false
       serviceAccountName: agent-knowledge
       terminationGracePeriodSeconds: 660
+      nodeSelector:
+        agent-knowledge.io/pod-pids-limit: "512"
       securityContext:
         seccompProfile:
           type: RuntimeDefault

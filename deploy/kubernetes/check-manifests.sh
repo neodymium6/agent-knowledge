@@ -59,6 +59,9 @@ jq -e '
     and (pod_spec.automountServiceAccountToken == false)
     and (pod_spec.serviceAccountName == "agent-knowledge")
     and (pod_spec.terminationGracePeriodSeconds >= 600)
+    and (pod_spec.nodeSelector == {
+      "agent-knowledge.io/pod-pids-limit": "512"
+    })
     and (pod_spec.securityContext.seccompProfile.type == "RuntimeDefault")
     and (pod_spec.securityContext.supplementalGroupsPolicy == "Merge")
     and (pod_spec.securityContext | has("fsGroup") | not)
