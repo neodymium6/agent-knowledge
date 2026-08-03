@@ -395,6 +395,7 @@
                 gh
                 git
                 just
+                kustomize
                 nixfmt-tree
                 pre-commit
                 rustc
@@ -460,6 +461,21 @@
                       ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
                     touch "$out"
               '';
+          kubernetesManifestCheck =
+            pkgs.runCommand "check-agent-knowledge-kubernetes-manifests"
+              {
+                nativeBuildInputs = [
+                  pkgs.jq
+                  pkgs.kube-linter
+                  pkgs.kustomize
+                  pkgs.yq-go
+                ];
+              }
+              ''
+                ${pkgs.bash}/bin/bash ${./deploy/kubernetes/check-manifests.sh} \
+                  ${./deploy/kubernetes}
+                touch "$out"
+              '';
         in
         {
           package = package;
@@ -470,6 +486,7 @@
               touch "$out"
             '';
           container-image = workerContainerImageCheck;
+          kubernetes-manifests = kubernetesManifestCheck;
           worker-container-image = workerContainerImageCheck;
           queue-ingress-container-image =
             let
