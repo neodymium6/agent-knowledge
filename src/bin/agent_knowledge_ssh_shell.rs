@@ -12,6 +12,7 @@ use std::os::unix::process::CommandExt;
 
 const FORCED_COMMAND_VERSION: &str = "akg-v1";
 const GATEWAY_PROGRAM_NAME: &str = "agent-knowledge";
+const GATEWAY_HOME: &str = "/var/empty";
 
 fn main() -> ExitCode {
     match launch(env::args_os()) {
@@ -27,13 +28,8 @@ fn launch(arguments: impl IntoIterator<Item = OsString>) -> Result<(), ShellErro
     let invocation = ForcedCommandInvocation::parse(arguments)?;
     let current_executable = env::current_exe().map_err(ShellError::CurrentExecutable)?;
     let gateway_program = sibling_gateway_program(&current_executable)?;
-    let mut command = Command::new(gateway_program);
-    command
-        .arg("gateway")
-        .arg("--config")
-        .arg(invocation.config)
-        .arg("--client-id")
-        .arg(invocation.client_id.as_str());
+    let original_command = env::var_os("SSH_ORIGINAL_COMMAND");
+    let mut command = gateway_command(gateway_program, invocation, original_command);
 
     #[cfg(unix)]
     {
@@ -44,6 +40,26 @@ fn launch(arguments: impl IntoIterator<Item = OsString>) -> Result<(), ShellErro
         let _ = command;
         Err(ShellError::UnsupportedPlatform)
     }
+}
+
+fn gateway_command(
+    gateway_program: PathBuf,
+    invocation: ForcedCommandInvocation,
+    original_command: Option<OsString>,
+) -> Command {
+    let mut command = Command::new(gateway_program);
+    command
+        .env_clear()
+        .env("HOME", GATEWAY_HOME)
+        .arg("gateway")
+        .arg("--config")
+        .arg(invocation.config)
+        .arg("--client-id")
+        .arg(invocation.client_id.as_str());
+    if let Some(original_command) = original_command {
+        command.env("SSH_ORIGINAL_COMMAND", original_command);
+    }
+    command
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -137,7 +153,8 @@ impl std::error::Error for ShellError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ForcedCommandInvocation, ShellError, sibling_gateway_program};
+    use super::{ForcedCommandInvocation, ShellError, gateway_command, sibling_gateway_program};
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
@@ -207,5 +224,33 @@ mod tests {
                 .unwrap_or_else(|error| panic!("sibling path must resolve: {error}")),
             PathBuf::from("/opt/fictional/bin/agent-knowledge")
         );
+    }
+
+    #[test]
+    fn child_environment_contains_only_gateway_inputs() {
+        let invocation = ForcedCommandInvocation::parse(arguments(
+            "akg-v1 /etc/agent-knowledge/gateway.yaml fictional-node-a",
+        ))
+        .unwrap_or_else(|error| panic!("forced command must parse: {error}"));
+        let command = gateway_command(
+            PathBuf::from("/opt/fictional/bin/agent-knowledge"),
+            invocation,
+            Some("akp-v1 list".into()),
+        );
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(OsString::from)))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(environment.len(), 2);
+        assert_eq!(
+            environment.get(&OsString::from("HOME")),
+            Some(&Some(OsString::from("/var/empty")))
+        );
+        assert_eq!(
+            environment.get(&OsString::from("SSH_ORIGINAL_COMMAND")),
+            Some(&Some(OsString::from("akp-v1 list")))
+        );
+        assert!(!environment.contains_key(&OsString::from("BASH_ENV")));
     }
 }

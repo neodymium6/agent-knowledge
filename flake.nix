@@ -141,14 +141,14 @@
         in
         pkgs.runCommand "agent-knowledge-openssh-gateway-${projectVersion}"
           {
-            nativeBuildInputs = [ pkgs.makeWrapper ];
+            nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
             pname = "agent-knowledge-openssh-gateway";
             version = projectVersion;
             meta = unwrappedPackage.meta;
           }
           ''
             mkdir -p "$out/bin"
-            makeWrapper ${unwrappedPackage}/bin/agent-knowledge \
+            makeBinaryWrapper ${unwrappedPackage}/bin/agent-knowledge \
               "$out/bin/agent-knowledge" \
               --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.gitMinimal ]}
             install -m755 ${unwrappedPackage}/bin/agent-knowledge-ssh-shell \

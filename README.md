@@ -150,10 +150,12 @@ included in the image.
 deterministic timestamps, role-locked entrypoints, fixed identity metadata,
 role-specific environment, and required filesystem entries without Docker or
 Podman. It also verifies the Worker's CA bundle, both Gateway variants' local
-Git dependency, and the absence of embedded OpenSSH configuration, key
-material, and role-inappropriate CA artifacts. Runtime storage, configuration,
-secrets, runtime socket directory, and writable paths are deployment-supplied
-mounts.
+Git dependency, and the absence of embedded deployment-specific OpenSSH
+configuration, key material, and role-inappropriate CA artifacts. The OpenSSH
+package's inert upstream default configuration remains in its closure, but the
+image entrypoint ignores it and requires the deployment-specific configuration
+at `/etc/agent-knowledge/sshd_config`. Runtime storage, configuration, secrets,
+runtime socket directory, and writable paths are deployment-supplied mounts.
 
 ### systemd service
 

@@ -381,6 +381,12 @@ if [[ $expected_namespace == openssh-gateway ]]; then
       echo "OpenSSH Gateway image executable must not be empty: ${executable_path}" >&2
       exit 1
     fi
+    executable_magic=$(od -An -tx1 -N4 "$work_directory/${executable_path##*/}")
+    executable_magic=${executable_magic//[[:space:]]/}
+    if [[ $executable_magic != 7f454c46 ]]; then
+      echo "OpenSSH Gateway image executable must be an ELF binary: ${executable_path}" >&2
+      exit 1
+    fi
   done
 fi
 if [[ $expected_ca_bundle != - ]]; then

@@ -169,17 +169,19 @@ general shell, and replaces itself with the Gateway while preserving
 `SSH_ORIGINAL_COMMAND`. Its OpenSSH master starts as root so it can authenticate
 and drop to the fixed Gateway identity; it does not require a privileged
 container. Deployment-specific server configuration, host keys, authorized
-keys, and Gateway configuration are mounted inputs rather than image content. The
-Gateway joins the ingress group; the broker does not join the Gateway reader
-group. Container deployments explicitly add supplemental GID `10004`; they do
-not rely on a runtime interpreting `/etc/group` membership. Deployments mount
-configuration, secrets, durable storage, runtime socket storage, and writable
-homes as needed. No conventional shell path, role-specific configuration,
-credentials, keys, or content is included. A Gateway deployment also disables
-networking, uses a read-only root filesystem, drops all Linux capabilities, and
-forbids privilege escalation. The Git package's Nix closure contains internal
-shell and transport helpers, so those runtime controls are part of the image's
-least-privilege boundary.
+keys, and Gateway configuration are mounted inputs rather than image content.
+The Gateway joins the ingress group; the broker does not join the Gateway
+reader group. Container deployments explicitly add supplemental GID `10004`;
+they do not rely on a runtime interpreting `/etc/group` membership. Deployments
+mount configuration, secrets, durable storage, runtime socket storage, and
+writable homes as needed. No conventional shell path, deployment-specific role
+configuration, credentials, keys, or content is included. The OpenSSH package's
+inert upstream default configuration remains in the adapter closure, but the
+entrypoint ignores it and requires the mounted deployment configuration. A
+one-shot Gateway deployment also disables networking, uses a read-only root
+filesystem, drops all Linux capabilities, and forbids privilege escalation.
+The Git package's Nix closure contains internal shell and transport helpers, so
+those runtime controls are part of the image's least-privilege boundary.
 
 The same executable can be used with different entry-point arguments in a
 service or container. Separate binaries may be produced from the same
