@@ -148,6 +148,7 @@ fn bootstrap_storage_with_ids(
     let marker_path = storage_root.join(MARKER_NAME);
     let expected_marker = BootstrapMarker::new(&settings, identities);
     validate_official_branch(settings.official_branch())?;
+    preflight_runtime_directory(&request.runtime_directory)?;
     ensure_directory(&storage_root)?;
     let storage_lock = lock_storage_root(&storage_root)?;
     revalidate_storage_lock(&storage_root, &storage_lock)?;
@@ -173,6 +174,7 @@ fn bootstrap_storage_with_ids(
         }
         validate_same_storage_mount(&storage_root, &storage_paths(&settings))
             .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
+        validate_durable_initialized(&settings, identities)?;
         initialize_runtime_directory(&request.runtime_directory, identities)?;
         revalidate_storage_lock(&storage_root, &storage_lock)?;
         validate_initialized(&settings, &request.runtime_directory, identities)?;
@@ -299,6 +301,16 @@ fn initialize_runtime_directory(
         Mode::from_bits_truncate(0o640),
     )
     .map_err(|error| StorageBootstrapError::Permissions(runtime_directory.into(), error))
+}
+
+fn preflight_runtime_directory(runtime_directory: &Path) -> Result<(), StorageBootstrapError> {
+    require_absent_or_empty(runtime_directory)?;
+    if path_exists(runtime_directory)? {
+        validate_bootstrap_source_tree(runtime_directory).map_err(|error| {
+            StorageBootstrapError::Permissions(runtime_directory.to_path_buf(), error)
+        })?;
+    }
+    Ok(())
 }
 
 impl BootstrapMarker {
@@ -675,6 +687,14 @@ fn validate_initialized(
     runtime_directory: &Path,
     ids: StorageIdentities,
 ) -> Result<(), StorageBootstrapError> {
+    validate_durable_initialized(settings, ids)?;
+    validate_runtime_initialized(runtime_directory, ids)
+}
+
+fn validate_durable_initialized(
+    settings: &WorkerSettings,
+    ids: StorageIdentities,
+) -> Result<(), StorageBootstrapError> {
     let storage_root = common_storage_root(settings)?;
     validate_storage_directory_no_posix_acl(&storage_root)
         .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
@@ -714,20 +734,6 @@ fn validate_initialized(
         ids.worker_group,
         0o750,
     )?;
-    require_directory_metadata(
-        runtime_directory,
-        ids.queue_owner,
-        ids.ingress_group,
-        0o2750,
-    )?;
-    validate_storage_tree(
-        runtime_directory,
-        ids.queue_owner,
-        ids.ingress_group,
-        Mode::from_bits_truncate(0o2750),
-        Mode::from_bits_truncate(0o640),
-    )
-    .map_err(|error| StorageBootstrapError::Permissions(runtime_directory.into(), error))?;
     validate_queue_tree(
         settings.queue_root(),
         ids.queue_owner,
@@ -793,6 +799,26 @@ fn validate_initialized(
         StorageBootstrapError::Component("release validation", error.to_string())
     })?;
     Ok(())
+}
+
+fn validate_runtime_initialized(
+    runtime_directory: &Path,
+    ids: StorageIdentities,
+) -> Result<(), StorageBootstrapError> {
+    require_directory_metadata(
+        runtime_directory,
+        ids.queue_owner,
+        ids.ingress_group,
+        0o2750,
+    )?;
+    validate_storage_tree(
+        runtime_directory,
+        ids.queue_owner,
+        ids.ingress_group,
+        Mode::from_bits_truncate(0o2750),
+        Mode::from_bits_truncate(0o640),
+    )
+    .map_err(|error| StorageBootstrapError::Permissions(runtime_directory.into(), error))
 }
 
 fn require_directory_metadata(

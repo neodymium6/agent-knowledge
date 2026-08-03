@@ -219,6 +219,42 @@ fn rejects_inherited_posix_acl_before_mutating_fresh_storage() {
 }
 
 #[test]
+fn rejects_nonempty_runtime_before_creating_fresh_storage() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    fs::create_dir(&request.runtime_directory)
+        .unwrap_or_else(|error| panic!("runtime fixture must be created: {error}"));
+    fs::write(
+        request.runtime_directory.join("fictional-request.json"),
+        b"{}",
+    )
+    .unwrap_or_else(|error| panic!("runtime fixture must be populated: {error}"));
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::PartialInitialization(path))
+            if path == request.runtime_directory
+    ));
+    assert!(!root.path().join("storage").exists());
+}
+
+#[test]
+fn rejects_runtime_acl_before_creating_fresh_storage() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    fs::create_dir(&request.runtime_directory)
+        .unwrap_or_else(|error| panic!("runtime fixture must be created: {error}"));
+    set_extended_posix_acl(&request.runtime_directory, "system.posix_acl_access");
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::Permissions(path, StorageMigrationError::PosixAcl(acl_path)))
+            if path == request.runtime_directory && acl_path.as_os_str().is_empty()
+    ));
+    assert!(!root.path().join("storage").exists());
+}
+
+#[test]
 fn rejects_posix_acl_added_to_ephemeral_runtime() {
     let root = TestDirectory::new();
     let (request, identities) = fixture(root.path());
@@ -481,6 +517,8 @@ fn marked_storage_rejects_a_corrupt_repository_binding() {
         b"corrupt",
     )
     .unwrap_or_else(|error| panic!("binding must be replaceable in the fixture: {error}"));
+    fs::remove_dir(&request.runtime_directory)
+        .unwrap_or_else(|error| panic!("runtime fixture must be removed: {error}"));
 
     assert!(matches!(
         bootstrap_storage_with_ids(&request, identities, Vec::new()),
@@ -489,6 +527,7 @@ fn marked_storage_rejects_a_corrupt_repository_binding() {
             _
         ))
     ));
+    assert!(!request.runtime_directory.exists());
 }
 
 #[test]
