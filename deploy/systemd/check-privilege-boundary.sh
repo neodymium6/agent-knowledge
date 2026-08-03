@@ -419,7 +419,6 @@ PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 HostbasedAuthentication no
-GSSAPIAuthentication no
 UsePAM no
 PermitRootLogin no
 AllowUsers $gateway_account
