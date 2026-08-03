@@ -104,7 +104,31 @@ pub(crate) fn bootstrap_storage(
         ingress_group: resolve_group(&request.ingress_group)
             .map_err(StorageBootstrapError::Identity)?,
     };
+    validate_service_identities(identities)?;
     bootstrap_storage_with_ids(request, identities, output)
+}
+
+fn validate_service_identities(identities: StorageIdentities) -> Result<(), StorageBootstrapError> {
+    let service_uids = [identities.worker_owner, identities.queue_owner];
+    let role_groups = [
+        identities.worker_group,
+        identities.queue_group,
+        identities.gateway_group,
+        identities.ingress_group,
+    ];
+    let duplicate_group = role_groups
+        .iter()
+        .enumerate()
+        .any(|(index, group)| role_groups[..index].contains(group));
+    if service_uids.iter().any(|uid| uid.as_raw() == 0)
+        || service_uids[0] == service_uids[1]
+        || role_groups.iter().any(|group| group.as_raw() == 0)
+        || duplicate_group
+    {
+        Err(StorageBootstrapError::UnsafeServiceIdentities)
+    } else {
+        Ok(())
+    }
 }
 
 fn bootstrap_storage_with_ids(
@@ -873,6 +897,7 @@ pub(crate) enum StorageBootstrapError {
     RootRequired,
     Config(WorkerConfigError),
     Identity(StorageMigrationError),
+    UnsafeServiceIdentities,
     StorageLayout,
     StorageBusy,
     InvalidRuntimeDirectory,
@@ -899,6 +924,9 @@ impl fmt::Display for StorageBootstrapError {
             Self::RootRequired => formatter.write_str("storage bootstrap must run as root"),
             Self::Config(error) => write!(formatter, "invalid Worker configuration: {error}"),
             Self::Identity(error) => write!(formatter, "invalid storage identity: {error}"),
+            Self::UnsafeServiceIdentities => formatter.write_str(
+                "storage bootstrap service UIDs and role GIDs must be non-root and distinct",
+            ),
             Self::StorageLayout => formatter.write_str(
                 "storage bootstrap requires all five storage paths to be direct children of one non-root directory",
             ),

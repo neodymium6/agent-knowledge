@@ -204,7 +204,10 @@ agent-knowledge admin bootstrap-storage \
 
 The named identity defaults resolve to the same values in the supplied image,
 so Kubernetes manifests may omit the numeric overrides. Explicit numeric
-values make the volume ownership contract visible in a manifest.
+values make the volume ownership contract visible in a manifest. Both service
+UIDs and all four role GIDs must be non-root; the service UIDs must differ and
+the role GIDs must be pairwise distinct so an override cannot collapse the
+Worker, Queue Ingress, Gateway reader, and socket-client boundaries.
 
 `just check-package` validates all five image archives, architectures,
 deterministic timestamps, role-locked entrypoints, fixed identity metadata,

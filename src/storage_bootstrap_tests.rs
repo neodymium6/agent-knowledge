@@ -9,7 +9,7 @@ use xattr::FileExt as _;
 
 use super::{
     StorageBootstrap, StorageBootstrapError, StorageIdentities, StorageMigrationError,
-    bootstrap_storage_with_ids,
+    bootstrap_storage_with_ids, validate_service_identities,
 };
 
 struct TestDirectory {
@@ -78,6 +78,42 @@ fn fixture(root: &Path) -> (StorageBootstrap, StorageIdentities) {
             ingress_group: gid,
         },
     )
+}
+
+fn separated_service_identities() -> StorageIdentities {
+    StorageIdentities {
+        administrative_owner: Uid::from_raw(0),
+        administrative_group: Gid::from_raw(0),
+        worker_owner: Uid::from_raw(10_003),
+        worker_group: Gid::from_raw(10_003),
+        queue_owner: Uid::from_raw(10_002),
+        queue_group: Gid::from_raw(10_002),
+        gateway_group: Gid::from_raw(10_001),
+        ingress_group: Gid::from_raw(10_004),
+    }
+}
+
+#[test]
+fn requires_non_root_distinct_service_identities() {
+    let identities = separated_service_identities();
+    validate_service_identities(identities)
+        .unwrap_or_else(|error| panic!("separated service identities must be valid: {error}"));
+
+    let mut root_uid = identities;
+    root_uid.worker_owner = Uid::from_raw(0);
+    let mut shared_uid = identities;
+    shared_uid.queue_owner = shared_uid.worker_owner;
+    let mut root_group = identities;
+    root_group.gateway_group = Gid::from_raw(0);
+    let mut shared_group = identities;
+    shared_group.ingress_group = shared_group.queue_group;
+
+    for invalid in [root_uid, shared_uid, root_group, shared_group] {
+        assert!(matches!(
+            validate_service_identities(invalid),
+            Err(StorageBootstrapError::UnsafeServiceIdentities)
+        ));
+    }
 }
 
 fn set_extended_posix_acl(path: &Path, name: &str) {
