@@ -5,102 +5,6 @@ metadata:
 automountServiceAccountToken: false
 ---
 apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: agent-knowledge-config
-data:
-  worker.yaml: |
-    schema_version: 1
-    storage:
-      queue_root: /var/lib/agent-knowledge/queue
-      repository_root: /var/lib/agent-knowledge/repository
-      content_root: /var/lib/agent-knowledge/content
-      work_root: /var/lib/agent-knowledge/work
-      release_root: /var/lib/agent-knowledge/releases
-    repository:
-      official_branch: main
-      author_name: Fictional Knowledge Worker
-      author_email: worker@example.invalid
-    quartz:
-      program: /opt/agent-knowledge-quartz/bin/build-site
-      integration_root: /opt/agent-knowledge-quartz
-      timeout_seconds: 300
-    batch:
-      debounce_seconds: 30
-      maximum_age_seconds: 300
-      maximum_scan_entries: 1024
-      maximum_requests: 100
-      maximum_recovery_requests: 10000
-    retention:
-      retained_releases: 10
-      maximum_scan_entries: 10000
-      maximum_removals: 10
-  gateway.yaml: |
-    schema_version: 4
-    identity:
-      gateway_uid: 10001
-    storage:
-      queue_socket: /run/agent-knowledge/queue-ingress.sock
-      git_directory: /var/lib/agent-knowledge/repository
-      content_root: /var/lib/agent-knowledge/content
-    repository:
-      official_branch: main
-    reads:
-      maximum_results: 100
-      maximum_query_characters: 512
-      maximum_index_entries: 100000
-      maximum_index_markdown_bytes: 536870912
-      maximum_search_documents: 10000
-      maximum_search_markdown_bytes: 536870912
-      operation_timeout_seconds: 30
-      maximum_response_bytes: 268435456
-      search_metadata:
-        node: true
-        agent: true
-        session: true
-        request_id: true
-    transport:
-      submit_timeout_seconds: 300
-  sshd_config: |
-    ListenAddress 0.0.0.0
-    ListenAddress ::
-    AddressFamily any
-    HostKey /etc/agent-knowledge/ssh/ssh_host_ed25519_key
-    PidFile /run/sshd/sshd.pid
-    AuthorizedKeysFile /etc/agent-knowledge/ssh/authorized_keys
-    AuthorizedKeysCommand none
-    TrustedUserCAKeys none
-    AuthenticationMethods publickey
-    PubkeyAuthentication yes
-    PasswordAuthentication no
-    KbdInteractiveAuthentication no
-    HostbasedAuthentication no
-    UsePAM no
-    PermitRootLogin no
-    AllowUsers agent-knowledge-gateway
-    AllowGroups agent-knowledge-gateway
-    PermitTTY no
-    DisableForwarding yes
-    AllowAgentForwarding no
-    AllowTcpForwarding no
-    GatewayPorts no
-    X11Forwarding no
-    PermitTunnel no
-    PermitUserEnvironment no
-    PermitUserRC no
-    MaxAuthTries 3
-    MaxSessions 1
-    MaxStartups 10:30:30
-    LoginGraceTime 10
-    ClientAliveInterval 15
-    ClientAliveCountMax 1
-    StrictModes yes
-    PrintMotd no
-    PrintLastLog no
-    UseDNS no
-    LogLevel VERBOSE
----
-apiVersion: v1
 kind: Service
 metadata:
   name: agent-knowledge-headless
@@ -355,7 +259,7 @@ spec:
             sizeLimit: 16Mi
         - name: ssh-credentials
           secret:
-            secretName: agent-knowledge-ssh
+            secretName: agent-knowledge-ssh-v1
             defaultMode: 0400
             items:
               - key: ssh_host_ed25519_key
@@ -366,7 +270,7 @@ spec:
                 mode: 0444
         - name: quartz
           persistentVolumeClaim:
-            claimName: agent-knowledge-quartz
+            claimName: agent-knowledge-quartz-v1
             readOnly: true
   volumeClaimTemplates:
     - metadata:

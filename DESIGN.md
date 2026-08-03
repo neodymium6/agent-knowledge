@@ -344,6 +344,13 @@ identity. The deployment must not select `Strict`, which intentionally ignores
 the image account database and would remove the two required container-specific
 memberships.
 
+All containers in the Pod must consume one coherent set of startup inputs.
+Generated configuration uses a content-addressed ConfigMap name, while SSH
+credentials and Quartz content use immutable, versioned deployment-owned
+objects. Rotating either external input requires a new object name in the Pod
+template so Kubernetes rolls the complete Pod; updating a projected object or
+mounted claim in place is not supported.
+
 Each socket-activated Queue Ingress process additionally compares its accepted
 standard-input socket's local Unix address with the root-controlled configured
 path and validates the socket file's queue-owner UID, ingress-client GID, and

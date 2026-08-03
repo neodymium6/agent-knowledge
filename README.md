@@ -268,12 +268,22 @@ applying it, create an overlay that:
 - replaces the four `example.invalid` image references with immutable images
   built from this revision;
 - patches the fictional Worker and Gateway settings when appropriate;
-- provides an `agent-knowledge-quartz` claim containing the root-owned,
-  non-writable Quartz launcher and integration tree at the paths named in
-  `worker.yaml`; and
-- provides an `agent-knowledge-ssh` Secret with `ssh_host_ed25519_key` and
-  `authorized_keys` entries. Each authorized key must carry the forced command
-  `akg-v1 /etc/agent-knowledge/gateway.yaml <client-id>`.
+- provides an immutable, versioned `agent-knowledge-quartz-v1` claim containing
+  the root-owned, non-writable Quartz launcher and integration tree at the paths
+  named in `worker.yaml`; and
+- provides an immutable, versioned `agent-knowledge-ssh-v1` Secret with
+  `ssh_host_ed25519_key` and `authorized_keys` entries. Each authorized key must
+  carry the forced command `akg-v1 /etc/agent-knowledge/gateway.yaml
+  <client-id>`.
+
+Kustomize gives the generated configuration ConfigMap a content-hashed name,
+so changing any file below `deploy/kubernetes/config` changes the Pod template
+and triggers a rollout. Treat the external Secret and Quartz claim as immutable
+inputs: set `immutable: true` on the Secret, never replace claim contents in
+place, and use a new versioned name for every rotation or Quartz release. Patch
+the corresponding volume reference in the overlay; that Pod-template change
+rolls all processes together instead of exposing a mixture of old and new
+startup inputs.
 
 Do not place Secret data, host keys, client keys, Git credentials, or private
 infrastructure values in the overlay repository. The default StorageClass must

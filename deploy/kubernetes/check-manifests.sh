@@ -48,6 +48,10 @@ jq -e '
     })
     and (stateful_set.spec.selector.matchLabels
       == stateful_set.spec.template.metadata.labels)
+    and (resources("ConfigMap")[0].metadata.name
+      | startswith("agent-knowledge-config-"))
+    and (volume("configuration").configMap.name
+      == resources("ConfigMap")[0].metadata.name)
     and (stateful_set.spec.volumeClaimTemplates | length == 1)
     and (stateful_set.spec.volumeClaimTemplates[0].metadata.name == "knowledge")
     and (stateful_set.spec.volumeClaimTemplates[0].spec.accessModes
@@ -92,13 +96,14 @@ jq -e '
     and (mount(container("worker"); "quartz").readOnly == true)
     and (volume("runtime") | has("emptyDir"))
     and (volume("sshd-runtime") | has("emptyDir"))
-    and (volume("ssh-credentials").secret.secretName == "agent-knowledge-ssh")
+    and (volume("ssh-credentials").secret.secretName
+      == "agent-knowledge-ssh-v1")
     and (volume("ssh-credentials").secret.items
       | map(select(.key == "ssh_host_ed25519_key"))[0].mode == 256)
     and (volume("ssh-credentials").secret.items
       | map(select(.key == "authorized_keys"))[0].mode == 292)
     and (volume("quartz").persistentVolumeClaim.claimName
-      == "agent-knowledge-quartz")
+      == "agent-knowledge-quartz-v1")
     and (volume("quartz").persistentVolumeClaim.readOnly == true)
     and (pod_spec.volumes | all(.[]; has("hostPath") | not))
     and (resources("ConfigMap")[0].data | keys | sort
