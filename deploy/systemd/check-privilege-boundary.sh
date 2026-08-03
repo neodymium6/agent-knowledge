@@ -348,6 +348,19 @@ grep -Fq 'queue-owner and ingress-client groups' \
   "$test_root/collapsed-ingress.log"
 chown "$queue_uid":"$ingress_gid" "$test_root/run"
 
+chmod 2770 "$test_root/run"
+if setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
+  "$test_root/agent-knowledge" queue-ingress serve \
+  --queue-root "$test_root/storage/queue" \
+  --socket-path "$test_root/run/queue-ingress.sock" </dev/null \
+  >"$test_root/writable-runtime.log" 2>&1; then
+  echo "Queue Ingress accepted a group-writable socket namespace" >&2
+  exit 1
+fi
+grep -Fq 'mode 2770 does not match required 2750' \
+  "$test_root/writable-runtime.log"
+chmod 2750 "$test_root/run"
+
 if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" \
   --groups="$ingress_gid,$queue_gid" \
   env SSH_ORIGINAL_COMMAND='akp-v1 list' \

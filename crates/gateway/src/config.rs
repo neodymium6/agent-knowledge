@@ -188,7 +188,8 @@ impl TryFrom<WireGatewayConfig> for GatewaySettings {
                 found: wire.schema_version,
             });
         }
-        if wire.identity.gateway_uid == 0 {
+        let identity = wire.identity.ok_or(GatewayConfigError::MissingIdentity)?;
+        if identity.gateway_uid == 0 {
             return Err(GatewayConfigError::InvalidGatewayUid);
         }
         let queue_socket = validate_storage_path(wire.storage.queue_socket, "queue_socket")?;
@@ -241,7 +242,7 @@ impl TryFrom<WireGatewayConfig> for GatewaySettings {
             return Err(GatewayConfigError::InvalidSubmitTimeout);
         }
         Ok(Self {
-            gateway_uid: wire.identity.gateway_uid,
+            gateway_uid: identity.gateway_uid,
             queue_socket,
             git_directory,
             content_root,
@@ -310,7 +311,7 @@ fn validate_storage_path(
 #[serde(deny_unknown_fields)]
 struct WireGatewayConfig {
     schema_version: u16,
-    identity: WireIdentity,
+    identity: Option<WireIdentity>,
     storage: WireStorage,
     repository: WireRepository,
     reads: WireReads,
@@ -387,6 +388,8 @@ pub enum GatewayConfigError {
         /// Version found in the file.
         found: u16,
     },
+    /// The current schema omitted its required service identity section.
+    MissingIdentity,
     /// The configured Gateway user ID was root.
     InvalidGatewayUid,
     /// A storage path was relative, non-normalized, or a filesystem root.
@@ -437,6 +440,9 @@ impl fmt::Display for GatewayConfigError {
                 formatter,
                 "unsupported Gateway configuration schema version {found}"
             ),
+            Self::MissingIdentity => {
+                formatter.write_str("Gateway configuration requires an `identity` section")
+            }
             Self::InvalidGatewayUid => {
                 formatter.write_str("Gateway user ID must be a non-root numeric ID")
             }
@@ -506,12 +512,19 @@ mod tests {
         assert_eq!(settings.maximum_response_bytes(), 268_435_456);
         assert_eq!(settings.search_metadata_fields(), [true; 4]);
 
-        assert!(
-            GatewaySettings::decode(
-                &VALID_CONFIG.replace("schema_version: 4", "schema_version: 3")
-            )
-            .is_err()
+        let version_three = VALID_CONFIG.replacen(
+            "schema_version: 4\nidentity:\n  gateway_uid: 61001\n",
+            "schema_version: 3\n",
+            1,
         );
+        assert!(matches!(
+            GatewaySettings::decode(&version_three),
+            Err(GatewayConfigError::UnsupportedSchemaVersion { found: 3 })
+        ));
+        assert!(matches!(
+            GatewaySettings::decode(&VALID_CONFIG.replace("identity:\n  gateway_uid: 61001\n", "")),
+            Err(GatewayConfigError::MissingIdentity)
+        ));
         assert!(
             GatewaySettings::decode(
                 &VALID_CONFIG.replace("/run/agent-knowledge/queue-ingress.sock", "relative/socket")

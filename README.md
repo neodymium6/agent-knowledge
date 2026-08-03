@@ -416,8 +416,10 @@ agent-knowledge queue-ingress listen \
 
 The runtime directory must already exist, be owned and writable by the
 queue-ingress identity, use the setgid `agent-knowledge-ingress` group, and be
-writable by neither group nor other; mode `2750` is recommended. The container
-identity database assigns this group GID `10004`, and the Gateway joins it.
+writable by neither group nor other. Runtime identity validation requires exact
+mode `2750` and rejects both access and default POSIX ACLs. The container
+identity database assigns the ingress group GID `10004`, and the Gateway joins
+it.
 Its configured path must already be canonical, must not traverse symbolic
 links, and must leave room within Linux `sun_path` for the listener's 30-byte
 `.ak-<ULID>` temporary socket name; this is checked before listener state is

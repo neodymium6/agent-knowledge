@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use agent_knowledge_gateway::GatewaySettings;
@@ -14,12 +14,17 @@ use agent_knowledge_worker::WorkerSettings;
 use nix::sys::socket::{UnixAddr, getsockname};
 #[cfg(target_os = "linux")]
 use nix::unistd::{Gid, Uid, getgroups};
+#[cfg(target_os = "linux")]
+use xattr::FileExt as _;
 
 const WORKER_ROLE: &str = "Worker";
 const QUEUE_INGRESS_ROLE: &str = "Queue Ingress";
 const GATEWAY_ROLE: &str = "Gateway";
 #[cfg(target_os = "linux")]
 const ACTIVATED_SOCKET_MODE: u32 = 0o660;
+const RUNTIME_DIRECTORY_MODE: u32 = 0o2750;
+#[cfg(target_os = "linux")]
+const POSIX_ACL_XATTRS: [&str; 2] = ["system.posix_acl_access", "system.posix_acl_default"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProcessIdentity {
@@ -58,24 +63,47 @@ struct DirectoryIdentity {
     path: PathBuf,
     uid: u32,
     gid: u32,
+    mode: u32,
 }
 
 impl DirectoryIdentity {
     #[cfg(target_os = "linux")]
     fn inspect(path: &Path) -> Result<Self, RuntimeIdentityError> {
-        let metadata = fs::symlink_metadata(path).map_err(|source| {
-            RuntimeIdentityError::BoundaryInspection {
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|source| RuntimeIdentityError::BoundaryInspection {
                 path: path.to_path_buf(),
                 source,
-            }
-        })?;
+            })?;
+        let metadata =
+            directory
+                .metadata()
+                .map_err(|source| RuntimeIdentityError::BoundaryInspection {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
         if !metadata.file_type().is_dir() {
             return Err(RuntimeIdentityError::InvalidBoundary(path.to_path_buf()));
+        }
+        for name in POSIX_ACL_XATTRS {
+            if directory
+                .get_xattr(name)
+                .map_err(|source| RuntimeIdentityError::BoundaryInspection {
+                    path: path.to_path_buf(),
+                    source,
+                })?
+                .is_some()
+            {
+                return Err(RuntimeIdentityError::PosixAclBoundary(path.to_path_buf()));
+            }
         }
         Ok(Self {
             path: path.to_path_buf(),
             uid: metadata.uid(),
             gid: metadata.gid(),
+            mode: metadata.mode() & 0o7777,
         })
     }
 
@@ -85,11 +113,12 @@ impl DirectoryIdentity {
     }
 
     #[cfg(test)]
-    fn fictional(path: &str, uid: u32, gid: u32) -> Self {
+    fn fictional(path: &str, uid: u32, gid: u32, mode: u32) -> Self {
         Self {
             path: PathBuf::from(path),
             uid,
             gid,
+            mode,
         }
     }
 }
@@ -248,6 +277,7 @@ fn validate_queue_ingress_identity(
     queue: &DirectoryIdentity,
     runtime: &DirectoryIdentity,
 ) -> Result<(), RuntimeIdentityError> {
+    require_boundary_mode(QUEUE_INGRESS_ROLE, runtime, RUNTIME_DIRECTORY_MODE)?;
     require_matching_owner(QUEUE_INGRESS_ROLE, queue, &[runtime])?;
     require_distinct(
         QUEUE_INGRESS_ROLE,
@@ -275,6 +305,7 @@ fn validate_gateway_identity(
     expected_uid: u32,
     boundaries: &GatewayBoundaries,
 ) -> Result<(), RuntimeIdentityError> {
+    require_boundary_mode(GATEWAY_ROLE, &boundaries.runtime, RUNTIME_DIRECTORY_MODE)?;
     require_matching_owner(GATEWAY_ROLE, &boundaries.repository, &[&boundaries.content])?;
     require_matching_group(GATEWAY_ROLE, &boundaries.repository, &[&boundaries.content])?;
     require_distinct(
@@ -302,6 +333,22 @@ fn validate_gateway_identity(
         boundaries.repository.gid,
         [boundaries.repository.gid, boundaries.runtime.gid],
     )
+}
+
+fn require_boundary_mode(
+    role: &'static str,
+    boundary: &DirectoryIdentity,
+    expected: u32,
+) -> Result<(), RuntimeIdentityError> {
+    if boundary.mode != expected {
+        return Err(RuntimeIdentityError::BoundaryModeMismatch {
+            role,
+            path: boundary.path.clone(),
+            expected,
+            actual: boundary.mode,
+        });
+    }
+    Ok(())
 }
 
 fn require_matching_owner(
@@ -431,6 +478,13 @@ pub(crate) enum RuntimeIdentityError {
         source: io::Error,
     },
     InvalidBoundary(PathBuf),
+    PosixAclBoundary(PathBuf),
+    BoundaryModeMismatch {
+        role: &'static str,
+        path: PathBuf,
+        expected: u32,
+        actual: u32,
+    },
     UnnamedActivatedSocket,
     ActivatedSocketPathMismatch {
         expected: PathBuf,
@@ -518,6 +572,21 @@ impl fmt::Display for RuntimeIdentityError {
                     path.display()
                 )
             }
+            Self::PosixAclBoundary(path) => write!(
+                formatter,
+                "runtime identity boundary {} has a POSIX ACL",
+                path.display()
+            ),
+            Self::BoundaryModeMismatch {
+                role,
+                path,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{role} boundary {} mode {actual:04o} does not match required {expected:04o}",
+                path.display()
+            ),
             Self::UnnamedActivatedSocket => {
                 formatter.write_str("activated Unix socket has no filesystem path")
             }
@@ -627,12 +696,14 @@ impl std::error::Error for RuntimeIdentityError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, File};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
 
+    use nix::unistd::Uid;
     use ulid::Ulid;
+    use xattr::FileExt as _;
 
     use super::{
         ACTIVATED_SOCKET_MODE, DirectoryIdentity, GatewayBoundaries, ProcessIdentity,
@@ -687,13 +758,59 @@ mod tests {
             .unwrap_or_else(|error| panic!("socket test directory must be removed: {error}"));
     }
 
+    #[test]
+    fn directory_inspection_rejects_posix_acls() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-knowledge-runtime-acl-test-{}",
+            Ulid::generate()
+        ));
+        fs::create_dir(&directory)
+            .unwrap_or_else(|error| panic!("ACL test directory must be created: {error}"));
+        let named_uid = Uid::effective().as_raw();
+        let mut value = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01_u16, 0o7_u16, u32::MAX),
+            (0x02_u16, 0o7_u16, named_uid),
+            (0x04_u16, 0o5_u16, u32::MAX),
+            (0x10_u16, 0o7_u16, u32::MAX),
+            (0x20_u16, 0o5_u16, u32::MAX),
+        ] {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&permissions.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        let file = File::open(&directory)
+            .unwrap_or_else(|error| panic!("ACL test directory must open: {error}"));
+        file.set_xattr("system.posix_acl_access", &value)
+            .unwrap_or_else(|error| panic!("ACL fixture must be written: {error}"));
+
+        assert!(matches!(
+            DirectoryIdentity::inspect(&directory),
+            Err(RuntimeIdentityError::PosixAclBoundary(path)) if path == directory
+        ));
+
+        drop(file);
+        fs::remove_dir(&directory)
+            .unwrap_or_else(|error| panic!("ACL test directory must be removed: {error}"));
+    }
+
     fn worker_boundaries() -> WorkerBoundaries {
         WorkerBoundaries {
-            queue: DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 62_002),
-            repository: DirectoryIdentity::fictional("/srv/fictional/repository", 61_003, 62_001),
-            content: DirectoryIdentity::fictional("/srv/fictional/content", 61_003, 62_001),
-            work: DirectoryIdentity::fictional("/srv/fictional/work", 61_003, 62_003),
-            releases: DirectoryIdentity::fictional("/srv/fictional/releases", 61_003, 62_003),
+            queue: DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 62_002, 0o2770),
+            repository: DirectoryIdentity::fictional(
+                "/srv/fictional/repository",
+                61_003,
+                62_001,
+                0o2750,
+            ),
+            content: DirectoryIdentity::fictional("/srv/fictional/content", 61_003, 62_001, 0o2750),
+            work: DirectoryIdentity::fictional("/srv/fictional/work", 61_003, 62_003, 0o750),
+            releases: DirectoryIdentity::fictional(
+                "/srv/fictional/releases",
+                61_003,
+                62_003,
+                0o750,
+            ),
         }
     }
 
@@ -732,8 +849,8 @@ mod tests {
 
     #[test]
     fn accepts_exact_queue_ingress_identity() {
-        let queue = DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 62_002);
-        let runtime = DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004);
+        let queue = DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 62_002, 0o2770);
+        let runtime = DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004, 0o2750);
         assert!(
             validate_queue_ingress_identity(&process(61_002, 62_002, &[62_002]), &queue, &runtime,)
                 .is_ok()
@@ -742,8 +859,8 @@ mod tests {
 
     #[test]
     fn rejects_queue_ingress_in_the_socket_client_group() {
-        let queue = DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 62_002);
-        let runtime = DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004);
+        let queue = DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 62_002, 0o2770);
+        let runtime = DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004, 0o2750);
         assert!(matches!(
             validate_queue_ingress_identity(
                 &process(61_002, 62_002, &[62_002, 62_004]),
@@ -756,19 +873,34 @@ mod tests {
 
     #[test]
     fn rejects_queue_ingress_with_a_root_owned_queue() {
-        let queue = DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 0);
-        let runtime = DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004);
+        let queue = DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 0, 0o2770);
+        let runtime = DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004, 0o2750);
         assert!(matches!(
             validate_queue_ingress_identity(&process(61_002, 0, &[0]), &queue, &runtime),
             Err(RuntimeIdentityError::CollapsedBoundary { .. })
         ));
     }
 
+    #[test]
+    fn rejects_queue_ingress_with_a_writable_socket_namespace() {
+        let queue = DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 62_002, 0o2770);
+        let runtime = DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004, 0o2770);
+        assert!(matches!(
+            validate_queue_ingress_identity(&process(61_002, 62_002, &[62_002]), &queue, &runtime,),
+            Err(RuntimeIdentityError::BoundaryModeMismatch { .. })
+        ));
+    }
+
     fn gateway_boundaries() -> GatewayBoundaries {
         GatewayBoundaries {
-            repository: DirectoryIdentity::fictional("/srv/fictional/repository", 61_003, 62_001),
-            content: DirectoryIdentity::fictional("/srv/fictional/content", 61_003, 62_001),
-            runtime: DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004),
+            repository: DirectoryIdentity::fictional(
+                "/srv/fictional/repository",
+                61_003,
+                62_001,
+                0o2750,
+            ),
+            content: DirectoryIdentity::fictional("/srv/fictional/content", 61_003, 62_001, 0o2750),
+            runtime: DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004, 0o2750),
         }
     }
 
