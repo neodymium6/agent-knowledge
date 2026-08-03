@@ -19,9 +19,9 @@ asynchronously with durable retry state. Derived-release retention and
 document-bundle export are implemented. The flake provides reproducible Linux
 packaging, a conventional systemd Worker service, and a systemd-activated local
 queue-ingress broker that isolates the forced-command Gateway from durable queue
-access under distinct service identities. Reproducible Worker and Queue
-Ingress container packaging is implemented; the Gateway container and
-single-replica Kubernetes packaging remain future work.
+access under distinct service identities. Reproducible Worker, Queue Ingress,
+and one-shot Gateway container packaging is implemented; single-replica
+Kubernetes packaging remains future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -81,6 +81,14 @@ nix build .#queue-ingress-container-image
 docker load < result
 ```
 
+Build the role-locked, one-shot Gateway image used by an external OpenSSH
+forced command:
+
+```sh
+nix build .#gateway-container-image
+docker load < result
+```
+
 The flake builds the image natively for both `x86_64-linux` (`amd64`) and
 `aarch64-linux` (`arm64`). Its entrypoint fixes the wrapped executable and
 `worker run` role; the configuration path is supplied as an argument by the
@@ -98,10 +106,25 @@ runtime directory, and listener arguments. A dedicated ingress-socket group
 (`10004`) grants the Gateway access to the `0660` socket without granting the
 broker the Gateway reader group or granting Gateway access to the queue.
 
-`just check-package` validates both image archives, architectures,
+The Gateway image fixes the non-root `agent-knowledge-gateway` identity
+(`10001:10001`) and `gateway` entrypoint. The forced-command deployment passes
+the root-controlled `--config` path and per-key `--client-id`, preserves the
+exact `SSH_ORIGINAL_COMMAND`, and connects the container standard streams to
+the authenticated SSH session. The image includes local Git for committed
+reads, but no SSH client, SSH server, CA bundle, credentials, keys, shell, or
+deployment configuration. OpenSSH authentication and process creation remain
+outside the image, consistent with the existing transport boundary. The
+container runtime must add supplemental GID `10004` so the Gateway can connect
+to the queue-ingress socket; identity-database membership alone is not a
+portable substitute for an explicit runtime group. It must also mount the
+root-controlled configuration, committed repository and content for read-only
+access, and the queue-ingress runtime directory.
+
+`just check-package` validates all three image archives, architectures,
 deterministic timestamps, role-locked entrypoints, non-root metadata, identity
 database, role-specific environment, and required filesystem entries without
-Docker or Podman. It also verifies the Worker's CA bundle. Runtime storage,
+Docker or Podman. It also verifies the Worker's CA bundle, the Gateway's local
+Git dependency, and the absence of cross-role executables. Runtime storage,
 configuration, secrets, runtime socket directory, and writable paths are
 deployment-supplied mounts.
 

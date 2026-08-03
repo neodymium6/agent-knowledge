@@ -146,21 +146,27 @@ program path and integration directory. The package contains no credentials,
 host keys, client keys, deployment-specific Worker or Gateway configuration,
 or Quartz content.
 
-The flake also publishes reproducible, Docker-compatible Worker and Queue
-Ingress image archives for `amd64` and `arm64`. Their entrypoints fix the
-executable and exact `worker run` or `queue-ingress listen` role so deployment
-arguments cannot start another role with the mounted authority. The Worker
+The flake also publishes reproducible, Docker-compatible Worker, Queue Ingress,
+and Gateway image archives for `amd64` and `arm64`. Their entrypoints fix the
+executable and exact `worker run`, `queue-ingress listen`, or `gateway` role so
+deployment arguments cannot start another role with the mounted authority. The Worker
 image resolves its non-root account to `10003:10003`, includes queue GID
 `10002` as a supplementary group, retains the Git/OpenSSH runtime wrapper, and
 provides an immutable CA bundle through `SSL_CERT_FILE` for HTTPS Git
 replication. The Queue Ingress image resolves its account to `10002:10002`,
 publishes its socket with dedicated ingress GID `10004`, and uses the raw Rust
-executable closure without Git, OpenSSH, or a CA bundle. The Gateway joins the
-ingress group; the broker does not join the Gateway reader group. Deployments mount configuration,
-secrets, durable storage, runtime socket storage, and writable homes as needed.
-No conventional shell path, role-specific configuration, credentials, keys,
-or content is included. The future Gateway image must similarly fix its
-entrypoint and least-privilege identity.
+executable closure without Git, OpenSSH, or a CA bundle. The one-shot Gateway
+image resolves its account to `10001:10001`, includes local Git for committed
+reads, and contains neither OpenSSH nor a CA bundle. OpenSSH remains an external
+deployment boundary that starts one container per forced command, supplies the
+root-controlled configuration and per-key client ID, preserves
+`SSH_ORIGINAL_COMMAND`, and connects the authenticated standard streams. The
+Gateway joins the ingress group; the broker does not join the Gateway reader
+group. Container deployments explicitly add supplemental GID `10004`; they do
+not rely on a runtime interpreting `/etc/group` membership. Deployments mount
+configuration, secrets, durable storage, runtime socket storage, and writable
+homes as needed. No conventional shell path, role-specific configuration,
+credentials, keys, or content is included.
 
 The same executable can be used with different entry-point arguments in a
 service or container. Separate binaries may be produced from the same
@@ -1735,8 +1741,8 @@ Implementation proceeds in these increments:
    - reproducible Worker container packaging (implemented); and
    - native queue-ingress listener and role-specific container for supervisors
      without socket activation (implemented); and
-   - role-specific Gateway container plus optional
-     single-replica Kubernetes packaging.
+   - role-specific one-shot Gateway container (implemented); and
+   - optional single-replica Kubernetes packaging.
 10. Production Gateway privilege separation through the systemd-activated
     local queue-ingress broker, verified with distinct-UID integration tests
     (implemented).

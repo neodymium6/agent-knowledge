@@ -71,7 +71,13 @@ jq -e \
     .os == "linux" and
     .config.User == $user and
     .config.WorkingDir == $working_directory and
-    .config.Entrypoint == [$entrypoint, $namespace, $action] and
+    .config.Entrypoint == (
+      if $action == "-" then
+        [$entrypoint, $namespace]
+      else
+        [$entrypoint, $namespace, $action]
+      end
+    ) and
     .config.Cmd == null and
     .config.Env == (
       if $ca_bundle == "-" then
@@ -151,10 +157,11 @@ if grep -Eq '(^|/)\.wh\.' "$normalized_layer_contents"; then
 fi
 
 entrypoint_path=${expected_entrypoint#/}
+working_directory_path=${expected_working_directory#/}
 for required_path in \
   etc/passwd \
   etc/group \
-  var/lib/agent-knowledge \
+  "$working_directory_path" \
   "$entrypoint_path"; do
   if ! grep -Fxq "$required_path" "$normalized_layer_contents"; then
     echo "container image is missing ${required_path}" >&2
@@ -172,7 +179,7 @@ fi
 for unique_path in \
   etc/passwd \
   etc/group \
-  var/lib/agent-knowledge \
+  "$working_directory_path" \
   "$entrypoint_path"; do
   if [[ $(grep -Fxc "$unique_path" "$normalized_layer_contents") -ne 1 ]]; then
     echo "container image path must occur in exactly one layer: ${unique_path}" >&2
@@ -356,8 +363,8 @@ extract_image_file "$entrypoint_path" "$work_directory/entrypoint" executable
 if [[ $expected_ca_bundle != - ]]; then
   extract_image_file "$ca_bundle_path" "$work_directory/ca-bundle"
 fi
-validate_image_ancestors var/lib/agent-knowledge
-validate_image_directory var/lib/agent-knowledge required
+validate_image_ancestors "$working_directory_path"
+validate_image_directory "$working_directory_path" required
 if ! cmp -s "$expected_passwd" "$work_directory/passwd"; then
   echo "container passwd database does not match the packaged identities" >&2
   exit 1
@@ -384,4 +391,15 @@ if [[ $expected_namespace == queue-ingress ]] &&
     "$normalized_layer_contents"; then
   echo "queue ingress image contains a Worker-only executable or CA bundle" >&2
   exit 1
+fi
+if [[ $expected_namespace == gateway ]]; then
+  if ! grep -Eq '(^|/)bin/git$' "$normalized_layer_contents"; then
+    echo "Gateway image is missing the read-only Git executable" >&2
+    exit 1
+  fi
+  if grep -Eq '(^|/)(bin/ssh|etc/ssl/certs/ca-bundle\.crt)$' \
+    "$normalized_layer_contents"; then
+    echo "Gateway image contains a Worker-only SSH executable or CA bundle" >&2
+    exit 1
+  fi
 fi
