@@ -219,6 +219,20 @@ fn rejects_inherited_posix_acl_before_mutating_fresh_storage() {
 }
 
 #[test]
+fn rejects_storage_parent_default_acl_before_creating_fresh_storage() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    set_extended_posix_acl(root.path(), "system.posix_acl_default");
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::Permissions(path, StorageMigrationError::PosixAcl(acl_path)))
+            if path == root.path() && acl_path.as_os_str().is_empty()
+    ));
+    assert!(!root.path().join("storage").exists());
+}
+
+#[test]
 fn rejects_nonempty_runtime_before_creating_fresh_storage() {
     let root = TestDirectory::new();
     let (request, identities) = fixture(root.path());

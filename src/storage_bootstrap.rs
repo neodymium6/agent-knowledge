@@ -144,6 +144,7 @@ fn bootstrap_storage_with_ids(
     let storage_root = common_storage_root(&settings)?;
     validate_trusted_parent(&storage_root, identities.administrative_owner)?;
     validate_trusted_parent(&request.runtime_directory, identities.administrative_owner)?;
+    validate_parent_no_posix_acl(&storage_root)?;
     validate_runtime_directory(&request.runtime_directory, &storage_root)?;
     let marker_path = storage_root.join(MARKER_NAME);
     let expected_marker = BootstrapMarker::new(&settings, identities);
@@ -304,11 +305,7 @@ fn initialize_runtime_directory(
 }
 
 fn preflight_runtime_directory(runtime_directory: &Path) -> Result<(), StorageBootstrapError> {
-    let runtime_parent = runtime_directory
-        .parent()
-        .ok_or(StorageBootstrapError::InvalidRuntimeDirectory)?;
-    validate_storage_directory_no_posix_acl(runtime_parent)
-        .map_err(|error| StorageBootstrapError::Permissions(runtime_parent.to_path_buf(), error))?;
+    validate_parent_no_posix_acl(runtime_directory)?;
     require_absent_or_empty(runtime_directory)?;
     if path_exists(runtime_directory)? {
         validate_bootstrap_source_tree(runtime_directory).map_err(|error| {
@@ -316,6 +313,12 @@ fn preflight_runtime_directory(runtime_directory: &Path) -> Result<(), StorageBo
         })?;
     }
     Ok(())
+}
+
+fn validate_parent_no_posix_acl(path: &Path) -> Result<(), StorageBootstrapError> {
+    let parent = path.parent().ok_or(StorageBootstrapError::StorageLayout)?;
+    validate_storage_directory_no_posix_acl(parent)
+        .map_err(|error| StorageBootstrapError::Permissions(parent.to_path_buf(), error))
 }
 
 impl BootstrapMarker {
