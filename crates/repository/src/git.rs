@@ -3267,6 +3267,16 @@ pub(crate) fn ensure_supported_git() -> Result<(), GitTransactionError> {
     ensure_supported_git_until(None)
 }
 
+/// Validates that the trusted Git executable supports required durability options.
+///
+/// # Errors
+///
+/// Returns an error when Git cannot be executed, its version cannot be parsed,
+/// or it is older than the minimum supported version.
+pub fn validate_git_compatibility() -> Result<(), GitTransactionError> {
+    ensure_supported_git()
+}
+
 pub(crate) fn ensure_supported_git_until(
     deadline: Option<Instant>,
 ) -> Result<(), GitTransactionError> {

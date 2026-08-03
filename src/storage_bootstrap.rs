@@ -10,7 +10,10 @@ use std::process::{Command, Stdio};
 use agent_knowledge_core::{PathAttestation, PathAttestationError};
 use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueReader};
 use agent_knowledge_release::{ReleasePolicy, ReleaseReader, ReleaseStore};
-use agent_knowledge_repository::{CommittedStore, GitRepository, trusted_git_program};
+use agent_knowledge_repository::{
+    CommittedStore, GitRepository, GitTransactionError, trusted_git_program,
+    validate_git_compatibility,
+};
 use agent_knowledge_worker::{WorkerConfigError, WorkerSettings};
 use nix::sys::stat::Mode;
 use nix::unistd::{Gid, Uid, fchown};
@@ -138,7 +141,18 @@ fn validate_service_identities(identities: StorageIdentities) -> Result<(), Stor
 fn bootstrap_storage_with_ids(
     request: &StorageBootstrap,
     identities: StorageIdentities,
+    output: impl Write,
+) -> Result<(), StorageBootstrapError> {
+    bootstrap_storage_with_ids_and_git_check(request, identities, output, || {
+        validate_git_compatibility().map_err(Box::new)
+    })
+}
+
+fn bootstrap_storage_with_ids_and_git_check(
+    request: &StorageBootstrap,
+    identities: StorageIdentities,
     mut output: impl Write,
+    git_check: impl FnOnce() -> Result<(), Box<GitTransactionError>>,
 ) -> Result<(), StorageBootstrapError> {
     let settings = WorkerSettings::load(&request.config).map_err(StorageBootstrapError::Config)?;
     let storage_root = common_storage_root(&settings)?;
@@ -149,6 +163,9 @@ fn bootstrap_storage_with_ids(
     let marker_path = storage_root.join(MARKER_NAME);
     let expected_marker = BootstrapMarker::new(&settings, identities);
     validate_official_branch(settings.official_branch())?;
+    git_check().map_err(|error| {
+        StorageBootstrapError::Component("Git compatibility validation", error.to_string())
+    })?;
     preflight_runtime_directory(&request.runtime_directory)?;
     ensure_directory(&storage_root)?;
     let storage_lock = lock_storage_root(&storage_root)?;

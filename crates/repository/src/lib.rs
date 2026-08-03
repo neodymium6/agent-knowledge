@@ -10,7 +10,7 @@ pub use apply::ApplyError;
 pub use git::{
     BatchCommitOutcome, BatchPublication, ClaimedBatch, GitIdentity, GitRepository,
     GitTransactionError, PublicationError, RepositoryTransaction, RequestFailure,
-    trusted_git_program,
+    trusted_git_program, validate_git_compatibility,
 };
 pub use index::{
     AttachmentRecord, ContentIndex, ContentIndexError, ContentPolicy, DocumentLocation,

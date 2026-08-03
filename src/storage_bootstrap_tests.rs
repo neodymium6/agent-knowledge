@@ -9,7 +9,8 @@ use xattr::FileExt as _;
 
 use super::{
     MARKER_NAME, StorageBootstrap, StorageBootstrapError, StorageIdentities, StorageMigrationError,
-    bootstrap_administrative_group, bootstrap_storage_with_ids, validate_service_identities,
+    bootstrap_administrative_group, bootstrap_storage_with_ids,
+    bootstrap_storage_with_ids_and_git_check, validate_service_identities,
 };
 
 struct TestDirectory {
@@ -228,6 +229,27 @@ fn rejects_storage_parent_default_acl_before_creating_fresh_storage() {
         bootstrap_storage_with_ids(&request, identities, Vec::new()),
         Err(StorageBootstrapError::Permissions(path, StorageMigrationError::PosixAcl(acl_path)))
             if path == root.path() && acl_path.as_os_str().is_empty()
+    ));
+    assert!(!root.path().join("storage").exists());
+}
+
+#[test]
+fn rejects_unsupported_git_before_creating_fresh_storage() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+
+    assert!(matches!(
+        bootstrap_storage_with_ids_and_git_check(&request, identities, Vec::new(), || {
+            Err(Box::new(
+                agent_knowledge_repository::GitTransactionError::UnsupportedGitVersion {
+                    found: "git version 2.35.8".into(),
+                },
+            ))
+        }),
+        Err(StorageBootstrapError::Component(
+            "Git compatibility validation",
+            _
+        ))
     ));
     assert!(!root.path().join("storage").exists());
 }
