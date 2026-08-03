@@ -20,10 +20,11 @@ document-bundle export are implemented. The flake provides reproducible Linux
 packaging, a conventional systemd Worker service, and a systemd-activated local
 queue-ingress broker that isolates the forced-command Gateway from durable queue
 access under distinct service identities. Reproducible Worker, Queue Ingress,
-and one-shot Gateway container packaging is implemented; single-replica
-Kubernetes packaging remains future work. CI verifies the client and Gateway
-through a real restricted OpenSSH server with fictional ephemeral keys and
-accounts, in addition to exercising the service privilege boundary.
+one-shot Gateway, and OpenSSH Gateway adapter container packaging is
+implemented; single-replica Kubernetes manifests remain future work. CI
+verifies the client, login-shell adapter, and Gateway through a real restricted
+OpenSSH server with fictional ephemeral keys and accounts, in addition to
+exercising the service privilege boundary.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -91,7 +92,15 @@ nix build .#gateway-container-image
 docker load < result
 ```
 
-The flake builds the image natively for both `x86_64-linux` (`amd64`) and
+Build the long-running OpenSSH adapter image intended for the future
+single-Pod Kubernetes deployment:
+
+```sh
+nix build .#openssh-gateway-container-image
+docker load < result
+```
+
+The Worker image is built natively for both `x86_64-linux` (`amd64`) and
 `aarch64-linux` (`arm64`). Its entrypoint fixes the wrapped executable and
 `worker run` role; the configuration path is supplied as an argument by the
 deployment. The image resolves the non-root `agent-knowledge` account to
@@ -126,11 +135,29 @@ access, and the queue-ingress runtime directory. Run the one-shot container
 with a read-only root filesystem, no network, no Linux capabilities, and no
 privilege escalation.
 
-`just check-package` validates all three image archives, architectures,
-deterministic timestamps, role-locked entrypoints, non-root metadata, identity
-database, role-specific environment, and required filesystem entries without
-Docker or Podman. It also verifies the Worker's CA bundle, the Gateway's local
-Git dependency, and the absence of role-inappropriate SSH and CA artifacts.
+The OpenSSH Gateway adapter image starts the `sshd` supervisor with default
+port `2222` and uses the Rust `agent-knowledge-ssh-shell` executable as the
+Gateway account's login shell. A root-controlled authorized-key command uses
+the exact grammar `akg-v1 <absolute-config-path> <client-id>`; the adapter
+validates that grammar without invoking a general shell and then replaces
+itself with the Gateway.
+The `sshd` master starts as root so OpenSSH can authenticate and drop to UID/GID
+`10001:10001`; it does not require a privileged container. The deployment must
+mount `sshd_config`, host keys, authorized keys, and the Gateway configuration,
+and must grant the Gateway supplemental GID `10004`. None of those inputs is
+included in the image.
+
+`just check-package` validates all four image archives, architectures,
+deterministic timestamps, role-locked entrypoints, fixed identity metadata,
+role-specific environment, and required filesystem entries without Docker or
+Podman. It also verifies the Worker's CA bundle, both Gateway variants' local
+Git dependency, and the absence of embedded deployment-specific OpenSSH
+configuration, key material, and role-inappropriate CA artifacts. The OpenSSH
+package's inert upstream default configuration remains in its closure, but the
+image entrypoint ignores it, sets the command-line port default to `2222`, and
+requires the deployment-specific configuration at
+`/etc/agent-knowledge/sshd_config`. That mounted configuration must not specify
+a port-qualified `ListenAddress`; an address without a port inherits `2222`.
 Runtime storage, configuration, secrets, runtime socket directory, and writable
 paths are deployment-supplied mounts.
 

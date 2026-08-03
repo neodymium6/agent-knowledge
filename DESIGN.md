@@ -89,7 +89,7 @@ Gateway, Worker, client CLI, and administrative commands are implemented in one
 Rust workspace. They share domain types, validation rules, path handling,
 queue-state transitions, revision calculation, and error codes.
 
-The initial release produces one executable with subcommands:
+The initial release produces one main application executable with subcommands:
 
 ```text
 agent-knowledge client ...
@@ -99,6 +99,11 @@ agent-knowledge queue-ingress listen ...
 agent-knowledge worker ...
 agent-knowledge admin ...
 ```
+
+The OpenSSH adapter package also provides the restricted
+`agent-knowledge-ssh-shell` login-shell helper. It is not a general-purpose
+shell or a second application interface; it validates the root-controlled
+forced-command grammar and replaces itself with the main Gateway process.
 
 The executable retains a local-only administrative intake command for
 operators and tests:
@@ -139,17 +144,20 @@ bound, removal bound, and operation deadline. Retention never runs through the
 Gateway and never removes canonical content, Git history, or accepted request
 packages.
 
-The flake publishes one wrapped production executable for `x86_64-linux` and
-`aarch64-linux`. Its runtime closure provides the Git and OpenSSH executables
-invoked by the application. Quartz remains an explicitly configured absolute
-program path and integration directory. The package contains no credentials,
-host keys, client keys, deployment-specific Worker or Gateway configuration,
-or Quartz content.
+The flake publishes the wrapped main production executable for `x86_64-linux`
+and `aarch64-linux`. Its runtime closure provides the Git and OpenSSH
+executables invoked by the application. The dedicated adapter package combines
+the restricted login-shell helper with a binary-wrapped main executable and
+the local Git runtime used by committed reads. Quartz remains an explicitly
+configured absolute program path and integration directory. The packages
+contain no credentials, host keys, client keys, deployment-specific Worker or
+Gateway configuration, or Quartz content.
 
 The flake also publishes reproducible, Docker-compatible Worker, Queue Ingress,
-and Gateway image archives for `amd64` and `arm64`. Their entrypoints fix the
-executable and exact `worker run`, `queue-ingress listen`, or `gateway` role so
-deployment arguments cannot start another role with the mounted authority. The Worker
+one-shot Gateway, and OpenSSH Gateway adapter image archives for `amd64` and
+`arm64`. The first three entrypoints fix the executable and exact `worker run`,
+`queue-ingress listen`, or `gateway` role so deployment arguments cannot start
+another role with the mounted authority. The Worker
 image resolves its non-root account to `10003:10003`, includes queue GID
 `10002` as a supplementary group, retains the Git/OpenSSH runtime wrapper, and
 provides an immutable CA bundle through `SSL_CERT_FILE` for HTTPS Git
@@ -161,16 +169,26 @@ reads, and contains neither OpenSSH nor a CA bundle. OpenSSH remains an external
 deployment boundary that starts one container per forced command, supplies the
 root-controlled configuration and per-key client ID, preserves
 `SSH_ORIGINAL_COMMAND`, and connects the authenticated standard streams. The
-Gateway joins the ingress group; the broker does not join the Gateway reader
-group. Container deployments explicitly add supplemental GID `10004`; they do
-not rely on a runtime interpreting `/etc/group` membership. Deployments mount
-configuration, secrets, durable storage, runtime socket storage, and writable
-homes as needed. No conventional shell path, role-specific configuration,
-credentials, keys, or content is included. A Gateway deployment also disables
-networking, uses a read-only root filesystem, drops all Linux capabilities, and
-forbids privilege escalation. The Git package's Nix closure contains internal
-shell and transport helpers, so those runtime controls are part of the image's
-least-privilege boundary.
+adapter image instead runs an OpenSSH supervisor and uses a small Rust
+login-shell executable for the Gateway identity. The adapter accepts only the
+root-controlled `akg-v1 <absolute-config-path> <client-id>` grammar, invokes no
+general shell, and replaces itself with the Gateway while preserving
+`SSH_ORIGINAL_COMMAND`. Its OpenSSH master starts as root so it can authenticate
+and drop to the fixed Gateway identity; it does not require a privileged
+container. Deployment-specific server configuration, host keys, authorized
+keys, and Gateway configuration are mounted inputs rather than image content.
+The Gateway joins the ingress group; the broker does not join the Gateway
+reader group. Container deployments explicitly add supplemental GID `10004`;
+they do not rely on a runtime interpreting `/etc/group` membership. Deployments
+mount configuration, secrets, durable storage, runtime socket storage, and
+writable homes as needed. No conventional shell path, deployment-specific role
+configuration, credentials, keys, or content is included. The OpenSSH package's
+inert upstream default configuration remains in the adapter closure, but the
+entrypoint ignores it and requires the mounted deployment configuration. A
+one-shot Gateway deployment also disables networking, uses a read-only root
+filesystem, drops all Linux capabilities, and forbids privilege escalation.
+The Git package's Nix closure contains internal shell and transport helpers, so
+those runtime controls are part of the image's least-privilege boundary.
 
 The same executable can be used with different entry-point arguments in a
 service or container. Separate binaries may be produced from the same
@@ -253,6 +271,16 @@ directory descriptor, including incompatible NFS configurations, are not
 supported as the transaction store. A local or block-backed filesystem with
 the required semantics is suitable. Kubernetes compatibility does not imply
 initial support for multiple Gateway or Worker replicas.
+
+The dedicated OpenSSH Gateway adapter image is the transport boundary for that
+Pod. It shares the committed repository, content checkout, and queue-ingress
+socket through explicit volumes with the other role containers. Kubernetes
+manifests must assign explicit identities and supplemental groups, mount server
+configuration and keys read-only, and grant only the capabilities required by
+the OpenSSH master to bind a non-privileged port and drop to the Gateway
+account. The image sets the command-line default to `2222`; the mounted
+configuration must not use a port-qualified `ListenAddress` that changes that
+port. Packaging the adapter does not itself define those manifests.
 
 SSH host keys, client public keys, Git credentials, and other secrets are
 deployment inputs. They are never stored in this repository or in committed
@@ -767,6 +795,21 @@ A fictional `authorized_keys` entry has this form:
 ```text
 restrict,command="/nix/var/nix/profiles/agent-knowledge/bin/agent-knowledge gateway --config /etc/agent-knowledge/gateway.yaml --client-id fictional-node-a" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFictionalKeyMaterialOnly
 ```
+
+The dedicated OpenSSH Gateway adapter image instead configures
+`agent-knowledge-ssh-shell` as the Gateway account's login shell and uses this
+form:
+
+```text
+restrict,command="akg-v1 /etc/agent-knowledge/gateway.yaml fictional-node-a" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFictionalKeyMaterialOnly
+```
+
+OpenSSH invokes the login shell with `-c` and that root-controlled forced
+command. The adapter accepts exactly three space-separated fields, requires an
+absolute configuration path and valid client ID, resolves the Gateway beside
+its own executable, and calls it directly without shell evaluation. The
+original client command remains available to the Gateway as
+`SSH_ORIGINAL_COMMAND` for operation selection.
 
 Each key maps to one configured client ID. The Gateway overwrites or rejects
 any client-supplied identity that conflicts with the authenticated identity.
@@ -1721,8 +1764,9 @@ The implementation requires:
 - recovery tests for every processing phase;
 - batching tests with a mixture of valid, conflicting, and invalid requests;
 - protocol compatibility fixtures; and
-- end-to-end tests through a restricted OpenSSH configuration with ephemeral
-  fictional accounts, host keys, and client keys on Linux (implemented).
+- end-to-end tests through a restricted OpenSSH configuration and the dedicated
+  login-shell adapter with ephemeral fictional accounts, host keys, and client
+  keys on Linux (implemented).
 
 Tests and examples use clearly fictional identities and infrastructure values.
 
@@ -1746,6 +1790,7 @@ Implementation proceeds in these increments:
    - native queue-ingress listener and role-specific container for supervisors
      without socket activation (implemented); and
    - role-specific one-shot Gateway container (implemented); and
+   - dedicated OpenSSH Gateway adapter container (implemented); and
    - optional single-replica Kubernetes packaging.
 10. Production Gateway privilege separation through the systemd-activated
     local queue-ingress broker, verified with distinct-UID integration tests

@@ -72,7 +72,9 @@ jq -e \
     .config.User == $user and
     .config.WorkingDir == $working_directory and
     .config.Entrypoint == (
-      if $action == "-" then
+      if $namespace == "openssh-gateway" then
+        [$entrypoint, "-D", "-e", "-p", "2222", "-f", "/etc/agent-knowledge/sshd_config"]
+      elif $action == "-" then
         [$entrypoint, $namespace]
       else
         [$entrypoint, $namespace, $action]
@@ -84,6 +86,13 @@ jq -e \
         ["HOME=" + $working_directory]
       else
         ["HOME=" + $working_directory, "SSL_CERT_FILE=" + $ca_bundle]
+      end
+    ) and
+    .config.ExposedPorts == (
+      if $namespace == "openssh-gateway" then
+        {"2222/tcp": {}}
+      else
+        null
       end
     ) and
     .config.StopSignal == "SIGTERM" and
@@ -360,6 +369,26 @@ validate_image_root
 extract_image_file etc/passwd "$work_directory/passwd"
 extract_image_file etc/group "$work_directory/group"
 extract_image_file "$entrypoint_path" "$work_directory/entrypoint" executable
+if [[ $expected_namespace == openssh-gateway ]]; then
+  for executable_path in bin/agent-knowledge bin/agent-knowledge-ssh-shell; do
+    if [[ $(grep -Fxc "$executable_path" "$normalized_layer_contents") -ne 1 ]]; then
+      echo "OpenSSH Gateway image path must occur in exactly one layer: ${executable_path}" >&2
+      exit 1
+    fi
+    extract_image_file \
+      "$executable_path" "$work_directory/${executable_path##*/}" executable
+    if [[ ! -s $work_directory/${executable_path##*/} ]]; then
+      echo "OpenSSH Gateway image executable must not be empty: ${executable_path}" >&2
+      exit 1
+    fi
+    executable_magic=$(od -An -tx1 -N4 "$work_directory/${executable_path##*/}")
+    executable_magic=${executable_magic//[[:space:]]/}
+    if [[ $executable_magic != 7f454c46 ]]; then
+      echo "OpenSSH Gateway image executable must be an ELF binary: ${executable_path}" >&2
+      exit 1
+    fi
+  done
+fi
 if [[ $expected_ca_bundle != - ]]; then
   extract_image_file "$ca_bundle_path" "$work_directory/ca-bundle"
 fi
@@ -400,6 +429,23 @@ if [[ $expected_namespace == gateway ]]; then
   if grep -Eq '(^|/)(bin/ssh|etc/ssl/certs/ca-bundle\.crt)$' \
     "$normalized_layer_contents"; then
     echo "Gateway image contains a Worker-only SSH executable or CA bundle" >&2
+    exit 1
+  fi
+fi
+if [[ $expected_namespace == openssh-gateway ]]; then
+  for required_executable in bin/sshd bin/agent-knowledge bin/agent-knowledge-ssh-shell; do
+    if ! grep -Fxq "$required_executable" "$normalized_layer_contents"; then
+      echo "OpenSSH Gateway image is missing ${required_executable}" >&2
+      exit 1
+    fi
+  done
+  if ! grep -Eq '(^|/)bin/git$' "$normalized_layer_contents"; then
+    echo "OpenSSH Gateway image is missing the read-only Git executable" >&2
+    exit 1
+  fi
+  if grep -Eq '(^|/)(etc/ssl/certs/ca-bundle\.crt|authorized_keys|ssh_host_[^/]*)$|^etc/agent-knowledge($|/)' \
+    "$normalized_layer_contents"; then
+    echo "OpenSSH Gateway image contains deployment configuration, key material, or a CA bundle" >&2
     exit 1
   fi
 fi

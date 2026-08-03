@@ -41,6 +41,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+default-run = "agent-knowledge"
+
+[[bin]]
+name = "agent-knowledge-ssh-shell"
+path = "src/bin/agent_knowledge_ssh_shell.rs"
 
 [lints]
 workspace = true

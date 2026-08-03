@@ -30,7 +30,7 @@ check-code:
 # Build and validate the production package for the current Linux system.
 check-package:
   package_path="$(nix build .#agent-knowledge --no-link --print-out-paths)" && deploy/systemd/check-package.sh "$package_path"
-  system="$(nix eval --impure --raw --expr builtins.currentSystem)" && nix build ".#checks.$system.worker-container-image" ".#checks.$system.queue-ingress-container-image" ".#checks.$system.gateway-container-image" --no-link
+  system="$(nix eval --impure --raw --expr builtins.currentSystem)" && nix build ".#checks.$system.worker-container-image" ".#checks.$system.queue-ingress-container-image" ".#checks.$system.gateway-container-image" ".#checks.$system.openssh-gateway-container-image" --no-link
 
 # CI source-check alias; package jobs build each supported architecture.
 ci: check-code
