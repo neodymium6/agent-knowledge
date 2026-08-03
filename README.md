@@ -111,22 +111,26 @@ The Gateway image fixes the non-root `agent-knowledge-gateway` identity
 the root-controlled `--config` path and per-key `--client-id`, preserves the
 exact `SSH_ORIGINAL_COMMAND`, and connects the container standard streams to
 the authenticated SSH session. The image includes local Git for committed
-reads, but no SSH client, SSH server, CA bundle, credentials, keys, shell, or
-deployment configuration. OpenSSH authentication and process creation remain
-outside the image, consistent with the existing transport boundary. The
-container runtime must add supplemental GID `10004` so the Gateway can connect
-to the queue-ingress socket; identity-database membership alone is not a
-portable substitute for an explicit runtime group. It must also mount the
+reads, but no SSH client, SSH server, CA bundle, credentials, keys, or
+deployment configuration. It exposes no conventional shell path; the Nix Git
+closure still contains internal shell and transport helpers and must not be
+treated as a shell-free sandbox. OpenSSH authentication and process creation
+remain outside the image, consistent with the existing transport boundary.
+The container runtime must add supplemental GID `10004` so the Gateway can
+connect to the queue-ingress socket; identity-database membership alone is not
+a portable substitute for an explicit runtime group. It must also mount the
 root-controlled configuration, committed repository and content for read-only
-access, and the queue-ingress runtime directory.
+access, and the queue-ingress runtime directory. Run the one-shot container
+with a read-only root filesystem, no network, no Linux capabilities, and no
+privilege escalation.
 
 `just check-package` validates all three image archives, architectures,
 deterministic timestamps, role-locked entrypoints, non-root metadata, identity
 database, role-specific environment, and required filesystem entries without
 Docker or Podman. It also verifies the Worker's CA bundle, the Gateway's local
-Git dependency, and the absence of cross-role executables. Runtime storage,
-configuration, secrets, runtime socket directory, and writable paths are
-deployment-supplied mounts.
+Git dependency, and the absence of role-inappropriate SSH and CA artifacts.
+Runtime storage, configuration, secrets, runtime socket directory, and writable
+paths are deployment-supplied mounts.
 
 ### systemd service
 

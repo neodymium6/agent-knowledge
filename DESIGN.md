@@ -166,7 +166,11 @@ group. Container deployments explicitly add supplemental GID `10004`; they do
 not rely on a runtime interpreting `/etc/group` membership. Deployments mount
 configuration, secrets, durable storage, runtime socket storage, and writable
 homes as needed. No conventional shell path, role-specific configuration,
-credentials, keys, or content is included.
+credentials, keys, or content is included. A Gateway deployment also disables
+networking, uses a read-only root filesystem, drops all Linux capabilities, and
+forbids privilege escalation. The Git package's Nix closure contains internal
+shell and transport helpers, so those runtime controls are part of the image's
+least-privilege boundary.
 
 The same executable can be used with different entry-point arguments in a
 service or container. Separate binaries may be produced from the same
