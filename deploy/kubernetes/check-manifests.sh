@@ -121,7 +121,7 @@ jq -e '
     and (mount(container("worker"); "quartz").readOnly == true)
     and (volume("runtime") | has("emptyDir"))
     and (volume("sshd-runtime") | has("emptyDir"))
-    and (volume("ssh-credentials") | has("emptyDir"))
+    and (volume("ssh-credentials").emptyDir.medium == "Memory")
     and (mount(container("openssh-gateway"); "ssh-credentials").readOnly == true)
     and (container("openssh-gateway").volumeMounts
       | any(.[]; .name == "ssh-credentials-source") | not)

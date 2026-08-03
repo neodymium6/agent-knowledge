@@ -348,6 +348,7 @@ spec:
             sizeLimit: 16Mi
         - name: ssh-credentials
           emptyDir:
+            medium: Memory
             sizeLimit: 1Mi
         - name: ssh-credentials-source
           secret:
