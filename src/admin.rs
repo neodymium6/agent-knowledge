@@ -153,9 +153,12 @@ fn migrate_v1_storage_with_ids(
     let mut queue_fingerprint = TreeFingerprintBuilder::new();
     migrate_directory(
         &queue.file,
-        queue_group,
-        Mode::from_bits_truncate(0o2770),
-        Mode::from_bits_truncate(0o660),
+        TreePermissions {
+            owner: None,
+            group: queue_group,
+            directory_mode: Mode::from_bits_truncate(0o2770),
+            file_mode: Mode::from_bits_truncate(0o660),
+        },
         0,
         Path::new(""),
         &mut queue_fingerprint,
@@ -164,9 +167,12 @@ fn migrate_v1_storage_with_ids(
     let mut git_fingerprint = TreeFingerprintBuilder::new();
     migrate_directory(
         &git.file,
-        gateway_group,
-        Mode::from_bits_truncate(0o2750),
-        Mode::from_bits_truncate(0o640),
+        TreePermissions {
+            owner: None,
+            group: gateway_group,
+            directory_mode: Mode::from_bits_truncate(0o2750),
+            file_mode: Mode::from_bits_truncate(0o640),
+        },
         0,
         Path::new(""),
         &mut git_fingerprint,
@@ -175,9 +181,12 @@ fn migrate_v1_storage_with_ids(
     let mut content_fingerprint = TreeFingerprintBuilder::new();
     migrate_directory(
         &content.file,
-        gateway_group,
-        Mode::from_bits_truncate(0o2750),
-        Mode::from_bits_truncate(0o640),
+        TreePermissions {
+            owner: None,
+            group: gateway_group,
+            directory_mode: Mode::from_bits_truncate(0o2750),
+            file_mode: Mode::from_bits_truncate(0o640),
+        },
         0,
         Path::new(""),
         &mut content_fingerprint,
@@ -234,7 +243,66 @@ fn migrate_v1_storage_with_ids(
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_user(value: &OsStr) -> Result<Uid, StorageMigrationError> {
+pub(crate) fn normalize_storage_tree(
+    root: &Path,
+    owner: Uid,
+    group: Gid,
+    directory_mode: Mode,
+    file_mode: Mode,
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let mut budget = MigrationBudget::new();
+    preflight_directory(&root.file, 0, Path::new(""), &mut budget)?;
+    let mut fingerprint = TreeFingerprintBuilder::new();
+    migrate_directory(
+        &root.file,
+        TreePermissions {
+            owner: Some(owner),
+            group,
+            directory_mode,
+            file_mode,
+        },
+        0,
+        Path::new(""),
+        &mut fingerprint,
+    )?;
+    let fingerprint = fingerprint.finish();
+    verify_fingerprint(&root.file, &fingerprint)?;
+    root.file.sync_all().map_err(StorageMigrationError::Io)?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn normalize_storage_directory(
+    path: &Path,
+    owner: Uid,
+    group: Gid,
+    mode: Mode,
+) -> Result<(), StorageMigrationError> {
+    normalized_absolute_suffix(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+        .map_err(StorageMigrationError::Io)?;
+    let attestation =
+        PathAttestation::capture(path, &file).map_err(StorageMigrationError::Attestation)?;
+    if attestation.path() != path {
+        return Err(StorageMigrationError::InvalidRoot(path.to_path_buf()));
+    }
+    set_identity_and_mode(&file, Some(owner), group, mode)?;
+    file.sync_all().map_err(StorageMigrationError::Io)?;
+    let observed =
+        PathAttestation::capture(path, &file).map_err(StorageMigrationError::Attestation)?;
+    if observed.path() == path && attestation.matches_destination(&observed) {
+        Ok(())
+    } else {
+        Err(StorageMigrationError::TreeChanged(path.to_path_buf()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn resolve_user(value: &OsStr) -> Result<Uid, StorageMigrationError> {
     if let Some(identifier) = value.to_str().and_then(|value| value.parse::<u32>().ok()) {
         return Ok(Uid::from_raw(identifier));
     }
@@ -248,7 +316,7 @@ fn resolve_user(value: &OsStr) -> Result<Uid, StorageMigrationError> {
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_group(value: &OsStr) -> Result<Gid, StorageMigrationError> {
+pub(crate) fn resolve_group(value: &OsStr) -> Result<Gid, StorageMigrationError> {
     if let Some(identifier) = value.to_str().and_then(|value| value.parse::<u32>().ok()) {
         return Ok(Gid::from_raw(identifier));
     }
@@ -361,7 +429,7 @@ fn open_regular_beneath(root: &File, path: &Path) -> Result<File, StorageMigrati
     let file = open_relative(
         root,
         path,
-        OFlag::O_RDWR | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         true,
     )?;
     if object_identity(&file)? != identity {
@@ -490,11 +558,17 @@ fn preflight_directory(
 }
 
 #[cfg(target_os = "linux")]
-fn migrate_directory(
-    directory: &File,
+#[derive(Clone, Copy)]
+struct TreePermissions {
+    owner: Option<Uid>,
     group: Gid,
     directory_mode: Mode,
     file_mode: Mode,
+}
+
+fn migrate_directory(
+    directory: &File,
+    permissions: TreePermissions,
     depth: usize,
     relative: &Path,
     fingerprint: &mut TreeFingerprintBuilder,
@@ -512,21 +586,19 @@ fn migrate_directory(
             if object_identity(&child)? != identity {
                 return Err(StorageMigrationError::TreeChanged(path));
             }
-            migrate_directory(
-                &child,
-                group,
-                directory_mode,
-                file_mode,
-                depth + 1,
-                &path,
-                fingerprint,
-            )?;
+            migrate_directory(&child, permissions, depth + 1, &path, fingerprint)?;
         } else if identity.file_type == nix::libc::S_IFREG && identity.links == 1 {
             let child = open_child_regular(directory, name)?;
             if object_identity(&child)? != identity {
                 return Err(StorageMigrationError::TreeChanged(path));
             }
-            set_regular_identity_and_mode(&child, group, file_mode, &path)?;
+            set_regular_identity_and_mode(
+                &child,
+                permissions.owner,
+                permissions.group,
+                permissions.file_mode,
+                &path,
+            )?;
             fingerprint.record(&path, object_identity(&child)?)?;
         } else {
             return Err(StorageMigrationError::UnsafeEntry(path));
@@ -535,7 +607,12 @@ fn migrate_directory(
     if entries != directory_entries(directory, relative)? {
         return Err(StorageMigrationError::TreeChanged(relative.to_path_buf()));
     }
-    set_identity_and_mode(directory, None, group, directory_mode)?;
+    set_identity_and_mode(
+        directory,
+        permissions.owner,
+        permissions.group,
+        permissions.directory_mode,
+    )?;
     fingerprint.record(relative, object_identity(directory)?)?;
     Ok(())
 }
@@ -592,7 +669,7 @@ fn open_child_regular(parent: &File, name: &CStr) -> Result<File, StorageMigrati
     open_relative(
         parent,
         Path::new(OsStr::from_bytes(name.to_bytes())),
-        OFlag::O_RDWR | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         true,
     )
 }
@@ -610,12 +687,13 @@ fn require_regular(file: &File, path: &Path) -> Result<ObjectIdentity, StorageMi
 #[cfg(target_os = "linux")]
 fn set_regular_identity_and_mode(
     file: &File,
+    owner: Option<Uid>,
     group: Gid,
     mode: Mode,
     path: &Path,
 ) -> Result<(), StorageMigrationError> {
     require_regular(file, path)?;
-    set_identity_and_mode(file, None, group, mode)?;
+    set_identity_and_mode(file, owner, group, mode)?;
     require_regular(file, path).map(|_| ())
 }
 

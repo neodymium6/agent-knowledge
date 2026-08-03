@@ -272,6 +272,19 @@ supported as the transaction store. A local or block-backed filesystem with
 the required semantics is suitable. Kubernetes compatibility does not imply
 initial support for multiple Gateway or Worker replicas.
 
+A root-only init container initializes a fresh persistent volume before any
+service container starts. It consumes the validated Worker configuration,
+requires the five durable roots to be siblings, creates the durable queue,
+bare repository and official branch, canonical content worktree, transaction
+root, and release store, then applies the fixed service ownership boundary. A
+root-owned completion marker is published only after validation succeeds.
+Matching marked storage is accepted idempotently; nonempty unmarked storage or
+a marker that disagrees with configuration or identities is rejected instead
+of repaired. The runtime socket directory is not covered by durable completion:
+it is recreated and validated from a separate `emptyDir` on each Pod start.
+Quartz remains an independently supplied immutable deployment input and is not
+bundled into the init image.
+
 The dedicated OpenSSH Gateway adapter image is the transport boundary for that
 Pod. It shares the committed repository, content checkout, and queue-ingress
 socket through explicit volumes with the other role containers. Kubernetes
@@ -789,6 +802,14 @@ depend on whether the Worker or first broker connection starts first. The
 repository and content roots are setgid to the Gateway reader group; the Worker
 owns them and its `0027` umask grants the Gateway read/execute access without
 write access. Worktrees, releases, and credentials remain Worker-only.
+
+Fresh container storage is created by the same explicit bootstrap contract.
+Initialization normalizes regular Git object files even when Git created them
+read-only, rejects links, special files, hard links, cross-mount descendants,
+and excessive trees, and records completion only after read-only queue,
+repository, and release reopen checks succeed. An interrupted initialization
+therefore leaves unmarked nonempty storage that requires operator inspection;
+the next init attempt does not delete or silently repair it.
 
 A fictional `authorized_keys` entry has this form:
 
@@ -1791,6 +1812,7 @@ Implementation proceeds in these increments:
      without socket activation (implemented); and
    - role-specific one-shot Gateway container (implemented); and
    - dedicated OpenSSH Gateway adapter container (implemented); and
+   - root-only storage-bootstrap init container (implemented); and
    - optional single-replica Kubernetes packaging.
 10. Production Gateway privilege separation through the systemd-activated
     local queue-ingress broker, verified with distinct-UID integration tests

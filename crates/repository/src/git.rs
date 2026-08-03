@@ -66,6 +66,18 @@ impl GitIdentity {
             email: email.into(),
         })
     }
+
+    /// Returns the configured commit author name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the configured commit author email address.
+    #[must_use]
+    pub fn email(&self) -> &str {
+        &self.email
+    }
 }
 
 fn valid_identity_value(value: &str) -> bool {

@@ -55,6 +55,8 @@ agent-knowledge-core = { path = "crates/core" }
 agent-knowledge-gateway = { path = "crates/gateway" }
 agent-knowledge-protocol = { path = "crates/protocol" }
 agent-knowledge-queue = { path = "crates/queue" }
+agent-knowledge-release = { path = "crates/release" }
+agent-knowledge-repository = { path = "crates/repository" }
 agent-knowledge-worker = { path = "crates/worker" }
 serde.workspace = true
 serde_json.workspace = true

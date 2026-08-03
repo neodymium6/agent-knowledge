@@ -22,12 +22,15 @@ use crate::admin::{StorageMigration, StorageMigrationError};
 use crate::client::{self, ClientCommandError};
 use crate::gateway::{self, GatewayCommandError};
 use crate::queue_ingress::{self, ListenSettings, QueueIngressCommandError};
+#[cfg(target_os = "linux")]
+use crate::storage_bootstrap::{StorageBootstrap, StorageBootstrapError};
 use crate::worker::{self, WorkerCommandError};
 
 const USAGE: &str = "usage:\n\
     agent-knowledge admin submit --queue-root <path> --package-root <path>\n\
     agent-knowledge admin status --config <path> [--maximum-queue-entries <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge admin prune-releases --config <path> [--dry-run] [--timeout-seconds <seconds>]\n\
+    agent-knowledge admin bootstrap-storage --config <path> [--runtime-directory <path>] [--worker-owner <name-or-id>] [--worker-group <name-or-id>] [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>] [--ingress-group <name-or-id>]\n\
     agent-knowledge admin migrate-v1-storage --queue-root <path> --git-directory <path> --content-root <path> [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>]\n\
     agent-knowledge client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
     agent-knowledge client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
@@ -77,6 +80,11 @@ where
             timeout,
         } => admin::prune_releases(&config, dry_run, timeout, output)
             .map_err(CliError::AdminRetention),
+        #[cfg(target_os = "linux")]
+        Command::AdminBootstrapStorage(settings) => {
+            crate::storage_bootstrap::bootstrap_storage(&settings, output)
+                .map_err(CliError::StorageBootstrap)
+        }
         #[cfg(target_os = "linux")]
         Command::AdminMigrateV1Storage {
             queue_root,
@@ -174,6 +182,8 @@ enum Command {
         dry_run: bool,
         timeout: Duration,
     },
+    #[cfg(target_os = "linux")]
+    AdminBootstrapStorage(StorageBootstrap),
     #[cfg(target_os = "linux")]
     AdminMigrateV1Storage {
         queue_root: PathBuf,
@@ -298,6 +308,13 @@ where
                 && action == std::ffi::OsStr::new("prune-releases") =>
         {
             parse_admin_prune_releases_arguments(arguments)
+        }
+        #[cfg(target_os = "linux")]
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("admin")
+                && action == std::ffi::OsStr::new("bootstrap-storage") =>
+        {
+            parse_admin_bootstrap_storage_arguments(arguments)
         }
         #[cfg(target_os = "linux")]
         (Some(namespace), Some(action))
@@ -757,6 +774,48 @@ where
     })
 }
 
+#[cfg(target_os = "linux")]
+fn parse_admin_bootstrap_storage_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut config = None;
+    let mut runtime_directory = None;
+    let mut worker_owner = None;
+    let mut worker_group = None;
+    let mut queue_owner = None;
+    let mut queue_group = None;
+    let mut gateway_group = None;
+    let mut ingress_group = None;
+    while let Some(flag) = arguments.next() {
+        let value = arguments.next().ok_or(CliError::Usage)?;
+        match flag.to_str() {
+            Some("--config") if config.is_none() => config = Some(PathBuf::from(value)),
+            Some("--runtime-directory") if runtime_directory.is_none() => {
+                runtime_directory = Some(PathBuf::from(value));
+            }
+            Some("--worker-owner") if worker_owner.is_none() => worker_owner = Some(value),
+            Some("--worker-group") if worker_group.is_none() => worker_group = Some(value),
+            Some("--queue-owner") if queue_owner.is_none() => queue_owner = Some(value),
+            Some("--queue-group") if queue_group.is_none() => queue_group = Some(value),
+            Some("--gateway-group") if gateway_group.is_none() => gateway_group = Some(value),
+            Some("--ingress-group") if ingress_group.is_none() => ingress_group = Some(value),
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(Command::AdminBootstrapStorage(StorageBootstrap {
+        config: config.ok_or(CliError::Usage)?,
+        runtime_directory: runtime_directory
+            .unwrap_or_else(|| PathBuf::from("/run/agent-knowledge")),
+        worker_owner: worker_owner.unwrap_or_else(|| "agent-knowledge".into()),
+        worker_group: worker_group.unwrap_or_else(|| "agent-knowledge".into()),
+        queue_owner: queue_owner.unwrap_or_else(|| "agent-knowledge-queue".into()),
+        queue_group: queue_group.unwrap_or_else(|| "agent-knowledge-queue".into()),
+        gateway_group: gateway_group.unwrap_or_else(|| "agent-knowledge-gateway".into()),
+        ingress_group: ingress_group.unwrap_or_else(|| "agent-knowledge-ingress".into()),
+    }))
+}
+
 fn parse_worker_arguments<I>(mut arguments: I) -> Result<Command, CliError>
 where
     I: Iterator<Item = OsString>,
@@ -848,6 +907,8 @@ pub enum CliError {
     AdminRetention(AdminRetentionError),
     #[cfg(target_os = "linux")]
     StorageMigration(StorageMigrationError),
+    #[cfg(target_os = "linux")]
+    StorageBootstrap(StorageBootstrapError),
     Worker(WorkerCommandError),
     Gateway(GatewayCommandError),
     IngressServe(IngressServeError),
@@ -879,6 +940,8 @@ impl fmt::Display for CliError {
             Self::AdminRetention(error) => error.fmt(formatter),
             #[cfg(target_os = "linux")]
             Self::StorageMigration(error) => error.fmt(formatter),
+            #[cfg(target_os = "linux")]
+            Self::StorageBootstrap(error) => error.fmt(formatter),
             Self::Worker(error) => error.fmt(formatter),
             Self::Gateway(error) => error.fmt(formatter),
             Self::IngressServe(error) => error.fmt(formatter),
@@ -899,6 +962,8 @@ impl std::error::Error for CliError {
             Self::AdminRetention(error) => Some(error),
             #[cfg(target_os = "linux")]
             Self::StorageMigration(error) => Some(error),
+            #[cfg(target_os = "linux")]
+            Self::StorageBootstrap(error) => Some(error),
             Self::Worker(error) => Some(error),
             Self::Gateway(error) => Some(error),
             Self::IngressServe(error) => Some(error),

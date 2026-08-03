@@ -1,0 +1,698 @@
+use std::ffi::OsString;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueReader};
+use agent_knowledge_release::{ReleasePolicy, ReleaseReader, ReleaseStore};
+use agent_knowledge_repository::{CommittedStore, GitRepository};
+use agent_knowledge_worker::{WorkerConfigError, WorkerSettings};
+use nix::sys::stat::Mode;
+use nix::unistd::{Gid, Uid};
+use serde::{Deserialize, Serialize};
+use ulid::Ulid;
+
+use crate::admin::{
+    StorageMigrationError, normalize_storage_directory, normalize_storage_tree, resolve_group,
+    resolve_user,
+};
+
+const MARKER_NAME: &str = ".agent-knowledge-bootstrap-v1.json";
+const MARKER_VERSION: u16 = 1;
+const MAXIMUM_MARKER_BYTES: u64 = 64 * 1024;
+const MAXIMUM_GIT_OUTPUT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct StorageBootstrap {
+    pub(crate) config: PathBuf,
+    pub(crate) runtime_directory: PathBuf,
+    pub(crate) worker_owner: OsString,
+    pub(crate) worker_group: OsString,
+    pub(crate) queue_owner: OsString,
+    pub(crate) queue_group: OsString,
+    pub(crate) gateway_group: OsString,
+    pub(crate) ingress_group: OsString,
+}
+
+#[derive(Clone, Copy)]
+struct StorageIdentities {
+    administrative_owner: Uid,
+    worker_owner: Uid,
+    worker_group: Gid,
+    queue_owner: Uid,
+    queue_group: Gid,
+    gateway_group: Gid,
+    ingress_group: Gid,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapMarker {
+    schema_version: u16,
+    queue_root: PathBuf,
+    repository_root: PathBuf,
+    content_root: PathBuf,
+    work_root: PathBuf,
+    release_root: PathBuf,
+    runtime_directory: PathBuf,
+    official_branch: String,
+    worker_uid: u32,
+    worker_gid: u32,
+    queue_uid: u32,
+    queue_gid: u32,
+    gateway_gid: u32,
+    ingress_gid: u32,
+}
+
+#[derive(Serialize)]
+struct BootstrapOutput<'a> {
+    status: &'a str,
+}
+
+pub(crate) fn bootstrap_storage(
+    request: &StorageBootstrap,
+    output: impl Write,
+) -> Result<(), StorageBootstrapError> {
+    if !Uid::effective().is_root() {
+        return Err(StorageBootstrapError::RootRequired);
+    }
+    let identities = StorageIdentities {
+        administrative_owner: Uid::effective(),
+        worker_owner: resolve_user(&request.worker_owner)
+            .map_err(StorageBootstrapError::Identity)?,
+        worker_group: resolve_group(&request.worker_group)
+            .map_err(StorageBootstrapError::Identity)?,
+        queue_owner: resolve_user(&request.queue_owner).map_err(StorageBootstrapError::Identity)?,
+        queue_group: resolve_group(&request.queue_group)
+            .map_err(StorageBootstrapError::Identity)?,
+        gateway_group: resolve_group(&request.gateway_group)
+            .map_err(StorageBootstrapError::Identity)?,
+        ingress_group: resolve_group(&request.ingress_group)
+            .map_err(StorageBootstrapError::Identity)?,
+    };
+    bootstrap_storage_with_ids(request, identities, output)
+}
+
+fn bootstrap_storage_with_ids(
+    request: &StorageBootstrap,
+    identities: StorageIdentities,
+    mut output: impl Write,
+) -> Result<(), StorageBootstrapError> {
+    let settings = WorkerSettings::load(&request.config).map_err(StorageBootstrapError::Config)?;
+    let storage_root = common_storage_root(&settings)?;
+    validate_runtime_directory(&request.runtime_directory, &settings)?;
+    let marker_path = storage_root.join(MARKER_NAME);
+    let expected_marker = BootstrapMarker::new(&settings, &request.runtime_directory, identities);
+    validate_official_branch(settings.official_branch())?;
+
+    if path_exists(&marker_path)? {
+        let marker = read_marker(&marker_path, identities.administrative_owner)?;
+        if marker != expected_marker {
+            return Err(StorageBootstrapError::MarkerMismatch);
+        }
+        initialize_runtime_directory(&request.runtime_directory, identities)?;
+        validate_initialized(&settings, &request.runtime_directory, identities)?;
+        return write_output(&mut output, "already_initialized");
+    }
+
+    for path in storage_paths(&settings) {
+        require_absent_or_empty(path)?;
+    }
+    ensure_directory(&storage_root)?;
+    normalize_storage_directory(
+        &storage_root,
+        identities.administrative_owner,
+        identities.queue_group,
+        Mode::from_bits_truncate(0o751),
+    )
+    .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
+    for path in storage_paths(&settings) {
+        ensure_directory(path)?;
+    }
+    initialize_runtime_directory(&request.runtime_directory, identities)?;
+
+    FileQueue::initialize(settings.queue_root(), PackagePolicy::default()).map_err(|error| {
+        StorageBootstrapError::Component("queue initialization", error.to_string())
+    })?;
+    initialize_repository(&settings)?;
+    GitRepository::open(
+        settings.repository_root(),
+        settings.content_root(),
+        settings.work_root(),
+        settings.official_branch(),
+        settings.identity().clone(),
+    )
+    .map_err(|error| {
+        StorageBootstrapError::Component("repository validation", error.to_string())
+    })?;
+    ReleaseStore::open(settings.release_root(), ReleasePolicy::default()).map_err(|error| {
+        StorageBootstrapError::Component("release initialization", error.to_string())
+    })?;
+
+    normalize_storage_tree(
+        settings.queue_root(),
+        identities.queue_owner,
+        identities.queue_group,
+        Mode::from_bits_truncate(0o2770),
+        Mode::from_bits_truncate(0o660),
+    )
+    .map_err(|error| StorageBootstrapError::Permissions(settings.queue_root().into(), error))?;
+    for path in [settings.repository_root(), settings.content_root()] {
+        normalize_storage_tree(
+            path,
+            identities.worker_owner,
+            identities.gateway_group,
+            Mode::from_bits_truncate(0o2750),
+            Mode::from_bits_truncate(0o640),
+        )
+        .map_err(|error| StorageBootstrapError::Permissions(path.into(), error))?;
+    }
+    for path in [settings.work_root(), settings.release_root()] {
+        normalize_storage_tree(
+            path,
+            identities.worker_owner,
+            identities.worker_group,
+            Mode::from_bits_truncate(0o750),
+            Mode::from_bits_truncate(0o640),
+        )
+        .map_err(|error| StorageBootstrapError::Permissions(path.into(), error))?;
+    }
+    validate_initialized(&settings, &request.runtime_directory, identities)?;
+    write_marker(&marker_path, &expected_marker)?;
+    write_output(&mut output, "initialized")
+}
+
+fn validate_official_branch(branch: &str) -> Result<(), StorageBootstrapError> {
+    let reference = format!("refs/heads/{branch}");
+    run_git(
+        [
+            OsString::from("check-ref-format"),
+            OsString::from(reference),
+        ],
+        &[],
+    )
+    .map(|_| ())
+}
+
+fn initialize_runtime_directory(
+    runtime_directory: &Path,
+    identities: StorageIdentities,
+) -> Result<(), StorageBootstrapError> {
+    require_absent_or_empty(runtime_directory)?;
+    ensure_directory(runtime_directory)?;
+    normalize_storage_tree(
+        runtime_directory,
+        identities.queue_owner,
+        identities.ingress_group,
+        Mode::from_bits_truncate(0o2750),
+        Mode::from_bits_truncate(0o640),
+    )
+    .map_err(|error| StorageBootstrapError::Permissions(runtime_directory.into(), error))
+}
+
+impl BootstrapMarker {
+    fn new(settings: &WorkerSettings, runtime_directory: &Path, ids: StorageIdentities) -> Self {
+        Self {
+            schema_version: MARKER_VERSION,
+            queue_root: settings.queue_root().to_path_buf(),
+            repository_root: settings.repository_root().to_path_buf(),
+            content_root: settings.content_root().to_path_buf(),
+            work_root: settings.work_root().to_path_buf(),
+            release_root: settings.release_root().to_path_buf(),
+            runtime_directory: runtime_directory.to_path_buf(),
+            official_branch: settings.official_branch().to_owned(),
+            worker_uid: ids.worker_owner.as_raw(),
+            worker_gid: ids.worker_group.as_raw(),
+            queue_uid: ids.queue_owner.as_raw(),
+            queue_gid: ids.queue_group.as_raw(),
+            gateway_gid: ids.gateway_group.as_raw(),
+            ingress_gid: ids.ingress_group.as_raw(),
+        }
+    }
+}
+
+fn storage_paths(settings: &WorkerSettings) -> [&Path; 5] {
+    [
+        settings.queue_root(),
+        settings.repository_root(),
+        settings.content_root(),
+        settings.work_root(),
+        settings.release_root(),
+    ]
+}
+
+fn common_storage_root(settings: &WorkerSettings) -> Result<PathBuf, StorageBootstrapError> {
+    let paths = storage_paths(settings);
+    let Some(parent) = paths[0].parent() else {
+        return Err(StorageBootstrapError::StorageLayout);
+    };
+    if parent.parent().is_none() || paths.iter().any(|path| path.parent() != Some(parent)) {
+        return Err(StorageBootstrapError::StorageLayout);
+    }
+    Ok(parent.to_path_buf())
+}
+
+fn validate_runtime_directory(
+    runtime_directory: &Path,
+    settings: &WorkerSettings,
+) -> Result<(), StorageBootstrapError> {
+    if !runtime_directory.is_absolute()
+        || runtime_directory.parent().is_none()
+        || storage_paths(settings).iter().any(|storage| {
+            runtime_directory.starts_with(storage) || storage.starts_with(runtime_directory)
+        })
+    {
+        return Err(StorageBootstrapError::InvalidRuntimeDirectory);
+    }
+    Ok(())
+}
+
+fn require_absent_or_empty(path: &Path) -> Result<(), StorageBootstrapError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            let mut entries = fs::read_dir(path).map_err(StorageBootstrapError::Io)?;
+            if entries
+                .next()
+                .transpose()
+                .map_err(StorageBootstrapError::Io)?
+                .is_some()
+            {
+                Err(StorageBootstrapError::PartialInitialization(
+                    path.to_path_buf(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Ok(_) => Err(StorageBootstrapError::UnsafePath(path.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StorageBootstrapError::Io(error)),
+    }
+}
+
+fn ensure_directory(path: &Path) -> Result<(), StorageBootstrapError> {
+    match fs::create_dir(path) {
+        Ok(()) => sync_parent(path),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).map_err(StorageBootstrapError::Io)?;
+            if metadata.file_type().is_dir() {
+                Ok(())
+            } else {
+                Err(StorageBootstrapError::UnsafePath(path.to_path_buf()))
+            }
+        }
+        Err(error) => Err(StorageBootstrapError::Io(error)),
+    }
+}
+
+fn initialize_repository(settings: &WorkerSettings) -> Result<(), StorageBootstrapError> {
+    let initial_ref = format!("refs/heads/{}", settings.official_branch());
+    let initial_branch = format!("--initial-branch={}", settings.official_branch());
+    run_git(
+        [
+            OsString::from("init"),
+            OsString::from("--bare"),
+            OsString::from("--template="),
+            OsString::from(initial_branch),
+            settings.repository_root().as_os_str().to_owned(),
+        ],
+        &[],
+    )?;
+    let tree = run_git(
+        [
+            git_directory_argument(settings.repository_root()),
+            OsString::from("mktree"),
+        ],
+        &[],
+    )?;
+    let tree = parse_git_line(&tree)?;
+    let name = format!("user.name={}", settings.identity().name());
+    let email = format!("user.email={}", settings.identity().email());
+    let commit = run_git(
+        [
+            git_directory_argument(settings.repository_root()),
+            OsString::from("-c"),
+            OsString::from(name),
+            OsString::from("-c"),
+            OsString::from(email),
+            OsString::from("commit-tree"),
+            OsString::from(tree),
+        ],
+        b"Initialize knowledge storage\n",
+    )?;
+    let commit = parse_git_line(&commit)?;
+    run_git(
+        [
+            git_directory_argument(settings.repository_root()),
+            OsString::from("update-ref"),
+            OsString::from(&initial_ref),
+            OsString::from(commit),
+        ],
+        &[],
+    )?;
+    run_git(
+        [
+            git_directory_argument(settings.repository_root()),
+            OsString::from("symbolic-ref"),
+            OsString::from("HEAD"),
+            OsString::from(&initial_ref),
+        ],
+        &[],
+    )?;
+    run_git(
+        [
+            git_directory_argument(settings.repository_root()),
+            OsString::from("worktree"),
+            OsString::from("add"),
+            settings.content_root().as_os_str().to_owned(),
+            OsString::from(settings.official_branch()),
+        ],
+        &[],
+    )?;
+    Ok(())
+}
+
+fn git_directory_argument(path: &Path) -> OsString {
+    let mut argument = OsString::from("--git-dir=");
+    argument.push(path);
+    argument
+}
+
+fn run_git(
+    arguments: impl IntoIterator<Item = OsString>,
+    input: &[u8],
+) -> Result<Vec<u8>, StorageBootstrapError> {
+    let mut command = Command::new("git");
+    command
+        .args(arguments)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", "/var/empty")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(StorageBootstrapError::Io)?;
+    child
+        .stdin
+        .take()
+        .ok_or(StorageBootstrapError::GitProtocol)?
+        .write_all(input)
+        .map_err(StorageBootstrapError::Io)?;
+    let result = child
+        .wait_with_output()
+        .map_err(StorageBootstrapError::Io)?;
+    if result.stdout.len() > MAXIMUM_GIT_OUTPUT_BYTES
+        || result.stderr.len() > MAXIMUM_GIT_OUTPUT_BYTES
+    {
+        return Err(StorageBootstrapError::GitOutputTooLarge);
+    }
+    if result.status.success() {
+        Ok(result.stdout)
+    } else {
+        let diagnostic = String::from_utf8_lossy(&result.stderr).trim().to_owned();
+        Err(StorageBootstrapError::GitFailed(diagnostic))
+    }
+}
+
+fn parse_git_line(bytes: &[u8]) -> Result<&str, StorageBootstrapError> {
+    let value = std::str::from_utf8(bytes)
+        .map_err(|_| StorageBootstrapError::GitProtocol)?
+        .trim();
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        Err(StorageBootstrapError::GitProtocol)
+    } else {
+        Ok(value)
+    }
+}
+
+fn validate_initialized(
+    settings: &WorkerSettings,
+    runtime_directory: &Path,
+    ids: StorageIdentities,
+) -> Result<(), StorageBootstrapError> {
+    let storage_root = common_storage_root(settings)?;
+    require_directory_metadata(
+        &storage_root,
+        ids.administrative_owner,
+        ids.queue_group,
+        0o751,
+    )?;
+    require_directory_metadata(
+        settings.queue_root(),
+        ids.queue_owner,
+        ids.queue_group,
+        0o2770,
+    )?;
+    require_directory_metadata(
+        settings.repository_root(),
+        ids.worker_owner,
+        ids.gateway_group,
+        0o2750,
+    )?;
+    require_directory_metadata(
+        settings.content_root(),
+        ids.worker_owner,
+        ids.gateway_group,
+        0o2750,
+    )?;
+    require_directory_metadata(
+        settings.work_root(),
+        ids.worker_owner,
+        ids.worker_group,
+        0o750,
+    )?;
+    require_directory_metadata(
+        settings.release_root(),
+        ids.worker_owner,
+        ids.worker_group,
+        0o750,
+    )?;
+    require_directory_metadata(
+        runtime_directory,
+        ids.queue_owner,
+        ids.ingress_group,
+        0o2750,
+    )?;
+    QueueReader::open_until(settings.queue_root().to_path_buf(), None)
+        .map_err(|error| StorageBootstrapError::Component("queue validation", error.to_string()))?;
+    CommittedStore::open(
+        settings.repository_root(),
+        settings.content_root(),
+        settings.official_branch(),
+    )
+    .map_err(|error| {
+        StorageBootstrapError::Component("repository validation", error.to_string())
+    })?;
+    ReleaseReader::open(settings.release_root(), ReleasePolicy::default()).map_err(|error| {
+        StorageBootstrapError::Component("release validation", error.to_string())
+    })?;
+    for relative in [
+        "transactions",
+        "worktrees",
+        ".agent-knowledge-repository-binding-v2",
+    ] {
+        require_real_entry(&settings.work_root().join(relative))?;
+    }
+    require_real_entry(
+        &settings
+            .repository_root()
+            .join("agent-knowledge/binding-v2"),
+    )?;
+    Ok(())
+}
+
+fn require_directory_metadata(
+    path: &Path,
+    owner: Uid,
+    group: Gid,
+    mode: u32,
+) -> Result<(), StorageBootstrapError> {
+    let metadata = fs::symlink_metadata(path).map_err(StorageBootstrapError::Io)?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != owner.as_raw()
+        || metadata.gid() != group.as_raw()
+        || metadata.permissions().mode() & 0o7777 != mode
+    {
+        return Err(StorageBootstrapError::InvalidInitializedPath(
+            path.to_path_buf(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_real_entry(path: &Path) -> Result<(), StorageBootstrapError> {
+    let metadata = fs::symlink_metadata(path).map_err(StorageBootstrapError::Io)?;
+    if metadata.file_type().is_dir() || (metadata.file_type().is_file() && metadata.nlink() == 1) {
+        Ok(())
+    } else {
+        Err(StorageBootstrapError::InvalidInitializedPath(
+            path.to_path_buf(),
+        ))
+    }
+}
+
+fn read_marker(path: &Path, owner: Uid) -> Result<BootstrapMarker, StorageBootstrapError> {
+    let metadata = fs::symlink_metadata(path).map_err(StorageBootstrapError::Io)?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != owner.as_raw()
+        || metadata.permissions().mode() & 0o7777 != 0o444
+        || metadata.len() > MAXIMUM_MARKER_BYTES
+    {
+        return Err(StorageBootstrapError::InvalidMarker);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .map_err(StorageBootstrapError::Io)?
+        .take(MAXIMUM_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(StorageBootstrapError::Io)?;
+    if bytes.len() as u64 > MAXIMUM_MARKER_BYTES {
+        return Err(StorageBootstrapError::InvalidMarker);
+    }
+    let marker: BootstrapMarker =
+        serde_json::from_slice(&bytes).map_err(StorageBootstrapError::MarkerJson)?;
+    if marker.schema_version != MARKER_VERSION {
+        return Err(StorageBootstrapError::InvalidMarker);
+    }
+    Ok(marker)
+}
+
+fn write_marker(path: &Path, marker: &BootstrapMarker) -> Result<(), StorageBootstrapError> {
+    let parent = path.parent().ok_or(StorageBootstrapError::StorageLayout)?;
+    let temporary = parent.join(format!(".{MARKER_NAME}.{}.tmp", Ulid::generate()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .open(&temporary)
+        .map_err(StorageBootstrapError::Io)?;
+    serde_json::to_writer(&mut file, marker).map_err(StorageBootstrapError::MarkerJson)?;
+    file.write_all(b"\n").map_err(StorageBootstrapError::Io)?;
+    file.sync_all().map_err(StorageBootstrapError::Io)?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))
+        .map_err(StorageBootstrapError::Io)?;
+    fs::rename(&temporary, path).map_err(StorageBootstrapError::Io)?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(StorageBootstrapError::Io)
+}
+
+fn path_exists(path: &Path) -> Result<bool, StorageBootstrapError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StorageBootstrapError::Io(error)),
+    }
+}
+
+fn sync_parent(path: &Path) -> Result<(), StorageBootstrapError> {
+    let parent = path.parent().ok_or(StorageBootstrapError::StorageLayout)?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(StorageBootstrapError::Io)
+}
+
+fn write_output(
+    output: &mut impl Write,
+    status: &'static str,
+) -> Result<(), StorageBootstrapError> {
+    serde_json::to_writer(output.by_ref(), &BootstrapOutput { status })
+        .map_err(StorageBootstrapError::MarkerJson)?;
+    output.write_all(b"\n").map_err(StorageBootstrapError::Io)?;
+    output.flush().map_err(StorageBootstrapError::Io)
+}
+
+#[derive(Debug)]
+pub(crate) enum StorageBootstrapError {
+    RootRequired,
+    Config(WorkerConfigError),
+    Identity(StorageMigrationError),
+    StorageLayout,
+    InvalidRuntimeDirectory,
+    PartialInitialization(PathBuf),
+    UnsafePath(PathBuf),
+    MarkerMismatch,
+    InvalidMarker,
+    InvalidInitializedPath(PathBuf),
+    Component(&'static str, String),
+    GitFailed(String),
+    GitProtocol,
+    GitOutputTooLarge,
+    Permissions(PathBuf, StorageMigrationError),
+    MarkerJson(serde_json::Error),
+    Io(io::Error),
+}
+
+impl fmt::Display for StorageBootstrapError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootRequired => formatter.write_str("storage bootstrap must run as root"),
+            Self::Config(error) => write!(formatter, "invalid Worker configuration: {error}"),
+            Self::Identity(error) => write!(formatter, "invalid storage identity: {error}"),
+            Self::StorageLayout => formatter.write_str(
+                "storage bootstrap requires all five storage paths to be direct children of one non-root directory",
+            ),
+            Self::InvalidRuntimeDirectory => {
+                formatter.write_str("runtime directory must be an absolute path outside durable storage")
+            }
+            Self::PartialInitialization(path) => write!(
+                formatter,
+                "storage bootstrap found nonempty storage without a completion marker: {}",
+                path.display()
+            ),
+            Self::UnsafePath(path) => write!(
+                formatter,
+                "storage bootstrap path is not a real directory: {}",
+                path.display()
+            ),
+            Self::MarkerMismatch => formatter.write_str(
+                "storage bootstrap marker does not match the requested configuration or identities",
+            ),
+            Self::InvalidMarker => formatter.write_str("storage bootstrap marker is invalid"),
+            Self::InvalidInitializedPath(path) => write!(
+                formatter,
+                "initialized storage metadata is invalid: {}",
+                path.display()
+            ),
+            Self::Component(component, error) => write!(formatter, "{component} failed: {error}"),
+            Self::GitFailed(error) if error.is_empty() => {
+                formatter.write_str("storage bootstrap Git command failed")
+            }
+            Self::GitFailed(error) => write!(formatter, "storage bootstrap Git command failed: {error}"),
+            Self::GitProtocol => formatter.write_str("storage bootstrap Git output is invalid"),
+            Self::GitOutputTooLarge => {
+                formatter.write_str("storage bootstrap Git output exceeded its limit")
+            }
+            Self::Permissions(path, error) => write!(
+                formatter,
+                "storage permission setup failed for {}: {error}",
+                path.display()
+            ),
+            Self::MarkerJson(error) => write!(formatter, "storage bootstrap JSON failed: {error}"),
+            Self::Io(error) => write!(formatter, "storage bootstrap I/O failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StorageBootstrapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::Identity(error) | Self::Permissions(_, error) => Some(error),
+            Self::MarkerJson(error) => Some(error),
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "storage_bootstrap_tests.rs"]
+mod tests;

@@ -20,8 +20,9 @@ document-bundle export are implemented. The flake provides reproducible Linux
 packaging, a conventional systemd Worker service, and a systemd-activated local
 queue-ingress broker that isolates the forced-command Gateway from durable queue
 access under distinct service identities. Reproducible Worker, Queue Ingress,
-one-shot Gateway, and OpenSSH Gateway adapter container packaging is
-implemented; single-replica Kubernetes manifests remain future work. CI
+one-shot Gateway, OpenSSH Gateway adapter, and storage-bootstrap init container
+packaging is implemented; single-replica Kubernetes manifests remain future
+work. CI
 verifies the client, login-shell adapter, and Gateway through a real restricted
 OpenSSH server with fictional ephemeral keys and accounts, in addition to
 exercising the service privilege boundary.
@@ -100,6 +101,13 @@ nix build .#openssh-gateway-container-image
 docker load < result
 ```
 
+Build the root-only storage init image for that deployment:
+
+```sh
+nix build .#storage-bootstrap-container-image
+docker load < result
+```
+
 The Worker image is built natively for both `x86_64-linux` (`amd64`) and
 `aarch64-linux` (`arm64`). Its entrypoint fixes the wrapped executable and
 `worker run` role; the configuration path is supplied as an argument by the
@@ -147,7 +155,43 @@ mount `sshd_config`, host keys, authorized keys, and the Gateway configuration,
 and must grant the Gateway supplemental GID `10004`. None of those inputs is
 included in the image.
 
-`just check-package` validates all four image archives, architectures,
+The Storage Bootstrap image fixes the `admin bootstrap-storage` entrypoint and
+runs as root only during Pod initialization. Given the same Worker
+configuration later used by the Worker, it creates the durable queue, bare Git
+repository, empty initial commit, canonical content worktree, transaction and
+release stores, and the ephemeral queue-ingress runtime directory with the
+fixed container UID/GID boundary. It contains Git but no OpenSSH, CA bundle,
+Quartz content, configuration, or credentials. The deployment supplies the
+Worker configuration and mounts one persistent volume containing its five
+sibling storage roots plus a separate runtime `emptyDir`.
+
+The command writes a root-owned completion marker beside the five durable
+roots only after every component has initialized and permissions have been
+normalized. A matching marker makes later runs idempotent and allows the
+ephemeral runtime directory to be recreated after a Pod restart. Nonempty
+durable storage without that marker, a mismatched marker, a partially populated
+runtime directory, links, special files, or inconsistent component bindings
+fail closed; the command never guesses how to repair or remove them. The five
+configured durable paths must be direct children of one non-root directory.
+For the fixed container identities, an init container invocation is:
+
+```sh
+agent-knowledge admin bootstrap-storage \
+  --config /etc/agent-knowledge/worker.yaml \
+  --runtime-directory /run/agent-knowledge \
+  --worker-owner 10003 \
+  --worker-group 10003 \
+  --queue-owner 10002 \
+  --queue-group 10002 \
+  --gateway-group 10001 \
+  --ingress-group 10004
+```
+
+The named identity defaults resolve to the same values in the supplied image,
+so Kubernetes manifests may omit the numeric overrides. Explicit numeric
+values make the volume ownership contract visible in a manifest.
+
+`just check-package` validates all five image archives, architectures,
 deterministic timestamps, role-locked entrypoints, fixed identity metadata,
 role-specific environment, and required filesystem entries without Docker or
 Podman. It also verifies the Worker's CA bundle, both Gateway variants' local
@@ -172,13 +216,15 @@ sudo nix profile add --profile /nix/var/nix/profiles/agent-knowledge \
   .#agent-knowledge
 package_path=/nix/var/nix/profiles/agent-knowledge
 sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
+sudo install -d -m 0755 -o root -g root /etc/agent-knowledge
+sudo install -m 0640 -o root -g agent-knowledge \
+  ./fictional-worker.yaml /etc/agent-knowledge/worker.yaml
+sudo "$package_path/bin/agent-knowledge" admin bootstrap-storage \
+  --config /etc/agent-knowledge/worker.yaml
 sudo ln -sfn \
   "$package_path/lib/tmpfiles.d/agent-knowledge.conf" \
   /etc/tmpfiles.d/agent-knowledge.conf
 sudo systemd-tmpfiles --create agent-knowledge.conf
-sudo install -d -m 0755 -o root -g root /etc/agent-knowledge
-sudo install -m 0640 -o root -g agent-knowledge \
-  ./fictional-worker.yaml /etc/agent-knowledge/worker.yaml
 sudo systemctl link "$package_path/lib/systemd/system/agent-knowledge-worker.service"
 sudo systemctl link \
   "$package_path/lib/systemd/system/agent-knowledge-queue-ingress.socket"
@@ -193,11 +239,15 @@ packaged definition.
 The supplied storage layout uses sibling roots below
 `/var/lib/agent-knowledge/`. A matching Worker configuration uses `queue`,
 `repository`, `content`, `work`, and `releases` below that directory. The
-operator must initialize `repository` as a bare Git repository with the
-configured official branch, attach `content` as that branch's canonical
-worktree, and deploy the configured Quartz launcher and integration tree before
-starting the service. The Worker intentionally does not invent these
-deployment inputs. After validating them, enable and start the Worker:
+operator must initialize the queue, repository, canonical content worktree,
+work root, and release store before starting the service. This can be done
+explicitly before `systemd-tmpfiles --create` with the root-only
+`admin bootstrap-storage --config /etc/agent-knowledge/worker.yaml` command, or
+with an equivalent audited provisioning process. The bootstrap command does
+not validate or install Quartz. Deploy the configured Quartz launcher and
+integration tree separately before starting the Worker. The Worker
+intentionally does not invent these deployment inputs. After validating them,
+enable and start the Worker:
 
 ```sh
 sudo systemctl enable --now agent-knowledge-queue-ingress.socket

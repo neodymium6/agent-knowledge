@@ -17,6 +17,7 @@
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       forLinuxSystems = nixpkgs.lib.genAttrs linuxSystems;
+      pkgsFor = forAllSystems (system: import nixpkgs { inherit system; });
       projectVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
       queueIngressService = builtins.path {
         path = ./deploy/systemd + "/agent-knowledge-queue-ingress@.service";
@@ -29,7 +30,7 @@
       unwrappedPackageFor =
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor.${system};
         in
         pkgs.rustPlatform.buildRustPackage {
           pname = "agent-knowledge";
@@ -78,7 +79,7 @@
       packageFor =
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor.${system};
           unwrappedPackage = unwrappedPackageFor system;
         in
         pkgs.runCommand "agent-knowledge-${projectVersion}"
@@ -117,7 +118,7 @@
       gatewayPackageFor =
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor.${system};
           unwrappedPackage = unwrappedPackageFor system;
         in
         pkgs.runCommand "agent-knowledge-gateway-${projectVersion}"
@@ -136,7 +137,7 @@
       opensshGatewayPackageFor =
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor.${system};
           unwrappedPackage = unwrappedPackageFor system;
         in
         pkgs.runCommand "agent-knowledge-openssh-gateway-${projectVersion}"
@@ -154,10 +155,29 @@
             install -m755 ${unwrappedPackage}/bin/agent-knowledge-ssh-shell \
               "$out/bin/agent-knowledge-ssh-shell"
           '';
+      storageBootstrapPackageFor =
+        system:
+        let
+          pkgs = pkgsFor.${system};
+          unwrappedPackage = unwrappedPackageFor system;
+        in
+        pkgs.runCommand "agent-knowledge-storage-bootstrap-${projectVersion}"
+          {
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            pname = "agent-knowledge-storage-bootstrap";
+            version = projectVersion;
+            meta = unwrappedPackage.meta;
+          }
+          ''
+            mkdir -p "$out/bin"
+            makeWrapper ${unwrappedPackage}/bin/agent-knowledge \
+              "$out/bin/agent-knowledge" \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.gitMinimal ]}
+          '';
       containerRootFilesystemFor =
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor.${system};
         in
         pkgs.runCommand "agent-knowledge-container-root" { } ''
           install -d "$out/etc" "$out/var/empty" "$out/var/lib/agent-knowledge"
@@ -167,7 +187,7 @@
       workerContainerImageFor =
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor.${system};
           package = packageFor system;
           rootFilesystem = containerRootFilesystemFor system;
         in
@@ -202,7 +222,7 @@
       queueIngressContainerImageFor =
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor.${system};
           package = unwrappedPackageFor system;
           rootFilesystem = containerRootFilesystemFor system;
         in
@@ -233,7 +253,7 @@
       gatewayContainerImageFor =
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor.${system};
           package = gatewayPackageFor system;
           rootFilesystem = containerRootFilesystemFor system;
         in
@@ -263,7 +283,7 @@
       opensshGatewayContainerImageFor =
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor.${system};
           package = opensshGatewayPackageFor system;
           rootFilesystem = pkgs.runCommand "agent-knowledge-openssh-gateway-root" { } ''
             install -d "$out/bin" "$out/etc" "$out/var/empty"
@@ -309,12 +329,43 @@
             };
           };
         };
+      storageBootstrapContainerImageFor =
+        system:
+        let
+          pkgs = pkgsFor.${system};
+          package = storageBootstrapPackageFor system;
+          rootFilesystem = containerRootFilesystemFor system;
+        in
+        pkgs.dockerTools.buildLayeredImage {
+          name = "agent-knowledge-storage-bootstrap";
+          tag = projectVersion;
+          contents = [
+            package
+            rootFilesystem
+          ];
+          config = {
+            User = "0";
+            WorkingDir = "/var/empty";
+            Entrypoint = [
+              "${package}/bin/agent-knowledge"
+              "admin"
+              "bootstrap-storage"
+            ];
+            Env = [ "HOME=/var/empty" ];
+            StopSignal = "SIGTERM";
+            Labels = {
+              "org.opencontainers.image.title" = "Agent Knowledge Storage Bootstrap";
+              "org.opencontainers.image.version" = projectVersion;
+              "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+            };
+          };
+        };
     in
     {
       devShells = forAllSystems (
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor.${system};
         in
         {
           default = pkgs.mkShell {
@@ -345,6 +396,7 @@
         gateway-container-image = gatewayContainerImageFor system;
         openssh-gateway-package = opensshGatewayPackageFor system;
         openssh-gateway-container-image = opensshGatewayContainerImageFor system;
+        storage-bootstrap-container-image = storageBootstrapContainerImageFor system;
         queue-ingress-container-image = queueIngressContainerImageFor system;
         worker-container-image = workerContainerImageFor system;
         default = agent-knowledge;
@@ -362,7 +414,7 @@
       checks = forLinuxSystems (
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor.${system};
           package = packageFor system;
           workerContainerImage = workerContainerImageFor system;
           workerContainerImageCheck =
@@ -491,9 +543,39 @@
                       -
                     touch "$out"
               '';
+          storage-bootstrap-container-image =
+            let
+              storageBootstrapContainerImage = storageBootstrapContainerImageFor system;
+              storageBootstrapPackage = storageBootstrapPackageFor system;
+            in
+            pkgs.runCommand "check-agent-knowledge-storage-bootstrap-container-image"
+              {
+                nativeBuildInputs = [
+                  pkgs.gnutar
+                  pkgs.gzip
+                  pkgs.jq
+                ];
+              }
+              ''
+                ${pkgs.bash}/bin/bash ${./deploy/container/check-image.sh} \
+                      ${storageBootstrapContainerImage} \
+                      ${containerArchitecture.${system}} \
+                      ${storageBootstrapPackage}/bin/agent-knowledge \
+                      ${projectVersion} \
+                      ${./deploy/container/passwd} \
+                      ${./deploy/container/group} \
+                      agent-knowledge-storage-bootstrap \
+                      0 \
+                      admin \
+                      bootstrap-storage \
+                      /var/empty \
+                      "Agent Knowledge Storage Bootstrap" \
+                      -
+                    touch "$out"
+              '';
         }
       );
 
-      formatter = forAllSystems (system: (import nixpkgs { inherit system; }).nixfmt-tree);
+      formatter = forAllSystems (system: pkgsFor.${system}.nixfmt-tree);
     };
 }
