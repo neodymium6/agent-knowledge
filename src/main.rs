@@ -3,6 +3,7 @@ mod cli;
 mod client;
 mod gateway;
 mod queue_ingress;
+mod runtime_identity;
 #[cfg(target_os = "linux")]
 mod storage_bootstrap;
 mod worker;

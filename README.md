@@ -117,6 +117,11 @@ bundle and `SSL_CERT_FILE` setting needed for HTTPS Git replication. It exposes
 no conventional shell path, and the Worker process enforces umask `0027`
 independently of the container runtime. The image contains no deployment configuration,
 credentials, keys, or Quartz content.
+Before opening any component, the Worker verifies that its effective user owns
+all Worker-written roots, its primary group owns the private work and release
+roots, and its complete process group set contains exactly that group and the
+queue-owner group. Repository and content reader groups must remain distinct
+from both.
 
 The Queue Ingress image fixes the non-root `agent-knowledge-queue` identity
 (`10002:10002`) and `queue-ingress listen` entrypoint. It contains the raw Rust
@@ -126,6 +131,11 @@ runtime directory, and listener arguments. A dedicated ingress-socket group
 (`10004`) grants the Gateway access to the `0660` socket without granting the
 broker the Gateway reader group or granting Gateway access to the queue. The
 broker process enforces umask `0007` independently of the container runtime.
+Before opening the queue or publishing a socket, it verifies that its effective
+user owns the queue and runtime directory, its primary group owns the queue,
+and its complete process group set contains only that queue group. The runtime
+directory's ingress-client group must be distinct and is intentionally absent
+from the broker process.
 
 The Gateway image fixes the non-root `agent-knowledge-gateway` identity
 (`10001:10001`) and `gateway` entrypoint. The forced-command deployment passes
@@ -144,6 +154,11 @@ root-controlled configuration, committed repository and content for read-only
 access, and the queue-ingress runtime directory. Run the one-shot container
 with a read-only root filesystem, no network, no Linux capabilities, and no
 privilege escalation.
+Every Gateway request verifies its effective identity before reading a request
+body or opening Git. Its primary group must match the repository and content
+reader group, its only other process group must match the queue-ingress runtime
+directory, and its user must own neither the Worker storage nor the broker
+runtime directory.
 
 The OpenSSH Gateway adapter image starts the `sshd` supervisor with default
 port `2222` and uses the Rust `agent-knowledge-ssh-shell` executable as the
@@ -213,6 +228,16 @@ only to the queue role group, and the Gateway only to the Gateway-reader and
 ingress-client role groups. Bootstrap resolves primary and supplementary groups
 from the system account database before any storage mutation and rejects every
 additional membership.
+
+For a future single-Pod Kubernetes deployment, do not set Pod-wide `fsGroup` or
+`supplementalGroups`: Kubernetes applies those groups to every container in the
+Pod and would collapse the role boundary. The role-specific images instead use
+their immutable `/etc/passwd` and `/etc/group` entries with Kubernetes' `Merge`
+supplemental-group policy. The live checks above make this fail closed if a
+runtime omits a required image group or injects any additional group. A
+`Strict` policy ignores image group membership and is therefore incompatible
+with these images unless Kubernetes gains an equivalent container-scoped group
+mechanism.
 
 `just check-package` validates all five image archives, architectures,
 deterministic timestamps, role-locked entrypoints, fixed identity metadata,
@@ -309,7 +334,10 @@ The Worker receives the queue group as a supplementary group so it can perform
 state transitions without sharing either service UID. The durable storage root
 is `0751 root:agent-knowledge-queue`: the broker and Worker can open it for
 directory durability syncs, while the Gateway can only traverse to its known
-read-only repository and content paths.
+read-only repository and content paths. Service startup requires the
+provisioned directory modes exactly: queue `2770`, repository/content `2750`,
+and work/releases `0750`. It also rejects POSIX ACLs on these boundaries so ACL
+entries cannot silently broaden the mode-based authorization model.
 
 The dedicated system profile keeps the package output live across Nix garbage
 collection. The unit allows writes only below `/var/lib/agent-knowledge`, uses
@@ -355,7 +383,9 @@ sudo systemctl link --force \
   "$package_path/lib/systemd/system/agent-knowledge-queue-ingress.socket"
 sudo systemctl link --force \
   "$package_path/lib/systemd/system/agent-knowledge-queue-ingress@.service"
-# Before restarting, change Gateway schema_version to 3 and replace
+# Before restarting, change Gateway schema_version to 4, set
+# identity.gateway_uid to the output of: id -u "$gateway_account"
+# Then replace
 # storage.queue_root with:
 #   queue_socket: /run/agent-knowledge/queue-ingress.sock
 sudo systemctl daemon-reload
@@ -363,10 +393,12 @@ sudo systemctl enable --now agent-knowledge-queue-ingress.socket
 sudo systemctl start agent-knowledge-worker.service
 ```
 
-Gateway schema v2 is intentionally not accepted after this upgrade. Update
-`/etc/agent-knowledge/gateway.yaml` to schema v3 while access is disabled;
-replace `storage.queue_root` with `storage.queue_socket` as shown in the Gateway
-configuration example below. A deployment using non-default durable roots
+Gateway schemas older than v4 are intentionally not accepted after this
+upgrade. Update `/etc/agent-knowledge/gateway.yaml` to schema v4 while access
+is disabled, set `identity.gateway_uid` to the dedicated forced-command
+account's numeric UID, and replace `storage.queue_root` with
+`storage.queue_socket` as shown in the Gateway configuration example below. A
+deployment using non-default durable roots
 passes the three configured roots independently to the migration command and
 updates `ReadWritePaths`, `WorkingDirectory`, and the queue-ingress service's
 `ExecStart` queue root with systemd drop-ins.
@@ -387,8 +419,10 @@ agent-knowledge queue-ingress listen \
 
 The runtime directory must already exist, be owned and writable by the
 queue-ingress identity, use the setgid `agent-knowledge-ingress` group, and be
-writable by neither group nor other; mode `2750` is recommended. The container
-identity database assigns this group GID `10004`, and the Gateway joins it.
+writable by neither group nor other. Runtime identity validation requires exact
+mode `2750` and rejects both access and default POSIX ACLs. The container
+identity database assigns the ingress group GID `10004`, and the Gateway joins
+it.
 Its configured path must already be canonical, must not traverse symbolic
 links, and must leave room within Linux `sun_path` for the listener's 30-byte
 `.ak-<ULID>` temporary socket name; this is checked before listener state is
@@ -397,7 +431,8 @@ The listener publishes the socket as `0660`, refuses to overwrite live,
 non-socket, or unowned stale paths, recovers a stale socket recorded by its own
 locked state file after a crash, and rejects a socket basename change while a
 prior recorded socket still exists, including while upgrading v1 state through
-a bounded identity scan. Internal lock and state basenames are reserved. The
+a bounded identity scan. Socket-activated requests also reject POSIX ACLs on
+the published socket. Internal lock and state basenames are reserved. The
 listener bounds concurrent connections and handler shutdown, hands diagnostics
 to a capacity-one best-effort reporter after connection completion, and stops
 accepting and cancels active queue lock waits on `SIGINT` or `SIGTERM`. A
@@ -405,7 +440,11 @@ handler that ignores cancellation past the grace period makes the listener exit
 with failure so its supervisor can replace the process without accumulating
 detached threads.
 `queue-ingress serve` remains the one-connection entrypoint used by the
-packaged systemd units.
+packaged systemd units. Its required `--socket-path` identifies the activated
+socket's root-managed runtime directory so the process can validate the same
+owner and group boundary as the long-running listener. Before consuming a
+request, it also requires the accepted stdin socket's local address to match
+that path and verifies the socket file's owner, group, and mode `0660`.
 
 Run the Repository Worker with a validated deployment configuration:
 
@@ -590,12 +629,16 @@ reached, including when a proxy descendant retains an output pipe.
 The forced-command account needs read access to this root-controlled
 configuration and membership in `agent-knowledge-gateway`, but no queue or
 Worker-account membership. It also joins `agent-knowledge-ingress` to connect
-to the local broker socket.
+to the local broker socket. `identity.gateway_uid` pins the process to that
+dedicated account; use the account's numeric UID rather than relying on its
+current process identity.
 
 The forced command requires a strict Gateway configuration such as:
 
 ```yaml
-schema_version: 3
+schema_version: 4
+identity:
+  gateway_uid: 10001
 storage:
   queue_socket: /run/agent-knowledge/queue-ingress.sock
   git_directory: /srv/fictional-knowledge/repository

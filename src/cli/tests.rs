@@ -396,13 +396,30 @@ fn parses_the_systemd_activated_queue_ingress_command() {
         "serve".into(),
         "--queue-root".into(),
         "/srv/fictional-knowledge/queue".into(),
+        "--socket-path".into(),
+        "/run/fictional-knowledge/queue-ingress.sock".into(),
     ])
     .unwrap_or_else(|error| panic!("queue ingress command must parse: {error}"));
 
     assert!(matches!(
         command,
-        Command::ServeQueueIngress { queue_root }
+        Command::ServeQueueIngress { queue_root, socket_path }
             if queue_root == Path::new("/srv/fictional-knowledge/queue")
+                && socket_path == Path::new("/run/fictional-knowledge/queue-ingress.sock")
+    ));
+}
+
+#[test]
+fn rejects_systemd_activated_queue_ingress_without_its_socket_path() {
+    assert!(matches!(
+        parse_arguments([
+            "agent-knowledge".into(),
+            "queue-ingress".into(),
+            "serve".into(),
+            "--queue-root".into(),
+            "/srv/fictional-knowledge/queue".into(),
+        ]),
+        Err(CliError::Usage)
     ));
 }
 

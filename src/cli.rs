@@ -26,6 +26,7 @@ use crate::admin::{StorageMigration, StorageMigrationError};
 use crate::client::{self, ClientCommandError};
 use crate::gateway::{self, GatewayCommandError};
 use crate::queue_ingress::{self, ListenSettings, QueueIngressCommandError};
+use crate::runtime_identity::RuntimeIdentityError;
 #[cfg(target_os = "linux")]
 use crate::storage_bootstrap::{StorageBootstrap, StorageBootstrapError};
 use crate::worker::{self, WorkerCommandError};
@@ -42,7 +43,7 @@ const COMMON_USAGE: &str = "usage:\n\
     agent-knowledge client status --destination <ssh-destination> --request-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge client search --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge gateway --config <path> --client-id <id>\n\
-    agent-knowledge queue-ingress serve --queue-root <path>\n\
+    agent-knowledge queue-ingress serve --queue-root <path> --socket-path <path>\n\
     agent-knowledge queue-ingress listen --queue-root <path> --socket-path <path> [--maximum-connections <count>] [--connection-timeout-seconds <seconds>]\n\
     agent-knowledge worker run --config <path>";
 #[cfg(target_os = "linux")]
@@ -118,9 +119,20 @@ where
             std::env::var_os("SSH_ORIGINAL_COMMAND"),
         )
         .map_err(CliError::Gateway),
-        Command::ServeQueueIngress { queue_root } => {
+        Command::ServeQueueIngress {
+            queue_root,
+            socket_path,
+        } => {
             queue_ingress::enforce_writer_umask();
-            agent_knowledge_gateway::serve_ingress(&queue_root, io::stdin().lock(), output)
+            let stdin = io::stdin();
+            let input = stdin.lock();
+            crate::runtime_identity::validate_activated_queue_ingress(
+                &queue_root,
+                &socket_path,
+                &input,
+            )
+            .map_err(CliError::RuntimeIdentity)?;
+            agent_knowledge_gateway::serve_ingress(&queue_root, input, output)
                 .map_err(CliError::IngressServe)
         }
         Command::ListenQueueIngress { settings } => {
@@ -209,6 +221,7 @@ enum Command {
     },
     ServeQueueIngress {
         queue_root: PathBuf,
+        socket_path: PathBuf,
     },
     ListenQueueIngress {
         settings: ListenSettings,
@@ -629,11 +642,13 @@ where
     }
     let queue_root = queue_root.ok_or(CliError::Usage)?;
     if action == std::ffi::OsStr::new("serve")
-        && socket_path.is_none()
         && maximum_connections.is_none()
         && connection_timeout_seconds.is_none()
     {
-        return Ok(Command::ServeQueueIngress { queue_root });
+        return Ok(Command::ServeQueueIngress {
+            queue_root,
+            socket_path: socket_path.ok_or(CliError::Usage)?,
+        });
     }
     if action != std::ffi::OsStr::new("listen") {
         return Err(CliError::Usage);
@@ -936,6 +951,7 @@ pub enum CliError {
     PackageValidation(PackageValidationError),
     Queue(QueueError),
     LocalQueueOwner(PathBuf),
+    RuntimeIdentity(RuntimeIdentityError),
     AdminStatus(AdminStatusError),
     AdminRetention(AdminRetentionError),
     #[cfg(target_os = "linux")]
@@ -979,6 +995,12 @@ impl fmt::Display for CliError {
                 "local queue submission must run as the owner of {}",
                 path.display()
             ),
+            Self::RuntimeIdentity(error) => {
+                write!(
+                    formatter,
+                    "Queue Ingress identity validation failed: {error}"
+                )
+            }
             Self::AdminStatus(error) => error.fmt(formatter),
             Self::AdminRetention(error) => error.fmt(formatter),
             #[cfg(target_os = "linux")]
@@ -1002,6 +1024,7 @@ impl std::error::Error for CliError {
             Self::PackageValidation(error) => Some(error),
             Self::Queue(error) => Some(error),
             Self::LocalQueueOwner(_) => None,
+            Self::RuntimeIdentity(error) => Some(error),
             Self::AdminStatus(error) => Some(error),
             Self::AdminRetention(error) => Some(error),
             #[cfg(target_os = "linux")]

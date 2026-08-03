@@ -13,6 +13,7 @@ openssh_bin=$4
 test_root=$(mktemp -d /tmp/agent-knowledge-e2e.XXXXXX)
 chmod 0711 "$test_root"
 activation_pid=
+mismatch_activation_pid=
 sshd_pid=
 gateway_account_created=false
 client_account_created=false
@@ -32,6 +33,10 @@ cleanup() {
   if [[ -n $activation_pid ]]; then
     kill "$activation_pid" 2>/dev/null || true
     wait "$activation_pid" 2>/dev/null || true
+  fi
+  if [[ -n $mismatch_activation_pid ]]; then
+    kill "$mismatch_activation_pid" 2>/dev/null || true
+    wait "$mismatch_activation_pid" 2>/dev/null || true
   fi
   if [[ $client_account_created == true ]]; then
     userdel fictional-ak-client 2>/dev/null || true
@@ -222,6 +227,55 @@ if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
   exit 1
 fi
 
+install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
+  "$test_root/quartz-integration"
+cat >"$test_root/quartz-integration/build-site" <<'EOF'
+#!/bin/sh
+printf '%s\n' '<p>fictional site</p>' >"$5/index.html"
+EOF
+chown "$worker_uid":"$worker_gid" "$test_root/quartz-integration/build-site"
+chmod 0500 "$test_root/quartz-integration/build-site"
+cat >"$test_root/worker.yaml" <<EOF
+schema_version: 1
+storage:
+  queue_root: $test_root/storage/queue
+  repository_root: $test_root/storage/repository
+  content_root: $test_root/storage/content
+  work_root: $test_root/storage/work
+  release_root: $test_root/storage/releases
+repository:
+  official_branch: main
+  author_name: Fictional Knowledge Worker
+  author_email: worker@fictional.invalid
+quartz:
+  program: $test_root/quartz-integration/build-site
+  integration_root: $test_root/quartz-integration
+  timeout_seconds: 30
+batch:
+  debounce_seconds: 30
+  maximum_age_seconds: 300
+  maximum_scan_entries: 1024
+  maximum_requests: 100
+  maximum_recovery_requests: 10000
+EOF
+chown root:"$worker_gid" "$test_root/worker.yaml"
+chmod 0640 "$test_root/worker.yaml"
+set +e
+setpriv --reuid="$worker_uid" --regid="$worker_gid" --groups="$queue_gid" \
+  env "HOME=$test_root/worker-home" \
+  timeout --signal=TERM --kill-after=5 2 \
+  "$test_root/agent-knowledge" worker run --config "$test_root/worker.yaml" \
+  >"$test_root/worker.log" 2>&1
+worker_status=$?
+set -e
+if ((worker_status != 124)); then
+  echo "Worker systemd identity smoke test exited unexpectedly: ${worker_status}" >&2
+  sed 's/^/  /' "$test_root/worker.log" >&2
+  exit 1
+fi
+grep -Fq '"event":"worker_started"' "$test_root/worker.log"
+grep -Fq '"event":"worker_stopped"' "$test_root/worker.log"
+
 tar --format=gnu --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
   -C "$test_root/package" -cf "$test_root/request.tar" request.json payload
 cp -a "$test_root/package" "$test_root/package-two"
@@ -240,7 +294,9 @@ sed -i \
   "$test_root/package-three/payload/run/index.md"
 
 cat >"$test_root/gateway.yaml" <<EOF
-schema_version: 3
+schema_version: 4
+identity:
+  gateway_uid: $gateway_uid
 storage:
   queue_socket: $test_root/run/queue-ingress.sock
   git_directory: $test_root/storage/repository
@@ -268,12 +324,115 @@ chown root:"$gateway_gid" \
   "$test_root/gateway.yaml" "$test_root/request.tar" "$test_root/request-two.tar"
 chmod 0640 "$test_root/gateway.yaml" "$test_root/request.tar" "$test_root/request-two.tar"
 
+if setpriv --reuid="$queue_uid" --regid="$queue_gid" --groups="$ingress_gid" \
+  "$test_root/agent-knowledge" queue-ingress serve \
+  --queue-root "$test_root/storage/queue" \
+  --socket-path "$test_root/run/queue-ingress.sock" </dev/null \
+  >"$test_root/unsafe-ingress.log" 2>&1; then
+  echo "Queue Ingress accepted an unrelated supplementary group" >&2
+  exit 1
+fi
+grep -Fq 'Queue Ingress identity validation failed' \
+  "$test_root/unsafe-ingress.log"
+
+chown "$queue_uid":"$queue_gid" "$test_root/run"
+if setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
+  "$test_root/agent-knowledge" queue-ingress serve \
+  --queue-root "$test_root/storage/queue" \
+  --socket-path "$test_root/run/queue-ingress.sock" </dev/null \
+  >"$test_root/collapsed-ingress.log" 2>&1; then
+  echo "Queue Ingress accepted a collapsed socket client group" >&2
+  exit 1
+fi
+grep -Fq 'queue-owner and ingress-client groups' \
+  "$test_root/collapsed-ingress.log"
+chown "$queue_uid":"$ingress_gid" "$test_root/run"
+
+chmod 2770 "$test_root/run"
+if setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
+  "$test_root/agent-knowledge" queue-ingress serve \
+  --queue-root "$test_root/storage/queue" \
+  --socket-path "$test_root/run/queue-ingress.sock" </dev/null \
+  >"$test_root/writable-runtime.log" 2>&1; then
+  echo "Queue Ingress accepted a group-writable socket namespace" >&2
+  exit 1
+fi
+grep -Fq 'mode 2770 does not match required 2750' \
+  "$test_root/writable-runtime.log"
+chmod 2750 "$test_root/run"
+
+if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" \
+  --groups="$ingress_gid,$queue_gid" \
+  env SSH_ORIGINAL_COMMAND='akp-v1 list' \
+  "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
+  --client-id fictional-node-a </dev/null \
+  >"$test_root/unsafe-gateway.log" 2>&1; then
+  echo "Gateway accepted an unrelated supplementary group" >&2
+  exit 1
+fi
+grep -Fq '"error_code":"INTERNAL_ERROR"' "$test_root/unsafe-gateway.log"
+
+chmod 2770 "$test_root/storage/repository"
+if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" \
+  --groups="$ingress_gid" \
+  env SSH_ORIGINAL_COMMAND='akp-v1 list' \
+  "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
+  --client-id fictional-node-a </dev/null \
+  >"$test_root/writable-repository.log" 2>&1; then
+  echo "Gateway accepted a group-writable repository" >&2
+  exit 1
+fi
+grep -Fq '"error_code":"INTERNAL_ERROR"' \
+  "$test_root/writable-repository.log"
+chmod 2750 "$test_root/storage/repository"
+
 umask 0007
+mismatch_socket=$test_root/run/unexpected-ingress.sock
+cp "$test_root/gateway.yaml" "$test_root/mismatch-gateway.yaml"
+sed -i \
+  "s#queue_socket: .*#queue_socket: $mismatch_socket#" \
+  "$test_root/mismatch-gateway.yaml"
+chown root:"$gateway_gid" "$test_root/mismatch-gateway.yaml"
+chmod 0640 "$test_root/mismatch-gateway.yaml"
+systemd-socket-activate --accept --inetd \
+  --listen="$mismatch_socket" \
+  setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
+  "$test_root/agent-knowledge" queue-ingress serve \
+  --queue-root "$test_root/storage/queue" \
+  --socket-path "$test_root/run/queue-ingress.sock" \
+  >"$test_root/mismatch-activation.log" 2>&1 &
+mismatch_activation_pid=$!
+for _ in $(seq 1 100); do
+  [[ -S $mismatch_socket ]] && break
+  sleep 0.05
+done
+test -S "$mismatch_socket"
+chown "$queue_uid":"$ingress_gid" "$mismatch_socket"
+chmod 0660 "$mismatch_socket"
+if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
+  env SSH_ORIGINAL_COMMAND='akp-v1 submit' \
+  "$test_root/agent-knowledge" gateway --config "$test_root/mismatch-gateway.yaml" \
+  --client-id fictional-node-a <"$test_root/request.tar" \
+  >"$test_root/mismatch-gateway.log" 2>&1; then
+  echo "Queue Ingress accepted a connection from an unexpected activated socket" >&2
+  exit 1
+fi
+for _ in $(seq 1 100); do
+  grep -Fq 'does not match configured path' "$test_root/mismatch-activation.log" && break
+  sleep 0.05
+done
+grep -Fq 'does not match configured path' "$test_root/mismatch-activation.log"
+kill "$mismatch_activation_pid" 2>/dev/null || true
+wait "$mismatch_activation_pid" 2>/dev/null || true
+mismatch_activation_pid=
+rm -f -- "$mismatch_socket"
+
 systemd-socket-activate --accept --inetd \
   --listen="$test_root/run/queue-ingress.sock" \
   setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
   "$test_root/agent-knowledge" queue-ingress serve \
   --queue-root "$test_root/storage/queue" \
+  --socket-path "$test_root/run/queue-ingress.sock" \
   >"$test_root/activation.log" 2>&1 &
 activation_pid=$!
 for _ in $(seq 1 100); do

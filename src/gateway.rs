@@ -19,6 +19,8 @@ use agent_knowledge_protocol::{
 };
 use serde::de::DeserializeOwned;
 
+use crate::runtime_identity::{RuntimeIdentityError, validate_gateway};
+
 const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
 
 #[cfg(target_os = "linux")]
@@ -29,6 +31,7 @@ pub fn run_stdio(
 ) -> Result<(), GatewayCommandError> {
     let settings = GatewaySettings::load(config)
         .map_err(|error| GatewayCommandError::Config(Box::new(error)))?;
+    validate_gateway(&settings).map_err(GatewayCommandError::Identity)?;
     let timeout = settings.submit_timeout();
     let stdin = io::stdin();
     let input = std::fs::File::from(nix::unistd::dup(&stdin).map_err(|error| {
@@ -50,6 +53,7 @@ pub fn run_stdio(
 ) -> Result<(), GatewayCommandError> {
     let settings = GatewaySettings::load(config)
         .map_err(|error| GatewayCommandError::Config(Box::new(error)))?;
+    validate_gateway(&settings).map_err(GatewayCommandError::Identity)?;
     run_with_settings(
         settings,
         client_id,
@@ -362,6 +366,7 @@ pub enum GatewayCommandError {
     InvalidClientIdEncoding,
     ClientId(ClientIdError),
     Config(Box<GatewayConfigError>),
+    Identity(RuntimeIdentityError),
     Gateway(Box<GatewayError>),
     Ingress(IngressClientError),
     InputSetup(io::Error),
@@ -398,6 +403,7 @@ impl GatewayCommandError {
             Self::InvalidClientIdEncoding
             | Self::ClientId(_)
             | Self::Config(_)
+            | Self::Identity(_)
             | Self::InputSetup(_)
             | Self::OutputSetup(_)
             | Self::ControlInput(_)
@@ -436,6 +442,9 @@ impl fmt::Display for GatewayCommandError {
                 write!(formatter, "forced-command client ID is invalid: {error}")
             }
             Self::Config(error) => write!(formatter, "Gateway configuration failed: {error}"),
+            Self::Identity(error) => {
+                write!(formatter, "Gateway identity validation failed: {error}")
+            }
             Self::Gateway(error) => error.fmt(formatter),
             Self::Ingress(error) => error.fmt(formatter),
             Self::InputSetup(error) => write!(formatter, "Gateway input setup failed: {error}"),
@@ -458,6 +467,7 @@ impl std::error::Error for GatewayCommandError {
         match self {
             Self::ClientId(error) => Some(error),
             Self::Config(error) => Some(error.as_ref()),
+            Self::Identity(error) => Some(error),
             Self::Gateway(error) => Some(error.as_ref()),
             Self::Ingress(error) => Some(error),
             Self::InputSetup(error) => Some(error),

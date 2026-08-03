@@ -234,10 +234,12 @@ requires:
   resolve `/proc/<worker-pid>/fd`.
 
 All durable paths are configurable. Processes handle termination signals and
-shut down at transaction boundaries. The configured queue root may be created
-by the application, but its parent directory must already exist so the
-application can durably synchronize the new root entry without recursively
-creating unsynchronized ancestors.
+shut down at transaction boundaries. Low-level storage APIs may create a queue
+root for tests and administrative tooling when its parent already exists, but
+the production `worker run` command requires the queue, repository, content,
+work, and release roots to have been initialized by `admin bootstrap-storage`
+or an equivalent audited provisioning process. It validates their live
+identities before any component can create or mutate storage.
 
 The Worker process converts `SIGINT` and `SIGTERM` into a shutdown flag. It
 checks that flag between bounded queue scans, during bounded waits, and after a
@@ -319,12 +321,33 @@ bundled into the init image.
 The dedicated OpenSSH Gateway adapter image is the transport boundary for that
 Pod. It shares the committed repository, content checkout, and queue-ingress
 socket through explicit volumes with the other role containers. Kubernetes
-manifests must assign explicit identities and supplemental groups, mount server
-configuration and keys read-only, and grant only the capabilities required by
+manifests must assign explicit primary identities, preserve the role-specific
+image memberships, mount server configuration and keys read-only, and grant only the capabilities required by
 the OpenSSH master to bind a non-privileged port and drop to the Gateway
 account. The image sets the command-line default to `2222`; the mounted
 configuration must not use a port-qualified `ListenAddress` that changes that
 port. Packaging the adapter does not itself define those manifests.
+
+Kubernetes `fsGroup` and `supplementalGroups` are Pod-scoped and therefore must
+not be used for this single-Pod deployment: either role group would otherwise
+be granted to every service container. The role-specific image account
+databases carry the Worker queue-owner membership and Gateway ingress-client
+membership under the `Merge` supplemental-group policy. Queue Ingress has no
+supplementary membership. Worker, Queue Ingress, and each forced-command
+Gateway process inspect their effective user, primary group, and complete group
+set before opening a mutable component or consuming a request. They derive the
+expected users and groups from root-controlled configuration and the
+initialized directories they are permitted to know,
+require an exact set match, reject root or collapsed service identities, and
+fail before durable mutation when the runtime changes or augments the packaged
+identity. The deployment must not select `Strict`, which intentionally ignores
+the image account database and would remove the two required container-specific
+memberships.
+
+Each socket-activated Queue Ingress process additionally compares its accepted
+standard-input socket's local Unix address with the root-controlled configured
+path and validates the socket file's queue-owner UID, ingress-client GID, and
+mode before reading the request.
 
 SSH host keys, client public keys, Git credentials, and other secrets are
 deployment inputs. They are never stored in this repository or in committed
@@ -1749,6 +1772,7 @@ untrusted. Defense in depth includes:
 - safe process argument construction;
 - execution timeouts and output limits for Git and Quartz;
 - least-privilege service accounts;
+- startup validation of each service process's exact live user and group set;
 - no credentials in request packages, content, logs, or commits; and
 - audit records containing client ID and request ID.
 

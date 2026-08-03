@@ -24,6 +24,8 @@ use nix::unistd::Uid;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use ulid::Ulid;
 
+use crate::runtime_identity::{RuntimeIdentityError, validate_queue_ingress};
+
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HANDLER_CANCELLATION_GRACE: Duration = Duration::from_secs(1);
 const LISTENER_LOCK_FILE: &str = ".agent-knowledge-queue-ingress.lock";
@@ -63,6 +65,8 @@ where
     W: Write + Send + 'static,
 {
     enforce_writer_umask();
+    validate_queue_ingress(&settings.queue_root, &settings.socket_path)
+        .map_err(QueueIngressCommandError::Identity)?;
     let stopping = Arc::new(AtomicBool::new(false));
     let _sigint = signal_hook::flag::register(SIGINT, Arc::clone(&stopping))
         .map_err(QueueIngressCommandError::SignalRegistration)?;
@@ -1036,6 +1040,7 @@ impl Drop for OwnedSocketNode {
 
 #[derive(Debug)]
 pub(crate) enum QueueIngressCommandError {
+    Identity(RuntimeIdentityError),
     SignalRegistration(io::Error),
     Listener(QueueIngressListenerError),
 }
@@ -1043,6 +1048,12 @@ pub(crate) enum QueueIngressCommandError {
 impl fmt::Display for QueueIngressCommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Identity(error) => {
+                write!(
+                    formatter,
+                    "Queue Ingress identity validation failed: {error}"
+                )
+            }
             Self::SignalRegistration(error) => {
                 write!(
                     formatter,
@@ -1057,6 +1068,7 @@ impl fmt::Display for QueueIngressCommandError {
 impl std::error::Error for QueueIngressCommandError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Identity(error) => Some(error),
             Self::SignalRegistration(error) => Some(error),
             Self::Listener(error) => Some(error),
         }
