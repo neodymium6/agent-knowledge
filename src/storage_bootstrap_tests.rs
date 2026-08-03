@@ -255,6 +255,25 @@ fn rejects_runtime_acl_before_creating_fresh_storage() {
 }
 
 #[test]
+fn rejects_runtime_parent_default_acl_before_creating_fresh_storage() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    let runtime_parent = request
+        .runtime_directory
+        .parent()
+        .unwrap_or_else(|| panic!("runtime fixture must have a parent"));
+    set_extended_posix_acl(runtime_parent, "system.posix_acl_default");
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::Permissions(path, StorageMigrationError::PosixAcl(acl_path)))
+            if path == runtime_parent && acl_path.as_os_str().is_empty()
+    ));
+    assert!(!request.runtime_directory.exists());
+    assert!(!root.path().join("storage").exists());
+}
+
+#[test]
 fn rejects_posix_acl_added_to_ephemeral_runtime() {
     let root = TestDirectory::new();
     let (request, identities) = fixture(root.path());

@@ -304,6 +304,11 @@ fn initialize_runtime_directory(
 }
 
 fn preflight_runtime_directory(runtime_directory: &Path) -> Result<(), StorageBootstrapError> {
+    let runtime_parent = runtime_directory
+        .parent()
+        .ok_or(StorageBootstrapError::InvalidRuntimeDirectory)?;
+    validate_storage_directory_no_posix_acl(runtime_parent)
+        .map_err(|error| StorageBootstrapError::Permissions(runtime_parent.to_path_buf(), error))?;
     require_absent_or_empty(runtime_directory)?;
     if path_exists(runtime_directory)? {
         validate_bootstrap_source_tree(runtime_directory).map_err(|error| {
