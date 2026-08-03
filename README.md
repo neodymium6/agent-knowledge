@@ -203,9 +203,10 @@ agent-knowledge admin bootstrap-storage \
   --ingress-group 10004
 ```
 
-The named identity defaults resolve to the same values in the supplied image,
-so Kubernetes manifests may omit the numeric overrides. Explicit numeric
-values make the volume ownership contract visible in a manifest. All three
+The Worker, Queue Ingress, and role-group name defaults resolve to the same
+values in the supplied image. The deployment must always pass the actual
+Gateway account with `--gateway-owner`; explicit numeric values make the full
+volume ownership contract visible in a manifest. All three
 service UIDs and all four role GIDs must be non-root and pairwise distinct. The
 Worker must belong only to the Worker and queue role groups, the Queue Ingress
 only to the queue role group, and the Gateway only to the Gateway-reader and
@@ -240,8 +241,11 @@ sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
 sudo install -d -m 0755 -o root -g root /etc/agent-knowledge
 sudo install -m 0640 -o root -g agent-knowledge \
   ./fictional-worker.yaml /etc/agent-knowledge/worker.yaml
+# Replace this fictional name with the deployment-managed forced-command account.
+gateway_account=fictional-agent-knowledge-gateway
 sudo "$package_path/bin/agent-knowledge" admin bootstrap-storage \
-  --config /etc/agent-knowledge/worker.yaml
+  --config /etc/agent-knowledge/worker.yaml \
+  --gateway-owner "$gateway_account"
 sudo ln -sfn \
   "$package_path/lib/tmpfiles.d/agent-knowledge.conf" \
   /etc/tmpfiles.d/agent-knowledge.conf

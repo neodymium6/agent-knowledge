@@ -302,6 +302,8 @@ system account database must report exactly the intended role-group matrix:
 Worker plus queue-owner for the Worker, queue-owner for Queue Ingress, and
 Gateway-reader plus ingress-client for the Gateway. Membership in unrelated
 groups is permitted, but membership in any other storage role group is rejected.
+The deployment must explicitly identify its Gateway account; bootstrap does not
+assume that a deployment-managed SSH user has a fixed name.
 The bootstrap process sets umask `0077` before creating any path. Existing
 unmarked roots and children must be root-owned and not group- or world-writable,
 and every child mount is checked before ownership or mode normalization. An

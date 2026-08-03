@@ -355,6 +355,17 @@ fn parses_the_storage_bootstrap_command() {
                 && settings.gateway_group == "61006"
                 && settings.ingress_group == "61007"
     ));
+
+    assert!(matches!(
+        parse_arguments([
+            "agent-knowledge".into(),
+            "admin".into(),
+            "bootstrap-storage".into(),
+            "--config".into(),
+            "/etc/fictional-knowledge/worker.yaml".into(),
+        ]),
+        Err(CliError::Usage)
+    ));
 }
 
 #[test]
