@@ -114,6 +114,8 @@
                   pkgs.openssh
                 ]
               }
+            install -m755 ${unwrappedPackage}/bin/agent-knowledge-ssh-shell \
+              "$out/bin/agent-knowledge-ssh-shell"
 
             install -Dm644 ${./deploy/systemd/agent-knowledge-worker.service} \
               "$out/lib/systemd/system/agent-knowledge-worker.service"
