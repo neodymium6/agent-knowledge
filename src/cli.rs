@@ -26,6 +26,7 @@ use crate::admin::{StorageMigration, StorageMigrationError};
 use crate::client::{self, ClientCommandError};
 use crate::gateway::{self, GatewayCommandError};
 use crate::queue_ingress::{self, ListenSettings, QueueIngressCommandError};
+use crate::runtime_identity::{RuntimeIdentityError, validate_queue_ingress};
 #[cfg(target_os = "linux")]
 use crate::storage_bootstrap::{StorageBootstrap, StorageBootstrapError};
 use crate::worker::{self, WorkerCommandError};
@@ -120,6 +121,7 @@ where
         .map_err(CliError::Gateway),
         Command::ServeQueueIngress { queue_root } => {
             queue_ingress::enforce_writer_umask();
+            validate_queue_ingress(&queue_root, None).map_err(CliError::RuntimeIdentity)?;
             agent_knowledge_gateway::serve_ingress(&queue_root, io::stdin().lock(), output)
                 .map_err(CliError::IngressServe)
         }
@@ -936,6 +938,7 @@ pub enum CliError {
     PackageValidation(PackageValidationError),
     Queue(QueueError),
     LocalQueueOwner(PathBuf),
+    RuntimeIdentity(RuntimeIdentityError),
     AdminStatus(AdminStatusError),
     AdminRetention(AdminRetentionError),
     #[cfg(target_os = "linux")]
@@ -979,6 +982,12 @@ impl fmt::Display for CliError {
                 "local queue submission must run as the owner of {}",
                 path.display()
             ),
+            Self::RuntimeIdentity(error) => {
+                write!(
+                    formatter,
+                    "Queue Ingress identity validation failed: {error}"
+                )
+            }
             Self::AdminStatus(error) => error.fmt(formatter),
             Self::AdminRetention(error) => error.fmt(formatter),
             #[cfg(target_os = "linux")]
@@ -1002,6 +1011,7 @@ impl std::error::Error for CliError {
             Self::PackageValidation(error) => Some(error),
             Self::Queue(error) => Some(error),
             Self::LocalQueueOwner(_) => None,
+            Self::RuntimeIdentity(error) => Some(error),
             Self::AdminStatus(error) => Some(error),
             Self::AdminRetention(error) => Some(error),
             #[cfg(target_os = "linux")]

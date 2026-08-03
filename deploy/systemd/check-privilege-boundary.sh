@@ -268,6 +268,27 @@ chown root:"$gateway_gid" \
   "$test_root/gateway.yaml" "$test_root/request.tar" "$test_root/request-two.tar"
 chmod 0640 "$test_root/gateway.yaml" "$test_root/request.tar" "$test_root/request-two.tar"
 
+if setpriv --reuid="$queue_uid" --regid="$queue_gid" --groups="$ingress_gid" \
+  "$test_root/agent-knowledge" queue-ingress serve \
+  --queue-root "$test_root/storage/queue" </dev/null \
+  >"$test_root/unsafe-ingress.log" 2>&1; then
+  echo "Queue Ingress accepted an unrelated supplementary group" >&2
+  exit 1
+fi
+grep -Fq 'Queue Ingress identity validation failed' \
+  "$test_root/unsafe-ingress.log"
+
+if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" \
+  --groups="$ingress_gid,$queue_gid" \
+  env SSH_ORIGINAL_COMMAND='akp-v1 list' \
+  "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
+  --client-id fictional-node-a </dev/null \
+  >"$test_root/unsafe-gateway.log" 2>&1; then
+  echo "Gateway accepted an unrelated supplementary group" >&2
+  exit 1
+fi
+grep -Fq '"error_code":"INTERNAL_ERROR"' "$test_root/unsafe-gateway.log"
+
 umask 0007
 systemd-socket-activate --accept --inetd \
   --listen="$test_root/run/queue-ingress.sock" \

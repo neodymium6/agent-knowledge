@@ -16,6 +16,8 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::runtime_identity::{RuntimeIdentityError, validate_worker};
+
 const MAXIMUM_SIGNAL_WAIT: StandardDuration = StandardDuration::from_millis(250);
 #[cfg(not(test))]
 const WORKER_UMASK: u32 = 0o027;
@@ -70,6 +72,7 @@ where
 
     let should_stop = || stopping.load(Ordering::Relaxed);
     let settings = WorkerSettings::load(config).map_err(WorkerCommandError::Config)?;
+    validate_worker(&settings).map_err(WorkerCommandError::Identity)?;
     let bootstrap = WorkerBootstrap::open(settings).map_err(WorkerCommandError::Open)?;
     if should_stop() {
         return write_stopped_log(output, 0);
@@ -398,6 +401,7 @@ impl WorkerLogRecord {
 #[derive(Debug)]
 pub(crate) enum WorkerCommandError {
     Config(WorkerConfigError),
+    Identity(RuntimeIdentityError),
     Open(WorkerOpenError),
     Run(WorkerRunError),
     SignalRegistration(io::Error),
@@ -414,6 +418,7 @@ impl WorkerCommandError {
     fn stable_code(&self) -> Option<&'static str> {
         match self {
             Self::Config(_) => Some("worker_config_invalid"),
+            Self::Identity(_) => Some("worker_identity_invalid"),
             Self::Open(_) => Some("worker_startup_failed"),
             Self::Run(_) => Some("worker_cycle_failed"),
             Self::SignalRegistration(_) => Some("worker_signal_registration_failed"),
@@ -436,6 +441,9 @@ impl fmt::Display for WorkerCommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Config(error) => write!(formatter, "invalid Worker configuration: {error}"),
+            Self::Identity(error) => {
+                write!(formatter, "Worker identity validation failed: {error}")
+            }
             Self::Open(error) => write!(formatter, "Worker startup failed: {error}"),
             Self::Run(error) => write!(formatter, "Worker cycle failed: {error}"),
             Self::SignalRegistration(error) => {
@@ -462,6 +470,7 @@ impl std::error::Error for WorkerCommandError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Config(error) => Some(error),
+            Self::Identity(error) => Some(error),
             Self::Open(error) => Some(error),
             Self::Run(error) => Some(error),
             Self::SignalRegistration(error) => Some(error),

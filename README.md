@@ -117,6 +117,11 @@ bundle and `SSL_CERT_FILE` setting needed for HTTPS Git replication. It exposes
 no conventional shell path, and the Worker process enforces umask `0027`
 independently of the container runtime. The image contains no deployment configuration,
 credentials, keys, or Quartz content.
+Before opening any component, the Worker verifies that its effective user owns
+all Worker-written roots, its primary group owns the private work and release
+roots, and its complete process group set contains exactly that group and the
+queue-owner group. Repository and content reader groups must remain distinct
+from both.
 
 The Queue Ingress image fixes the non-root `agent-knowledge-queue` identity
 (`10002:10002`) and `queue-ingress listen` entrypoint. It contains the raw Rust
@@ -126,6 +131,11 @@ runtime directory, and listener arguments. A dedicated ingress-socket group
 (`10004`) grants the Gateway access to the `0660` socket without granting the
 broker the Gateway reader group or granting Gateway access to the queue. The
 broker process enforces umask `0007` independently of the container runtime.
+Before opening the queue or publishing a socket, it verifies that its effective
+user owns the queue and runtime directory, its primary group owns the queue,
+and its complete process group set contains only that queue group. The runtime
+directory's ingress-client group must be distinct and is intentionally absent
+from the broker process.
 
 The Gateway image fixes the non-root `agent-knowledge-gateway` identity
 (`10001:10001`) and `gateway` entrypoint. The forced-command deployment passes
@@ -144,6 +154,11 @@ root-controlled configuration, committed repository and content for read-only
 access, and the queue-ingress runtime directory. Run the one-shot container
 with a read-only root filesystem, no network, no Linux capabilities, and no
 privilege escalation.
+Every Gateway request verifies its effective identity before reading a request
+body or opening Git. Its primary group must match the repository and content
+reader group, its only other process group must match the queue-ingress runtime
+directory, and its user must own neither the Worker storage nor the broker
+runtime directory.
 
 The OpenSSH Gateway adapter image starts the `sshd` supervisor with default
 port `2222` and uses the Rust `agent-knowledge-ssh-shell` executable as the
@@ -213,6 +228,16 @@ only to the queue role group, and the Gateway only to the Gateway-reader and
 ingress-client role groups. Bootstrap resolves primary and supplementary groups
 from the system account database before any storage mutation and rejects every
 additional membership.
+
+For a future single-Pod Kubernetes deployment, do not set Pod-wide `fsGroup` or
+`supplementalGroups`: Kubernetes applies those groups to every container in the
+Pod and would collapse the role boundary. The role-specific images instead use
+their immutable `/etc/passwd` and `/etc/group` entries with Kubernetes' `Merge`
+supplemental-group policy. The live checks above make this fail closed if a
+runtime omits a required image group or injects any additional group. A
+`Strict` policy ignores image group membership and is therefore incompatible
+with these images unless Kubernetes gains an equivalent container-scoped group
+mechanism.
 
 `just check-package` validates all five image archives, architectures,
 deterministic timestamps, role-locked entrypoints, fixed identity metadata,
