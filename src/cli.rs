@@ -26,12 +26,10 @@ use crate::queue_ingress::{self, ListenSettings, QueueIngressCommandError};
 use crate::storage_bootstrap::{StorageBootstrap, StorageBootstrapError};
 use crate::worker::{self, WorkerCommandError};
 
-const USAGE: &str = "usage:\n\
+const COMMON_USAGE: &str = "usage:\n\
     agent-knowledge admin submit --queue-root <path> --package-root <path>\n\
     agent-knowledge admin status --config <path> [--maximum-queue-entries <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge admin prune-releases --config <path> [--dry-run] [--timeout-seconds <seconds>]\n\
-    agent-knowledge admin bootstrap-storage --config <path> [--runtime-directory <path>] [--worker-owner <name-or-id>] [--worker-group <name-or-id>] [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>] [--ingress-group <name-or-id>]\n\
-    agent-knowledge admin migrate-v1-storage --queue-root <path> --git-directory <path> --content-root <path> [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>]\n\
     agent-knowledge client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
     agent-knowledge client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge client recent --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
@@ -43,6 +41,10 @@ const USAGE: &str = "usage:\n\
     agent-knowledge queue-ingress serve --queue-root <path>\n\
     agent-knowledge queue-ingress listen --queue-root <path> --socket-path <path> [--maximum-connections <count>] [--connection-timeout-seconds <seconds>]\n\
     agent-knowledge worker run --config <path>";
+#[cfg(target_os = "linux")]
+const LINUX_USAGE: &str = "\n\
+    agent-knowledge admin bootstrap-storage --config <path> [--runtime-directory <path>] [--worker-owner <name-or-id>] [--worker-group <name-or-id>] [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>] [--ingress-group <name-or-id>]\n\
+    agent-knowledge admin migrate-v1-storage --queue-root <path> --git-directory <path> --content-root <path> [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>]";
 const DEFAULT_CLIENT_TIMEOUT_SECONDS: u64 = 300;
 const MAXIMUM_CLIENT_TIMEOUT_SECONDS: u64 = 3_600;
 const DEFAULT_READ_RESULTS: usize = 100;
@@ -930,7 +932,12 @@ impl CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage => formatter.write_str(USAGE),
+            Self::Usage => {
+                formatter.write_str(COMMON_USAGE)?;
+                #[cfg(target_os = "linux")]
+                formatter.write_str(LINUX_USAGE)?;
+                Ok(())
+            }
             Self::Io(error) => write!(formatter, "local submission I/O failed: {error}"),
             Self::PackageValidation(error) => {
                 write!(formatter, "local package validation failed: {error}")

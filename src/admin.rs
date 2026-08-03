@@ -296,8 +296,7 @@ pub(crate) fn validate_storage_tree(
         0,
         Path::new(""),
         &mut fingerprint,
-        false,
-        false,
+        TreeValidation::strict(),
     )?;
     let fingerprint = fingerprint.finish();
     verify_fingerprint(&root.file, &fingerprint)?;
@@ -328,8 +327,10 @@ pub(crate) fn validate_repository_tree(
         0,
         Path::new(""),
         &mut fingerprint,
-        true,
-        false,
+        TreeValidation {
+            allow_read_only_files: true,
+            ..TreeValidation::strict()
+        },
     )?;
     let fingerprint = fingerprint.finish();
     verify_fingerprint(&root.file, &fingerprint)?;
@@ -360,11 +361,46 @@ pub(crate) fn validate_release_tree(
         0,
         Path::new(""),
         &mut fingerprint,
-        false,
-        true,
+        TreeValidation {
+            allow_symlinks: true,
+            ..TreeValidation::strict()
+        },
     )?;
     let fingerprint = fingerprint.finish();
     verify_release_fingerprint(&root.file, &fingerprint)?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_queue_tree(
+    root: &Path,
+    queue_owner: Uid,
+    worker_owner: Uid,
+    group: Gid,
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let mut budget = MigrationBudget::new();
+    preflight_directory(&root.file, 0, Path::new(""), &mut budget)?;
+    let permissions = TreePermissions {
+        owner: Some(queue_owner),
+        group,
+        directory_mode: Mode::from_bits_truncate(0o2770),
+        file_mode: Mode::from_bits_truncate(0o660),
+    };
+    let mut fingerprint = TreeFingerprintBuilder::new();
+    validate_directory_permissions(
+        &root.file,
+        permissions,
+        0,
+        Path::new(""),
+        &mut fingerprint,
+        TreeValidation {
+            alternate_file: Some((worker_owner, Mode::from_bits_truncate(0o640))),
+            ..TreeValidation::strict()
+        },
+    )?;
+    let fingerprint = fingerprint.finish();
+    verify_fingerprint(&root.file, &fingerprint)?;
     root.revalidate()
 }
 
@@ -381,6 +417,22 @@ pub(crate) fn validate_same_storage_mount(
             return Err(StorageMigrationError::UnsafeEntry(descendant.configured));
         }
         descendant.revalidate()?;
+    }
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_storage_file_mount(
+    root: &Path,
+    file: &Path,
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let relative = file
+        .strip_prefix(&root.configured)
+        .map_err(|_| StorageMigrationError::UnsafeEntry(file.to_path_buf()))?;
+    let pinned = open_regular_beneath(&root.file, relative)?;
+    if linux_mount_id(&pinned)? != linux_mount_id(&root.file)? {
+        return Err(StorageMigrationError::UnsafeEntry(file.to_path_buf()));
     }
     root.revalidate()
 }
@@ -721,6 +773,25 @@ struct TreePermissions {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct TreeValidation {
+    allow_read_only_files: bool,
+    allow_symlinks: bool,
+    alternate_file: Option<(Uid, Mode)>,
+}
+
+#[cfg(target_os = "linux")]
+impl TreeValidation {
+    const fn strict() -> Self {
+        Self {
+            allow_read_only_files: false,
+            allow_symlinks: false,
+            alternate_file: None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn migrate_directory(
     directory: &File,
     permissions: TreePermissions,
@@ -781,8 +852,7 @@ fn validate_directory_permissions(
     depth: usize,
     relative: &Path,
     fingerprint: &mut TreeFingerprintBuilder,
-    allow_read_only_files: bool,
-    allow_symlinks: bool,
+    validation: TreeValidation,
 ) -> Result<(), StorageMigrationError> {
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
@@ -803,24 +873,26 @@ fn validate_directory_permissions(
                 depth + 1,
                 &path,
                 fingerprint,
-                allow_read_only_files,
-                allow_symlinks,
+                validation,
             )?;
         } else if identity.file_type == nix::libc::S_IFREG && identity.links == 1 {
             let child = open_child_regular(directory, name)?;
             if object_identity(&child)? != identity {
                 return Err(StorageMigrationError::TreeChanged(path));
             }
-            require_metadata(
+            require_file_metadata(
                 &child,
                 permissions.owner,
                 permissions.group,
                 permissions.file_mode,
                 &path,
-                allow_read_only_files,
+                validation.allow_read_only_files,
+                validation.alternate_file,
             )?;
             fingerprint.record(&path, identity)?;
-        } else if allow_symlinks && identity.file_type == nix::libc::S_IFLNK && identity.links == 1
+        } else if validation.allow_symlinks
+            && identity.file_type == nix::libc::S_IFLNK
+            && identity.links == 1
         {
             require_metadata(
                 &pinned,
@@ -860,18 +932,59 @@ fn require_metadata(
     allow_owner_write_missing: bool,
 ) -> Result<(), StorageMigrationError> {
     let metadata = file.metadata().map_err(StorageMigrationError::Io)?;
+    if metadata_matches(&metadata, owner, group, mode, allow_owner_write_missing) {
+        Ok(())
+    } else {
+        Err(StorageMigrationError::UnsafeEntry(path.to_path_buf()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn require_file_metadata(
+    file: &File,
+    owner: Option<Uid>,
+    group: Gid,
+    mode: Mode,
+    path: &Path,
+    allow_owner_write_missing: bool,
+    alternate: Option<(Uid, Mode)>,
+) -> Result<(), StorageMigrationError> {
+    let metadata = file.metadata().map_err(StorageMigrationError::Io)?;
+    if metadata_matches(&metadata, owner, group, mode, allow_owner_write_missing)
+        || (worker_owned_queue_file(path)
+            && alternate.is_some_and(|(owner, mode)| {
+                metadata_matches(&metadata, Some(owner), group, mode, false)
+            }))
+    {
+        Ok(())
+    } else {
+        Err(StorageMigrationError::UnsafeEntry(path.to_path_buf()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn worker_owned_queue_file(path: &Path) -> bool {
+    path.starts_with("worker-tmp")
+        || path
+            .file_name()
+            .is_some_and(|name| matches!(name.as_encoded_bytes(), b"phase.json" | b"result.json"))
+}
+
+#[cfg(target_os = "linux")]
+fn metadata_matches(
+    metadata: &std::fs::Metadata,
+    owner: Option<Uid>,
+    group: Gid,
+    mode: Mode,
+    allow_owner_write_missing: bool,
+) -> bool {
     let observed_mode = metadata.mode() & 0o7777;
     let expected_mode = mode.bits();
     let mode_matches = observed_mode == expected_mode
         || (allow_owner_write_missing && observed_mode == expected_mode & !0o200);
-    if owner.is_some_and(|owner| metadata.uid() != owner.as_raw())
-        || metadata.gid() != group.as_raw()
-        || !mode_matches
-    {
-        Err(StorageMigrationError::UnsafeEntry(path.to_path_buf()))
-    } else {
-        Ok(())
-    }
+    owner.is_none_or(|owner| metadata.uid() == owner.as_raw())
+        && metadata.gid() == group.as_raw()
+        && mode_matches
 }
 
 #[cfg(target_os = "linux")]

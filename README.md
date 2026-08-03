@@ -114,7 +114,8 @@ The Worker image is built natively for both `x86_64-linux` (`amd64`) and
 deployment. The image resolves the non-root `agent-knowledge` account to
 `10003:10003` and its queue supplementary group to `10002`, and includes the CA
 bundle and `SSL_CERT_FILE` setting needed for HTTPS Git replication. It exposes
-no conventional shell path and contains no deployment configuration,
+no conventional shell path, and the Worker process enforces umask `0027`
+independently of the container runtime. The image contains no deployment configuration,
 credentials, keys, or Quartz content.
 
 The Queue Ingress image fixes the non-root `agent-knowledge-queue` identity
@@ -123,7 +124,8 @@ executable closure rather than the Worker package's Git/OpenSSH wrapper, and it
 does not include a CA bundle. The deployment supplies the queue root, shared
 runtime directory, and listener arguments. A dedicated ingress-socket group
 (`10004`) grants the Gateway access to the `0660` socket without granting the
-broker the Gateway reader group or granting Gateway access to the queue.
+broker the Gateway reader group or granting Gateway access to the queue. The
+broker process enforces umask `0007` independently of the container runtime.
 
 The Gateway image fixes the non-root `agent-knowledge-gateway` identity
 (`10001:10001`) and `gateway` entrypoint. The forced-command deployment passes
@@ -176,8 +178,10 @@ durable storage without that marker, a mismatched marker, a partially populated
 runtime directory, unexpected links, special files, or inconsistent component bindings
 fail closed; the command never guesses how to repair or remove them. The five
 configured durable paths must be direct children on the same mount beneath one
-non-root directory. Concurrent bootstrap attempts are serialized on that
-directory, and the runtime path must resolve outside it.
+non-root directory. Their configured parent paths and the runtime parent must
+have canonical root-owned ancestry with no group- or world-writable component.
+Concurrent bootstrap attempts are serialized on the durable parent directory,
+and the runtime path must resolve outside it.
 For the fixed container identities, an init container invocation is:
 
 ```sh

@@ -161,9 +161,11 @@ another role with the mounted authority. The Worker
 image resolves its non-root account to `10003:10003`, includes queue GID
 `10002` as a supplementary group, retains the Git/OpenSSH runtime wrapper, and
 provides an immutable CA bundle through `SSL_CERT_FILE` for HTTPS Git
-replication. The Queue Ingress image resolves its account to `10002:10002`,
+replication. The Worker process enforces umask `0027` without relying on the
+container runtime. The Queue Ingress image resolves its account to `10002:10002`,
 publishes its socket with dedicated ingress GID `10004`, and uses the raw Rust
-executable closure without Git, OpenSSH, or a CA bundle. The one-shot Gateway
+executable closure without Git, OpenSSH, or a CA bundle. The broker process
+enforces umask `0007` without relying on the container runtime. The one-shot Gateway
 image resolves its account to `10001:10001`, includes local Git for committed
 reads, and contains neither OpenSSH nor a CA bundle. OpenSSH remains an external
 deployment boundary that starts one container per forced command, supplies the
@@ -284,7 +286,11 @@ read-only validation; nonempty unmarked storage or a marker that disagrees with
 configuration or identities is rejected instead of repaired. The runtime socket
 directory and its path are not covered by durable completion: it is recreated
 and validated outside the durable mount from a separate `emptyDir` on each Pod
-start.
+start. Before privileged mutation, the configured durable and runtime parents
+must resolve through canonical root-owned ancestry with no group- or
+world-writable component. The bootstrap process retains and repeatedly
+revalidates its locked durable-parent descriptor so pathname replacement cannot
+redirect later phases.
 Quartz remains an independently supplied immutable deployment input and is not
 bundled into the init image.
 

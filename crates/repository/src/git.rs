@@ -75,9 +75,10 @@ fn trusted_executable(path: &Path) -> bool {
     }
     path.ancestors().skip(1).all(|ancestor| {
         fs::symlink_metadata(ancestor).is_ok_and(|metadata| {
+            let mode = metadata.permissions().mode();
             metadata.file_type().is_dir()
                 && metadata.uid() == root_owner
-                && metadata.permissions().mode() & 0o022 == 0
+                && (mode & 0o022 == 0 || mode & 0o1000 != 0)
         })
     })
 }

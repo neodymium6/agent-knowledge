@@ -18,8 +18,8 @@ use ulid::Ulid;
 
 use crate::admin::{
     StorageMigrationError, normalize_storage_directory, normalize_storage_tree, resolve_group,
-    resolve_user, validate_release_tree, validate_repository_tree, validate_same_storage_mount,
-    validate_storage_tree,
+    resolve_user, validate_queue_tree, validate_release_tree, validate_repository_tree,
+    validate_same_storage_mount, validate_storage_file_mount, validate_storage_tree,
 };
 
 const MARKER_NAME: &str = ".agent-knowledge-bootstrap-v1.json";
@@ -108,12 +108,15 @@ fn bootstrap_storage_with_ids(
 ) -> Result<(), StorageBootstrapError> {
     let settings = WorkerSettings::load(&request.config).map_err(StorageBootstrapError::Config)?;
     let storage_root = common_storage_root(&settings)?;
+    validate_trusted_parent(&storage_root, identities.administrative_owner)?;
+    validate_trusted_parent(&request.runtime_directory, identities.administrative_owner)?;
     validate_runtime_directory(&request.runtime_directory, &storage_root)?;
     let marker_path = storage_root.join(MARKER_NAME);
     let expected_marker = BootstrapMarker::new(&settings, identities);
     validate_official_branch(settings.official_branch())?;
     ensure_directory(&storage_root)?;
     let storage_lock = lock_storage_root(&storage_root)?;
+    revalidate_storage_lock(&storage_root, &storage_lock)?;
 
     if path_exists(&marker_path)? {
         require_directory_metadata(
@@ -122,6 +125,8 @@ fn bootstrap_storage_with_ids(
             identities.queue_group,
             0o751,
         )?;
+        validate_storage_file_mount(&storage_root, &marker_path)
+            .map_err(|_| StorageBootstrapError::InvalidMarker)?;
         let marker = read_marker(
             &marker_path,
             identities.administrative_owner,
@@ -133,6 +138,7 @@ fn bootstrap_storage_with_ids(
         validate_same_storage_mount(&storage_root, &storage_paths(&settings))
             .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
         initialize_runtime_directory(&request.runtime_directory, identities)?;
+        revalidate_storage_lock(&storage_root, &storage_lock)?;
         validate_initialized(&settings, &request.runtime_directory, identities)?;
         drop(storage_lock);
         return write_output(&mut output, "already_initialized");
@@ -145,6 +151,7 @@ fn bootstrap_storage_with_ids(
         Mode::from_bits_truncate(0o751),
     )
     .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
+    revalidate_storage_lock(&storage_root, &storage_lock)?;
     validate_fresh_storage_root(&storage_root, &settings)?;
     for path in storage_paths(&settings) {
         require_absent_or_empty(path)?;
@@ -166,6 +173,7 @@ fn bootstrap_storage_with_ids(
     FileQueue::initialize(settings.queue_root(), PackagePolicy::default()).map_err(|error| {
         StorageBootstrapError::Component("queue initialization", error.to_string())
     })?;
+    revalidate_storage_lock(&storage_root, &storage_lock)?;
     initialize_repository(&settings)?;
     GitRepository::open(
         settings.repository_root(),
@@ -180,6 +188,7 @@ fn bootstrap_storage_with_ids(
     ReleaseStore::open(settings.release_root(), ReleasePolicy::default()).map_err(|error| {
         StorageBootstrapError::Component("release initialization", error.to_string())
     })?;
+    revalidate_storage_lock(&storage_root, &storage_lock)?;
 
     normalize_storage_tree(
         settings.queue_root(),
@@ -209,8 +218,10 @@ fn bootstrap_storage_with_ids(
         )
         .map_err(|error| StorageBootstrapError::Permissions(path.into(), error))?;
     }
+    revalidate_storage_lock(&storage_root, &storage_lock)?;
     validate_initialized(&settings, &request.runtime_directory, identities)?;
     sync_storage_filesystem(&storage_root)?;
+    revalidate_storage_lock(&storage_root, &storage_lock)?;
     write_marker(&marker_path, &expected_marker)?;
     drop(storage_lock);
     write_output(&mut output, "initialized")
@@ -277,6 +288,39 @@ fn lock_storage_root(path: &Path) -> Result<File, StorageBootstrapError> {
         Err(TryLockError::WouldBlock) => Err(StorageBootstrapError::StorageBusy),
         Err(TryLockError::Error(error)) => Err(StorageBootstrapError::Io(error)),
     }
+}
+
+fn revalidate_storage_lock(path: &Path, locked: &File) -> Result<(), StorageBootstrapError> {
+    let observed =
+        PathAttestation::capture(path, locked).map_err(StorageBootstrapError::Attestation)?;
+    if observed.path() == path {
+        Ok(())
+    } else {
+        Err(StorageBootstrapError::UnsafePath(path.to_path_buf()))
+    }
+}
+
+fn validate_trusted_parent(path: &Path, owner: Uid) -> Result<(), StorageBootstrapError> {
+    if !owner.is_root() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or(StorageBootstrapError::UntrustedAncestry(path.to_path_buf()))?;
+    let canonical = fs::canonicalize(parent).map_err(StorageBootstrapError::Io)?;
+    if canonical != parent {
+        return Err(StorageBootstrapError::UntrustedAncestry(path.to_path_buf()));
+    }
+    for ancestor in parent.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor).map_err(StorageBootstrapError::Io)?;
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != owner.as_raw()
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(StorageBootstrapError::UntrustedAncestry(path.to_path_buf()));
+        }
+    }
+    Ok(())
 }
 
 fn validate_fresh_storage_root(
@@ -573,12 +617,11 @@ fn validate_initialized(
         ids.ingress_group,
         0o2750,
     )?;
-    validate_storage_tree(
+    validate_queue_tree(
         settings.queue_root(),
         ids.queue_owner,
+        ids.worker_owner,
         ids.queue_group,
-        Mode::from_bits_truncate(0o2770),
-        Mode::from_bits_truncate(0o660),
     )
     .map_err(|error| StorageBootstrapError::Permissions(settings.queue_root().into(), error))?;
     validate_repository_tree(
@@ -757,6 +800,7 @@ pub(crate) enum StorageBootstrapError {
     InvalidRuntimeDirectory,
     PartialInitialization(PathBuf),
     UnsafePath(PathBuf),
+    UntrustedAncestry(PathBuf),
     MarkerMismatch,
     InvalidMarker,
     InvalidInitializedPath(PathBuf),
@@ -792,6 +836,11 @@ impl fmt::Display for StorageBootstrapError {
             Self::UnsafePath(path) => write!(
                 formatter,
                 "storage bootstrap path is not a real directory: {}",
+                path.display()
+            ),
+            Self::UntrustedAncestry(path) => write!(
+                formatter,
+                "storage bootstrap path has aliased or writable ancestry: {}",
                 path.display()
             ),
             Self::MarkerMismatch => formatter.write_str(

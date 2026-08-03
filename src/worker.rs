@@ -17,11 +17,15 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const MAXIMUM_SIGNAL_WAIT: StandardDuration = StandardDuration::from_millis(250);
+#[cfg(not(test))]
+const WORKER_UMASK: u32 = 0o027;
 
 pub(crate) fn run<W>(config: &Path, mut output: W) -> Result<(), WorkerCommandError>
 where
     W: Write,
 {
+    #[cfg(not(test))]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(WORKER_UMASK));
     match run_inner(config, &mut output) {
         Ok(()) => Ok(()),
         Err(error) => match write_failure_log(&mut output, &error) {

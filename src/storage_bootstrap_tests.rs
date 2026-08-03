@@ -276,6 +276,27 @@ fn marked_storage_rejects_descendant_permission_drift() {
 }
 
 #[test]
+fn marked_storage_accepts_worker_queue_metadata() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("fresh bootstrap must succeed: {error}"));
+    let worker_temporary = root.path().join("storage/queue/worker-tmp");
+    fs::set_permissions(&worker_temporary, fs::Permissions::from_mode(0o2770))
+        .unwrap_or_else(|error| panic!("Worker temporary directory mode must be set: {error}"));
+    let temporary = worker_temporary.join(".phase-fictional");
+    fs::write(&temporary, b"fictional phase")
+        .unwrap_or_else(|error| panic!("Worker metadata fixture must be written: {error}"));
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o640))
+        .unwrap_or_else(|error| panic!("Worker metadata mode must be set: {error}"));
+
+    let mut output = Vec::new();
+    bootstrap_storage_with_ids(&request, identities, &mut output)
+        .unwrap_or_else(|error| panic!("valid Worker metadata must be accepted: {error}"));
+    assert_eq!(output, b"{\"status\":\"already_initialized\"}\n");
+}
+
+#[test]
 fn marker_covers_the_initial_commit_identity() {
     let root = TestDirectory::new();
     let (request, identities) = fixture(root.path());
