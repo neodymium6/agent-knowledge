@@ -22,6 +22,9 @@ const QUEUE_INGRESS_ROLE: &str = "Queue Ingress";
 const GATEWAY_ROLE: &str = "Gateway";
 #[cfg(target_os = "linux")]
 const ACTIVATED_SOCKET_MODE: u32 = 0o660;
+const QUEUE_DIRECTORY_MODE: u32 = 0o2770;
+const READER_DIRECTORY_MODE: u32 = 0o2750;
+const WORKER_PRIVATE_DIRECTORY_MODE: u32 = 0o750;
 const RUNTIME_DIRECTORY_MODE: u32 = 0o2750;
 #[cfg(target_os = "linux")]
 const POSIX_ACL_XATTRS: [&str; 2] = ["system.posix_acl_access", "system.posix_acl_default"];
@@ -172,12 +175,7 @@ fn validate_activated_socket(
             actual: actual_path.to_path_buf(),
         });
     }
-    let metadata = fs::symlink_metadata(expected_path).map_err(|source| {
-        RuntimeIdentityError::SocketBoundaryInspection {
-            path: expected_path.to_path_buf(),
-            source,
-        }
-    })?;
+    let metadata = inspect_socket_boundary(expected_path)?;
     if !metadata.file_type().is_socket() {
         return Err(RuntimeIdentityError::InvalidSocketBoundary(
             expected_path.to_path_buf(),
@@ -187,13 +185,52 @@ fn validate_activated_socket(
         .parent()
         .ok_or_else(|| RuntimeIdentityError::InvalidBoundary(expected_path.to_path_buf()))?;
     let runtime = DirectoryIdentity::inspect(parent)?;
+    require_socket_identity(expected_path, &metadata, &runtime)?;
+    let device = metadata.dev();
+    let inode = metadata.ino();
+    for name in POSIX_ACL_XATTRS {
+        if xattr::get(expected_path, name)
+            .map_err(|source| RuntimeIdentityError::SocketBoundaryInspection {
+                path: expected_path.to_path_buf(),
+                source,
+            })?
+            .is_some()
+        {
+            return Err(RuntimeIdentityError::PosixAclSocketBoundary(
+                expected_path.to_path_buf(),
+            ));
+        }
+    }
+    let observed = inspect_socket_boundary(expected_path)?;
+    if !observed.file_type().is_socket() || observed.dev() != device || observed.ino() != inode {
+        return Err(RuntimeIdentityError::SocketBoundaryChanged(
+            expected_path.to_path_buf(),
+        ));
+    }
+    require_socket_identity(expected_path, &observed, &runtime)
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_socket_boundary(path: &Path) -> Result<fs::Metadata, RuntimeIdentityError> {
+    fs::symlink_metadata(path).map_err(|source| RuntimeIdentityError::SocketBoundaryInspection {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn require_socket_identity(
+    path: &Path,
+    metadata: &fs::Metadata,
+    runtime: &DirectoryIdentity,
+) -> Result<(), RuntimeIdentityError> {
     let mode = metadata.mode() & 0o7777;
     if metadata.uid() != runtime.uid
         || metadata.gid() != runtime.gid
         || mode != ACTIVATED_SOCKET_MODE
     {
         return Err(RuntimeIdentityError::InvalidSocketIdentity {
-            path: expected_path.to_path_buf(),
+            path: path.to_path_buf(),
             expected_uid: runtime.uid,
             actual_uid: metadata.uid(),
             expected_gid: runtime.gid,
@@ -242,6 +279,15 @@ fn validate_worker_identity(
     process: &ProcessIdentity,
     boundaries: &WorkerBoundaries,
 ) -> Result<(), RuntimeIdentityError> {
+    require_boundary_mode(WORKER_ROLE, &boundaries.queue, QUEUE_DIRECTORY_MODE)?;
+    require_boundary_mode(WORKER_ROLE, &boundaries.repository, READER_DIRECTORY_MODE)?;
+    require_boundary_mode(WORKER_ROLE, &boundaries.content, READER_DIRECTORY_MODE)?;
+    require_boundary_mode(WORKER_ROLE, &boundaries.work, WORKER_PRIVATE_DIRECTORY_MODE)?;
+    require_boundary_mode(
+        WORKER_ROLE,
+        &boundaries.releases,
+        WORKER_PRIVATE_DIRECTORY_MODE,
+    )?;
     require_matching_owner(
         WORKER_ROLE,
         &boundaries.repository,
@@ -277,6 +323,7 @@ fn validate_queue_ingress_identity(
     queue: &DirectoryIdentity,
     runtime: &DirectoryIdentity,
 ) -> Result<(), RuntimeIdentityError> {
+    require_boundary_mode(QUEUE_INGRESS_ROLE, queue, QUEUE_DIRECTORY_MODE)?;
     require_boundary_mode(QUEUE_INGRESS_ROLE, runtime, RUNTIME_DIRECTORY_MODE)?;
     require_matching_owner(QUEUE_INGRESS_ROLE, queue, &[runtime])?;
     require_distinct(
@@ -305,6 +352,8 @@ fn validate_gateway_identity(
     expected_uid: u32,
     boundaries: &GatewayBoundaries,
 ) -> Result<(), RuntimeIdentityError> {
+    require_boundary_mode(GATEWAY_ROLE, &boundaries.repository, READER_DIRECTORY_MODE)?;
+    require_boundary_mode(GATEWAY_ROLE, &boundaries.content, READER_DIRECTORY_MODE)?;
     require_boundary_mode(GATEWAY_ROLE, &boundaries.runtime, RUNTIME_DIRECTORY_MODE)?;
     require_matching_owner(GATEWAY_ROLE, &boundaries.repository, &[&boundaries.content])?;
     require_matching_group(GATEWAY_ROLE, &boundaries.repository, &[&boundaries.content])?;
@@ -495,6 +544,8 @@ pub(crate) enum RuntimeIdentityError {
         source: io::Error,
     },
     InvalidSocketBoundary(PathBuf),
+    PosixAclSocketBoundary(PathBuf),
+    SocketBoundaryChanged(PathBuf),
     InvalidSocketIdentity {
         path: PathBuf,
         expected_uid: u32,
@@ -604,6 +655,16 @@ impl fmt::Display for RuntimeIdentityError {
             Self::InvalidSocketBoundary(path) => write!(
                 formatter,
                 "activated Unix socket path {} is not a socket",
+                path.display()
+            ),
+            Self::PosixAclSocketBoundary(path) => write!(
+                formatter,
+                "activated Unix socket {} has a POSIX ACL",
+                path.display()
+            ),
+            Self::SocketBoundaryChanged(path) => write!(
+                formatter,
+                "activated Unix socket {} changed during identity validation",
                 path.display()
             ),
             Self::InvalidSocketIdentity {
@@ -720,6 +781,22 @@ mod tests {
         }
     }
 
+    fn extended_posix_acl(named_uid: u32) -> Vec<u8> {
+        let mut value = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01_u16, 0o7_u16, u32::MAX),
+            (0x02_u16, 0o7_u16, named_uid),
+            (0x04_u16, 0o5_u16, u32::MAX),
+            (0x10_u16, 0o7_u16, u32::MAX),
+            (0x20_u16, 0o5_u16, u32::MAX),
+        ] {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&permissions.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        value
+    }
+
     #[test]
     fn activated_socket_must_match_the_configured_path() {
         let directory = std::env::temp_dir().join(format!(
@@ -748,6 +825,21 @@ mod tests {
             validate_activated_socket(accepted.as_raw_fd(), &configured_path),
             Err(RuntimeIdentityError::ActivatedSocketPathMismatch { .. })
         ));
+        xattr::set(
+            &actual_path,
+            "system.posix_acl_access",
+            &extended_posix_acl(Uid::effective().as_raw()),
+        )
+        .unwrap_or_else(|error| panic!("socket ACL fixture must be written: {error}"));
+        fs::set_permissions(
+            &actual_path,
+            fs::Permissions::from_mode(ACTIVATED_SOCKET_MODE),
+        )
+        .unwrap_or_else(|error| panic!("socket test mode must be restored: {error}"));
+        assert!(matches!(
+            validate_activated_socket(accepted.as_raw_fd(), &actual_path),
+            Err(RuntimeIdentityError::PosixAclSocketBoundary(path)) if path == actual_path
+        ));
 
         drop(accepted);
         drop(client);
@@ -766,23 +858,13 @@ mod tests {
         ));
         fs::create_dir(&directory)
             .unwrap_or_else(|error| panic!("ACL test directory must be created: {error}"));
-        let named_uid = Uid::effective().as_raw();
-        let mut value = 2_u32.to_le_bytes().to_vec();
-        for (tag, permissions, id) in [
-            (0x01_u16, 0o7_u16, u32::MAX),
-            (0x02_u16, 0o7_u16, named_uid),
-            (0x04_u16, 0o5_u16, u32::MAX),
-            (0x10_u16, 0o7_u16, u32::MAX),
-            (0x20_u16, 0o5_u16, u32::MAX),
-        ] {
-            value.extend_from_slice(&tag.to_le_bytes());
-            value.extend_from_slice(&permissions.to_le_bytes());
-            value.extend_from_slice(&id.to_le_bytes());
-        }
         let file = File::open(&directory)
             .unwrap_or_else(|error| panic!("ACL test directory must open: {error}"));
-        file.set_xattr("system.posix_acl_access", &value)
-            .unwrap_or_else(|error| panic!("ACL fixture must be written: {error}"));
+        file.set_xattr(
+            "system.posix_acl_access",
+            &extended_posix_acl(Uid::effective().as_raw()),
+        )
+        .unwrap_or_else(|error| panic!("ACL fixture must be written: {error}"));
 
         assert!(matches!(
             DirectoryIdentity::inspect(&directory),
@@ -848,6 +930,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_worker_with_writable_reader_storage() {
+        let mut boundaries = worker_boundaries();
+        boundaries.repository.mode = 0o2770;
+        assert!(matches!(
+            validate_worker_identity(&process(61_003, 62_003, &[62_002, 62_003]), &boundaries,),
+            Err(RuntimeIdentityError::BoundaryModeMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn accepts_exact_queue_ingress_identity() {
         let queue = DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 62_002, 0o2770);
         let runtime = DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004, 0o2750);
@@ -891,6 +983,16 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rejects_queue_ingress_with_world_writable_storage() {
+        let queue = DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 62_002, 0o2777);
+        let runtime = DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004, 0o2750);
+        assert!(matches!(
+            validate_queue_ingress_identity(&process(61_002, 62_002, &[62_002]), &queue, &runtime,),
+            Err(RuntimeIdentityError::BoundaryModeMismatch { .. })
+        ));
+    }
+
     fn gateway_boundaries() -> GatewayBoundaries {
         GatewayBoundaries {
             repository: DirectoryIdentity::fictional(
@@ -925,6 +1027,20 @@ mod tests {
                 &gateway_boundaries(),
             ),
             Err(RuntimeIdentityError::UnsafeProcessUser { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_gateway_with_writable_reader_storage() {
+        let mut boundaries = gateway_boundaries();
+        boundaries.content.mode = 0o2770;
+        assert!(matches!(
+            validate_gateway_identity(
+                &process(61_001, 62_001, &[62_001, 62_004]),
+                61_001,
+                &boundaries,
+            ),
+            Err(RuntimeIdentityError::BoundaryModeMismatch { .. })
         ));
     }
 

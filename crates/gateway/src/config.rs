@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -5,6 +6,7 @@ use std::time::Duration;
 
 use agent_knowledge_core::{BoundedFileError, read_bounded_regular_file};
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 
 /// Gateway configuration schema supported by this release.
 pub const CURRENT_GATEWAY_CONFIG_VERSION: u16 = 4;
@@ -90,6 +92,14 @@ impl GatewaySettings {
             strict_booleans: true,
             with_snippet: false,
         };
+        let envelope: WireSchemaEnvelope =
+            serde_saphyr::from_str_with_options(yaml, options.clone())
+                .map_err(|error| GatewayConfigError::InvalidYaml(Box::new(error)))?;
+        if envelope.schema_version != CURRENT_GATEWAY_CONFIG_VERSION {
+            return Err(GatewayConfigError::UnsupportedSchemaVersion {
+                found: envelope.schema_version,
+            });
+        }
         let wire: WireGatewayConfig = serde_saphyr::from_str_with_options(yaml, options)
             .map_err(|error| GatewayConfigError::InvalidYaml(Box::new(error)))?;
         Self::try_from(wire)
@@ -188,8 +198,7 @@ impl TryFrom<WireGatewayConfig> for GatewaySettings {
                 found: wire.schema_version,
             });
         }
-        let identity = wire.identity.ok_or(GatewayConfigError::MissingIdentity)?;
-        if identity.gateway_uid == 0 {
+        if wire.identity.gateway_uid == 0 {
             return Err(GatewayConfigError::InvalidGatewayUid);
         }
         let queue_socket = validate_storage_path(wire.storage.queue_socket, "queue_socket")?;
@@ -242,7 +251,7 @@ impl TryFrom<WireGatewayConfig> for GatewaySettings {
             return Err(GatewayConfigError::InvalidSubmitTimeout);
         }
         Ok(Self {
-            gateway_uid: identity.gateway_uid,
+            gateway_uid: wire.identity.gateway_uid,
             queue_socket,
             git_directory,
             content_root,
@@ -308,10 +317,17 @@ fn validate_storage_path(
 }
 
 #[derive(Debug, Deserialize)]
+struct WireSchemaEnvelope {
+    schema_version: u16,
+    #[serde(flatten)]
+    _remaining: BTreeMap<String, IgnoredAny>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireGatewayConfig {
     schema_version: u16,
-    identity: Option<WireIdentity>,
+    identity: WireIdentity,
     storage: WireStorage,
     repository: WireRepository,
     reads: WireReads,
@@ -388,8 +404,6 @@ pub enum GatewayConfigError {
         /// Version found in the file.
         found: u16,
     },
-    /// The current schema omitted its required service identity section.
-    MissingIdentity,
     /// The configured Gateway user ID was root.
     InvalidGatewayUid,
     /// A storage path was relative, non-normalized, or a filesystem root.
@@ -440,9 +454,6 @@ impl fmt::Display for GatewayConfigError {
                 formatter,
                 "unsupported Gateway configuration schema version {found}"
             ),
-            Self::MissingIdentity => {
-                formatter.write_str("Gateway configuration requires an `identity` section")
-            }
             Self::InvalidGatewayUid => {
                 formatter.write_str("Gateway user ID must be a non-root numeric ID")
             }
@@ -521,9 +532,16 @@ mod tests {
             GatewaySettings::decode(&version_three),
             Err(GatewayConfigError::UnsupportedSchemaVersion { found: 3 })
         ));
+        let version_two = version_three
+            .replacen("schema_version: 3", "schema_version: 2", 1)
+            .replacen("queue_socket:", "queue_root:", 1);
+        assert!(matches!(
+            GatewaySettings::decode(&version_two),
+            Err(GatewayConfigError::UnsupportedSchemaVersion { found: 2 })
+        ));
         assert!(matches!(
             GatewaySettings::decode(&VALID_CONFIG.replace("identity:\n  gateway_uid: 61001\n", "")),
-            Err(GatewayConfigError::MissingIdentity)
+            Err(GatewayConfigError::InvalidYaml(_))
         ));
         assert!(
             GatewaySettings::decode(
@@ -571,10 +589,16 @@ mod tests {
             GatewaySettings::decode(&VALID_CONFIG.replace("gateway_uid: 61001", "gateway_uid: 0"))
                 .is_err()
         );
+        let future_version = VALID_CONFIG
+            .replacen("schema_version: 4", "schema_version: 5", 1)
+            .replacen(
+                "identity:\n  gateway_uid: 61001\n",
+                "future_identity: true\n",
+                1,
+            )
+            .replacen("queue_socket:", "future_queue_endpoint:", 1);
         assert!(matches!(
-            GatewaySettings::decode(
-                &VALID_CONFIG.replace("schema_version: 4", "schema_version: 5")
-            ),
+            GatewaySettings::decode(&future_version),
             Err(GatewayConfigError::UnsupportedSchemaVersion { found: 5 })
         ));
     }

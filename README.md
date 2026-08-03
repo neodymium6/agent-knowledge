@@ -334,7 +334,10 @@ The Worker receives the queue group as a supplementary group so it can perform
 state transitions without sharing either service UID. The durable storage root
 is `0751 root:agent-knowledge-queue`: the broker and Worker can open it for
 directory durability syncs, while the Gateway can only traverse to its known
-read-only repository and content paths.
+read-only repository and content paths. Service startup requires the
+provisioned directory modes exactly: queue `2770`, repository/content `2750`,
+and work/releases `0750`. It also rejects POSIX ACLs on these boundaries so ACL
+entries cannot silently broaden the mode-based authorization model.
 
 The dedicated system profile keeps the package output live across Nix garbage
 collection. The unit allows writes only below `/var/lib/agent-knowledge`, uses
@@ -428,7 +431,8 @@ The listener publishes the socket as `0660`, refuses to overwrite live,
 non-socket, or unowned stale paths, recovers a stale socket recorded by its own
 locked state file after a crash, and rejects a socket basename change while a
 prior recorded socket still exists, including while upgrading v1 state through
-a bounded identity scan. Internal lock and state basenames are reserved. The
+a bounded identity scan. Socket-activated requests also reject POSIX ACLs on
+the published socket. Internal lock and state basenames are reserved. The
 listener bounds concurrent connections and handler shutdown, hands diagnostics
 to a capacity-one best-effort reporter after connection completion, and stops
 accepting and cancels active queue lock waits on `SIGINT` or `SIGTERM`. A

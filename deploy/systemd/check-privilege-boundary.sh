@@ -372,6 +372,20 @@ if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" \
 fi
 grep -Fq '"error_code":"INTERNAL_ERROR"' "$test_root/unsafe-gateway.log"
 
+chmod 2770 "$test_root/storage/repository"
+if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" \
+  --groups="$ingress_gid" \
+  env SSH_ORIGINAL_COMMAND='akp-v1 list' \
+  "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
+  --client-id fictional-node-a </dev/null \
+  >"$test_root/writable-repository.log" 2>&1; then
+  echo "Gateway accepted a group-writable repository" >&2
+  exit 1
+fi
+grep -Fq '"error_code":"INTERNAL_ERROR"' \
+  "$test_root/writable-repository.log"
+chmod 2750 "$test_root/storage/repository"
+
 umask 0007
 mismatch_socket=$test_root/run/unexpected-ingress.sock
 cp "$test_root/gateway.yaml" "$test_root/mismatch-gateway.yaml"
