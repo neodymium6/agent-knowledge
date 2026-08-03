@@ -20,9 +20,8 @@ document-bundle export are implemented. The flake provides reproducible Linux
 packaging, a conventional systemd Worker service, and a systemd-activated local
 queue-ingress broker that isolates the forced-command Gateway from durable queue
 access under distinct service identities. Reproducible Worker, Queue Ingress,
-one-shot Gateway, OpenSSH Gateway adapter, and storage-bootstrap init container
-packaging is implemented; single-replica Kubernetes manifests remain future
-work. CI
+one-shot Gateway, OpenSSH Gateway adapter, storage-bootstrap init container,
+and single-replica Kubernetes packaging are implemented. CI
 verifies the client, login-shell adapter, and Gateway through a real restricted
 OpenSSH server with fictional ephemeral keys and accounts, in addition to
 exercising the service privilege boundary.
@@ -93,8 +92,8 @@ nix build .#gateway-container-image
 docker load < result
 ```
 
-Build the long-running OpenSSH adapter image intended for the future
-single-Pod Kubernetes deployment:
+Build the long-running OpenSSH adapter image used by the supplied single-Pod
+Kubernetes deployment:
 
 ```sh
 nix build .#openssh-gateway-container-image
@@ -229,7 +228,7 @@ ingress-client role groups. Bootstrap resolves primary and supplementary groups
 from the system account database before any storage mutation and rejects every
 additional membership.
 
-For a future single-Pod Kubernetes deployment, do not set Pod-wide `fsGroup` or
+For the supplied single-Pod Kubernetes deployment, do not set Pod-wide `fsGroup` or
 `supplementalGroups`: Kubernetes applies those groups to every container in the
 Pod and would collapse the role boundary. The role-specific images instead use
 their immutable `/etc/passwd` and `/etc/group` entries with Kubernetes' `Merge`
@@ -252,6 +251,57 @@ requires the deployment-specific configuration at
 a port-qualified `ListenAddress`; an address without a port inherits `2222`.
 Runtime storage, configuration, secrets, runtime socket directory, and writable
 paths are deployment-supplied mounts.
+
+### Kubernetes deployment
+
+`deploy/kubernetes` provides a Kustomize base for a single-replica StatefulSet.
+It runs Storage Bootstrap as an init container and Worker, Queue Ingress, and
+the OpenSSH Gateway adapter as separate role-locked containers in one Pod. The
+base uses one `ReadWriteOncePod` claim for durable knowledge storage, a separate
+read-only claim for Quartz, and `emptyDir` volumes for the queue-ingress socket
+and OpenSSH runtime state. It does not use `subPath`, Pod-wide `fsGroup`, or
+Pod-wide `supplementalGroups`.
+
+The base deliberately cannot start without deployment-owned inputs. Before
+applying it, create an overlay that:
+
+- replaces the four `example.invalid` image references with immutable images
+  built from this revision;
+- patches the fictional Worker and Gateway settings when appropriate;
+- provides an `agent-knowledge-quartz` claim containing the root-owned,
+  non-writable Quartz launcher and integration tree at the paths named in
+  `worker.yaml`; and
+- provides an `agent-knowledge-ssh` Secret with `ssh_host_ed25519_key` and
+  `authorized_keys` entries. Each authorized key must carry the forced command
+  `akg-v1 /etc/agent-knowledge/gateway.yaml <client-id>`.
+
+Do not place Secret data, host keys, client keys, Git credentials, or private
+infrastructure values in the overlay repository. The default StorageClass must
+support `ReadWriteOncePod`, atomic rename, durable synchronization, stable inode
+identity, and exclusive `flock`; incompatible network filesystems are not
+supported. Kubernetes 1.33 or newer with node support for
+`supplementalGroupsPolicy` is required. The base explicitly selects `Merge` so
+the role-specific image group databases remain effective.
+
+The SSH Service is internal `ClusterIP` port `2222`; external exposure remains
+an operator policy. The included NetworkPolicy permits Pod ingress only on that
+port and does not restrict egress. The two root processes receive only their
+required capabilities: Storage Bootstrap can normalize volume ownership and
+mode, while OpenSSH can change identity and enter its privilege-separation
+root. Every container uses a read-only root filesystem, disables privilege
+escalation, drops all other capabilities, and inherits `RuntimeDefault`
+seccomp.
+
+Render and run the pinned static validation without contacting a cluster:
+
+```sh
+just check-kubernetes
+kustomize build deploy/kubernetes
+```
+
+After supplying the external inputs and reviewing the rendered overlay, apply
+that overlay with `kubectl apply -k <overlay-directory>`. Do not apply the base
+unchanged.
 
 ### systemd service
 

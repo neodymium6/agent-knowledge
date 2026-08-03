@@ -8,8 +8,8 @@ preserve.
 
 The implementation language is Rust. The initial deployment target is a
 conventional Linux host with a local POSIX-style file system. The design should
-remain deployable on Kubernetes, but Kubernetes deployment manifests and
-horizontal scaling are not part of the initial release.
+remain deployable on Kubernetes. A single-replica Kubernetes packaging base is
+provided, but horizontal scaling is not part of the initial release.
 
 ## 2. Purpose
 
@@ -270,8 +270,8 @@ single-process container is not restarted until its previous container has
 fully stopped. Starting recovery while a Git child from the previous Worker can
 still run is unsupported and must fail closed operationally.
 
-A future Kubernetes deployment uses one StatefulSet replica and one persistent
-volume mounted by a single Pod. The volume must provide the file-system
+The supplied Kubernetes deployment uses one StatefulSet replica and one
+persistent volume mounted by a single Pod. The volume must provide the file-system
 semantics above and preserve inode identity across ordinary Pod restarts.
 Network filesystems that cannot take an exclusive `flock` on a read-only
 directory descriptor, including incompatible NFS configurations, are not
@@ -1868,7 +1868,7 @@ Implementation proceeds in these increments:
    - role-specific one-shot Gateway container (implemented); and
    - dedicated OpenSSH Gateway adapter container (implemented); and
    - root-only storage-bootstrap init container (implemented); and
-   - optional single-replica Kubernetes packaging.
+   - optional single-replica Kubernetes packaging (implemented).
 10. Production Gateway privilege separation through the systemd-activated
     local queue-ingress broker, verified with distinct-UID integration tests
     (implemented).
