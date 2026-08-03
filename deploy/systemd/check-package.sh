@@ -12,12 +12,14 @@ ingress_socket="$package_path/lib/systemd/system/agent-knowledge-queue-ingress.s
 ingress_service="$package_path/lib/systemd/system/agent-knowledge-queue-ingress@.service"
 sysusers="$package_path/lib/sysusers.d/agent-knowledge.conf"
 tmpfiles="$package_path/lib/tmpfiles.d/agent-knowledge.conf"
+ssh_shell="$package_path/bin/agent-knowledge-ssh-shell"
 
 test -f "$service"
 test -f "$ingress_socket"
 test -f "$ingress_service"
 test -f "$sysusers"
 test -f "$tmpfiles"
+test -x "$ssh_shell"
 test "$(grep -Fxc "ExecStart=$package_path/bin/agent-knowledge worker run --config /etc/agent-knowledge/worker.yaml" "$service")" -eq 1
 for directive in \
   'Type=exec' \

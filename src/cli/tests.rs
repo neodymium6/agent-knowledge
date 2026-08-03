@@ -314,6 +314,60 @@ fn parses_the_descriptor_relative_storage_migration_command() {
     ));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn parses_the_storage_bootstrap_command() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "admin".into(),
+        "bootstrap-storage".into(),
+        "--config".into(),
+        "/etc/fictional-knowledge/worker.yaml".into(),
+        "--runtime-directory".into(),
+        "/run/fictional-knowledge".into(),
+        "--worker-owner".into(),
+        "61001".into(),
+        "--worker-group".into(),
+        "61002".into(),
+        "--queue-owner".into(),
+        "61003".into(),
+        "--queue-group".into(),
+        "61004".into(),
+        "--gateway-owner".into(),
+        "61005".into(),
+        "--gateway-group".into(),
+        "61006".into(),
+        "--ingress-group".into(),
+        "61007".into(),
+    ])
+    .unwrap_or_else(|error| panic!("storage bootstrap command must parse: {error}"));
+
+    assert!(matches!(
+        command,
+        Command::AdminBootstrapStorage(settings)
+            if settings.config == Path::new("/etc/fictional-knowledge/worker.yaml")
+                && settings.runtime_directory == Path::new("/run/fictional-knowledge")
+                && settings.worker_owner == "61001"
+                && settings.worker_group == "61002"
+                && settings.queue_owner == "61003"
+                && settings.queue_group == "61004"
+                && settings.gateway_owner == "61005"
+                && settings.gateway_group == "61006"
+                && settings.ingress_group == "61007"
+    ));
+
+    assert!(matches!(
+        parse_arguments([
+            "agent-knowledge".into(),
+            "admin".into(),
+            "bootstrap-storage".into(),
+            "--config".into(),
+            "/etc/fictional-knowledge/worker.yaml".into(),
+        ]),
+        Err(CliError::Usage)
+    ));
+}
+
 #[test]
 fn parses_the_forced_command_gateway_configuration() {
     let command = parse_arguments([

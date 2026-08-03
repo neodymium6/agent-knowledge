@@ -117,7 +117,10 @@ agent-knowledge admin submit \
 `package-root` contains extracted `request.json` and `payload/` entries. The
 command validates that directory, restreams every permitted file through the
 same `FileQueue` limits as the queue ingress broker, and prints one JSON acceptance
-result. It never copies an unchecked directory into an accepted queue state.
+result. It must run as the owner of the queue root and enforces the queue-writer
+umask `0007`; this keeps local intake compatible with the same ownership and
+mode contract as the broker. It never copies an unchecked directory into an
+accepted queue state.
 
 Operators inspect an initialized deployment with the same trusted Worker
 configuration:
@@ -161,9 +164,11 @@ another role with the mounted authority. The Worker
 image resolves its non-root account to `10003:10003`, includes queue GID
 `10002` as a supplementary group, retains the Git/OpenSSH runtime wrapper, and
 provides an immutable CA bundle through `SSL_CERT_FILE` for HTTPS Git
-replication. The Queue Ingress image resolves its account to `10002:10002`,
+replication. The Worker process enforces umask `0027` without relying on the
+container runtime. The Queue Ingress image resolves its account to `10002:10002`,
 publishes its socket with dedicated ingress GID `10004`, and uses the raw Rust
-executable closure without Git, OpenSSH, or a CA bundle. The one-shot Gateway
+executable closure without Git, OpenSSH, or a CA bundle. The broker process
+enforces umask `0007` without relying on the container runtime. The one-shot Gateway
 image resolves its account to `10001:10001`, includes local Git for committed
 reads, and contains neither OpenSSH nor a CA bundle. OpenSSH remains an external
 deployment boundary that starts one container per forced command, supplies the
@@ -271,6 +276,45 @@ directory descriptor, including incompatible NFS configurations, are not
 supported as the transaction store. A local or block-backed filesystem with
 the required semantics is suitable. Kubernetes compatibility does not imply
 initial support for multiple Gateway or Worker replicas.
+
+A root-only init container initializes a fresh persistent volume before any
+service container starts. It consumes the validated Worker configuration,
+requires the five durable roots to be siblings, creates the durable queue,
+bare repository and official branch, canonical content worktree, transaction
+root, and release store, then applies the fixed service ownership boundary. A
+root-owned, GID-`0`, mode-`0444` completion marker is published after validation and a
+filesystem durability barrier succeed. The marker and all five roots must share
+one mount. Matching marked storage is accepted idempotently only after bounded
+read-only validation; nonempty unmarked storage or a marker that disagrees with
+configuration or identities is rejected instead of repaired. The runtime socket
+directory and its path are not covered by durable completion: it is recreated
+and validated outside the durable mount from a separate `emptyDir` on each Pod
+start. Before privileged mutation, the configured durable and runtime parents
+must resolve through canonical root-owned ancestry with no group- or
+world-writable component. The bootstrap process retains and repeatedly
+revalidates its locked durable-parent descriptor so pathname replacement cannot
+redirect later phases.
+Resolved Worker, Queue Ingress, and Gateway service UIDs must be non-root and distinct. The
+Worker, queue-owner, Gateway-reader, and ingress-client role GIDs must likewise
+be non-root and pairwise distinct, preventing deployment overrides from
+collapsing the intended access sets before any filesystem mutation occurs. The
+system account database must report exactly the intended role-group matrix:
+Worker plus queue-owner for the Worker, queue-owner for Queue Ingress, and
+Gateway-reader plus ingress-client for the Gateway. Membership in unrelated
+groups is rejected so a forced-command account cannot inherit an independent
+privilege such as container-engine or credential access.
+The deployment must explicitly identify its Gateway account; bootstrap does not
+assume that a deployment-managed SSH user has a fixed name.
+The bootstrap process sets umask `0077` before creating any path. Existing
+unmarked roots and children must be root-owned and not group- or world-writable,
+and every child mount is checked before ownership or mode normalization. An
+empty root-owned mode-`0700` `lost+found` on the durable filesystem is the only
+permitted non-application entry in a fresh volume; any recovered content fails
+closed. POSIX access and default ACLs are rejected during preflight and final
+validation across the durable and ephemeral runtime trees; ownership and mode
+bits alone are not treated as a complete authorization description.
+Quartz remains an independently supplied immutable deployment input and is not
+bundled into the init image.
 
 The dedicated OpenSSH Gateway adapter image is the transport boundary for that
 Pod. It shares the committed repository, content checkout, and queue-ingress
@@ -789,6 +833,14 @@ depend on whether the Worker or first broker connection starts first. The
 repository and content roots are setgid to the Gateway reader group; the Worker
 owns them and its `0027` umask grants the Gateway read/execute access without
 write access. Worktrees, releases, and credentials remain Worker-only.
+
+Fresh container storage is created by the same explicit bootstrap contract.
+Initialization normalizes regular Git object files even when Git created them
+read-only, rejects links, special files, hard links, cross-mount descendants,
+and excessive trees, and records completion only after read-only queue,
+repository, and release reopen checks succeed. An interrupted initialization
+therefore leaves unmarked nonempty storage that requires operator inspection;
+the next init attempt does not delete or silently repair it.
 
 A fictional `authorized_keys` entry has this form:
 
@@ -1791,6 +1843,7 @@ Implementation proceeds in these increments:
      without socket activation (implemented); and
    - role-specific one-shot Gateway container (implemented); and
    - dedicated OpenSSH Gateway adapter container (implemented); and
+   - root-only storage-bootstrap init container (implemented); and
    - optional single-replica Kubernetes packaging.
 10. Production Gateway privilege separation through the systemd-activated
     local queue-ingress broker, verified with distinct-UID integration tests

@@ -3,6 +3,8 @@ mod cli;
 mod client;
 mod gateway;
 mod queue_ingress;
+#[cfg(target_os = "linux")]
+mod storage_bootstrap;
 mod worker;
 
 fn main() {

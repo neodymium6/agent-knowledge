@@ -20,7 +20,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 
 #[cfg(target_os = "linux")]
-use agent_knowledge_core::{PathAttestation, PathAttestationError};
+use agent_knowledge_core::{PathAttestation, PathAttestationError, RequestId};
 
 #[cfg(target_os = "linux")]
 use nix::dir::Dir;
@@ -32,6 +32,10 @@ use nix::sys::stat::{Mode, fchmod};
 use nix::unistd::{Gid, Group, Uid, User, dup, fchown};
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
+use ulid::Ulid;
+#[cfg(target_os = "linux")]
+use xattr::FileExt as _;
 
 #[cfg(target_os = "linux")]
 const MAXIMUM_MIGRATION_DEPTH: usize = 128;
@@ -41,6 +45,8 @@ const MAXIMUM_FD_INFO_BYTES: u64 = 16 * 1024;
 const MAXIMUM_MIGRATION_ENTRIES: u64 = 1_000_000;
 #[cfg(target_os = "linux")]
 const MAXIMUM_MIGRATION_PATH_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const POSIX_ACL_XATTRS: [&str; 2] = ["system.posix_acl_access", "system.posix_acl_default"];
 
 pub(crate) fn status<W>(
     config: &Path,
@@ -153,9 +159,12 @@ fn migrate_v1_storage_with_ids(
     let mut queue_fingerprint = TreeFingerprintBuilder::new();
     migrate_directory(
         &queue.file,
-        queue_group,
-        Mode::from_bits_truncate(0o2770),
-        Mode::from_bits_truncate(0o660),
+        TreePermissions {
+            owner: None,
+            group: queue_group,
+            directory_mode: Mode::from_bits_truncate(0o2770),
+            file_mode: Mode::from_bits_truncate(0o660),
+        },
         0,
         Path::new(""),
         &mut queue_fingerprint,
@@ -164,9 +173,12 @@ fn migrate_v1_storage_with_ids(
     let mut git_fingerprint = TreeFingerprintBuilder::new();
     migrate_directory(
         &git.file,
-        gateway_group,
-        Mode::from_bits_truncate(0o2750),
-        Mode::from_bits_truncate(0o640),
+        TreePermissions {
+            owner: None,
+            group: gateway_group,
+            directory_mode: Mode::from_bits_truncate(0o2750),
+            file_mode: Mode::from_bits_truncate(0o640),
+        },
         0,
         Path::new(""),
         &mut git_fingerprint,
@@ -175,9 +187,12 @@ fn migrate_v1_storage_with_ids(
     let mut content_fingerprint = TreeFingerprintBuilder::new();
     migrate_directory(
         &content.file,
-        gateway_group,
-        Mode::from_bits_truncate(0o2750),
-        Mode::from_bits_truncate(0o640),
+        TreePermissions {
+            owner: None,
+            group: gateway_group,
+            directory_mode: Mode::from_bits_truncate(0o2750),
+            file_mode: Mode::from_bits_truncate(0o640),
+        },
         0,
         Path::new(""),
         &mut content_fingerprint,
@@ -234,7 +249,251 @@ fn migrate_v1_storage_with_ids(
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_user(value: &OsStr) -> Result<Uid, StorageMigrationError> {
+pub(crate) fn normalize_storage_tree(
+    root: &Path,
+    owner: Uid,
+    group: Gid,
+    directory_mode: Mode,
+    file_mode: Mode,
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let mut budget = MigrationBudget::new();
+    preflight_directory(&root.file, 0, Path::new(""), &mut budget)?;
+    let mut fingerprint = TreeFingerprintBuilder::new();
+    migrate_directory(
+        &root.file,
+        TreePermissions {
+            owner: Some(owner),
+            group,
+            directory_mode,
+            file_mode,
+        },
+        0,
+        Path::new(""),
+        &mut fingerprint,
+    )?;
+    let fingerprint = fingerprint.finish();
+    verify_fingerprint(&root.file, &fingerprint)?;
+    root.file.sync_all().map_err(StorageMigrationError::Io)?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_bootstrap_source_tree(root: &Path) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let mut budget = MigrationBudget::new();
+    preflight_directory(&root.file, 0, Path::new(""), &mut budget)?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_storage_directory_no_posix_acl(
+    path: &Path,
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(path)?;
+    require_no_posix_acl(&root.file, Path::new(""))?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_storage_tree(
+    root: &Path,
+    owner: Uid,
+    group: Gid,
+    directory_mode: Mode,
+    file_mode: Mode,
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let mut budget = MigrationBudget::new();
+    preflight_directory(&root.file, 0, Path::new(""), &mut budget)?;
+    let permissions = TreePermissions {
+        owner: Some(owner),
+        group,
+        directory_mode,
+        file_mode,
+    };
+    let mut fingerprint = TreeFingerprintBuilder::new();
+    validate_directory_permissions(
+        &root.file,
+        permissions,
+        0,
+        Path::new(""),
+        &mut fingerprint,
+        TreeValidation::strict(),
+    )?;
+    let fingerprint = fingerprint.finish();
+    verify_fingerprint(&root.file, &fingerprint)?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_repository_tree(
+    root: &Path,
+    owner: Uid,
+    group: Gid,
+    directory_mode: Mode,
+    file_mode: Mode,
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let mut budget = MigrationBudget::new();
+    preflight_directory(&root.file, 0, Path::new(""), &mut budget)?;
+    let permissions = TreePermissions {
+        owner: Some(owner),
+        group,
+        directory_mode,
+        file_mode,
+    };
+    let mut fingerprint = TreeFingerprintBuilder::new();
+    validate_directory_permissions(
+        &root.file,
+        permissions,
+        0,
+        Path::new(""),
+        &mut fingerprint,
+        TreeValidation {
+            allow_read_only_files: true,
+            ..TreeValidation::strict()
+        },
+    )?;
+    let fingerprint = fingerprint.finish();
+    verify_fingerprint(&root.file, &fingerprint)?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_release_tree(
+    root: &Path,
+    owner: Uid,
+    group: Gid,
+    directory_mode: Mode,
+    file_mode: Mode,
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let mut budget = MigrationBudget::new();
+    preflight_release_directory(&root.file, 0, Path::new(""), &mut budget)?;
+    let permissions = TreePermissions {
+        owner: Some(owner),
+        group,
+        directory_mode,
+        file_mode,
+    };
+    let mut fingerprint = TreeFingerprintBuilder::new();
+    validate_directory_permissions(
+        &root.file,
+        permissions,
+        0,
+        Path::new(""),
+        &mut fingerprint,
+        TreeValidation {
+            allow_symlinks: true,
+            ..TreeValidation::strict()
+        },
+    )?;
+    let fingerprint = fingerprint.finish();
+    verify_release_fingerprint(&root.file, &fingerprint)?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_queue_tree(
+    root: &Path,
+    queue_owner: Uid,
+    worker_owner: Uid,
+    group: Gid,
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let mut budget = MigrationBudget::new();
+    preflight_directory(&root.file, 0, Path::new(""), &mut budget)?;
+    let permissions = TreePermissions {
+        owner: Some(queue_owner),
+        group,
+        directory_mode: Mode::from_bits_truncate(0o2770),
+        file_mode: Mode::from_bits_truncate(0o660),
+    };
+    let mut fingerprint = TreeFingerprintBuilder::new();
+    validate_directory_permissions(
+        &root.file,
+        permissions,
+        0,
+        Path::new(""),
+        &mut fingerprint,
+        TreeValidation {
+            alternate_file: Some((worker_owner, Mode::from_bits_truncate(0o640))),
+            ..TreeValidation::strict()
+        },
+    )?;
+    let fingerprint = fingerprint.finish();
+    verify_fingerprint(&root.file, &fingerprint)?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_same_storage_mount(
+    root: &Path,
+    descendants: &[&Path],
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let expected = linux_mount_id(&root.file)?;
+    for descendant in descendants {
+        let descendant = MigrationRoot::open(descendant)?;
+        if linux_mount_id(&descendant.file)? != expected {
+            return Err(StorageMigrationError::UnsafeEntry(descendant.configured));
+        }
+        descendant.revalidate()?;
+    }
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_storage_file_mount(
+    root: &Path,
+    file: &Path,
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let relative = file
+        .strip_prefix(&root.configured)
+        .map_err(|_| StorageMigrationError::UnsafeEntry(file.to_path_buf()))?;
+    let pinned = open_regular_beneath(&root.file, relative)?;
+    if linux_mount_id(&pinned)? != linux_mount_id(&root.file)? {
+        return Err(StorageMigrationError::UnsafeEntry(file.to_path_buf()));
+    }
+    require_no_posix_acl(&pinned, relative)?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn normalize_storage_directory(
+    path: &Path,
+    owner: Uid,
+    group: Gid,
+    mode: Mode,
+) -> Result<(), StorageMigrationError> {
+    normalized_absolute_suffix(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+        .map_err(StorageMigrationError::Io)?;
+    let attestation =
+        PathAttestation::capture(path, &file).map_err(StorageMigrationError::Attestation)?;
+    if attestation.path() != path {
+        return Err(StorageMigrationError::InvalidRoot(path.to_path_buf()));
+    }
+    require_no_posix_acl(&file, Path::new(""))?;
+    set_identity_and_mode(&file, Some(owner), group, mode)?;
+    require_no_posix_acl(&file, Path::new(""))?;
+    file.sync_all().map_err(StorageMigrationError::Io)?;
+    let observed =
+        PathAttestation::capture(path, &file).map_err(StorageMigrationError::Attestation)?;
+    if observed.path() == path && attestation.matches_destination(&observed) {
+        Ok(())
+    } else {
+        Err(StorageMigrationError::TreeChanged(path.to_path_buf()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn resolve_user(value: &OsStr) -> Result<Uid, StorageMigrationError> {
     if let Some(identifier) = value.to_str().and_then(|value| value.parse::<u32>().ok()) {
         return Ok(Uid::from_raw(identifier));
     }
@@ -248,7 +507,7 @@ fn resolve_user(value: &OsStr) -> Result<Uid, StorageMigrationError> {
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_group(value: &OsStr) -> Result<Gid, StorageMigrationError> {
+pub(crate) fn resolve_group(value: &OsStr) -> Result<Gid, StorageMigrationError> {
     if let Some(identifier) = value.to_str().and_then(|value| value.parse::<u32>().ok()) {
         return Ok(Gid::from_raw(identifier));
     }
@@ -361,7 +620,7 @@ fn open_regular_beneath(root: &File, path: &Path) -> Result<File, StorageMigrati
     let file = open_relative(
         root,
         path,
-        OFlag::O_RDWR | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         true,
     )?;
     if object_identity(&file)? != identity {
@@ -460,6 +719,7 @@ fn preflight_directory(
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
     }
+    require_no_posix_acl(directory, relative)?;
     budget.record(relative)?;
     let cloned = directory.try_clone().map_err(StorageMigrationError::Io)?;
     let mut entries = Dir::from_fd(cloned.into()).map_err(nix_io_error)?;
@@ -481,6 +741,11 @@ fn preflight_directory(
             }
             preflight_directory(&child, depth + 1, &path, budget)?;
         } else if identity.file_type == nix::libc::S_IFREG && identity.links == 1 {
+            let child = open_child_regular(directory, &name)?;
+            if object_identity(&child)? != identity {
+                return Err(StorageMigrationError::TreeChanged(path));
+            }
+            require_no_posix_acl(&child, &path)?;
             budget.record(&path)?;
         } else {
             return Err(StorageMigrationError::UnsafeEntry(path));
@@ -490,11 +755,86 @@ fn preflight_directory(
 }
 
 #[cfg(target_os = "linux")]
-fn migrate_directory(
+fn preflight_release_directory(
     directory: &File,
+    depth: usize,
+    relative: &Path,
+    budget: &mut MigrationBudget,
+) -> Result<(), StorageMigrationError> {
+    if depth > MAXIMUM_MIGRATION_DEPTH {
+        return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
+    }
+    require_no_posix_acl(directory, relative)?;
+    budget.record(relative)?;
+    let cloned = directory.try_clone().map_err(StorageMigrationError::Io)?;
+    let mut entries = Dir::from_fd(cloned.into()).map_err(nix_io_error)?;
+    for entry in entries.iter() {
+        let entry = entry.map_err(nix_io_error)?;
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let name = CString::new(name.to_bytes())
+            .map_err(|_| StorageMigrationError::UnsafeEntry(relative.to_path_buf()))?;
+        let path = relative.join(OsStr::from_bytes(name.to_bytes()));
+        let pinned = open_child_path(directory, &name)?;
+        let identity = object_identity(&pinned)?;
+        if identity.file_type == nix::libc::S_IFDIR {
+            let child = open_child_directory(directory, &name)?;
+            if object_identity(&child)? != identity {
+                return Err(StorageMigrationError::TreeChanged(path));
+            }
+            preflight_release_directory(&child, depth + 1, &path, budget)?;
+        } else if matches!(identity.file_type, nix::libc::S_IFREG | nix::libc::S_IFLNK)
+            && identity.links == 1
+        {
+            if identity.file_type == nix::libc::S_IFREG {
+                let child = open_child_regular(directory, &name)?;
+                if object_identity(&child)? != identity {
+                    return Err(StorageMigrationError::TreeChanged(path));
+                }
+                require_no_posix_acl(&child, &path)?;
+            }
+            budget.record(&path)?;
+        } else {
+            return Err(StorageMigrationError::UnsafeEntry(path));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct TreePermissions {
+    owner: Option<Uid>,
     group: Gid,
     directory_mode: Mode,
     file_mode: Mode,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct TreeValidation {
+    allow_read_only_files: bool,
+    allow_symlinks: bool,
+    alternate_file: Option<(Uid, Mode)>,
+}
+
+#[cfg(target_os = "linux")]
+impl TreeValidation {
+    const fn strict() -> Self {
+        Self {
+            allow_read_only_files: false,
+            allow_symlinks: false,
+            alternate_file: None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn migrate_directory(
+    directory: &File,
+    permissions: TreePermissions,
     depth: usize,
     relative: &Path,
     fingerprint: &mut TreeFingerprintBuilder,
@@ -512,21 +852,20 @@ fn migrate_directory(
             if object_identity(&child)? != identity {
                 return Err(StorageMigrationError::TreeChanged(path));
             }
-            migrate_directory(
-                &child,
-                group,
-                directory_mode,
-                file_mode,
-                depth + 1,
-                &path,
-                fingerprint,
-            )?;
+            migrate_directory(&child, permissions, depth + 1, &path, fingerprint)?;
         } else if identity.file_type == nix::libc::S_IFREG && identity.links == 1 {
             let child = open_child_regular(directory, name)?;
             if object_identity(&child)? != identity {
                 return Err(StorageMigrationError::TreeChanged(path));
             }
-            set_regular_identity_and_mode(&child, group, file_mode, &path)?;
+            set_regular_identity_and_mode(
+                &child,
+                permissions.owner,
+                permissions.group,
+                permissions.file_mode,
+                &path,
+            )?;
+            child.sync_all().map_err(StorageMigrationError::Io)?;
             fingerprint.record(&path, object_identity(&child)?)?;
         } else {
             return Err(StorageMigrationError::UnsafeEntry(path));
@@ -535,9 +874,203 @@ fn migrate_directory(
     if entries != directory_entries(directory, relative)? {
         return Err(StorageMigrationError::TreeChanged(relative.to_path_buf()));
     }
-    set_identity_and_mode(directory, None, group, directory_mode)?;
+    set_identity_and_mode(
+        directory,
+        permissions.owner,
+        permissions.group,
+        permissions.directory_mode,
+    )?;
+    directory.sync_all().map_err(StorageMigrationError::Io)?;
     fingerprint.record(relative, object_identity(directory)?)?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_directory_permissions(
+    directory: &File,
+    permissions: TreePermissions,
+    depth: usize,
+    relative: &Path,
+    fingerprint: &mut TreeFingerprintBuilder,
+    validation: TreeValidation,
+) -> Result<(), StorageMigrationError> {
+    if depth > MAXIMUM_MIGRATION_DEPTH {
+        return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
+    }
+    let entries = directory_entries(directory, relative)?;
+    for name in &entries {
+        let path = relative.join(OsStr::from_bytes(name.to_bytes()));
+        let pinned = open_child_path(directory, name)?;
+        let identity = object_identity(&pinned)?;
+        if identity.file_type == nix::libc::S_IFDIR {
+            let child = open_child_directory(directory, name)?;
+            if object_identity(&child)? != identity {
+                return Err(StorageMigrationError::TreeChanged(path));
+            }
+            validate_directory_permissions(
+                &child,
+                permissions,
+                depth + 1,
+                &path,
+                fingerprint,
+                validation,
+            )?;
+        } else if identity.file_type == nix::libc::S_IFREG && identity.links == 1 {
+            let child = open_child_regular(directory, name)?;
+            if object_identity(&child)? != identity {
+                return Err(StorageMigrationError::TreeChanged(path));
+            }
+            require_no_posix_acl(&child, &path)?;
+            require_file_metadata(
+                &child,
+                permissions.owner,
+                permissions.group,
+                permissions.file_mode,
+                &path,
+                validation.allow_read_only_files,
+                validation.alternate_file,
+            )?;
+            fingerprint.record(&path, identity)?;
+        } else if validation.allow_symlinks
+            && identity.file_type == nix::libc::S_IFLNK
+            && identity.links == 1
+        {
+            require_metadata(
+                &pinned,
+                permissions.owner,
+                permissions.group,
+                Mode::from_bits_truncate(0o777),
+                &path,
+                false,
+            )?;
+            fingerprint.record(&path, identity)?;
+        } else {
+            return Err(StorageMigrationError::UnsafeEntry(path));
+        }
+    }
+    if entries != directory_entries(directory, relative)? {
+        return Err(StorageMigrationError::TreeChanged(relative.to_path_buf()));
+    }
+    require_no_posix_acl(directory, relative)?;
+    require_metadata(
+        directory,
+        permissions.owner,
+        permissions.group,
+        permissions.directory_mode,
+        relative,
+        false,
+    )?;
+    fingerprint.record(relative, object_identity(directory)?)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn require_no_posix_acl(file: &File, path: &Path) -> Result<(), StorageMigrationError> {
+    for name in POSIX_ACL_XATTRS {
+        if file
+            .get_xattr(name)
+            .map_err(StorageMigrationError::Io)?
+            .is_some()
+        {
+            return Err(StorageMigrationError::PosixAcl(path.to_path_buf()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn require_metadata(
+    file: &File,
+    owner: Option<Uid>,
+    group: Gid,
+    mode: Mode,
+    path: &Path,
+    allow_owner_write_missing: bool,
+) -> Result<(), StorageMigrationError> {
+    let metadata = file.metadata().map_err(StorageMigrationError::Io)?;
+    if metadata_matches(&metadata, owner, group, mode, allow_owner_write_missing) {
+        Ok(())
+    } else {
+        Err(StorageMigrationError::UnsafeEntry(path.to_path_buf()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn require_file_metadata(
+    file: &File,
+    owner: Option<Uid>,
+    group: Gid,
+    mode: Mode,
+    path: &Path,
+    allow_owner_write_missing: bool,
+    alternate: Option<(Uid, Mode)>,
+) -> Result<(), StorageMigrationError> {
+    let metadata = file.metadata().map_err(StorageMigrationError::Io)?;
+    if metadata_matches(&metadata, owner, group, mode, allow_owner_write_missing)
+        || (worker_owned_queue_file(path)
+            && alternate.is_some_and(|(owner, mode)| {
+                metadata_matches(&metadata, Some(owner), group, mode, false)
+            }))
+    {
+        Ok(())
+    } else {
+        Err(StorageMigrationError::UnsafeEntry(path.to_path_buf()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn worker_owned_queue_file(path: &Path) -> bool {
+    let mut components = path.iter();
+    let Some(first) = components.next() else {
+        return false;
+    };
+    if first == "worker-tmp" {
+        let Some(name) = components.next().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        return components.next().is_none() && valid_worker_temporary_name(name);
+    }
+    if !matches!(
+        first.as_encoded_bytes(),
+        b"pending" | b"processing" | b"completed" | b"failed"
+    ) {
+        return false;
+    }
+    let Some(request_id) = components.next().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(sidecar) = components.next() else {
+        return false;
+    };
+    components.next().is_none()
+        && request_id.parse::<RequestId>().is_ok()
+        && matches!(sidecar.as_encoded_bytes(), b"phase.json" | b"result.json")
+}
+
+#[cfg(target_os = "linux")]
+fn valid_worker_temporary_name(name: &str) -> bool {
+    [".phase-", ".result-"].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .and_then(|value| value.parse::<Ulid>().ok().map(|id| (value, id)))
+            .is_some_and(|(value, id)| id.to_string() == value)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn metadata_matches(
+    metadata: &std::fs::Metadata,
+    owner: Option<Uid>,
+    group: Gid,
+    mode: Mode,
+    allow_owner_write_missing: bool,
+) -> bool {
+    let observed_mode = metadata.mode() & 0o7777;
+    let expected_mode = mode.bits();
+    let mode_matches = observed_mode == expected_mode
+        || (allow_owner_write_missing && observed_mode == expected_mode & !0o200);
+    owner.is_none_or(|owner| metadata.uid() == owner.as_raw())
+        && metadata.gid() == group.as_raw()
+        && mode_matches
 }
 
 #[cfg(target_os = "linux")]
@@ -592,7 +1125,7 @@ fn open_child_regular(parent: &File, name: &CStr) -> Result<File, StorageMigrati
     open_relative(
         parent,
         Path::new(OsStr::from_bytes(name.to_bytes())),
-        OFlag::O_RDWR | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         true,
     )
 }
@@ -610,12 +1143,13 @@ fn require_regular(file: &File, path: &Path) -> Result<ObjectIdentity, StorageMi
 #[cfg(target_os = "linux")]
 fn set_regular_identity_and_mode(
     file: &File,
+    owner: Option<Uid>,
     group: Gid,
     mode: Mode,
     path: &Path,
 ) -> Result<(), StorageMigrationError> {
     require_regular(file, path)?;
-    set_identity_and_mode(file, None, group, mode)?;
+    set_identity_and_mode(file, owner, group, mode)?;
     require_regular(file, path).map(|_| ())
 }
 
@@ -625,7 +1159,21 @@ fn verify_fingerprint(
     expected: &TreeFingerprint,
 ) -> Result<(), StorageMigrationError> {
     let mut observed = TreeFingerprintBuilder::new();
-    fingerprint_directory(root, 0, Path::new(""), &mut observed)?;
+    fingerprint_directory(root, 0, Path::new(""), &mut observed, false)?;
+    if &observed.finish() == expected {
+        Ok(())
+    } else {
+        Err(StorageMigrationError::TreeChanged(PathBuf::new()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_release_fingerprint(
+    root: &File,
+    expected: &TreeFingerprint,
+) -> Result<(), StorageMigrationError> {
+    let mut observed = TreeFingerprintBuilder::new();
+    fingerprint_directory(root, 0, Path::new(""), &mut observed, true)?;
     if &observed.finish() == expected {
         Ok(())
     } else {
@@ -639,6 +1187,7 @@ fn fingerprint_directory(
     depth: usize,
     relative: &Path,
     fingerprint: &mut TreeFingerprintBuilder,
+    allow_symlinks: bool,
 ) -> Result<(), StorageMigrationError> {
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
@@ -653,11 +1202,14 @@ fn fingerprint_directory(
             if object_identity(&child)? != identity {
                 return Err(StorageMigrationError::TreeChanged(path));
             }
-            fingerprint_directory(&child, depth + 1, &path, fingerprint)?;
-        } else if identity.file_type != nix::libc::S_IFREG || identity.links != 1 {
-            return Err(StorageMigrationError::UnsafeEntry(path));
-        } else {
+            fingerprint_directory(&child, depth + 1, &path, fingerprint, allow_symlinks)?;
+        } else if (identity.file_type == nix::libc::S_IFREG
+            || (allow_symlinks && identity.file_type == nix::libc::S_IFLNK))
+            && identity.links == 1
+        {
             fingerprint.record(&path, identity)?;
+        } else {
+            return Err(StorageMigrationError::UnsafeEntry(path));
         }
     }
     if entries != directory_entries(directory, relative)? {
@@ -836,6 +1388,7 @@ pub(crate) enum StorageMigrationError {
     UnknownIdentity(std::ffi::OsString),
     QueueBusy,
     DirectoryNotEmpty(PathBuf),
+    PosixAcl(PathBuf),
     UnsafeEntry(PathBuf),
     TreeChanged(PathBuf),
     MigrationLimitExceeded(PathBuf),
@@ -868,6 +1421,11 @@ impl fmt::Display for StorageMigrationError {
             Self::DirectoryNotEmpty(path) => write!(
                 formatter,
                 "storage migration requires an empty directory: {}",
+                path.display()
+            ),
+            Self::PosixAcl(path) => write!(
+                formatter,
+                "storage migration rejected a POSIX ACL: {}",
                 path.display()
             ),
             Self::UnsafeEntry(path) => write!(
@@ -990,10 +1548,31 @@ mod migration_tests {
 
     use super::{
         MAXIMUM_MIGRATION_ENTRIES, MAXIMUM_MIGRATION_PATH_BYTES, MigrationBudget,
-        StorageMigrationError, migrate_v1_storage_with_ids,
+        StorageMigrationError, migrate_v1_storage_with_ids, worker_owned_queue_file,
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn worker_queue_metadata_is_limited_to_exact_sidecar_paths() {
+        assert!(worker_owned_queue_file(Path::new(
+            "processing/01K00000000000000000000000/phase.json"
+        )));
+        assert!(worker_owned_queue_file(Path::new(
+            "failed/01K00000000000000000000000/result.json"
+        )));
+        assert!(worker_owned_queue_file(Path::new(
+            "worker-tmp/.phase-01K00000000000000000000000"
+        )));
+        assert!(!worker_owned_queue_file(Path::new("phase.json")));
+        assert!(!worker_owned_queue_file(Path::new(
+            "pending/01K00000000000000000000000/payload/phase.json"
+        )));
+        assert!(!worker_owned_queue_file(Path::new(
+            "pending/not-a-request/result.json"
+        )));
+        assert!(!worker_owned_queue_file(Path::new("worker-tmp/unexpected")));
+    }
 
     struct TestDirectory(PathBuf);
 
