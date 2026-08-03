@@ -15,9 +15,11 @@ activation_pid=
 sshd_pid=
 gateway_account_created=false
 client_account_created=false
+privsep_account_created=false
 gateway_group_created=false
 ingress_group_created=false
 client_group_created=false
+privsep_group_created=false
 var_empty_created=false
 cleanup() {
   cleanup_status=$?
@@ -36,6 +38,9 @@ cleanup() {
   if [[ $gateway_account_created == true ]]; then
     userdel fictional-ak-gateway 2>/dev/null || true
   fi
+  if [[ $privsep_account_created == true ]]; then
+    userdel sshd 2>/dev/null || true
+  fi
   if [[ $client_group_created == true ]]; then
     groupdel fictional-ak-client 2>/dev/null || true
   fi
@@ -44,6 +49,9 @@ cleanup() {
   fi
   if [[ $gateway_group_created == true ]]; then
     groupdel fictional-ak-gateway 2>/dev/null || true
+  fi
+  if [[ $privsep_group_created == true ]]; then
+    groupdel sshd 2>/dev/null || true
   fi
   if [[ $var_empty_created == true ]]; then
     rmdir /var/empty 2>/dev/null || true
@@ -70,6 +78,8 @@ worker_uid=61102
 worker_gid=61102
 client_uid=61104
 client_gid=61104
+privsep_uid=61105
+privsep_gid=61105
 document_bundle=2026-07-31-01K00000000000000000000001
 
 for program in getent groupadd groupdel timeout useradd userdel; do
@@ -220,6 +230,12 @@ sed -i \
   "$test_root/package-two/payload/run/index.md"
 tar --format=gnu --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
   -C "$test_root/package-two" -cf "$test_root/request-two.tar" request.json payload
+cp -a "$test_root/package-two" "$test_root/package-three"
+sed -i \
+  -e 's/01K00000000000000000000002/01K00000000000000000000004/g' \
+  -e 's/01K00000000000000000000003/01K00000000000000000000005/g' \
+  "$test_root/package-three/request.json" \
+  "$test_root/package-three/payload/run/index.md"
 
 cat >"$test_root/gateway.yaml" <<EOF
 schema_version: 3
@@ -326,14 +342,14 @@ groupadd --gid "$ingress_gid" "$ingress_group"
 ingress_group_created=true
 groupadd --gid "$client_gid" "$client_group"
 client_group_created=true
-install -d -m 0700 -o "$gateway_uid" -g "$gateway_gid" "$test_root/gateway-home"
+install -d -m 0755 -o 0 -g 0 "$test_root/gateway-home"
 install -d -m 0700 -o "$client_uid" -g "$client_gid" "$test_root/client-home"
 useradd --uid "$gateway_uid" --gid "$gateway_gid" --groups "$ingress_group" \
-  --home-dir "$test_root/gateway-home" --shell /bin/sh --password '*' \
+  --home-dir "$test_root/gateway-home" --shell /bin/sh --password NP \
   --no-create-home "$gateway_account"
 gateway_account_created=true
 useradd --uid "$client_uid" --gid "$client_gid" \
-  --home-dir "$test_root/client-home" --shell /bin/sh --password '*' \
+  --home-dir "$test_root/client-home" --shell /bin/sh --password NP \
   --no-create-home "$client_account"
 client_account_created=true
 
@@ -349,6 +365,24 @@ if [[ ! -d /var/empty || -L /var/empty || $var_empty_owner != 0:0 ]] ||
   exit 1
 fi
 
+if ! getent passwd sshd >/dev/null; then
+  if getent passwd "$privsep_uid" >/dev/null; then
+    echo "OpenSSH privilege-separation UID is already allocated: ${privsep_uid}" >&2
+    exit 1
+  fi
+  if ! getent group sshd >/dev/null; then
+    if getent group "$privsep_gid" >/dev/null; then
+      echo "OpenSSH privilege-separation GID is already allocated: ${privsep_gid}" >&2
+      exit 1
+    fi
+    groupadd --gid "$privsep_gid" sshd
+    privsep_group_created=true
+  fi
+  useradd --uid "$privsep_uid" --gid sshd --home-dir /var/empty \
+    --shell /bin/false --password '*' --no-create-home sshd
+  privsep_account_created=true
+fi
+
 ssh_keygen_binary=$openssh_bin/ssh-keygen
 ssh_binary=$openssh_bin/ssh
 sshd_binary=$openssh_bin/sshd
@@ -360,10 +394,13 @@ chmod 0600 "$test_root/ssh-host-key" "$test_root/client-key"
 chown "$client_uid":"$client_gid" "$test_root/client-key" "$test_root/client-key.pub"
 
 client_public_key=$(<"$test_root/client-key.pub")
+install -d -m 0700 -o 0 -g 0 \
+  "$test_root/gateway-home/.ssh"
 printf 'restrict,command="%s gateway --config %s --client-id fictional-node-a" %s\n' \
   "$test_root/agent-knowledge" "$test_root/gateway.yaml" "$client_public_key" \
-  >"$test_root/authorized-keys"
-chmod 0644 "$test_root/authorized-keys"
+  >"$test_root/gateway-home/.ssh/authorized_keys"
+chown 0:0 "$test_root/gateway-home/.ssh/authorized_keys"
+chmod 0600 "$test_root/gateway-home/.ssh/authorized_keys"
 
 ssh_port=
 for attempt in $(seq 0 99); do
@@ -374,7 +411,7 @@ ListenAddress 127.0.0.1
 AddressFamily inet
 HostKey $test_root/ssh-host-key
 PidFile $test_root/sshd.pid
-AuthorizedKeysFile $test_root/authorized-keys
+AuthorizedKeysFile .ssh/authorized_keys
 AuthenticationMethods publickey
 PubkeyAuthentication yes
 PasswordAuthentication no
@@ -461,11 +498,33 @@ chmod 0644 "$test_root/client-home/.ssh/known_hosts"
 
 client_list_response=$(
   setpriv --reuid="$client_uid" --regid="$client_gid" --clear-groups \
-    env HOME="$test_root/client-home" USER="$client_account" LOGNAME="$client_account" \
+    env "PATH=$openssh_bin:/usr/bin:/bin" HOME="$test_root/client-home" \
+    USER="$client_account" LOGNAME="$client_account" \
     "$test_root/agent-knowledge" client list \
     --destination fictional-knowledge --maximum-results 10 --timeout-seconds 10
 )
 grep -Fq '01K00000000000000000000001' <<<"$client_list_response"
+
+client_submit_response=$(
+  setpriv --reuid="$client_uid" --regid="$client_gid" --clear-groups \
+    env "PATH=$openssh_bin:/usr/bin:/bin" HOME="$test_root/client-home" \
+    USER="$client_account" LOGNAME="$client_account" \
+    "$test_root/agent-knowledge" client submit \
+    --destination fictional-knowledge --package-root "$test_root/package-three" \
+    --timeout-seconds 10
+)
+grep -Fq '"status":"accepted"' <<<"$client_submit_response"
+grep -Fq '"client_id":"fictional-node-a"' \
+  "$test_root/storage/queue/pending/01K00000000000000000000004/acceptance.json"
+client_status_response=$(
+  setpriv --reuid="$client_uid" --regid="$client_gid" --clear-groups \
+    env "PATH=$openssh_bin:/usr/bin:/bin" HOME="$test_root/client-home" \
+    USER="$client_account" LOGNAME="$client_account" \
+    "$test_root/agent-knowledge" client status \
+    --destination fictional-knowledge \
+    --request-id 01K00000000000000000000004 --timeout-seconds 10
+)
+grep -Fq '"status":"pending"' <<<"$client_status_response"
 
 set +e
 invalid_command_output=$(
@@ -484,17 +543,35 @@ if grep -Fq 'uid=' <<<"$invalid_command_output"; then
   exit 1
 fi
 
-if setpriv --reuid="$client_uid" --regid="$client_gid" --clear-groups \
+set +e
+setpriv --reuid="$client_uid" --regid="$client_gid" --clear-groups \
   timeout 10 "$ssh_binary" -F "$test_root/client-home/.ssh/config" \
   -o ExitOnForwardFailure=yes -N -R "0:127.0.0.1:$ssh_port" \
-  fictional-knowledge >"$test_root/forwarding.log" 2>&1; then
+  fictional-knowledge >"$test_root/forwarding.log" 2>&1
+forwarding_status=$?
+set -e
+if ((forwarding_status == 0 || forwarding_status == 124)); then
   echo "OpenSSH restriction allowed remote port forwarding" >&2
   exit 1
 fi
-if setpriv --reuid="$client_uid" --regid="$client_gid" --clear-groups \
-  timeout 10 "$ssh_binary" -F "$test_root/client-home/.ssh/config" \
-  -tt fictional-knowledge 'akp-v1 list' \
-  </dev/null >"$test_root/tty.log" 2>&1; then
+if ! grep -Fq 'remote port forwarding failed' "$test_root/forwarding.log"; then
+  echo "OpenSSH did not report an explicit forwarding rejection" >&2
+  exit 1
+fi
+
+set +e
+printf '%s\n' '{"protocol_version":1,"maximum_results":10}' |
+  setpriv --reuid="$client_uid" --regid="$client_gid" --clear-groups \
+    timeout 10 "$ssh_binary" -F "$test_root/client-home/.ssh/config" \
+    -tt fictional-knowledge 'akp-v1 list' \
+    >"$test_root/tty.log" 2>&1
+tty_status=${PIPESTATUS[1]}
+set -e
+if ((tty_status == 124)); then
+  echo "OpenSSH TTY restriction check timed out" >&2
+  exit 1
+fi
+if ! grep -Fq 'PTY allocation request failed' "$test_root/tty.log"; then
   echo "OpenSSH restriction allowed TTY allocation" >&2
   exit 1
 fi
