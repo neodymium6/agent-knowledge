@@ -394,13 +394,13 @@ chmod 0600 "$test_root/ssh-host-key" "$test_root/client-key"
 chown "$client_uid":"$client_gid" "$test_root/client-key" "$test_root/client-key.pub"
 
 client_public_key=$(<"$test_root/client-key.pub")
-install -d -m 0700 -o 0 -g 0 \
+install -d -m 0750 -o 0 -g "$gateway_gid" \
   "$test_root/gateway-home/.ssh"
 printf 'restrict,command="%s gateway --config %s --client-id fictional-node-a" %s\n' \
   "$test_root/agent-knowledge" "$test_root/gateway.yaml" "$client_public_key" \
   >"$test_root/gateway-home/.ssh/authorized_keys"
-chown 0:0 "$test_root/gateway-home/.ssh/authorized_keys"
-chmod 0600 "$test_root/gateway-home/.ssh/authorized_keys"
+chown 0:"$gateway_gid" "$test_root/gateway-home/.ssh/authorized_keys"
+chmod 0640 "$test_root/gateway-home/.ssh/authorized_keys"
 
 ssh_port=
 for attempt in $(seq 0 99); do
@@ -412,6 +412,8 @@ AddressFamily inet
 HostKey $test_root/ssh-host-key
 PidFile $test_root/sshd.pid
 AuthorizedKeysFile .ssh/authorized_keys
+AuthorizedKeysCommand none
+TrustedUserCAKeys none
 AuthenticationMethods publickey
 PubkeyAuthentication yes
 PasswordAuthentication no
@@ -516,6 +518,9 @@ client_submit_response=$(
 grep -Fq '"status":"accepted"' <<<"$client_submit_response"
 grep -Fq '"client_id":"fictional-node-a"' \
   "$test_root/storage/queue/pending/01K00000000000000000000004/acceptance.json"
+test "$(stat -c '%u:%g' \
+  "$test_root/storage/queue/pending/01K00000000000000000000004/acceptance.json")" = \
+  "$queue_uid:$queue_gid"
 client_status_response=$(
   setpriv --reuid="$client_uid" --regid="$client_gid" --clear-groups \
     env "PATH=$openssh_bin:/usr/bin:/bin" HOME="$test_root/client-home" \
@@ -581,9 +586,19 @@ if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid"
   echo "Gateway identity can read the durable queue" >&2
   exit 1
 fi
+if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
+  touch "$test_root/storage/queue/pending/gateway-write.fixture" 2>/dev/null; then
+  echo "Gateway identity can write the durable queue" >&2
+  exit 1
+fi
 if setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
   test -r "$test_root/storage/repository"; then
   echo "queue ingress identity can read the repository" >&2
+  exit 1
+fi
+if setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
+  touch "$test_root/storage/repository/ingress-write.fixture" 2>/dev/null; then
+  echo "queue ingress identity can write the repository" >&2
   exit 1
 fi
 setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
