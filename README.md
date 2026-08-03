@@ -167,8 +167,8 @@ Quartz content, configuration, or credentials. The deployment supplies the
 Worker configuration and mounts one persistent volume containing its five
 sibling storage roots plus a separate runtime `emptyDir`.
 
-The command writes a root-owned completion marker beside the five durable
-roots only after every component has initialized and permissions have been
+The command writes a root-owned, GID-`0`, mode-`0444` completion marker beside
+the five durable roots only after every component has initialized and permissions have been
 normalized, validated, and durably flushed on their shared filesystem. A
 matching marker makes later runs idempotent only after a bounded read-only
 validation of component bindings, descendant ownership, modes, and entry

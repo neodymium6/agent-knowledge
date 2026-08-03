@@ -8,8 +8,8 @@ use ulid::Ulid;
 use xattr::FileExt as _;
 
 use super::{
-    StorageBootstrap, StorageBootstrapError, StorageIdentities, StorageMigrationError,
-    bootstrap_storage_with_ids, validate_service_identities,
+    MARKER_NAME, StorageBootstrap, StorageBootstrapError, StorageIdentities, StorageMigrationError,
+    bootstrap_administrative_group, bootstrap_storage_with_ids, validate_service_identities,
 };
 
 struct TestDirectory {
@@ -95,6 +95,7 @@ fn separated_service_identities() -> StorageIdentities {
 
 #[test]
 fn requires_non_root_distinct_service_identities() {
+    assert_eq!(bootstrap_administrative_group(), Gid::from_raw(0));
     let identities = separated_service_identities();
     validate_service_identities(identities)
         .unwrap_or_else(|error| panic!("separated service identities must be valid: {error}"));
@@ -162,6 +163,11 @@ fn initializes_fresh_storage_and_is_idempotent() {
     assert!(storage.join("content/.git").is_file());
     assert!(storage.join("repository/refs/heads/main").is_file());
     assert!(storage.join("releases/by-id").is_dir());
+    let marker = fs::symlink_metadata(storage.join(MARKER_NAME))
+        .unwrap_or_else(|error| panic!("bootstrap marker metadata must exist: {error}"));
+    assert_eq!(marker.uid(), identities.administrative_owner.as_raw());
+    assert_eq!(marker.gid(), identities.administrative_group.as_raw());
+    assert_eq!(marker.permissions().mode() & 0o7777, 0o444);
 
     let mut second = Vec::new();
     bootstrap_storage_with_ids(&request, identities, &mut second)

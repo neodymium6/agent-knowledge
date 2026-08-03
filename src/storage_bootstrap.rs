@@ -13,7 +13,7 @@ use agent_knowledge_release::{ReleasePolicy, ReleaseReader, ReleaseStore};
 use agent_knowledge_repository::{CommittedStore, GitRepository, trusted_git_program};
 use agent_knowledge_worker::{WorkerConfigError, WorkerSettings};
 use nix::sys::stat::Mode;
-use nix::unistd::{Gid, Uid};
+use nix::unistd::{Gid, Uid, fchown};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -91,7 +91,7 @@ pub(crate) fn bootstrap_storage(
     nix::sys::stat::umask(Mode::from_bits_truncate(STORAGE_BOOTSTRAP_UMASK));
     let identities = StorageIdentities {
         administrative_owner: Uid::effective(),
-        administrative_group: Gid::effective(),
+        administrative_group: bootstrap_administrative_group(),
         worker_owner: resolve_user(&request.worker_owner)
             .map_err(StorageBootstrapError::Identity)?,
         worker_group: resolve_group(&request.worker_group)
@@ -106,6 +106,10 @@ pub(crate) fn bootstrap_storage(
     };
     validate_service_identities(identities)?;
     bootstrap_storage_with_ids(request, identities, output)
+}
+
+fn bootstrap_administrative_group() -> Gid {
+    Gid::from_raw(0)
 }
 
 fn validate_service_identities(identities: StorageIdentities) -> Result<(), StorageBootstrapError> {
@@ -259,7 +263,12 @@ fn bootstrap_storage_with_ids(
     validate_initialized(&settings, &request.runtime_directory, identities)?;
     sync_storage_filesystem(&storage_root)?;
     revalidate_storage_lock(&storage_root, &storage_lock)?;
-    write_marker(&marker_path, &expected_marker)?;
+    write_marker(
+        &marker_path,
+        &expected_marker,
+        identities.administrative_owner,
+        identities.administrative_group,
+    )?;
     drop(storage_lock);
     write_output(&mut output, "initialized")
 }
@@ -837,7 +846,12 @@ fn read_marker(
     Ok(marker)
 }
 
-fn write_marker(path: &Path, marker: &BootstrapMarker) -> Result<(), StorageBootstrapError> {
+fn write_marker(
+    path: &Path,
+    marker: &BootstrapMarker,
+    owner: Uid,
+    group: Gid,
+) -> Result<(), StorageBootstrapError> {
     let parent = path.parent().ok_or(StorageBootstrapError::StorageLayout)?;
     let temporary = parent.join(format!(".{MARKER_NAME}.{}.tmp", Ulid::generate()));
     let mut file = OpenOptions::new()
@@ -848,6 +862,8 @@ fn write_marker(path: &Path, marker: &BootstrapMarker) -> Result<(), StorageBoot
         .map_err(StorageBootstrapError::Io)?;
     serde_json::to_writer(&mut file, marker).map_err(StorageBootstrapError::MarkerJson)?;
     file.write_all(b"\n").map_err(StorageBootstrapError::Io)?;
+    fchown(&file, Some(owner), Some(group))
+        .map_err(|error| StorageBootstrapError::Io(io::Error::from_raw_os_error(error as i32)))?;
     file.set_permissions(fs::Permissions::from_mode(0o444))
         .map_err(StorageBootstrapError::Io)?;
     file.sync_all().map_err(StorageBootstrapError::Io)?;

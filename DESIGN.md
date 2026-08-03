@@ -282,7 +282,7 @@ service container starts. It consumes the validated Worker configuration,
 requires the five durable roots to be siblings, creates the durable queue,
 bare repository and official branch, canonical content worktree, transaction
 root, and release store, then applies the fixed service ownership boundary. A
-root-owned completion marker is published only after validation and a
+root-owned, GID-`0`, mode-`0444` completion marker is published after validation and a
 filesystem durability barrier succeed. The marker and all five roots must share
 one mount. Matching marked storage is accepted idempotently only after bounded
 read-only validation; nonempty unmarked storage or a marker that disagrees with
