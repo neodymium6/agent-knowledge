@@ -95,6 +95,7 @@ The initial release produces one executable with subcommands:
 agent-knowledge client ...
 agent-knowledge gateway ...
 agent-knowledge queue-ingress serve ...
+agent-knowledge queue-ingress listen ...
 agent-knowledge worker ...
 agent-knowledge admin ...
 ```
@@ -145,17 +146,21 @@ program path and integration directory. The package contains no credentials,
 host keys, client keys, deployment-specific Worker or Gateway configuration,
 or Quartz content.
 
-The flake also publishes a reproducible, Docker-compatible Worker image archive
-for `amd64` and `arm64`. Its entrypoint fixes the wrapped executable and the
-`worker run` role so deployment arguments cannot accidentally start another
-role with Worker authority. The image resolves the non-root Worker account to
-`10003:10003`, includes queue GID `10002` as a supplementary group, and provides
-an immutable CA bundle through `SSL_CERT_FILE` for HTTPS Git replication.
-Deployments mount configuration, secrets, durable storage, and a writable Worker
-home. No conventional shell path, role-specific configuration, credentials,
-keys, or content is included. Gateway and queue ingress images must similarly
-bind their entrypoints to their least-privilege identities when Kubernetes
-packaging is added.
+The flake also publishes reproducible, Docker-compatible Worker and Queue
+Ingress image archives for `amd64` and `arm64`. Their entrypoints fix the
+executable and exact `worker run` or `queue-ingress listen` role so deployment
+arguments cannot start another role with the mounted authority. The Worker
+image resolves its non-root account to `10003:10003`, includes queue GID
+`10002` as a supplementary group, retains the Git/OpenSSH runtime wrapper, and
+provides an immutable CA bundle through `SSL_CERT_FILE` for HTTPS Git
+replication. The Queue Ingress image resolves its account to `10002:10002`,
+publishes its socket with dedicated ingress GID `10004`, and uses the raw Rust
+executable closure without Git, OpenSSH, or a CA bundle. The Gateway joins the
+ingress group; the broker does not join the Gateway reader group. Deployments mount configuration,
+secrets, durable storage, runtime socket storage, and writable homes as needed.
+No conventional shell path, role-specific configuration, credentials, keys,
+or content is included. The future Gateway image must similarly fix its
+entrypoint and least-privilege identity.
 
 The same executable can be used with different entry-point arguments in a
 service or container. Separate binaries may be produced from the same
@@ -322,10 +327,43 @@ replication credentials. It:
 - reads durable request status without opening repository storage.
 
 The conventional Linux deployment uses a systemd Unix socket with `Accept=yes`
-and an instantiated service for each connection. The broker therefore needs no
-custom listener, accept loop, daemon lifecycle, or concurrency scheduler.
-`SocketMode` and `SocketGroup` allow only the dedicated Gateway group to
+and an instantiated `queue-ingress serve` process for each connection.
+`SocketMode` and `SocketGroup` allow only the dedicated ingress group to
 connect. A bounded connection count and service runtime cap resource use.
+
+Supervisors without socket activation use `queue-ingress listen`. This native
+listener owns the Unix socket for its complete lifetime, fixes its mode to
+`0660`, holds an exclusive lock, refuses to replace a live or non-socket
+target, and safely replaces a socket left by a crashed prior process. It uses a
+bounded thread per accepted connection, applies both inactivity timeouts and
+an absolute connection lifetime, cancels queue lock waits, and detaches a
+handler that cannot finish within the bounded shutdown grace period on
+`SIGINT` or `SIGTERM`. If an expired handler cannot stop within that grace
+period during normal operation, the listener fails instead of releasing its
+slot and accumulating unbounded threads; the supervisor then replaces the
+process. Connection diagnostics are handed to a capacity-one, best-effort
+reporter after connection completion, outside both the bounded handler slots
+and the listener control loop. A blocked diagnostic sink therefore cannot stop
+accepts, deadline enforcement, or signal handling. The
+deployment creates the runtime directory in advance, owned by the broker with
+mode `2750` and dedicated ingress group
+(`10004` in the container identity database). The parent namespace must be
+owned by root or the broker at every ancestor; group/other-writable ancestors
+must also be protected by the sticky bit. The configured parent path must
+already be canonical and cannot traverse symbolic links. Mutations other than
+the Linux pathname-only socket bind use the pinned directory. The listener
+binds a unique temporary socket, records its identity, and atomically renames
+it to the public path. Atomically published
+`preparing`/`prepared`/`owned` state makes stale-socket recovery
+crash-consistent, records the public socket basename, and constrains recovery
+to the listener's prior publication. A changed basename is rejected while the
+recorded public or temporary socket still exists. Socket probes use the
+preflighted canonical path and are nonblocking so a saturated listener backlog
+cannot stall startup. The three internal lock and state basenames are reserved
+and cannot be selected as the public socket. During a v1 state upgrade, a
+bounded directory scan locates the recorded socket identity before assigning
+its previously unstored basename.
+The listener never creates or guesses deployment ownership.
 
 The internal protocol is independent of the public SSH protocol. It begins
 with exactly one bounded newline-terminated JSON header:
@@ -701,8 +739,8 @@ account and cannot write the Git repository, canonical content, worktrees, or
 releases, or read Worker replication credentials. The local queue-ingress
 broker mediates queue submission and status operations; ordinary groups or
 ACLs never grant the Gateway direct queue access. The Gateway account belongs
-to a group which may connect to the broker socket and read the committed
-repository and content checkout, but not to the queue-owner group. The Worker
+to a dedicated group for the broker socket and a separate read-only group for
+the committed repository and content checkout, but not to the queue-owner group. The Worker
 belongs to the queue-owner group so it can transition queue entries, while the
 broker account has no access to Worker-owned storage.
 
@@ -1695,7 +1733,9 @@ Implementation proceeds in these increments:
    - reproducible Linux package output (implemented);
    - conventional Linux Worker service integration (implemented); and
    - reproducible Worker container packaging (implemented); and
-   - role-specific Gateway and queue ingress containers plus optional
+   - native queue-ingress listener and role-specific container for supervisors
+     without socket activation (implemented); and
+   - role-specific Gateway container plus optional
      single-replica Kubernetes packaging.
 10. Production Gateway privilege separation through the systemd-activated
     local queue-ingress broker, verified with distinct-UID integration tests

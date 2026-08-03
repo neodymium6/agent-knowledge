@@ -18,11 +18,15 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
       forLinuxSystems = nixpkgs.lib.genAttrs linuxSystems;
       projectVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+      queueIngressService = builtins.path {
+        path = ./deploy/systemd + "/agent-knowledge-queue-ingress@.service";
+        name = "agent-knowledge-queue-ingress-instance.service";
+      };
       containerArchitecture = {
         x86_64-linux = "amd64";
         aarch64-linux = "arm64";
       };
-      packageFor =
+      unwrappedPackageFor =
         system:
         let
           pkgs = import nixpkgs { inherit system; };
@@ -51,34 +55,8 @@
             "--workspace"
             "--all-features"
           ];
-          nativeBuildInputs = [ pkgs.makeWrapper ];
           doCheck = false;
           doInstallCheck = true;
-
-          postInstall = ''
-            wrapProgram "$out/bin/agent-knowledge" \
-              --prefix PATH : ${
-                pkgs.lib.makeBinPath [
-                  pkgs.gitMinimal
-                  pkgs.openssh
-                ]
-              }
-
-            install -Dm644 deploy/systemd/agent-knowledge-worker.service \
-              "$out/lib/systemd/system/agent-knowledge-worker.service"
-            substituteInPlace "$out/lib/systemd/system/agent-knowledge-worker.service" \
-              --replace-fail '@agentKnowledge@' "$out"
-            install -Dm644 deploy/systemd/agent-knowledge-queue-ingress.socket \
-              "$out/lib/systemd/system/agent-knowledge-queue-ingress.socket"
-            install -Dm644 deploy/systemd/agent-knowledge-queue-ingress@.service \
-              "$out/lib/systemd/system/agent-knowledge-queue-ingress@.service"
-            substituteInPlace "$out/lib/systemd/system/agent-knowledge-queue-ingress@.service" \
-              --replace-fail '@agentKnowledge@' "$out"
-            install -Dm644 deploy/systemd/agent-knowledge.conf.sysusers \
-              "$out/lib/sysusers.d/agent-knowledge.conf"
-            install -Dm644 deploy/systemd/agent-knowledge.conf.tmpfiles \
-              "$out/lib/tmpfiles.d/agent-knowledge.conf"
-          '';
 
           installCheckPhase = ''
             runHook preInstallCheck
@@ -97,16 +75,61 @@
             platforms = linuxSystems;
           };
         };
+      packageFor =
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          unwrappedPackage = unwrappedPackageFor system;
+        in
+        pkgs.runCommand "agent-knowledge-${projectVersion}"
+          {
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            pname = "agent-knowledge";
+            version = projectVersion;
+            meta = unwrappedPackage.meta;
+          }
+          ''
+            mkdir -p "$out/bin"
+            makeWrapper ${unwrappedPackage}/bin/agent-knowledge \
+              "$out/bin/agent-knowledge" \
+              --prefix PATH : ${
+                pkgs.lib.makeBinPath [
+                  pkgs.gitMinimal
+                  pkgs.openssh
+                ]
+              }
+
+            install -Dm644 ${./deploy/systemd/agent-knowledge-worker.service} \
+              "$out/lib/systemd/system/agent-knowledge-worker.service"
+            substituteInPlace "$out/lib/systemd/system/agent-knowledge-worker.service" \
+              --replace-fail '@agentKnowledge@' "$out"
+            install -Dm644 ${./deploy/systemd/agent-knowledge-queue-ingress.socket} \
+              "$out/lib/systemd/system/agent-knowledge-queue-ingress.socket"
+            install -Dm644 ${queueIngressService} \
+              "$out/lib/systemd/system/agent-knowledge-queue-ingress@.service"
+            substituteInPlace "$out/lib/systemd/system/agent-knowledge-queue-ingress@.service" \
+              --replace-fail '@agentKnowledge@' "$out"
+            install -Dm644 ${./deploy/systemd/agent-knowledge.conf.sysusers} \
+              "$out/lib/sysusers.d/agent-knowledge.conf"
+            install -Dm644 ${./deploy/systemd/agent-knowledge.conf.tmpfiles} \
+              "$out/lib/tmpfiles.d/agent-knowledge.conf"
+          '';
+      containerRootFilesystemFor =
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in
+        pkgs.runCommand "agent-knowledge-container-root" { } ''
+          install -d "$out/etc" "$out/var/empty" "$out/var/lib/agent-knowledge"
+          install -m444 ${./deploy/container/passwd} "$out/etc/passwd"
+          install -m444 ${./deploy/container/group} "$out/etc/group"
+        '';
       workerContainerImageFor =
         system:
         let
           pkgs = import nixpkgs { inherit system; };
           package = packageFor system;
-          rootFilesystem = pkgs.runCommand "agent-knowledge-container-root" { } ''
-            install -d "$out/etc" "$out/var/empty" "$out/var/lib/agent-knowledge"
-            install -m444 ${./deploy/container/passwd} "$out/etc/passwd"
-            install -m444 ${./deploy/container/group} "$out/etc/group"
-          '';
+          rootFilesystem = containerRootFilesystemFor system;
         in
         pkgs.dockerTools.buildLayeredImage {
           name = "agent-knowledge-worker";
@@ -131,6 +154,37 @@
             StopSignal = "SIGTERM";
             Labels = {
               "org.opencontainers.image.title" = "Agent Knowledge Worker";
+              "org.opencontainers.image.version" = projectVersion;
+              "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+            };
+          };
+        };
+      queueIngressContainerImageFor =
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          package = unwrappedPackageFor system;
+          rootFilesystem = containerRootFilesystemFor system;
+        in
+        pkgs.dockerTools.buildLayeredImage {
+          name = "agent-knowledge-queue-ingress";
+          tag = projectVersion;
+          contents = [
+            package
+            rootFilesystem
+          ];
+          config = {
+            User = "agent-knowledge-queue";
+            WorkingDir = "/var/lib/agent-knowledge";
+            Entrypoint = [
+              "${package}/bin/agent-knowledge"
+              "queue-ingress"
+              "listen"
+            ];
+            Env = [ "HOME=/var/lib/agent-knowledge" ];
+            StopSignal = "SIGTERM";
+            Labels = {
+              "org.opencontainers.image.title" = "Agent Knowledge Queue Ingress";
               "org.opencontainers.image.version" = projectVersion;
               "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
             };
@@ -166,6 +220,7 @@
 
       packages = forLinuxSystems (system: rec {
         agent-knowledge = packageFor system;
+        queue-ingress-container-image = queueIngressContainerImageFor system;
         worker-container-image = workerContainerImageFor system;
         default = agent-knowledge;
       });
@@ -185,10 +240,7 @@
           pkgs = import nixpkgs { inherit system; };
           package = packageFor system;
           workerContainerImage = workerContainerImageFor system;
-        in
-        {
-          package = package;
-          container-image =
+          workerContainerImageCheck =
             pkgs.runCommand "check-agent-knowledge-container-image"
               {
                 nativeBuildInputs = [
@@ -205,7 +257,54 @@
                       ${projectVersion} \
                       ${./deploy/container/passwd} \
                       ${./deploy/container/group} \
+                      agent-knowledge-worker \
+                      agent-knowledge \
+                      worker \
+                      run \
+                      /var/lib/agent-knowledge \
+                      "Agent Knowledge Worker" \
                       ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+                    touch "$out"
+              '';
+        in
+        {
+          package = package;
+          package-metadata =
+            assert package.pname == "agent-knowledge";
+            assert package.version == projectVersion;
+            pkgs.runCommand "check-agent-knowledge-package-metadata" { } ''
+              touch "$out"
+            '';
+          container-image = workerContainerImageCheck;
+          worker-container-image = workerContainerImageCheck;
+          queue-ingress-container-image =
+            let
+              queueIngressContainerImage = queueIngressContainerImageFor system;
+              queueIngressPackage = unwrappedPackageFor system;
+            in
+            pkgs.runCommand "check-agent-knowledge-queue-ingress-container-image"
+              {
+                nativeBuildInputs = [
+                  pkgs.gnutar
+                  pkgs.gzip
+                  pkgs.jq
+                ];
+              }
+              ''
+                ${pkgs.bash}/bin/bash ${./deploy/container/check-image.sh} \
+                      ${queueIngressContainerImage} \
+                      ${containerArchitecture.${system}} \
+                      ${queueIngressPackage}/bin/agent-knowledge \
+                      ${projectVersion} \
+                      ${./deploy/container/passwd} \
+                      ${./deploy/container/group} \
+                      agent-knowledge-queue-ingress \
+                      agent-knowledge-queue \
+                      queue-ingress \
+                      listen \
+                      /var/lib/agent-knowledge \
+                      "Agent Knowledge Queue Ingress" \
+                      -
                     touch "$out"
               '';
         }

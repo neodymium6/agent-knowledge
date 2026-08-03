@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-if [[ $# -ne 7 ]]; then
-  echo "usage: $0 <image-archive> <architecture> <entrypoint> <version> <passwd> <group> <ca-bundle>" >&2
+if [[ $# -ne 13 ]]; then
+  echo "usage: $0 <image-archive> <architecture> <entrypoint> <version> <passwd> <group> <image-name> <user> <namespace> <action> <working-directory> <title> <ca-bundle-or-dash>" >&2
   exit 2
 fi
 
@@ -13,7 +13,13 @@ expected_entrypoint=$3
 expected_version=$4
 expected_passwd=$5
 expected_group=$6
-expected_ca_bundle=$7
+expected_image_name=$7
+expected_user=$8
+expected_namespace=$9
+expected_action=${10}
+expected_working_directory=${11}
+expected_title=${12}
+expected_ca_bundle=${13}
 
 archive_members=$(tar -tzf "$image_archive")
 if grep -Eqv '^(manifest\.json|[0-9a-f]{64}\.json|[0-9a-f]{64}/layer\.tar)$' \
@@ -53,29 +59,38 @@ jq -e \
   --arg architecture "$expected_architecture" \
   --arg entrypoint "$expected_entrypoint" \
   --arg version "$expected_version" \
+  --arg user "$expected_user" \
+  --arg namespace "$expected_namespace" \
+  --arg action "$expected_action" \
+  --arg working_directory "$expected_working_directory" \
+  --arg title "$expected_title" \
+  --arg ca_bundle "$expected_ca_bundle" \
   '
     .created == "1970-01-01T00:00:01+00:00" and
     .architecture == $architecture and
     .os == "linux" and
-    .config.User == "agent-knowledge" and
-    .config.WorkingDir == "/var/lib/agent-knowledge" and
-    .config.Entrypoint == [$entrypoint, "worker", "run"] and
+    .config.User == $user and
+    .config.WorkingDir == $working_directory and
+    .config.Entrypoint == [$entrypoint, $namespace, $action] and
     .config.Cmd == null and
-    .config.Env == [
-      "HOME=/var/lib/agent-knowledge",
-      $ca_bundle
-    ] and
+    .config.Env == (
+      if $ca_bundle == "-" then
+        ["HOME=" + $working_directory]
+      else
+        ["HOME=" + $working_directory, "SSL_CERT_FILE=" + $ca_bundle]
+      end
+    ) and
     .config.StopSignal == "SIGTERM" and
     .config.Labels == {
       "org.opencontainers.image.source": "https://github.com/neodymium6/agent-knowledge",
-      "org.opencontainers.image.title": "Agent Knowledge Worker",
+      "org.opencontainers.image.title": $title,
       "org.opencontainers.image.version": $version
     }
-  ' --arg ca_bundle "SSL_CERT_FILE=$expected_ca_bundle" <<<"$config" >/dev/null
+  ' <<<"$config" >/dev/null
 
 layer_paths=$(jq -er '
   if length == 1 and
-     .[0].RepoTags == ["agent-knowledge-worker:" + $version] and
+     .[0].RepoTags == [$image_name + ":" + $version] and
      (.[0].Layers | length > 0) and
      all(.[0].Layers[]; test("^[0-9a-f]{64}/layer\\.tar$"))
   then
@@ -83,7 +98,8 @@ layer_paths=$(jq -er '
   else
     error("the archive manifest does not match the image contract")
   end
-' --arg version "$expected_version" <<<"$manifest")
+' --arg version "$expected_version" \
+  --arg image_name "$expected_image_name" <<<"$manifest")
 
 layer_contents="$work_directory/layer-contents"
 while IFS= read -r layer_path; do
@@ -135,30 +151,39 @@ if grep -Eq '(^|/)\.wh\.' "$normalized_layer_contents"; then
 fi
 
 entrypoint_path=${expected_entrypoint#/}
-ca_bundle_path=${expected_ca_bundle#/}
 for required_path in \
   etc/passwd \
   etc/group \
   var/lib/agent-knowledge \
-  "$entrypoint_path" \
-  "$ca_bundle_path"; do
+  "$entrypoint_path"; do
   if ! grep -Fxq "$required_path" "$normalized_layer_contents"; then
     echo "container image is missing ${required_path}" >&2
     exit 1
   fi
 done
+if [[ $expected_ca_bundle != - ]]; then
+  ca_bundle_path=${expected_ca_bundle#/}
+  if ! grep -Fxq "$ca_bundle_path" "$normalized_layer_contents"; then
+    echo "container image is missing ${ca_bundle_path}" >&2
+    exit 1
+  fi
+fi
 
 for unique_path in \
   etc/passwd \
   etc/group \
   var/lib/agent-knowledge \
-  "$entrypoint_path" \
-  "$ca_bundle_path"; do
+  "$entrypoint_path"; do
   if [[ $(grep -Fxc "$unique_path" "$normalized_layer_contents") -ne 1 ]]; then
     echo "container image path must occur in exactly one layer: ${unique_path}" >&2
     exit 1
   fi
 done
+if [[ $expected_ca_bundle != - ]] &&
+  [[ $(grep -Fxc "$ca_bundle_path" "$normalized_layer_contents") -ne 1 ]]; then
+  echo "container image path must occur in exactly one layer: ${ca_bundle_path}" >&2
+  exit 1
+fi
 
 validate_immutable_metadata() {
   local listing=$1
@@ -202,7 +227,7 @@ extract_image_file() {
         case ${listing:0:1} in
           -)
             if [[ ${listing:7:1} != r ]]; then
-              echo "container image path is not readable by the Worker: ${target_path}" >&2
+              echo "container image path is not readable by the configured identity: ${target_path}" >&2
               return 1
             fi
             if [[ $requirement == executable && ${listing:9:1} != x ]]; then
@@ -328,7 +353,9 @@ validate_image_root
 extract_image_file etc/passwd "$work_directory/passwd"
 extract_image_file etc/group "$work_directory/group"
 extract_image_file "$entrypoint_path" "$work_directory/entrypoint" executable
-extract_image_file "$ca_bundle_path" "$work_directory/ca-bundle"
+if [[ $expected_ca_bundle != - ]]; then
+  extract_image_file "$ca_bundle_path" "$work_directory/ca-bundle"
+fi
 validate_image_ancestors var/lib/agent-knowledge
 validate_image_directory var/lib/agent-knowledge required
 if ! cmp -s "$expected_passwd" "$work_directory/passwd"; then
@@ -339,12 +366,22 @@ if ! cmp -s "$expected_group" "$work_directory/group"; then
   echo "container group database does not match the packaged identities" >&2
   exit 1
 fi
-if [[ ! -s $work_directory/entrypoint || ! -s $work_directory/ca-bundle ]]; then
-  echo "container entrypoint and CA bundle must not be empty" >&2
+if [[ ! -s $work_directory/entrypoint ]]; then
+  echo "container entrypoint must not be empty" >&2
+  exit 1
+fi
+if [[ $expected_ca_bundle != - && ! -s $work_directory/ca-bundle ]]; then
+  echo "container CA bundle must not be empty" >&2
   exit 1
 fi
 
 if grep -Eq '^(bin/(ba)?sh|usr/bin/(ba)?sh)$' "$normalized_layer_contents"; then
   echo "container image must not expose a conventional shell path" >&2
+  exit 1
+fi
+if [[ $expected_namespace == queue-ingress ]] &&
+  grep -Eq '(^|/)(bin/git|bin/ssh|etc/ssl/certs/ca-bundle\.crt)$' \
+    "$normalized_layer_contents"; then
+  echo "queue ingress image contains a Worker-only executable or CA bundle" >&2
   exit 1
 fi

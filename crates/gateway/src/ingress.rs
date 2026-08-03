@@ -8,7 +8,9 @@ use agent_knowledge_core::{ErrorCode, PathAttestation, PathAttestationError, Req
 use agent_knowledge_protocol::{
     ClientId, ProtocolErrorResponse, RequestStatus, StatusRequest, StatusResponse, SubmitResponse,
 };
-use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueReader, QueueRequestStatus};
+use agent_knowledge_queue::{
+    FileQueue, PackagePolicy, QueueOperationDeadline, QueueReader, QueueRequestStatus,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{GatewayError, submit};
@@ -438,9 +440,33 @@ fn read_response(input: &mut impl Read) -> Result<IngressResponse, IngressClient
 pub fn serve(
     queue_root: &Path,
     input: impl Read,
-    mut output: impl Write,
+    output: impl Write,
 ) -> Result<(), IngressServeError> {
-    let result = serve_request(queue_root, input);
+    serve_with_deadline(queue_root, input, output, None)
+}
+
+/// Serves one native-listener connection with a cancellable absolute deadline.
+///
+/// # Errors
+///
+/// Returns the same errors as [`serve`]. Queue lock waits also stop when the
+/// supplied deadline expires or is cancelled.
+pub fn serve_until(
+    queue_root: &Path,
+    input: impl Read,
+    output: impl Write,
+    deadline: &QueueOperationDeadline,
+) -> Result<(), IngressServeError> {
+    serve_with_deadline(queue_root, input, output, Some(deadline))
+}
+
+fn serve_with_deadline(
+    queue_root: &Path,
+    input: impl Read,
+    mut output: impl Write,
+    deadline: Option<&QueueOperationDeadline>,
+) -> Result<(), IngressServeError> {
+    let result = serve_request(queue_root, input, deadline);
     let response = match &result {
         Ok(response) => (*response).clone(),
         Err(error) => IngressResponse::error(error.error_code()),
@@ -455,6 +481,7 @@ pub fn serve(
 fn serve_request(
     queue_root: &Path,
     input: impl Read,
+    deadline: Option<&QueueOperationDeadline>,
 ) -> Result<IngressResponse, IngressServeError> {
     let mut input = BufReader::new(input);
     let header = read_bounded_line(&mut input, MAXIMUM_HEADER_BYTES)
@@ -466,23 +493,27 @@ fn serve_request(
     }
     match request {
         IngressRequest::Submit { client_id, .. } => {
-            let queue = open_queue(queue_root)?;
-            submit::submit(&queue, client_id, &mut input)
+            let queue = open_queue(queue_root, deadline)?;
+            submit::submit_until(&queue, client_id, &mut input, deadline)
                 .map(IngressResponse::submit)
                 .map_err(IngressServeError::Gateway)
         }
         IngressRequest::Status { request_id, .. } => {
             ensure_end(&mut input)?;
-            status_response(queue_root, request_id).map(IngressResponse::status)
+            status_response(queue_root, request_id, deadline).map(IngressResponse::status)
         }
     }
 }
 
-fn open_queue(queue_root: &Path) -> Result<FileQueue, IngressServeError> {
+fn open_queue(
+    queue_root: &Path,
+    deadline: Option<&QueueOperationDeadline>,
+) -> Result<FileQueue, IngressServeError> {
     let resolved =
         PathAttestation::resolve_destination(queue_root).map_err(IngressServeError::Attestation)?;
-    let queue = FileQueue::initialize(resolved.stable_path(), PackagePolicy::default())
-        .map_err(|error| IngressServeError::Gateway(GatewayError::Queue(Box::new(error))))?;
+    let queue =
+        FileQueue::initialize_until(resolved.stable_path(), PackagePolicy::default(), deadline)
+            .map_err(|error| IngressServeError::Gateway(GatewayError::Queue(Box::new(error))))?;
     let observed = queue
         .storage_attestation()
         .map_err(IngressServeError::Attestation)?;
@@ -497,10 +528,12 @@ fn open_queue(queue_root: &Path) -> Result<FileQueue, IngressServeError> {
 fn status_response(
     queue_root: &Path,
     request_id: RequestId,
+    deadline: Option<&QueueOperationDeadline>,
 ) -> Result<StatusResponse, IngressServeError> {
     let resolved =
         PathAttestation::resolve_destination(queue_root).map_err(IngressServeError::Attestation)?;
-    let queue = QueueReader::open_until(resolved.stable_path(), None)
+    let expires_at = deadline.map(QueueOperationDeadline::expires_at);
+    let queue = QueueReader::open_until(resolved.stable_path(), expires_at)
         .map_err(|error| IngressServeError::Gateway(GatewayError::Queue(Box::new(error))))?;
     let observed = queue
         .storage_attestation()
@@ -511,7 +544,7 @@ fn status_response(
         ));
     }
     let status = queue
-        .status_until(request_id, None)
+        .status_until(request_id, expires_at)
         .map_err(|error| IngressServeError::Gateway(GatewayError::Queue(Box::new(error))))?
         .ok_or(IngressServeError::Gateway(GatewayError::RequestNotFound {
             request_id,
@@ -879,7 +912,7 @@ Fictional ingress body.\n";
     fn broker_error_codes_cross_the_client_boundary() {
         let root = TestDirectory::create();
         let queue = root.path().join("queue");
-        super::open_queue(&queue)
+        super::open_queue(&queue, None)
             .unwrap_or_else(|error| panic!("queue fixture must initialize: {error}"));
         let socket = root.path().join("ingress.sock");
         let listener = UnixListener::bind(&socket)
@@ -916,11 +949,11 @@ Fictional ingress body.\n";
         let root = TestDirectory::create();
         let queue = root.path().join("queue");
         drop(
-            super::open_queue(&queue)
+            super::open_queue(&queue, None)
                 .unwrap_or_else(|error| panic!("queue fixture must initialize: {error}")),
         );
         drop(
-            super::open_queue(&queue)
+            super::open_queue(&queue, None)
                 .unwrap_or_else(|error| panic!("existing queue must reopen: {error}")),
         );
     }

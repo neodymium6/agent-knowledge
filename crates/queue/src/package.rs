@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
+use crate::file_queue::QueueOperationDeadline;
+
 mod markdown;
 pub use markdown::MarkdownValidationError;
 
@@ -278,8 +280,27 @@ pub fn validate_package(
     package_root: &Path,
     policy: &PackagePolicy,
 ) -> Result<ValidatedPackage, PackageValidationError> {
-    validate_package_root(package_root, false)?;
-    validate_package_contents(package_root, policy)
+    validate_package_until(package_root, policy, None)
+}
+
+pub(crate) fn validate_package_until(
+    package_root: &Path,
+    policy: &PackagePolicy,
+    deadline: Option<&QueueOperationDeadline>,
+) -> Result<ValidatedPackage, PackageValidationError> {
+    validate_package_root(package_root, false, deadline)?;
+    validate_package_contents(package_root, policy, deadline, None)
+}
+
+#[cfg(test)]
+fn validate_package_until_with_digest_observer(
+    package_root: &Path,
+    policy: &PackagePolicy,
+    deadline: Option<&QueueOperationDeadline>,
+    digest_observer: &mut dyn FnMut(),
+) -> Result<ValidatedPackage, PackageValidationError> {
+    validate_package_root(package_root, false, deadline)?;
+    validate_package_contents(package_root, policy, deadline, Some(digest_observer))
 }
 
 /// Revalidates an accepted package and its stored digest.
@@ -292,10 +313,10 @@ pub fn validate_accepted_package(
     package_root: &Path,
     policy: &PackagePolicy,
 ) -> Result<ValidatedPackage, PackageValidationError> {
-    validate_package_root(package_root, true)?;
+    validate_package_root(package_root, true, None)?;
     let stored_digest = read_digest_file(&package_root.join(DIGEST_FILE_NAME))?;
     let acceptance = read_acceptance_file(&package_root.join(ACCEPTANCE_FILE_NAME))?;
-    let mut package = validate_package_contents(package_root, policy)?;
+    let mut package = validate_package_contents(package_root, policy, None, None)?;
     if stored_digest != package.digest {
         return Err(PackageValidationError::StoredDigestMismatch {
             stored: stored_digest,
@@ -309,9 +330,13 @@ pub fn validate_accepted_package(
 fn validate_package_contents(
     package_root: &Path,
     policy: &PackagePolicy,
+    deadline: Option<&QueueOperationDeadline>,
+    digest_observer: Option<&mut dyn FnMut()>,
 ) -> Result<ValidatedPackage, PackageValidationError> {
+    ensure_operation_active(deadline)?;
     let request_path = package_root.join(REQUEST_FILE_NAME);
-    let request_bytes = read_limited_file(&request_path, policy.limits.maximum_file_bytes)?;
+    let request_bytes =
+        read_limited_file_until(&request_path, policy.limits.maximum_file_bytes, deadline)?;
     let mut total_bytes = request_bytes.len() as u64;
     let mut file_count = 1_usize;
     enforce_totals(total_bytes, file_count, policy.limits)?;
@@ -332,10 +357,12 @@ fn validate_package_contents(
         &mut total_bytes,
         &mut file_count,
         &mut payload_files,
+        deadline,
     )?;
     payload_files.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
 
-    validate_payload_references(&request, &payload_files, policy)?;
+    validate_payload_references(&request, &payload_files, policy, deadline)?;
+    ensure_operation_active(deadline)?;
     markdown::validate_documents(
         &request,
         &payload_root,
@@ -346,7 +373,13 @@ fn validate_package_contents(
 
     let canonical_request =
         serde_json::to_vec(&request).map_err(PackageValidationError::CanonicalRequestJson)?;
-    let digest = calculate_digest(&canonical_request, &payload_root, &mut payload_files)?;
+    let digest = calculate_digest(
+        &canonical_request,
+        &payload_root,
+        &mut payload_files,
+        deadline,
+        digest_observer,
+    )?;
 
     Ok(ValidatedPackage {
         request,
@@ -359,7 +392,9 @@ fn validate_package_contents(
 fn validate_package_root(
     package_root: &Path,
     accepted: bool,
+    deadline: Option<&QueueOperationDeadline>,
 ) -> Result<(), PackageValidationError> {
+    ensure_operation_active(deadline)?;
     let root_metadata = fs::symlink_metadata(package_root).map_err(PackageValidationError::Io)?;
     if !root_metadata.file_type().is_dir() {
         return Err(PackageValidationError::InvalidEntryType {
@@ -369,6 +404,7 @@ fn validate_package_root(
 
     let mut names = HashSet::new();
     for entry in fs::read_dir(package_root).map_err(PackageValidationError::Io)? {
+        ensure_operation_active(deadline)?;
         let entry = entry.map_err(PackageValidationError::Io)?;
         let name = entry
             .file_name()
@@ -476,6 +512,7 @@ fn scan_payload_directory(
     total_bytes: &mut u64,
     file_count: &mut usize,
     files: &mut Vec<PayloadMetadata>,
+    deadline: Option<&QueueOperationDeadline>,
 ) -> Result<usize, PackageValidationError> {
     let mut stack = vec![directory.to_path_buf()];
     let mut directories = Vec::new();
@@ -483,6 +520,7 @@ fn scan_payload_directory(
     let mut entry_count = *file_count;
 
     while let Some(current) = stack.pop() {
+        ensure_operation_active(deadline)?;
         let remaining = limits.maximum_entry_count.saturating_sub(entry_count);
         let mut entries = fs::read_dir(&current)
             .map_err(PackageValidationError::Io)?
@@ -500,6 +538,7 @@ fn scan_payload_directory(
         entries.sort_by_key(fs::DirEntry::file_name);
 
         for entry in entries {
+            ensure_operation_active(deadline)?;
             let entry_path = entry.path();
             let metadata = fs::symlink_metadata(&entry_path).map_err(PackageValidationError::Io)?;
             let relative_path = entry_path
@@ -630,6 +669,7 @@ fn validate_payload_references(
     request: &ChangeRequest,
     payload: &[PayloadMetadata],
     policy: &PackagePolicy,
+    deadline: Option<&QueueOperationDeadline>,
 ) -> Result<(), PackageValidationError> {
     let available = payload
         .iter()
@@ -639,6 +679,7 @@ fn validate_payload_references(
     let mut materialized_bytes = 0_u64;
 
     for operation in &request.operations {
+        ensure_operation_active(deadline)?;
         let source = match operation {
             Operation::CreateDocument { content, .. }
             | Operation::UpdateDocument { content, .. } => {
@@ -709,6 +750,15 @@ fn require_payload(
 }
 
 fn read_limited_file(path: &Path, maximum: u64) -> Result<Vec<u8>, PackageValidationError> {
+    read_limited_file_until(path, maximum, None)
+}
+
+fn read_limited_file_until(
+    path: &Path,
+    maximum: u64,
+    deadline: Option<&QueueOperationDeadline>,
+) -> Result<Vec<u8>, PackageValidationError> {
+    ensure_operation_active(deadline)?;
     let metadata = fs::symlink_metadata(path).map_err(PackageValidationError::Io)?;
     enforce_file_size(metadata.len(), maximum, &path.display().to_string())?;
 
@@ -719,11 +769,24 @@ fn read_limited_file(path: &Path, maximum: u64) -> Result<Vec<u8>, PackageValida
             actual: metadata.len(),
         })?;
     let mut bytes = Vec::with_capacity(capacity);
-    File::open(path)
-        .map_err(PackageValidationError::Io)?
-        .take(maximum.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(PackageValidationError::Io)?;
+    let mut source = File::open(path).map_err(PackageValidationError::Io)?;
+    let mut buffer = [0_u8; HASH_BUFFER_LENGTH];
+    loop {
+        ensure_operation_active(deadline)?;
+        let remaining = maximum.saturating_add(1).saturating_sub(bytes.len() as u64);
+        if remaining == 0 {
+            break;
+        }
+        let read = source
+            .by_ref()
+            .take(remaining.min(HASH_BUFFER_LENGTH as u64))
+            .read(&mut buffer)
+            .map_err(PackageValidationError::Io)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
     if bytes.len() as u64 > maximum {
         return Err(PackageValidationError::LimitExceeded {
             limit: PackageLimit::IndividualFileBytes,
@@ -785,7 +848,10 @@ fn calculate_digest(
     canonical_request: &[u8],
     payload_root: &Path,
     payload: &mut [PayloadMetadata],
+    deadline: Option<&QueueOperationDeadline>,
+    mut digest_observer: Option<&mut dyn FnMut()>,
 ) -> Result<PackageDigest, PackageValidationError> {
+    ensure_operation_active(deadline)?;
     let mut hasher = Sha256::new();
     hasher.update(DIGEST_DOMAIN);
     hash_bytes(&mut hasher, b"request", canonical_request);
@@ -793,6 +859,7 @@ fn calculate_digest(
 
     let mut buffer = [0_u8; HASH_BUFFER_LENGTH];
     for file in payload {
+        ensure_operation_active(deadline)?;
         let mut file_hasher = Sha256::new();
         hash_length_prefixed(&mut hasher, file.path.as_str().as_bytes());
         hasher.update(file.byte_length.to_be_bytes());
@@ -801,11 +868,15 @@ fn calculate_digest(
             .map_err(PackageValidationError::Io)?;
         let mut observed_length = 0_u64;
         loop {
+            ensure_operation_active(deadline)?;
             let read = source
                 .read(&mut buffer)
                 .map_err(PackageValidationError::Io)?;
             if read == 0 {
                 break;
+            }
+            if let Some(observer) = digest_observer.as_deref_mut() {
+                observer();
             }
             observed_length = observed_length.checked_add(read as u64).ok_or(
                 PackageValidationError::FileChangedDuringValidation(file.path.clone()),
@@ -828,6 +899,19 @@ fn calculate_digest(
 
     let bytes: [u8; 32] = hasher.finalize().into();
     Ok(PackageDigest(Revision::from_bytes(bytes)))
+}
+
+fn ensure_operation_active(
+    deadline: Option<&QueueOperationDeadline>,
+) -> Result<(), PackageValidationError> {
+    deadline.map_or(Ok(()), |deadline| {
+        deadline.ensure_active().map_err(|_| {
+            PackageValidationError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "package validation deadline expired or was cancelled",
+            ))
+        })
+    })
 }
 
 fn hash_bytes(hasher: &mut Sha256, label: &[u8], bytes: &[u8]) {

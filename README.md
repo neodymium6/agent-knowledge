@@ -19,9 +19,9 @@ asynchronously with durable retry state. Derived-release retention and
 document-bundle export are implemented. The flake provides reproducible Linux
 packaging, a conventional systemd Worker service, and a systemd-activated local
 queue-ingress broker that isolates the forced-command Gateway from durable queue
-access under distinct service identities. Reproducible Worker container
-packaging is implemented; role-specific Gateway and queue ingress containers
-and single-replica Kubernetes packaging remain future work.
+access under distinct service identities. Reproducible Worker and Queue
+Ingress container packaging is implemented; the Gateway container and
+single-replica Kubernetes packaging remain future work.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
@@ -74,6 +74,13 @@ nix build .#worker-container-image
 docker load < result
 ```
 
+Build the independently role-locked Queue Ingress image in the same format:
+
+```sh
+nix build .#queue-ingress-container-image
+docker load < result
+```
+
 The flake builds the image natively for both `x86_64-linux` (`amd64`) and
 `aarch64-linux` (`arm64`). Its entrypoint fixes the wrapped executable and
 `worker run` role; the configuration path is supplied as an argument by the
@@ -83,10 +90,19 @@ bundle and `SSL_CERT_FILE` setting needed for HTTPS Git replication. It exposes
 no conventional shell path and contains no deployment configuration,
 credentials, keys, or Quartz content.
 
-`just check-package` validates the image archive, architecture, deterministic
-timestamp, role-locked entrypoint, non-root metadata, identity database, CA
-bundle, and required filesystem entries without Docker or Podman. Runtime
-storage, configuration, secrets, and a writable Worker home are
+The Queue Ingress image fixes the non-root `agent-knowledge-queue` identity
+(`10002:10002`) and `queue-ingress listen` entrypoint. It contains the raw Rust
+executable closure rather than the Worker package's Git/OpenSSH wrapper, and it
+does not include a CA bundle. The deployment supplies the queue root, shared
+runtime directory, and listener arguments. A dedicated ingress-socket group
+(`10004`) grants the Gateway access to the `0660` socket without granting the
+broker the Gateway reader group or granting Gateway access to the queue.
+
+`just check-package` validates both image archives, architectures,
+deterministic timestamps, role-locked entrypoints, non-root metadata, identity
+database, role-specific environment, and required filesystem entries without
+Docker or Podman. It also verifies the Worker's CA bundle. Runtime storage,
+configuration, secrets, runtime socket directory, and writable paths are
 deployment-supplied mounts.
 
 ### systemd service
@@ -100,7 +116,10 @@ sudo nix profile add --profile /nix/var/nix/profiles/agent-knowledge \
   .#agent-knowledge
 package_path=/nix/var/nix/profiles/agent-knowledge
 sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
-sudo systemd-tmpfiles --create "$package_path/lib/tmpfiles.d/agent-knowledge.conf"
+sudo ln -sfn \
+  "$package_path/lib/tmpfiles.d/agent-knowledge.conf" \
+  /etc/tmpfiles.d/agent-knowledge.conf
+sudo systemd-tmpfiles --create agent-knowledge.conf
 sudo install -d -m 0755 -o root -g root /etc/agent-knowledge
 sudo install -m 0640 -o root -g agent-knowledge \
   ./fictional-worker.yaml /etc/agent-knowledge/worker.yaml
@@ -110,6 +129,10 @@ sudo systemctl link \
 sudo systemctl link \
   "$package_path/lib/systemd/system/agent-knowledge-queue-ingress@.service"
 ```
+
+The `/etc/tmpfiles.d` link points through the stable system profile, so boot
+recreates the volatile runtime directory and profile upgrades select the new
+packaged definition.
 
 The supplied storage layout uses sibling roots below
 `/var/lib/agent-knowledge/`. A matching Worker configuration uses `queue`,
@@ -134,9 +157,10 @@ The packaged `agent-knowledge` and `agent-knowledge-queue` accounts are locked,
 non-login accounts for the Worker and queue ingress broker respectively. Never
 use either for OpenSSH. Create the deployment-specific SSH account according to
 the host's authentication policy and add only that account to the
-`agent-knowledge-gateway` group. That group can connect to the local ingress
-socket and read committed repository/content storage; it cannot open the
-durable queue. The broker owns the queue but cannot open Worker-owned storage.
+`agent-knowledge-gateway` and `agent-knowledge-ingress` groups. The first group
+can read committed repository/content storage; the second can connect to the
+local ingress socket. Neither can open the durable queue. The broker owns the
+queue but cannot open Worker-owned storage.
 The Worker receives the queue group as a supplementary group so it can perform
 state transitions without sharing either service UID. The durable storage root
 is `0751 root:agent-knowledge-queue`: the broker and Worker can open it for
@@ -169,12 +193,17 @@ sudo nix profile upgrade \
   --profile /nix/var/nix/profiles/agent-knowledge agent-knowledge
 package_path=/nix/var/nix/profiles/agent-knowledge
 sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
+# Replace this fictional name with the existing forced-command SSH account.
+gateway_account=fictional-agent-knowledge-gateway
+sudo usermod --append --groups agent-knowledge-ingress "$gateway_account"
 sudo "$package_path/bin/agent-knowledge" admin migrate-v1-storage \
   --queue-root /var/lib/agent-knowledge/queue \
   --git-directory /var/lib/agent-knowledge/repository \
   --content-root /var/lib/agent-knowledge/content
-sudo systemd-tmpfiles --create \
-  "$package_path/lib/tmpfiles.d/agent-knowledge.conf"
+sudo ln -sfn \
+  "$package_path/lib/tmpfiles.d/agent-knowledge.conf" \
+  /etc/tmpfiles.d/agent-knowledge.conf
+sudo systemd-tmpfiles --create agent-knowledge.conf
 sudo systemctl link --force \
   "$package_path/lib/systemd/system/agent-knowledge-worker.service"
 sudo systemctl link --force \
@@ -199,6 +228,39 @@ updates `ReadWritePaths`, `WorkingDirectory`, and the queue-ingress service's
 
 Configuration, SSH keys, Git credentials, Quartz, and service enablement remain
 deployment inputs.
+
+Supervisors that do not provide systemd-style socket activation can run the
+broker as one long-lived process:
+
+```sh
+agent-knowledge queue-ingress listen \
+  --queue-root /srv/fictional-knowledge/queue \
+  --socket-path /run/fictional-knowledge/queue-ingress.sock \
+  --maximum-connections 64 \
+  --connection-timeout-seconds 3900
+```
+
+The runtime directory must already exist, be owned and writable by the
+queue-ingress identity, use the setgid `agent-knowledge-ingress` group, and be
+writable by neither group nor other; mode `2750` is recommended. The container
+identity database assigns this group GID `10004`, and the Gateway joins it.
+Its configured path must already be canonical, must not traverse symbolic
+links, and must leave room within Linux `sun_path` for the listener's 30-byte
+`.ak-<ULID>` temporary socket name; this is checked before listener state is
+changed.
+The listener publishes the socket as `0660`, refuses to overwrite live,
+non-socket, or unowned stale paths, recovers a stale socket recorded by its own
+locked state file after a crash, and rejects a socket basename change while a
+prior recorded socket still exists, including while upgrading v1 state through
+a bounded identity scan. Internal lock and state basenames are reserved. The
+listener bounds concurrent connections and handler shutdown, hands diagnostics
+to a capacity-one best-effort reporter after connection completion, and stops
+accepting and cancels active queue lock waits on `SIGINT` or `SIGTERM`. A
+handler that ignores cancellation past the grace period makes the listener exit
+with failure so its supervisor can replace the process without accumulating
+detached threads.
+`queue-ingress serve` remains the one-connection entrypoint used by the
+packaged systemd units.
 
 Run the Repository Worker with a validated deployment configuration:
 
@@ -382,7 +444,8 @@ reached, including when a proxy descendant retains an output pipe.
 
 The forced-command account needs read access to this root-controlled
 configuration and membership in `agent-knowledge-gateway`, but no queue or
-Worker-account membership.
+Worker-account membership. It also joins `agent-knowledge-ingress` to connect
+to the local broker socket.
 
 The forced command requires a strict Gateway configuration such as:
 

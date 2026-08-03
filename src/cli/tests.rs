@@ -1,9 +1,10 @@
 use super::{CliError, Command, parse_arguments, run};
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 const REQUEST_JSON: &str = r#"{
     "protocol_version": 1,
@@ -37,6 +38,31 @@ status: active\n\
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory(PathBuf);
+
+#[derive(Clone, Default)]
+struct SharedOutput(Arc<Mutex<Vec<u8>>>);
+
+impl SharedOutput {
+    fn contents(&self) -> Vec<u8> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| panic!("CLI output must not be poisoned: {error}"))
+            .clone()
+    }
+}
+
+impl Write for SharedOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("CLI output lock poisoned"))?
+            .write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 impl TestDirectory {
     fn create() -> Self {
@@ -96,11 +122,11 @@ fn arguments(root: &Path, package: &Path) -> Vec<OsString> {
 fn submits_valid_directory_and_reports_idempotent_retry() {
     let root = TestDirectory::create();
     let package = write_package(root.path());
-    let mut first = Vec::new();
-    if let Err(error) = run(arguments(root.path(), &package), &mut first) {
+    let first = SharedOutput::default();
+    if let Err(error) = run(arguments(root.path(), &package), first.clone()) {
         panic!("first local submission must succeed: {error}");
     }
-    let first: serde_json::Value = match serde_json::from_slice(&first) {
+    let first: serde_json::Value = match serde_json::from_slice(&first.contents()) {
         Ok(response) => response,
         Err(error) => panic!("first response must be JSON: {error}"),
     };
@@ -112,11 +138,11 @@ fn submits_valid_directory_and_reports_idempotent_retry() {
             .is_dir()
     );
 
-    let mut second = Vec::new();
-    if let Err(error) = run(arguments(root.path(), &package), &mut second) {
+    let second = SharedOutput::default();
+    if let Err(error) = run(arguments(root.path(), &package), second.clone()) {
         panic!("idempotent local submission must succeed: {error}");
     }
-    let second: serde_json::Value = match serde_json::from_slice(&second) {
+    let second: serde_json::Value = match serde_json::from_slice(&second.contents()) {
         Ok(response) => response,
         Err(error) => panic!("second response must be JSON: {error}"),
     };
@@ -323,6 +349,34 @@ fn parses_the_systemd_activated_queue_ingress_command() {
         command,
         Command::ServeQueueIngress { queue_root }
             if queue_root == Path::new("/srv/fictional-knowledge/queue")
+    ));
+}
+
+#[test]
+fn parses_the_long_running_queue_ingress_command() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "queue-ingress".into(),
+        "listen".into(),
+        "--queue-root".into(),
+        "/srv/fictional-knowledge/queue".into(),
+        "--socket-path".into(),
+        "/run/fictional-knowledge/queue-ingress.sock".into(),
+        "--maximum-connections".into(),
+        "12".into(),
+        "--connection-timeout-seconds".into(),
+        "900".into(),
+    ])
+    .unwrap_or_else(|error| panic!("queue ingress listener command must parse: {error}"));
+
+    assert!(matches!(
+        command,
+        Command::ListenQueueIngress { settings }
+            if settings.queue_root == Path::new("/srv/fictional-knowledge/queue")
+                && settings.socket_path
+                    == Path::new("/run/fictional-knowledge/queue-ingress.sock")
+                && settings.maximum_connections.get() == 12
+                && settings.connection_timeout == std::time::Duration::from_secs(900)
     ));
 }
 

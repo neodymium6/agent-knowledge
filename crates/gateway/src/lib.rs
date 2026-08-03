@@ -14,7 +14,10 @@ use agent_knowledge_repository::{CommittedReadError, CommittedStore};
 use std::fmt;
 
 pub use config::{CURRENT_GATEWAY_CONFIG_VERSION, GatewayConfigError, GatewaySettings};
-pub use ingress::{IngressClient, IngressClientError, IngressServeError, serve as serve_ingress};
+pub use ingress::{
+    IngressClient, IngressClientError, IngressServeError, serve as serve_ingress,
+    serve_until as serve_ingress_until,
+};
 pub use read::{PreparedExport, ReadRequestError};
 pub use submit::ArchiveError;
 
@@ -40,7 +43,7 @@ impl SubmitGateway {
         client_id: agent_knowledge_protocol::ClientId,
         input: impl std::io::Read,
     ) -> Result<agent_knowledge_protocol::SubmitResponse, GatewayError> {
-        submit::submit(&self.queue, client_id, input)
+        submit::submit_until(&self.queue, client_id, input, None)
     }
 }
 

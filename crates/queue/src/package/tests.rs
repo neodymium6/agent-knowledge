@@ -1,13 +1,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use agent_knowledge_core::ErrorCode;
 
 use super::{
     MarkdownValidationError, PackageLimit, PackageLimits, PackagePolicy, PackageValidationError,
-    validate_accepted_package, validate_package,
+    validate_accepted_package, validate_package, validate_package_until_with_digest_observer,
 };
+use crate::QueueOperationDeadline;
 
 const REQUEST_JSON: &str = r#"{
     "protocol_version": 1,
@@ -158,6 +162,56 @@ fn validates_complete_package_and_calculates_stable_digest() {
         first_package.payload()[0].path().as_str(),
         "benchmark/index.md"
     );
+}
+
+#[test]
+fn cancellation_interrupts_payload_digest_validation() {
+    let root = TestDirectory::create();
+    write_fixture(root.path(), REQUEST_JSON, false);
+    fs::write(
+        root.path().join("payload/benchmark/results.csv"),
+        vec![b'4'; 16 * 1024 * 1024],
+    )
+    .unwrap_or_else(|error| panic!("large fictional payload must be written: {error}"));
+    let deadline = QueueOperationDeadline::new(Instant::now() + Duration::from_secs(30));
+    let operation_deadline = deadline.clone();
+    let package_root = root.path().to_path_buf();
+    let (entered_digest_sender, entered_digest_receiver) = mpsc::sync_channel(0);
+    let (resume_sender, resume_receiver) = mpsc::sync_channel(0);
+    let validation = thread::spawn(move || {
+        let mut first_chunk = true;
+        let mut digest_observer = || {
+            if first_chunk {
+                first_chunk = false;
+                entered_digest_sender
+                    .send(())
+                    .unwrap_or_else(|error| panic!("digest checkpoint must be reported: {error}"));
+                resume_receiver
+                    .recv()
+                    .unwrap_or_else(|error| panic!("digest validation must resume: {error}"));
+            }
+        };
+        validate_package_until_with_digest_observer(
+            &package_root,
+            &PackagePolicy::default(),
+            Some(&operation_deadline),
+            &mut digest_observer,
+        )
+    });
+    entered_digest_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("validation must reach payload digesting: {error}"));
+    deadline.cancel();
+    resume_sender
+        .send(())
+        .unwrap_or_else(|error| panic!("cancelled validation must resume: {error}"));
+    let result = validation
+        .join()
+        .unwrap_or_else(|_| panic!("validation thread must not panic"));
+    assert!(matches!(
+        result,
+        Err(PackageValidationError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut
+    ));
 }
 
 #[test]
