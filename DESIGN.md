@@ -89,7 +89,7 @@ Gateway, Worker, client CLI, and administrative commands are implemented in one
 Rust workspace. They share domain types, validation rules, path handling,
 queue-state transitions, revision calculation, and error codes.
 
-The initial release produces one executable with subcommands:
+The initial release produces one main application executable with subcommands:
 
 ```text
 agent-knowledge client ...
@@ -99,6 +99,11 @@ agent-knowledge queue-ingress listen ...
 agent-knowledge worker ...
 agent-knowledge admin ...
 ```
+
+The OpenSSH adapter package also provides the restricted
+`agent-knowledge-ssh-shell` login-shell helper. It is not a general-purpose
+shell or a second application interface; it validates the root-controlled
+forced-command grammar and replaces itself with the main Gateway process.
 
 The executable retains a local-only administrative intake command for
 operators and tests:
@@ -139,12 +144,14 @@ bound, removal bound, and operation deadline. Retention never runs through the
 Gateway and never removes canonical content, Git history, or accepted request
 packages.
 
-The flake publishes one wrapped production executable for `x86_64-linux` and
-`aarch64-linux`. Its runtime closure provides the Git and OpenSSH executables
-invoked by the application. Quartz remains an explicitly configured absolute
-program path and integration directory. The package contains no credentials,
-host keys, client keys, deployment-specific Worker or Gateway configuration,
-or Quartz content.
+The flake publishes the wrapped main production executable for `x86_64-linux`
+and `aarch64-linux`. Its runtime closure provides the Git and OpenSSH
+executables invoked by the application. The dedicated adapter package combines
+the restricted login-shell helper with a binary-wrapped main executable and
+the local Git runtime used by committed reads. Quartz remains an explicitly
+configured absolute program path and integration directory. The packages
+contain no credentials, host keys, client keys, deployment-specific Worker or
+Gateway configuration, or Quartz content.
 
 The flake also publishes reproducible, Docker-compatible Worker, Queue Ingress,
 one-shot Gateway, and OpenSSH Gateway adapter image archives for `amd64` and
@@ -270,8 +277,10 @@ Pod. It shares the committed repository, content checkout, and queue-ingress
 socket through explicit volumes with the other role containers. Kubernetes
 manifests must assign explicit identities and supplemental groups, mount server
 configuration and keys read-only, and grant only the capabilities required by
-the OpenSSH master to bind the fixed non-privileged port `2222` and drop to the
-Gateway account. Packaging the adapter does not itself define those manifests.
+the OpenSSH master to bind a non-privileged port and drop to the Gateway
+account. The image sets the command-line default to `2222`; the mounted
+configuration must not use a port-qualified `ListenAddress` that changes that
+port. Packaging the adapter does not itself define those manifests.
 
 SSH host keys, client public keys, Git credentials, and other secrets are
 deployment inputs. They are never stored in this repository or in committed

@@ -135,11 +135,12 @@ access, and the queue-ingress runtime directory. Run the one-shot container
 with a read-only root filesystem, no network, no Linux capabilities, and no
 privilege escalation.
 
-The OpenSSH Gateway adapter image runs the `sshd` supervisor on port `2222` and
-uses the Rust `agent-knowledge-ssh-shell` executable as the Gateway account's
-login shell. A root-controlled authorized-key command uses the exact grammar
-`akg-v1 <absolute-config-path> <client-id>`; the adapter validates that grammar
-without invoking a general shell and then replaces itself with the Gateway.
+The OpenSSH Gateway adapter image starts the `sshd` supervisor with default
+port `2222` and uses the Rust `agent-knowledge-ssh-shell` executable as the
+Gateway account's login shell. A root-controlled authorized-key command uses
+the exact grammar `akg-v1 <absolute-config-path> <client-id>`; the adapter
+validates that grammar without invoking a general shell and then replaces
+itself with the Gateway.
 The `sshd` master starts as root so OpenSSH can authenticate and drop to UID/GID
 `10001:10001`; it does not require a privileged container. The deployment must
 mount `sshd_config`, host keys, authorized keys, and the Gateway configuration,
@@ -153,10 +154,12 @@ Podman. It also verifies the Worker's CA bundle, both Gateway variants' local
 Git dependency, and the absence of embedded deployment-specific OpenSSH
 configuration, key material, and role-inappropriate CA artifacts. The OpenSSH
 package's inert upstream default configuration remains in its closure, but the
-image entrypoint ignores it, fixes the listener port to `2222`, and requires
-the deployment-specific configuration at
-`/etc/agent-knowledge/sshd_config`. Runtime storage, configuration, secrets,
-runtime socket directory, and writable paths are deployment-supplied mounts.
+image entrypoint ignores it, sets the command-line port default to `2222`, and
+requires the deployment-specific configuration at
+`/etc/agent-knowledge/sshd_config`. That mounted configuration must not specify
+a port-qualified `ListenAddress`; an address without a port inherits `2222`.
+Runtime storage, configuration, secrets, runtime socket directory, and writable
+paths are deployment-supplied mounts.
 
 ### systemd service
 
