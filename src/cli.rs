@@ -26,7 +26,7 @@ use crate::admin::{StorageMigration, StorageMigrationError};
 use crate::client::{self, ClientCommandError};
 use crate::gateway::{self, GatewayCommandError};
 use crate::queue_ingress::{self, ListenSettings, QueueIngressCommandError};
-use crate::runtime_identity::{RuntimeIdentityError, validate_queue_ingress};
+use crate::runtime_identity::RuntimeIdentityError;
 #[cfg(target_os = "linux")]
 use crate::storage_bootstrap::{StorageBootstrap, StorageBootstrapError};
 use crate::worker::{self, WorkerCommandError};
@@ -124,8 +124,15 @@ where
             socket_path,
         } => {
             queue_ingress::enforce_writer_umask();
-            validate_queue_ingress(&queue_root, &socket_path).map_err(CliError::RuntimeIdentity)?;
-            agent_knowledge_gateway::serve_ingress(&queue_root, io::stdin().lock(), output)
+            let stdin = io::stdin();
+            let input = stdin.lock();
+            crate::runtime_identity::validate_activated_queue_ingress(
+                &queue_root,
+                &socket_path,
+                &input,
+            )
+            .map_err(CliError::RuntimeIdentity)?;
+            agent_knowledge_gateway::serve_ingress(&queue_root, input, output)
                 .map_err(CliError::IngressServe)
         }
         Command::ListenQueueIngress { settings } => {
@@ -962,10 +969,6 @@ pub enum CliError {
 impl CliError {
     pub fn write_diagnostic(&self, mut output: impl Write) -> io::Result<()> {
         match self {
-            Self::Gateway(error @ GatewayCommandError::Identity(_)) => {
-                writeln!(output, "{error}")?;
-                error.write_protocol_error(output)
-            }
             Self::Gateway(error) => error.write_protocol_error(output),
             Self::Client(error) => error.write_diagnostic(output),
             _ => writeln!(output, "{self}"),

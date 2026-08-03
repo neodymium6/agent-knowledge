@@ -2,19 +2,24 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use agent_knowledge_gateway::GatewaySettings;
 use agent_knowledge_worker::WorkerSettings;
 
 #[cfg(target_os = "linux")]
+use nix::sys::socket::{UnixAddr, getsockname};
+#[cfg(target_os = "linux")]
 use nix::unistd::{Gid, Uid, getgroups};
 
 const WORKER_ROLE: &str = "Worker";
 const QUEUE_INGRESS_ROLE: &str = "Queue Ingress";
 const GATEWAY_ROLE: &str = "Gateway";
+#[cfg(target_os = "linux")]
+const ACTIVATED_SOCKET_MODE: u32 = 0o660;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProcessIdentity {
@@ -110,6 +115,73 @@ pub(crate) fn validate_queue_ingress(
         .ok_or_else(|| RuntimeIdentityError::InvalidBoundary(socket_path.to_path_buf()))
         .and_then(DirectoryIdentity::inspect)?;
     validate_queue_ingress_identity(&ProcessIdentity::current()?, &queue, &runtime)
+}
+
+pub(crate) fn validate_activated_queue_ingress(
+    queue_root: &Path,
+    socket_path: &Path,
+    input: &impl AsRawFd,
+) -> Result<(), RuntimeIdentityError> {
+    validate_queue_ingress(queue_root, socket_path)?;
+    validate_activated_socket(input.as_raw_fd(), socket_path)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_activated_socket(
+    input_fd: std::os::fd::RawFd,
+    expected_path: &Path,
+) -> Result<(), RuntimeIdentityError> {
+    let address = getsockname::<UnixAddr>(input_fd).map_err(|error| {
+        RuntimeIdentityError::SocketInspection(io::Error::from_raw_os_error(error as i32))
+    })?;
+    let actual_path = address
+        .path()
+        .ok_or(RuntimeIdentityError::UnnamedActivatedSocket)?;
+    if actual_path != expected_path {
+        return Err(RuntimeIdentityError::ActivatedSocketPathMismatch {
+            expected: expected_path.to_path_buf(),
+            actual: actual_path.to_path_buf(),
+        });
+    }
+    let metadata = fs::symlink_metadata(expected_path).map_err(|source| {
+        RuntimeIdentityError::SocketBoundaryInspection {
+            path: expected_path.to_path_buf(),
+            source,
+        }
+    })?;
+    if !metadata.file_type().is_socket() {
+        return Err(RuntimeIdentityError::InvalidSocketBoundary(
+            expected_path.to_path_buf(),
+        ));
+    }
+    let parent = expected_path
+        .parent()
+        .ok_or_else(|| RuntimeIdentityError::InvalidBoundary(expected_path.to_path_buf()))?;
+    let runtime = DirectoryIdentity::inspect(parent)?;
+    let mode = metadata.mode() & 0o7777;
+    if metadata.uid() != runtime.uid
+        || metadata.gid() != runtime.gid
+        || mode != ACTIVATED_SOCKET_MODE
+    {
+        return Err(RuntimeIdentityError::InvalidSocketIdentity {
+            path: expected_path.to_path_buf(),
+            expected_uid: runtime.uid,
+            actual_uid: metadata.uid(),
+            expected_gid: runtime.gid,
+            actual_gid: metadata.gid(),
+            expected_mode: ACTIVATED_SOCKET_MODE,
+            actual_mode: mode,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_activated_socket(
+    _input_fd: std::os::fd::RawFd,
+    _expected_path: &Path,
+) -> Result<(), RuntimeIdentityError> {
+    Err(RuntimeIdentityError::UnsupportedPlatform)
 }
 
 pub(crate) fn validate_gateway(settings: &GatewaySettings) -> Result<(), RuntimeIdentityError> {
@@ -353,11 +425,31 @@ pub(crate) enum RuntimeIdentityError {
     #[cfg(not(target_os = "linux"))]
     UnsupportedPlatform,
     GroupInspection(io::Error),
+    SocketInspection(io::Error),
     BoundaryInspection {
         path: PathBuf,
         source: io::Error,
     },
     InvalidBoundary(PathBuf),
+    UnnamedActivatedSocket,
+    ActivatedSocketPathMismatch {
+        expected: PathBuf,
+        actual: PathBuf,
+    },
+    SocketBoundaryInspection {
+        path: PathBuf,
+        source: io::Error,
+    },
+    InvalidSocketBoundary(PathBuf),
+    InvalidSocketIdentity {
+        path: PathBuf,
+        expected_uid: u32,
+        actual_uid: u32,
+        expected_gid: u32,
+        actual_gid: u32,
+        expected_mode: u32,
+        actual_mode: u32,
+    },
     UnsafeBoundaryIdentity {
         role: &'static str,
         path: PathBuf,
@@ -410,6 +502,12 @@ impl fmt::Display for RuntimeIdentityError {
             Self::GroupInspection(error) => {
                 write!(formatter, "could not inspect supplementary groups: {error}")
             }
+            Self::SocketInspection(error) => {
+                write!(
+                    formatter,
+                    "could not inspect activated Unix socket: {error}"
+                )
+            }
             Self::BoundaryInspection { path, source } => {
                 write!(formatter, "could not inspect {}: {source}", path.display())
             }
@@ -420,6 +518,38 @@ impl fmt::Display for RuntimeIdentityError {
                     path.display()
                 )
             }
+            Self::UnnamedActivatedSocket => {
+                formatter.write_str("activated Unix socket has no filesystem path")
+            }
+            Self::ActivatedSocketPathMismatch { expected, actual } => write!(
+                formatter,
+                "activated Unix socket {} does not match configured path {}",
+                actual.display(),
+                expected.display()
+            ),
+            Self::SocketBoundaryInspection { path, source } => write!(
+                formatter,
+                "could not inspect activated Unix socket {}: {source}",
+                path.display()
+            ),
+            Self::InvalidSocketBoundary(path) => write!(
+                formatter,
+                "activated Unix socket path {} is not a socket",
+                path.display()
+            ),
+            Self::InvalidSocketIdentity {
+                path,
+                expected_uid,
+                actual_uid,
+                expected_gid,
+                actual_gid,
+                expected_mode,
+                actual_mode,
+            } => write!(
+                formatter,
+                "activated Unix socket {} identity {actual_uid}:{actual_gid}:{actual_mode:04o} does not match required {expected_uid}:{expected_gid}:{expected_mode:04o}",
+                path.display()
+            ),
             Self::UnsafeBoundaryIdentity { role, path } => write!(
                 formatter,
                 "{role} boundary {} uses a root identity",
@@ -487,8 +617,9 @@ impl fmt::Display for RuntimeIdentityError {
 impl std::error::Error for RuntimeIdentityError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::GroupInspection(error) => Some(error),
-            Self::BoundaryInspection { source, .. } => Some(source),
+            Self::GroupInspection(error) | Self::SocketInspection(error) => Some(error),
+            Self::BoundaryInspection { source, .. }
+            | Self::SocketBoundaryInspection { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -496,10 +627,17 @@ impl std::error::Error for RuntimeIdentityError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    use ulid::Ulid;
+
     use super::{
-        DirectoryIdentity, GatewayBoundaries, ProcessIdentity, RuntimeIdentityError,
-        WorkerBoundaries, validate_gateway_identity, validate_queue_ingress_identity,
-        validate_worker_identity,
+        ACTIVATED_SOCKET_MODE, DirectoryIdentity, GatewayBoundaries, ProcessIdentity,
+        RuntimeIdentityError, WorkerBoundaries, validate_activated_socket,
+        validate_gateway_identity, validate_queue_ingress_identity, validate_worker_identity,
     };
     use std::collections::BTreeSet;
 
@@ -509,6 +647,44 @@ mod tests {
             primary_gid,
             groups: groups.iter().copied().collect::<BTreeSet<_>>(),
         }
+    }
+
+    #[test]
+    fn activated_socket_must_match_the_configured_path() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-knowledge-activated-socket-test-{}",
+            Ulid::generate()
+        ));
+        fs::create_dir(&directory)
+            .unwrap_or_else(|error| panic!("socket test directory must be created: {error}"));
+        let actual_path = directory.join("actual.sock");
+        let configured_path = directory.join("configured.sock");
+        let listener = UnixListener::bind(&actual_path)
+            .unwrap_or_else(|error| panic!("socket test listener must bind: {error}"));
+        fs::set_permissions(
+            &actual_path,
+            fs::Permissions::from_mode(ACTIVATED_SOCKET_MODE),
+        )
+        .unwrap_or_else(|error| panic!("socket test mode must be set: {error}"));
+        let client = UnixStream::connect(&actual_path)
+            .unwrap_or_else(|error| panic!("socket test client must connect: {error}"));
+        let (accepted, _) = listener
+            .accept()
+            .unwrap_or_else(|error| panic!("socket test connection must be accepted: {error}"));
+
+        assert!(validate_activated_socket(accepted.as_raw_fd(), &actual_path).is_ok());
+        assert!(matches!(
+            validate_activated_socket(accepted.as_raw_fd(), &configured_path),
+            Err(RuntimeIdentityError::ActivatedSocketPathMismatch { .. })
+        ));
+
+        drop(accepted);
+        drop(client);
+        drop(listener);
+        fs::remove_file(&actual_path)
+            .unwrap_or_else(|error| panic!("socket test path must be removed: {error}"));
+        fs::remove_dir(&directory)
+            .unwrap_or_else(|error| panic!("socket test directory must be removed: {error}"));
     }
 
     fn worker_boundaries() -> WorkerBoundaries {

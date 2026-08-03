@@ -1,6 +1,4 @@
 use super::{CliError, Command, parse_arguments, run};
-use crate::gateway::GatewayCommandError;
-use crate::runtime_identity::RuntimeIdentityError;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
@@ -38,26 +36,6 @@ status: active\n\
 ---\n";
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
-#[test]
-fn reports_gateway_identity_details_before_the_protocol_error() {
-    let error = CliError::Gateway(GatewayCommandError::Identity(
-        RuntimeIdentityError::ProcessUserMismatch {
-            role: "Gateway",
-            expected: 61_001,
-            actual: 61_099,
-        },
-    ));
-    let mut diagnostic = Vec::new();
-    error
-        .write_diagnostic(&mut diagnostic)
-        .unwrap_or_else(|error| panic!("Gateway diagnostic must encode: {error}"));
-    let diagnostic = String::from_utf8(diagnostic)
-        .unwrap_or_else(|error| panic!("Gateway diagnostic must be UTF-8: {error}"));
-
-    assert!(diagnostic.contains("process user 61099"));
-    assert!(diagnostic.ends_with("{\"protocol_version\":1,\"error_code\":\"INTERNAL_ERROR\"}\n"));
-}
 
 struct TestDirectory(PathBuf);
 

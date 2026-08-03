@@ -344,6 +344,11 @@ identity. The deployment must not select `Strict`, which intentionally ignores
 the image account database and would remove the two required container-specific
 memberships.
 
+Each socket-activated Queue Ingress process additionally compares its accepted
+standard-input socket's local Unix address with the root-controlled configured
+path and validates the socket file's queue-owner UID, ingress-client GID, and
+mode before reading the request.
+
 SSH host keys, client public keys, Git credentials, and other secrets are
 deployment inputs. They are never stored in this repository or in committed
 configuration examples.

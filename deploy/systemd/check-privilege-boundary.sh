@@ -13,6 +13,7 @@ openssh_bin=$4
 test_root=$(mktemp -d /tmp/agent-knowledge-e2e.XXXXXX)
 chmod 0711 "$test_root"
 activation_pid=
+mismatch_activation_pid=
 sshd_pid=
 gateway_account_created=false
 client_account_created=false
@@ -32,6 +33,10 @@ cleanup() {
   if [[ -n $activation_pid ]]; then
     kill "$activation_pid" 2>/dev/null || true
     wait "$activation_pid" 2>/dev/null || true
+  fi
+  if [[ -n $mismatch_activation_pid ]]; then
+    kill "$mismatch_activation_pid" 2>/dev/null || true
+    wait "$mismatch_activation_pid" 2>/dev/null || true
   fi
   if [[ $client_account_created == true ]]; then
     userdel fictional-ak-client 2>/dev/null || true
@@ -355,6 +360,46 @@ fi
 grep -Fq '"error_code":"INTERNAL_ERROR"' "$test_root/unsafe-gateway.log"
 
 umask 0007
+mismatch_socket=$test_root/run/unexpected-ingress.sock
+cp "$test_root/gateway.yaml" "$test_root/mismatch-gateway.yaml"
+sed -i \
+  "s#queue_socket: .*#queue_socket: $mismatch_socket#" \
+  "$test_root/mismatch-gateway.yaml"
+chown root:"$gateway_gid" "$test_root/mismatch-gateway.yaml"
+chmod 0640 "$test_root/mismatch-gateway.yaml"
+systemd-socket-activate --accept --inetd \
+  --listen="$mismatch_socket" \
+  setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
+  "$test_root/agent-knowledge" queue-ingress serve \
+  --queue-root "$test_root/storage/queue" \
+  --socket-path "$test_root/run/queue-ingress.sock" \
+  >"$test_root/mismatch-activation.log" 2>&1 &
+mismatch_activation_pid=$!
+for _ in $(seq 1 100); do
+  [[ -S $mismatch_socket ]] && break
+  sleep 0.05
+done
+test -S "$mismatch_socket"
+chown "$queue_uid":"$ingress_gid" "$mismatch_socket"
+chmod 0660 "$mismatch_socket"
+if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
+  env SSH_ORIGINAL_COMMAND='akp-v1 submit' \
+  "$test_root/agent-knowledge" gateway --config "$test_root/mismatch-gateway.yaml" \
+  --client-id fictional-node-a <"$test_root/request.tar" \
+  >"$test_root/mismatch-gateway.log" 2>&1; then
+  echo "Queue Ingress accepted a connection from an unexpected activated socket" >&2
+  exit 1
+fi
+for _ in $(seq 1 100); do
+  grep -Fq 'does not match configured path' "$test_root/mismatch-activation.log" && break
+  sleep 0.05
+done
+grep -Fq 'does not match configured path' "$test_root/mismatch-activation.log"
+kill "$mismatch_activation_pid" 2>/dev/null || true
+wait "$mismatch_activation_pid" 2>/dev/null || true
+mismatch_activation_pid=
+rm -f -- "$mismatch_socket"
+
 systemd-socket-activate --accept --inetd \
   --listen="$test_root/run/queue-ingress.sock" \
   setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \

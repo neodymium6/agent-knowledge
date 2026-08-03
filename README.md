@@ -436,7 +436,9 @@ detached threads.
 `queue-ingress serve` remains the one-connection entrypoint used by the
 packaged systemd units. Its required `--socket-path` identifies the activated
 socket's root-managed runtime directory so the process can validate the same
-owner and group boundary as the long-running listener.
+owner and group boundary as the long-running listener. Before consuming a
+request, it also requires the accepted stdin socket's local address to match
+that path and verifies the socket file's owner, group, and mode `0660`.
 
 Run the Repository Worker with a validated deployment configuration:
 
