@@ -138,6 +138,7 @@ fn requires_the_exact_service_role_membership_matrix() {
         worker_groups: vec![identities.worker_group, identities.queue_group],
         queue_primary: identities.queue_group,
         queue_groups: vec![identities.queue_group],
+        gateway_primary: identities.gateway_group,
         gateway_groups: vec![identities.gateway_group, identities.ingress_group],
     };
     validate_service_memberships(identities, &memberships)
@@ -166,6 +167,15 @@ fn requires_the_exact_service_role_membership_matrix() {
         Err(StorageBootstrapError::UnsafeServiceMemberships)
     ));
 
+    gateway_can_write_queue.gateway_groups =
+        vec![identities.gateway_group, identities.ingress_group];
+    gateway_can_write_queue.gateway_primary = identities.ingress_group;
+    assert!(matches!(
+        validate_service_memberships(identities, &gateway_can_write_queue),
+        Err(StorageBootstrapError::UnsafeServiceMemberships)
+    ));
+
+    gateway_can_write_queue.gateway_primary = identities.gateway_group;
     gateway_can_write_queue.gateway_groups =
         vec![identities.gateway_group, identities.ingress_group];
     gateway_can_write_queue.worker_groups = vec![identities.worker_group];

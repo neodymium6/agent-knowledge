@@ -156,6 +156,7 @@ struct ServiceMemberships {
     worker_groups: Vec<Gid>,
     queue_primary: Gid,
     queue_groups: Vec<Gid>,
+    gateway_primary: Gid,
     gateway_groups: Vec<Gid>,
 }
 
@@ -164,7 +165,7 @@ fn validate_system_service_memberships(
 ) -> Result<(), StorageBootstrapError> {
     let (worker_primary, worker_groups) = system_user_groups(identities.worker_owner)?;
     let (queue_primary, queue_groups) = system_user_groups(identities.queue_owner)?;
-    let (_, gateway_groups) = system_user_groups(identities.gateway_owner)?;
+    let (gateway_primary, gateway_groups) = system_user_groups(identities.gateway_owner)?;
     validate_service_memberships(
         identities,
         &ServiceMemberships {
@@ -172,6 +173,7 @@ fn validate_system_service_memberships(
             worker_groups,
             queue_primary,
             queue_groups,
+            gateway_primary,
             gateway_groups,
         },
     )
@@ -193,6 +195,7 @@ fn validate_service_memberships(
 ) -> Result<(), StorageBootstrapError> {
     let valid = memberships.worker_primary == identities.worker_group
         && memberships.queue_primary == identities.queue_group
+        && memberships.gateway_primary == identities.gateway_group
         && has_exact_groups(
             &memberships.worker_groups,
             &[identities.worker_group, identities.queue_group],
