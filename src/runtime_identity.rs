@@ -102,17 +102,14 @@ pub(crate) fn validate_worker(settings: &WorkerSettings) -> Result<(), RuntimeId
 
 pub(crate) fn validate_queue_ingress(
     queue_root: &Path,
-    socket_path: Option<&Path>,
+    socket_path: &Path,
 ) -> Result<(), RuntimeIdentityError> {
     let queue = DirectoryIdentity::inspect(queue_root)?;
     let runtime = socket_path
-        .map(|path| {
-            path.parent()
-                .ok_or_else(|| RuntimeIdentityError::InvalidBoundary(path.to_path_buf()))
-                .and_then(DirectoryIdentity::inspect)
-        })
-        .transpose()?;
-    validate_queue_ingress_identity(&ProcessIdentity::current()?, &queue, runtime.as_ref())
+        .parent()
+        .ok_or_else(|| RuntimeIdentityError::InvalidBoundary(socket_path.to_path_buf()))
+        .and_then(DirectoryIdentity::inspect)?;
+    validate_queue_ingress_identity(&ProcessIdentity::current()?, &queue, &runtime)
 }
 
 pub(crate) fn validate_gateway(settings: &GatewaySettings) -> Result<(), RuntimeIdentityError> {
@@ -125,7 +122,11 @@ pub(crate) fn validate_gateway(settings: &GatewaySettings) -> Result<(), Runtime
         content: DirectoryIdentity::inspect(settings.content_root())?,
         runtime: DirectoryIdentity::inspect(socket_parent)?,
     };
-    validate_gateway_identity(&ProcessIdentity::current()?, &boundaries)
+    validate_gateway_identity(
+        &ProcessIdentity::current()?,
+        settings.gateway_uid(),
+        &boundaries,
+    )
 }
 
 struct WorkerBoundaries {
@@ -173,17 +174,15 @@ fn validate_worker_identity(
 fn validate_queue_ingress_identity(
     process: &ProcessIdentity,
     queue: &DirectoryIdentity,
-    runtime: Option<&DirectoryIdentity>,
+    runtime: &DirectoryIdentity,
 ) -> Result<(), RuntimeIdentityError> {
-    if let Some(runtime) = runtime {
-        require_matching_owner(QUEUE_INGRESS_ROLE, queue, &[runtime])?;
-        require_distinct(
-            QUEUE_INGRESS_ROLE,
-            "queue-owner and ingress-client groups",
-            queue.gid,
-            runtime.gid,
-        )?;
-    }
+    require_matching_owner(QUEUE_INGRESS_ROLE, queue, &[runtime])?;
+    require_distinct(
+        QUEUE_INGRESS_ROLE,
+        "queue-owner and ingress-client groups",
+        queue.gid,
+        runtime.gid,
+    )?;
     require_process_identity(
         QUEUE_INGRESS_ROLE,
         process,
@@ -201,6 +200,7 @@ struct GatewayBoundaries {
 
 fn validate_gateway_identity(
     process: &ProcessIdentity,
+    expected_uid: u32,
     boundaries: &GatewayBoundaries,
 ) -> Result<(), RuntimeIdentityError> {
     require_matching_owner(GATEWAY_ROLE, &boundaries.repository, &[&boundaries.content])?;
@@ -226,7 +226,7 @@ fn validate_gateway_identity(
     require_process_identity(
         GATEWAY_ROLE,
         process,
-        process.uid,
+        expected_uid,
         boundaries.repository.gid,
         [boundaries.repository.gid, boundaries.runtime.gid],
     )
@@ -559,12 +559,8 @@ mod tests {
         let queue = DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 62_002);
         let runtime = DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004);
         assert!(
-            validate_queue_ingress_identity(
-                &process(61_002, 62_002, &[62_002]),
-                &queue,
-                Some(&runtime),
-            )
-            .is_ok()
+            validate_queue_ingress_identity(&process(61_002, 62_002, &[62_002]), &queue, &runtime,)
+                .is_ok()
         );
     }
 
@@ -576,7 +572,7 @@ mod tests {
             validate_queue_ingress_identity(
                 &process(61_002, 62_002, &[62_002, 62_004]),
                 &queue,
-                Some(&runtime),
+                &runtime,
             ),
             Err(RuntimeIdentityError::GroupSetMismatch { .. })
         ));
@@ -585,8 +581,9 @@ mod tests {
     #[test]
     fn rejects_queue_ingress_with_a_root_owned_queue() {
         let queue = DirectoryIdentity::fictional("/srv/fictional/queue", 61_002, 0);
+        let runtime = DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004);
         assert!(matches!(
-            validate_queue_ingress_identity(&process(61_002, 0, &[0]), &queue, None,),
+            validate_queue_ingress_identity(&process(61_002, 0, &[0]), &queue, &runtime),
             Err(RuntimeIdentityError::CollapsedBoundary { .. })
         ));
     }
@@ -604,6 +601,7 @@ mod tests {
         assert!(
             validate_gateway_identity(
                 &process(61_001, 62_001, &[62_001, 62_004]),
+                61_001,
                 &gateway_boundaries(),
             )
             .is_ok()
@@ -615,6 +613,7 @@ mod tests {
         assert!(matches!(
             validate_gateway_identity(
                 &process(61_003, 62_001, &[62_001, 62_004]),
+                61_001,
                 &gateway_boundaries(),
             ),
             Err(RuntimeIdentityError::UnsafeProcessUser { .. })
@@ -624,8 +623,24 @@ mod tests {
     #[test]
     fn rejects_gateway_without_the_ingress_group() {
         assert!(matches!(
-            validate_gateway_identity(&process(61_001, 62_001, &[62_001]), &gateway_boundaries(),),
+            validate_gateway_identity(
+                &process(61_001, 62_001, &[62_001]),
+                61_001,
+                &gateway_boundaries(),
+            ),
             Err(RuntimeIdentityError::GroupSetMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_gateway_running_as_an_unconfigured_user() {
+        assert!(matches!(
+            validate_gateway_identity(
+                &process(61_099, 62_001, &[62_001, 62_004]),
+                61_001,
+                &gateway_boundaries(),
+            ),
+            Err(RuntimeIdentityError::ProcessUserMismatch { .. })
         ));
     }
 }

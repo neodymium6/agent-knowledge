@@ -234,10 +234,12 @@ requires:
   resolve `/proc/<worker-pid>/fd`.
 
 All durable paths are configurable. Processes handle termination signals and
-shut down at transaction boundaries. The configured queue root may be created
-by the application, but its parent directory must already exist so the
-application can durably synchronize the new root entry without recursively
-creating unsynchronized ancestors.
+shut down at transaction boundaries. Low-level storage APIs may create a queue
+root for tests and administrative tooling when its parent already exists, but
+the production `worker run` command requires the queue, repository, content,
+work, and release roots to have been initialized by `admin bootstrap-storage`
+or an equivalent audited provisioning process. It validates their live
+identities before any component can create or mutate storage.
 
 The Worker process converts `SIGINT` and `SIGTERM` into a shutdown flag. It
 checks that flag between bounded queue scans, during bounded waits, and after a
@@ -334,7 +336,8 @@ membership under the `Merge` supplemental-group policy. Queue Ingress has no
 supplementary membership. Worker, Queue Ingress, and each forced-command
 Gateway process inspect their effective user, primary group, and complete group
 set before opening a mutable component or consuming a request. They derive the
-expected groups from the initialized directories they are permitted to know,
+expected users and groups from root-controlled configuration and the
+initialized directories they are permitted to know,
 require an exact set match, reject root or collapsed service identities, and
 fail before durable mutation when the runtime changes or augments the packaged
 identity. The deployment must not select `Strict`, which intentionally ignores

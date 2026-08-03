@@ -380,7 +380,9 @@ sudo systemctl link --force \
   "$package_path/lib/systemd/system/agent-knowledge-queue-ingress.socket"
 sudo systemctl link --force \
   "$package_path/lib/systemd/system/agent-knowledge-queue-ingress@.service"
-# Before restarting, change Gateway schema_version to 3 and replace
+# Before restarting, change Gateway schema_version to 4, set
+# identity.gateway_uid to the output of: id -u "$gateway_account"
+# Then replace
 # storage.queue_root with:
 #   queue_socket: /run/agent-knowledge/queue-ingress.sock
 sudo systemctl daemon-reload
@@ -388,10 +390,12 @@ sudo systemctl enable --now agent-knowledge-queue-ingress.socket
 sudo systemctl start agent-knowledge-worker.service
 ```
 
-Gateway schema v2 is intentionally not accepted after this upgrade. Update
-`/etc/agent-knowledge/gateway.yaml` to schema v3 while access is disabled;
-replace `storage.queue_root` with `storage.queue_socket` as shown in the Gateway
-configuration example below. A deployment using non-default durable roots
+Gateway schemas older than v4 are intentionally not accepted after this
+upgrade. Update `/etc/agent-knowledge/gateway.yaml` to schema v4 while access
+is disabled, set `identity.gateway_uid` to the dedicated forced-command
+account's numeric UID, and replace `storage.queue_root` with
+`storage.queue_socket` as shown in the Gateway configuration example below. A
+deployment using non-default durable roots
 passes the three configured roots independently to the migration command and
 updates `ReadWritePaths`, `WorkingDirectory`, and the queue-ingress service's
 `ExecStart` queue root with systemd drop-ins.
@@ -430,7 +434,9 @@ handler that ignores cancellation past the grace period makes the listener exit
 with failure so its supervisor can replace the process without accumulating
 detached threads.
 `queue-ingress serve` remains the one-connection entrypoint used by the
-packaged systemd units.
+packaged systemd units. Its required `--socket-path` identifies the activated
+socket's root-managed runtime directory so the process can validate the same
+owner and group boundary as the long-running listener.
 
 Run the Repository Worker with a validated deployment configuration:
 
@@ -615,12 +621,16 @@ reached, including when a proxy descendant retains an output pipe.
 The forced-command account needs read access to this root-controlled
 configuration and membership in `agent-knowledge-gateway`, but no queue or
 Worker-account membership. It also joins `agent-knowledge-ingress` to connect
-to the local broker socket.
+to the local broker socket. `identity.gateway_uid` pins the process to that
+dedicated account; use the account's numeric UID rather than relying on its
+current process identity.
 
 The forced command requires a strict Gateway configuration such as:
 
 ```yaml
-schema_version: 3
+schema_version: 4
+identity:
+  gateway_uid: 10001
 storage:
   queue_socket: /run/agent-knowledge/queue-ingress.sock
   git_directory: /srv/fictional-knowledge/repository

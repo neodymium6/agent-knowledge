@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn rejects_a_success_response_over_the_shared_wire_budget() {
         let settings = GatewaySettings::decode(
-            "schema_version: 3\nstorage:\n  queue_socket: /run/agent-knowledge/queue-ingress.sock\n  git_directory: /srv/fictional-knowledge/repository\n  content_root: /srv/fictional-knowledge/content\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 8\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
+            "schema_version: 4\nidentity:\n  gateway_uid: 61001\nstorage:\n  queue_socket: /run/agent-knowledge/queue-ingress.sock\n  git_directory: /srv/fictional-knowledge/repository\n  content_root: /srv/fictional-knowledge/content\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 8\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
         )
         .unwrap_or_else(|error| panic!("response-budget settings must decode: {error}"));
         let response = ListResponse::new(

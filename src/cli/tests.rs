@@ -1,4 +1,6 @@
 use super::{CliError, Command, parse_arguments, run};
+use crate::gateway::GatewayCommandError;
+use crate::runtime_identity::RuntimeIdentityError;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
@@ -36,6 +38,26 @@ status: active\n\
 ---\n";
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn reports_gateway_identity_details_before_the_protocol_error() {
+    let error = CliError::Gateway(GatewayCommandError::Identity(
+        RuntimeIdentityError::ProcessUserMismatch {
+            role: "Gateway",
+            expected: 61_001,
+            actual: 61_099,
+        },
+    ));
+    let mut diagnostic = Vec::new();
+    error
+        .write_diagnostic(&mut diagnostic)
+        .unwrap_or_else(|error| panic!("Gateway diagnostic must encode: {error}"));
+    let diagnostic = String::from_utf8(diagnostic)
+        .unwrap_or_else(|error| panic!("Gateway diagnostic must be UTF-8: {error}"));
+
+    assert!(diagnostic.contains("process user 61099"));
+    assert!(diagnostic.ends_with("{\"protocol_version\":1,\"error_code\":\"INTERNAL_ERROR\"}\n"));
+}
 
 struct TestDirectory(PathBuf);
 
@@ -396,13 +418,30 @@ fn parses_the_systemd_activated_queue_ingress_command() {
         "serve".into(),
         "--queue-root".into(),
         "/srv/fictional-knowledge/queue".into(),
+        "--socket-path".into(),
+        "/run/fictional-knowledge/queue-ingress.sock".into(),
     ])
     .unwrap_or_else(|error| panic!("queue ingress command must parse: {error}"));
 
     assert!(matches!(
         command,
-        Command::ServeQueueIngress { queue_root }
+        Command::ServeQueueIngress { queue_root, socket_path }
             if queue_root == Path::new("/srv/fictional-knowledge/queue")
+                && socket_path == Path::new("/run/fictional-knowledge/queue-ingress.sock")
+    ));
+}
+
+#[test]
+fn rejects_systemd_activated_queue_ingress_without_its_socket_path() {
+    assert!(matches!(
+        parse_arguments([
+            "agent-knowledge".into(),
+            "queue-ingress".into(),
+            "serve".into(),
+            "--queue-root".into(),
+            "/srv/fictional-knowledge/queue".into(),
+        ]),
+        Err(CliError::Usage)
     ));
 }
 

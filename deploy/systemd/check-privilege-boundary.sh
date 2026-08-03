@@ -222,6 +222,55 @@ if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --clear-groups \
   exit 1
 fi
 
+install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
+  "$test_root/quartz-integration"
+cat >"$test_root/quartz-integration/build-site" <<'EOF'
+#!/bin/sh
+printf '%s\n' '<p>fictional site</p>' >"$5/index.html"
+EOF
+chown "$worker_uid":"$worker_gid" "$test_root/quartz-integration/build-site"
+chmod 0500 "$test_root/quartz-integration/build-site"
+cat >"$test_root/worker.yaml" <<EOF
+schema_version: 1
+storage:
+  queue_root: $test_root/storage/queue
+  repository_root: $test_root/storage/repository
+  content_root: $test_root/storage/content
+  work_root: $test_root/storage/work
+  release_root: $test_root/storage/releases
+repository:
+  official_branch: main
+  author_name: Fictional Knowledge Worker
+  author_email: worker@fictional.invalid
+quartz:
+  program: $test_root/quartz-integration/build-site
+  integration_root: $test_root/quartz-integration
+  timeout_seconds: 30
+batch:
+  debounce_seconds: 30
+  maximum_age_seconds: 300
+  maximum_scan_entries: 1024
+  maximum_requests: 100
+  maximum_recovery_requests: 10000
+EOF
+chown root:"$worker_gid" "$test_root/worker.yaml"
+chmod 0640 "$test_root/worker.yaml"
+set +e
+setpriv --reuid="$worker_uid" --regid="$worker_gid" --groups="$queue_gid" \
+  env "HOME=$test_root/worker-home" \
+  timeout --signal=TERM --kill-after=5 2 \
+  "$test_root/agent-knowledge" worker run --config "$test_root/worker.yaml" \
+  >"$test_root/worker.log" 2>&1
+worker_status=$?
+set -e
+if ((worker_status != 124)); then
+  echo "Worker systemd identity smoke test exited unexpectedly: ${worker_status}" >&2
+  sed 's/^/  /' "$test_root/worker.log" >&2
+  exit 1
+fi
+grep -Fq '"event":"worker_started"' "$test_root/worker.log"
+grep -Fq '"event":"worker_stopped"' "$test_root/worker.log"
+
 tar --format=gnu --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
   -C "$test_root/package" -cf "$test_root/request.tar" request.json payload
 cp -a "$test_root/package" "$test_root/package-two"
@@ -240,7 +289,9 @@ sed -i \
   "$test_root/package-three/payload/run/index.md"
 
 cat >"$test_root/gateway.yaml" <<EOF
-schema_version: 3
+schema_version: 4
+identity:
+  gateway_uid: $gateway_uid
 storage:
   queue_socket: $test_root/run/queue-ingress.sock
   git_directory: $test_root/storage/repository
@@ -270,13 +321,27 @@ chmod 0640 "$test_root/gateway.yaml" "$test_root/request.tar" "$test_root/reques
 
 if setpriv --reuid="$queue_uid" --regid="$queue_gid" --groups="$ingress_gid" \
   "$test_root/agent-knowledge" queue-ingress serve \
-  --queue-root "$test_root/storage/queue" </dev/null \
+  --queue-root "$test_root/storage/queue" \
+  --socket-path "$test_root/run/queue-ingress.sock" </dev/null \
   >"$test_root/unsafe-ingress.log" 2>&1; then
   echo "Queue Ingress accepted an unrelated supplementary group" >&2
   exit 1
 fi
 grep -Fq 'Queue Ingress identity validation failed' \
   "$test_root/unsafe-ingress.log"
+
+chown "$queue_uid":"$queue_gid" "$test_root/run"
+if setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
+  "$test_root/agent-knowledge" queue-ingress serve \
+  --queue-root "$test_root/storage/queue" \
+  --socket-path "$test_root/run/queue-ingress.sock" </dev/null \
+  >"$test_root/collapsed-ingress.log" 2>&1; then
+  echo "Queue Ingress accepted a collapsed socket client group" >&2
+  exit 1
+fi
+grep -Fq 'queue-owner and ingress-client groups' \
+  "$test_root/collapsed-ingress.log"
+chown "$queue_uid":"$ingress_gid" "$test_root/run"
 
 if setpriv --reuid="$gateway_uid" --regid="$gateway_gid" \
   --groups="$ingress_gid,$queue_gid" \
@@ -295,6 +360,7 @@ systemd-socket-activate --accept --inetd \
   setpriv --reuid="$queue_uid" --regid="$queue_gid" --clear-groups \
   "$test_root/agent-knowledge" queue-ingress serve \
   --queue-root "$test_root/storage/queue" \
+  --socket-path "$test_root/run/queue-ingress.sock" \
   >"$test_root/activation.log" 2>&1 &
 activation_pid=$!
 for _ in $(seq 1 100); do

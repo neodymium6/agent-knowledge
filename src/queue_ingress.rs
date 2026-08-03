@@ -65,7 +65,7 @@ where
     W: Write + Send + 'static,
 {
     enforce_writer_umask();
-    validate_queue_ingress(&settings.queue_root, Some(&settings.socket_path))
+    validate_queue_ingress(&settings.queue_root, &settings.socket_path)
         .map_err(QueueIngressCommandError::Identity)?;
     let stopping = Arc::new(AtomicBool::new(false));
     let _sigint = signal_hook::flag::register(SIGINT, Arc::clone(&stopping))

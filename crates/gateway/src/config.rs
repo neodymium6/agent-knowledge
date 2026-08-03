@@ -7,7 +7,7 @@ use agent_knowledge_core::{BoundedFileError, read_bounded_regular_file};
 use serde::Deserialize;
 
 /// Gateway configuration schema supported by this release.
-pub const CURRENT_GATEWAY_CONFIG_VERSION: u16 = 3;
+pub const CURRENT_GATEWAY_CONFIG_VERSION: u16 = 4;
 const MAXIMUM_GATEWAY_CONFIG_BYTES: u64 = 64 * 1024;
 const MAXIMUM_SUBMIT_TIMEOUT_SECONDS: u64 = 3_600;
 const MAXIMUM_READ_RESULTS: usize = 10_000;
@@ -22,6 +22,7 @@ const MAXIMUM_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 /// Validated settings for one forced-command Gateway process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewaySettings {
+    gateway_uid: u32,
     queue_socket: PathBuf,
     git_directory: PathBuf,
     content_root: PathBuf,
@@ -42,6 +43,12 @@ pub struct GatewaySettings {
 }
 
 impl GatewaySettings {
+    /// Returns the dedicated Unix user ID allowed to run the Gateway.
+    #[must_use]
+    pub const fn gateway_uid(&self) -> u32 {
+        self.gateway_uid
+    }
+
     /// Loads one pinned, bounded, strict YAML configuration file.
     ///
     /// # Errors
@@ -181,6 +188,9 @@ impl TryFrom<WireGatewayConfig> for GatewaySettings {
                 found: wire.schema_version,
             });
         }
+        if wire.identity.gateway_uid == 0 {
+            return Err(GatewayConfigError::InvalidGatewayUid);
+        }
         let queue_socket = validate_storage_path(wire.storage.queue_socket, "queue_socket")?;
         let git_directory = validate_storage_path(wire.storage.git_directory, "git_directory")?;
         let content_root = validate_storage_path(wire.storage.content_root, "content_root")?;
@@ -231,6 +241,7 @@ impl TryFrom<WireGatewayConfig> for GatewaySettings {
             return Err(GatewayConfigError::InvalidSubmitTimeout);
         }
         Ok(Self {
+            gateway_uid: wire.identity.gateway_uid,
             queue_socket,
             git_directory,
             content_root,
@@ -299,10 +310,17 @@ fn validate_storage_path(
 #[serde(deny_unknown_fields)]
 struct WireGatewayConfig {
     schema_version: u16,
+    identity: WireIdentity,
     storage: WireStorage,
     repository: WireRepository,
     reads: WireReads,
     transport: WireTransport,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireIdentity {
+    gateway_uid: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,6 +387,8 @@ pub enum GatewayConfigError {
         /// Version found in the file.
         found: u16,
     },
+    /// The configured Gateway user ID was root.
+    InvalidGatewayUid,
     /// A storage path was relative, non-normalized, or a filesystem root.
     InvalidStoragePath {
         /// Invalid configuration field.
@@ -417,6 +437,9 @@ impl fmt::Display for GatewayConfigError {
                 formatter,
                 "unsupported Gateway configuration schema version {found}"
             ),
+            Self::InvalidGatewayUid => {
+                formatter.write_str("Gateway user ID must be a non-root numeric ID")
+            }
             Self::InvalidStoragePath { field } => write!(
                 formatter,
                 "Gateway `{field}` must be an absolute normalized non-root path"
@@ -460,7 +483,7 @@ mod tests {
 
     use super::{GatewayConfigError, GatewaySettings};
 
-    const VALID_CONFIG: &str = "schema_version: 3\nstorage:\n  queue_socket: /run/agent-knowledge/queue-ingress.sock\n  git_directory: /srv/fictional-knowledge/repository\n  content_root: /srv/fictional-knowledge/content\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n";
+    const VALID_CONFIG: &str = "schema_version: 4\nidentity:\n  gateway_uid: 61001\nstorage:\n  queue_socket: /run/agent-knowledge/queue-ingress.sock\n  git_directory: /srv/fictional-knowledge/repository\n  content_root: /srv/fictional-knowledge/content\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n";
 
     #[test]
     fn decodes_only_the_strict_versioned_gateway_shape() {
@@ -471,6 +494,7 @@ mod tests {
             std::path::Path::new("/run/agent-knowledge/queue-ingress.sock")
         );
         assert_eq!(settings.submit_timeout(), Duration::from_secs(300));
+        assert_eq!(settings.gateway_uid(), 61_001);
         assert_eq!(settings.official_branch(), "main");
         assert_eq!(settings.maximum_read_results(), 100);
         assert_eq!(settings.maximum_search_query_characters(), 512);
@@ -484,7 +508,7 @@ mod tests {
 
         assert!(
             GatewaySettings::decode(
-                &VALID_CONFIG.replace("schema_version: 3", "schema_version: 2")
+                &VALID_CONFIG.replace("schema_version: 4", "schema_version: 3")
             )
             .is_err()
         );
@@ -530,11 +554,15 @@ mod tests {
             .is_err()
         );
         assert!(GatewaySettings::decode(&format!("{VALID_CONFIG}extra: true\n")).is_err());
+        assert!(
+            GatewaySettings::decode(&VALID_CONFIG.replace("gateway_uid: 61001", "gateway_uid: 0"))
+                .is_err()
+        );
         assert!(matches!(
             GatewaySettings::decode(
-                &VALID_CONFIG.replace("schema_version: 3", "schema_version: 4")
+                &VALID_CONFIG.replace("schema_version: 4", "schema_version: 5")
             ),
-            Err(GatewayConfigError::UnsupportedSchemaVersion { found: 4 })
+            Err(GatewayConfigError::UnsupportedSchemaVersion { found: 5 })
         ));
     }
 }

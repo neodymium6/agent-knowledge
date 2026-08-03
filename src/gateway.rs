@@ -53,6 +53,7 @@ pub fn run_stdio(
 ) -> Result<(), GatewayCommandError> {
     let settings = GatewaySettings::load(config)
         .map_err(|error| GatewayCommandError::Config(Box::new(error)))?;
+    validate_gateway(&settings).map_err(GatewayCommandError::Identity)?;
     run_with_settings(
         settings,
         client_id,

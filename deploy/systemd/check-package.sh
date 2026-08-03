@@ -55,7 +55,7 @@ done
 for directive in \
   'User=agent-knowledge-queue' \
   'Group=agent-knowledge-queue' \
-  "ExecStart=$package_path/bin/agent-knowledge queue-ingress serve --queue-root /var/lib/agent-knowledge/queue" \
+  "ExecStart=$package_path/bin/agent-knowledge queue-ingress serve --queue-root /var/lib/agent-knowledge/queue --socket-path /run/agent-knowledge/queue-ingress.sock" \
   'StandardInput=socket' \
   'StandardOutput=socket' \
   'StandardError=journal' \

@@ -43,7 +43,7 @@ const COMMON_USAGE: &str = "usage:\n\
     agent-knowledge client status --destination <ssh-destination> --request-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge client search --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge gateway --config <path> --client-id <id>\n\
-    agent-knowledge queue-ingress serve --queue-root <path>\n\
+    agent-knowledge queue-ingress serve --queue-root <path> --socket-path <path>\n\
     agent-knowledge queue-ingress listen --queue-root <path> --socket-path <path> [--maximum-connections <count>] [--connection-timeout-seconds <seconds>]\n\
     agent-knowledge worker run --config <path>";
 #[cfg(target_os = "linux")]
@@ -119,9 +119,12 @@ where
             std::env::var_os("SSH_ORIGINAL_COMMAND"),
         )
         .map_err(CliError::Gateway),
-        Command::ServeQueueIngress { queue_root } => {
+        Command::ServeQueueIngress {
+            queue_root,
+            socket_path,
+        } => {
             queue_ingress::enforce_writer_umask();
-            validate_queue_ingress(&queue_root, None).map_err(CliError::RuntimeIdentity)?;
+            validate_queue_ingress(&queue_root, &socket_path).map_err(CliError::RuntimeIdentity)?;
             agent_knowledge_gateway::serve_ingress(&queue_root, io::stdin().lock(), output)
                 .map_err(CliError::IngressServe)
         }
@@ -211,6 +214,7 @@ enum Command {
     },
     ServeQueueIngress {
         queue_root: PathBuf,
+        socket_path: PathBuf,
     },
     ListenQueueIngress {
         settings: ListenSettings,
@@ -631,11 +635,13 @@ where
     }
     let queue_root = queue_root.ok_or(CliError::Usage)?;
     if action == std::ffi::OsStr::new("serve")
-        && socket_path.is_none()
         && maximum_connections.is_none()
         && connection_timeout_seconds.is_none()
     {
-        return Ok(Command::ServeQueueIngress { queue_root });
+        return Ok(Command::ServeQueueIngress {
+            queue_root,
+            socket_path: socket_path.ok_or(CliError::Usage)?,
+        });
     }
     if action != std::ffi::OsStr::new("listen") {
         return Err(CliError::Usage);
@@ -956,6 +962,10 @@ pub enum CliError {
 impl CliError {
     pub fn write_diagnostic(&self, mut output: impl Write) -> io::Result<()> {
         match self {
+            Self::Gateway(error @ GatewayCommandError::Identity(_)) => {
+                writeln!(output, "{error}")?;
+                error.write_protocol_error(output)
+            }
             Self::Gateway(error) => error.write_protocol_error(output),
             Self::Client(error) => error.write_diagnostic(output),
             _ => writeln!(output, "{self}"),
