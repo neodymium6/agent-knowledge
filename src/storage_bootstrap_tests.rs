@@ -8,9 +8,10 @@ use ulid::Ulid;
 use xattr::FileExt as _;
 
 use super::{
-    MARKER_NAME, StorageBootstrap, StorageBootstrapError, StorageIdentities, StorageMigrationError,
-    bootstrap_administrative_group, bootstrap_storage_with_ids,
+    MARKER_NAME, ServiceMemberships, StorageBootstrap, StorageBootstrapError, StorageIdentities,
+    StorageMigrationError, bootstrap_administrative_group, bootstrap_storage_with_ids,
     bootstrap_storage_with_ids_and_git_check, validate_service_identities,
+    validate_service_memberships,
 };
 
 struct TestDirectory {
@@ -65,6 +66,7 @@ fn fixture(root: &Path) -> (StorageBootstrap, StorageIdentities) {
             worker_group: OsString::from(gid.as_raw().to_string()),
             queue_owner: OsString::from(uid.as_raw().to_string()),
             queue_group: OsString::from(gid.as_raw().to_string()),
+            gateway_owner: OsString::from(uid.as_raw().to_string()),
             gateway_group: OsString::from(gid.as_raw().to_string()),
             ingress_group: OsString::from(gid.as_raw().to_string()),
         },
@@ -75,6 +77,7 @@ fn fixture(root: &Path) -> (StorageBootstrap, StorageIdentities) {
             worker_group: gid,
             queue_owner: uid,
             queue_group: gid,
+            gateway_owner: uid,
             gateway_group: gid,
             ingress_group: gid,
         },
@@ -89,6 +92,7 @@ fn separated_service_identities() -> StorageIdentities {
         worker_group: Gid::from_raw(10_003),
         queue_owner: Uid::from_raw(10_002),
         queue_group: Gid::from_raw(10_002),
+        gateway_owner: Uid::from_raw(10_001),
         gateway_group: Gid::from_raw(10_001),
         ingress_group: Gid::from_raw(10_004),
     }
@@ -107,15 +111,59 @@ fn requires_non_root_distinct_service_identities() {
     shared_uid.queue_owner = shared_uid.worker_owner;
     let mut root_group = identities;
     root_group.gateway_group = Gid::from_raw(0);
+    let mut shared_gateway_uid = identities;
+    shared_gateway_uid.gateway_owner = shared_gateway_uid.queue_owner;
     let mut shared_group = identities;
     shared_group.ingress_group = shared_group.queue_group;
 
-    for invalid in [root_uid, shared_uid, root_group, shared_group] {
+    for invalid in [
+        root_uid,
+        shared_uid,
+        root_group,
+        shared_gateway_uid,
+        shared_group,
+    ] {
         assert!(matches!(
             validate_service_identities(invalid),
             Err(StorageBootstrapError::UnsafeServiceIdentities)
         ));
     }
+}
+
+#[test]
+fn requires_the_exact_service_role_membership_matrix() {
+    let identities = separated_service_identities();
+    let memberships = ServiceMemberships {
+        worker_primary: identities.worker_group,
+        worker_groups: vec![identities.worker_group, identities.queue_group],
+        queue_primary: identities.queue_group,
+        queue_groups: vec![identities.queue_group],
+        gateway_primary: identities.gateway_group,
+        gateway_groups: vec![identities.gateway_group, identities.ingress_group],
+    };
+    validate_service_memberships(identities, &memberships)
+        .unwrap_or_else(|error| panic!("the intended membership matrix must be valid: {error}"));
+
+    let mut gateway_can_write_queue = ServiceMemberships {
+        gateway_groups: vec![
+            identities.gateway_group,
+            identities.ingress_group,
+            identities.queue_group,
+        ],
+        ..memberships
+    };
+    assert!(matches!(
+        validate_service_memberships(identities, &gateway_can_write_queue),
+        Err(StorageBootstrapError::UnsafeServiceMemberships)
+    ));
+
+    gateway_can_write_queue.gateway_groups =
+        vec![identities.gateway_group, identities.ingress_group];
+    gateway_can_write_queue.worker_groups = vec![identities.worker_group];
+    assert!(matches!(
+        validate_service_memberships(identities, &gateway_can_write_queue),
+        Err(StorageBootstrapError::UnsafeServiceMemberships)
+    ));
 }
 
 fn set_extended_posix_acl(path: &Path, name: &str) {

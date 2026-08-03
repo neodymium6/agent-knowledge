@@ -333,10 +333,12 @@ fn parses_the_storage_bootstrap_command() {
         "61003".into(),
         "--queue-group".into(),
         "61004".into(),
-        "--gateway-group".into(),
+        "--gateway-owner".into(),
         "61005".into(),
-        "--ingress-group".into(),
+        "--gateway-group".into(),
         "61006".into(),
+        "--ingress-group".into(),
+        "61007".into(),
     ])
     .unwrap_or_else(|error| panic!("storage bootstrap command must parse: {error}"));
 
@@ -349,8 +351,9 @@ fn parses_the_storage_bootstrap_command() {
                 && settings.worker_group == "61002"
                 && settings.queue_owner == "61003"
                 && settings.queue_group == "61004"
-                && settings.gateway_group == "61005"
-                && settings.ingress_group == "61006"
+                && settings.gateway_owner == "61005"
+                && settings.gateway_group == "61006"
+                && settings.ingress_group == "61007"
     ));
 }
 

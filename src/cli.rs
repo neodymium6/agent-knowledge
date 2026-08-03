@@ -47,7 +47,7 @@ const COMMON_USAGE: &str = "usage:\n\
     agent-knowledge worker run --config <path>";
 #[cfg(target_os = "linux")]
 const LINUX_USAGE: &str = "\n\
-    agent-knowledge admin bootstrap-storage --config <path> [--runtime-directory <path>] [--worker-owner <name-or-id>] [--worker-group <name-or-id>] [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>] [--ingress-group <name-or-id>]\n\
+    agent-knowledge admin bootstrap-storage --config <path> [--runtime-directory <path>] [--worker-owner <name-or-id>] [--worker-group <name-or-id>] [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-owner <name-or-id>] [--gateway-group <name-or-id>] [--ingress-group <name-or-id>]\n\
     agent-knowledge admin migrate-v1-storage --queue-root <path> --git-directory <path> --content-root <path> [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>]";
 const DEFAULT_CLIENT_TIMEOUT_SECONDS: u64 = 300;
 const MAXIMUM_CLIENT_TIMEOUT_SECONDS: u64 = 3_600;
@@ -792,6 +792,7 @@ where
     let mut worker_group = None;
     let mut queue_owner = None;
     let mut queue_group = None;
+    let mut gateway_owner = None;
     let mut gateway_group = None;
     let mut ingress_group = None;
     while let Some(flag) = arguments.next() {
@@ -805,6 +806,7 @@ where
             Some("--worker-group") if worker_group.is_none() => worker_group = Some(value),
             Some("--queue-owner") if queue_owner.is_none() => queue_owner = Some(value),
             Some("--queue-group") if queue_group.is_none() => queue_group = Some(value),
+            Some("--gateway-owner") if gateway_owner.is_none() => gateway_owner = Some(value),
             Some("--gateway-group") if gateway_group.is_none() => gateway_group = Some(value),
             Some("--ingress-group") if ingress_group.is_none() => ingress_group = Some(value),
             _ => return Err(CliError::Usage),
@@ -818,6 +820,7 @@ where
         worker_group: worker_group.unwrap_or_else(|| "agent-knowledge".into()),
         queue_owner: queue_owner.unwrap_or_else(|| "agent-knowledge-queue".into()),
         queue_group: queue_group.unwrap_or_else(|| "agent-knowledge-queue".into()),
+        gateway_owner: gateway_owner.unwrap_or_else(|| "agent-knowledge-gateway".into()),
         gateway_group: gateway_group.unwrap_or_else(|| "agent-knowledge-gateway".into()),
         ingress_group: ingress_group.unwrap_or_else(|| "agent-knowledge-ingress".into()),
     }))

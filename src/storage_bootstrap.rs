@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
@@ -16,7 +16,7 @@ use agent_knowledge_repository::{
 };
 use agent_knowledge_worker::{WorkerConfigError, WorkerSettings};
 use nix::sys::stat::Mode;
-use nix::unistd::{Gid, Uid, fchown};
+use nix::unistd::{Gid, Uid, User, fchown, getgrouplist};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -42,6 +42,7 @@ pub(crate) struct StorageBootstrap {
     pub(crate) worker_group: OsString,
     pub(crate) queue_owner: OsString,
     pub(crate) queue_group: OsString,
+    pub(crate) gateway_owner: OsString,
     pub(crate) gateway_group: OsString,
     pub(crate) ingress_group: OsString,
 }
@@ -54,6 +55,7 @@ struct StorageIdentities {
     worker_group: Gid,
     queue_owner: Uid,
     queue_group: Gid,
+    gateway_owner: Uid,
     gateway_group: Gid,
     ingress_group: Gid,
 }
@@ -74,6 +76,7 @@ struct BootstrapMarker {
     worker_gid: u32,
     queue_uid: u32,
     queue_gid: u32,
+    gateway_uid: u32,
     gateway_gid: u32,
     ingress_gid: u32,
 }
@@ -102,12 +105,15 @@ pub(crate) fn bootstrap_storage(
         queue_owner: resolve_user(&request.queue_owner).map_err(StorageBootstrapError::Identity)?,
         queue_group: resolve_group(&request.queue_group)
             .map_err(StorageBootstrapError::Identity)?,
+        gateway_owner: resolve_user(&request.gateway_owner)
+            .map_err(StorageBootstrapError::Identity)?,
         gateway_group: resolve_group(&request.gateway_group)
             .map_err(StorageBootstrapError::Identity)?,
         ingress_group: resolve_group(&request.ingress_group)
             .map_err(StorageBootstrapError::Identity)?,
     };
     validate_service_identities(identities)?;
+    validate_system_service_memberships(identities)?;
     bootstrap_storage_with_ids(request, identities, output)
 }
 
@@ -116,7 +122,11 @@ fn bootstrap_administrative_group() -> Gid {
 }
 
 fn validate_service_identities(identities: StorageIdentities) -> Result<(), StorageBootstrapError> {
-    let service_uids = [identities.worker_owner, identities.queue_owner];
+    let service_uids = [
+        identities.worker_owner,
+        identities.queue_owner,
+        identities.gateway_owner,
+    ];
     let role_groups = [
         identities.worker_group,
         identities.queue_group,
@@ -128,7 +138,10 @@ fn validate_service_identities(identities: StorageIdentities) -> Result<(), Stor
         .enumerate()
         .any(|(index, group)| role_groups[..index].contains(group));
     if service_uids.iter().any(|uid| uid.as_raw() == 0)
-        || service_uids[0] == service_uids[1]
+        || service_uids
+            .iter()
+            .enumerate()
+            .any(|(index, uid)| service_uids[..index].contains(uid))
         || role_groups.iter().any(|group| group.as_raw() == 0)
         || duplicate_group
     {
@@ -136,6 +149,87 @@ fn validate_service_identities(identities: StorageIdentities) -> Result<(), Stor
     } else {
         Ok(())
     }
+}
+
+struct ServiceMemberships {
+    worker_primary: Gid,
+    worker_groups: Vec<Gid>,
+    queue_primary: Gid,
+    queue_groups: Vec<Gid>,
+    gateway_primary: Gid,
+    gateway_groups: Vec<Gid>,
+}
+
+fn validate_system_service_memberships(
+    identities: StorageIdentities,
+) -> Result<(), StorageBootstrapError> {
+    let (worker_primary, worker_groups) = system_user_groups(identities.worker_owner)?;
+    let (queue_primary, queue_groups) = system_user_groups(identities.queue_owner)?;
+    let (gateway_primary, gateway_groups) = system_user_groups(identities.gateway_owner)?;
+    validate_service_memberships(
+        identities,
+        &ServiceMemberships {
+            worker_primary,
+            worker_groups,
+            queue_primary,
+            queue_groups,
+            gateway_primary,
+            gateway_groups,
+        },
+    )
+}
+
+fn system_user_groups(uid: Uid) -> Result<(Gid, Vec<Gid>), StorageBootstrapError> {
+    let user = User::from_uid(uid)
+        .map_err(|_| StorageBootstrapError::ServiceIdentityLookup)?
+        .ok_or(StorageBootstrapError::ServiceIdentityLookup)?;
+    let name = CString::new(user.name).map_err(|_| StorageBootstrapError::ServiceIdentityLookup)?;
+    let groups =
+        getgrouplist(&name, user.gid).map_err(|_| StorageBootstrapError::ServiceIdentityLookup)?;
+    Ok((user.gid, groups))
+}
+
+fn validate_service_memberships(
+    identities: StorageIdentities,
+    memberships: &ServiceMemberships,
+) -> Result<(), StorageBootstrapError> {
+    let role_groups = [
+        identities.worker_group,
+        identities.queue_group,
+        identities.gateway_group,
+        identities.ingress_group,
+    ];
+    let valid = memberships.worker_primary == identities.worker_group
+        && memberships.queue_primary == identities.queue_group
+        && memberships.gateway_primary == identities.gateway_group
+        && has_exact_role_groups(
+            &memberships.worker_groups,
+            &[identities.worker_group, identities.queue_group],
+            &role_groups,
+        )
+        && has_exact_role_groups(
+            &memberships.queue_groups,
+            &[identities.queue_group],
+            &role_groups,
+        )
+        && has_exact_role_groups(
+            &memberships.gateway_groups,
+            &[identities.gateway_group, identities.ingress_group],
+            &role_groups,
+        );
+    if valid {
+        Ok(())
+    } else {
+        Err(StorageBootstrapError::UnsafeServiceMemberships)
+    }
+}
+
+fn has_exact_role_groups(actual: &[Gid], expected: &[Gid], role_groups: &[Gid]) -> bool {
+    expected.iter().all(|group| actual.contains(group))
+        && actual
+            .iter()
+            .filter(|group| role_groups.contains(group))
+            .all(|group| expected.contains(group))
 }
 
 fn bootstrap_storage_with_ids(
@@ -354,6 +448,7 @@ impl BootstrapMarker {
             worker_gid: ids.worker_group.as_raw(),
             queue_uid: ids.queue_owner.as_raw(),
             queue_gid: ids.queue_group.as_raw(),
+            gateway_uid: ids.gateway_owner.as_raw(),
             gateway_gid: ids.gateway_group.as_raw(),
             ingress_gid: ids.ingress_group.as_raw(),
         }
@@ -965,6 +1060,8 @@ pub(crate) enum StorageBootstrapError {
     Config(WorkerConfigError),
     Identity(StorageMigrationError),
     UnsafeServiceIdentities,
+    ServiceIdentityLookup,
+    UnsafeServiceMemberships,
     StorageLayout,
     StorageBusy,
     InvalidRuntimeDirectory,
@@ -993,6 +1090,12 @@ impl fmt::Display for StorageBootstrapError {
             Self::Identity(error) => write!(formatter, "invalid storage identity: {error}"),
             Self::UnsafeServiceIdentities => formatter.write_str(
                 "storage bootstrap service UIDs and role GIDs must be non-root and distinct",
+            ),
+            Self::ServiceIdentityLookup => formatter.write_str(
+                "storage bootstrap could not resolve a service account's group memberships",
+            ),
+            Self::UnsafeServiceMemberships => formatter.write_str(
+                "storage bootstrap service accounts do not match the required role-group membership matrix",
             ),
             Self::StorageLayout => formatter.write_str(
                 "storage bootstrap requires all five storage paths to be direct children of one non-root directory",

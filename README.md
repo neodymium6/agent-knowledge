@@ -198,16 +198,19 @@ agent-knowledge admin bootstrap-storage \
   --worker-group 10003 \
   --queue-owner 10002 \
   --queue-group 10002 \
+  --gateway-owner 10001 \
   --gateway-group 10001 \
   --ingress-group 10004
 ```
 
 The named identity defaults resolve to the same values in the supplied image,
 so Kubernetes manifests may omit the numeric overrides. Explicit numeric
-values make the volume ownership contract visible in a manifest. Both service
-UIDs and all four role GIDs must be non-root; the service UIDs must differ and
-the role GIDs must be pairwise distinct so an override cannot collapse the
-Worker, Queue Ingress, Gateway reader, and socket-client boundaries.
+values make the volume ownership contract visible in a manifest. All three
+service UIDs and all four role GIDs must be non-root and pairwise distinct. The
+Worker must belong only to the Worker and queue role groups, the Queue Ingress
+only to the queue role group, and the Gateway only to the Gateway-reader and
+ingress-client role groups. Bootstrap resolves primary and supplementary groups
+from the system account database before any storage mutation.
 
 `just check-package` validates all five image archives, architectures,
 deterministic timestamps, role-locked entrypoints, fixed identity metadata,

@@ -294,10 +294,14 @@ must resolve through canonical root-owned ancestry with no group- or
 world-writable component. The bootstrap process retains and repeatedly
 revalidates its locked durable-parent descriptor so pathname replacement cannot
 redirect later phases.
-Resolved Worker and Queue service UIDs must be non-root and distinct. The
+Resolved Worker, Queue Ingress, and Gateway service UIDs must be non-root and distinct. The
 Worker, queue-owner, Gateway-reader, and ingress-client role GIDs must likewise
 be non-root and pairwise distinct, preventing deployment overrides from
-collapsing the intended access sets before any filesystem mutation occurs.
+collapsing the intended access sets before any filesystem mutation occurs. The
+system account database must report exactly the intended role-group matrix:
+Worker plus queue-owner for the Worker, queue-owner for Queue Ingress, and
+Gateway-reader plus ingress-client for the Gateway. Membership in unrelated
+groups is permitted, but membership in any other storage role group is rejected.
 The bootstrap process sets umask `0077` before creating any path. Existing
 unmarked roots and children must be root-owned and not group- or world-writable,
 and every child mount is checked before ownership or mode normalization. An
