@@ -211,7 +211,8 @@ service UIDs and all four role GIDs must be non-root and pairwise distinct. The
 Worker must belong only to the Worker and queue role groups, the Queue Ingress
 only to the queue role group, and the Gateway only to the Gateway-reader and
 ingress-client role groups. Bootstrap resolves primary and supplementary groups
-from the system account database before any storage mutation.
+from the system account database before any storage mutation and rejects every
+additional membership.
 
 `just check-package` validates all five image archives, architectures,
 deterministic timestamps, role-locked entrypoints, fixed identity metadata,
@@ -241,7 +242,8 @@ sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
 sudo install -d -m 0755 -o root -g root /etc/agent-knowledge
 sudo install -m 0640 -o root -g agent-knowledge \
   ./fictional-worker.yaml /etc/agent-knowledge/worker.yaml
-# Replace this fictional name with the deployment-managed forced-command account.
+# Replace this fictional name with a dedicated account whose primary group is
+# agent-knowledge-gateway and whose only supplementary group is agent-knowledge-ingress.
 gateway_account=fictional-agent-knowledge-gateway
 sudo "$package_path/bin/agent-knowledge" admin bootstrap-storage \
   --config /etc/agent-knowledge/worker.yaml \
@@ -287,11 +289,12 @@ than repeatedly restarting an incompletely provisioned deployment.
 The packaged `agent-knowledge` and `agent-knowledge-queue` accounts are locked,
 non-login accounts for the Worker and queue ingress broker respectively. Never
 use either for OpenSSH. Create the deployment-specific SSH account according to
-the host's authentication policy and add only that account to the
-`agent-knowledge-gateway` and `agent-knowledge-ingress` groups. The first group
-can read committed repository/content storage; the second can connect to the
-local ingress socket. Neither can open the durable queue. The broker owns the
-queue but cannot open Worker-owned storage.
+the host's authentication policy with `agent-knowledge-gateway` as its primary
+group and `agent-knowledge-ingress` as its only supplementary group. The first
+group can read committed repository/content storage; the second can connect to
+the local ingress socket. Neither can open the durable queue. The broker owns
+the queue but cannot open Worker-owned storage. Bootstrap rejects any additional
+primary or supplementary membership for all three service accounts.
 The Worker receives the queue group as a supplementary group so it can perform
 state transitions without sharing either service UID. The durable storage root
 is `0751 root:agent-knowledge-queue`: the broker and Worker can open it for
@@ -324,9 +327,10 @@ sudo nix profile upgrade \
   --profile /nix/var/nix/profiles/agent-knowledge agent-knowledge
 package_path=/nix/var/nix/profiles/agent-knowledge
 sudo systemd-sysusers "$package_path/lib/sysusers.d/agent-knowledge.conf"
-# Replace this fictional name with the existing forced-command SSH account.
+# Replace this fictional name with the existing dedicated forced-command SSH account.
 gateway_account=fictional-agent-knowledge-gateway
-sudo usermod --append --groups agent-knowledge-ingress "$gateway_account"
+sudo usermod --gid agent-knowledge-gateway \
+  --groups agent-knowledge-ingress "$gateway_account"
 sudo "$package_path/bin/agent-knowledge" admin migrate-v1-storage \
   --queue-root /var/lib/agent-knowledge/queue \
   --git-directory /var/lib/agent-knowledge/repository \

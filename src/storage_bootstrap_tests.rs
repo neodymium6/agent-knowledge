@@ -156,6 +156,16 @@ fn requires_the_exact_service_role_membership_matrix() {
         Err(StorageBootstrapError::UnsafeServiceMemberships)
     ));
 
+    gateway_can_write_queue.gateway_groups = vec![
+        identities.gateway_group,
+        identities.ingress_group,
+        Gid::from_raw(10_005),
+    ];
+    assert!(matches!(
+        validate_service_memberships(identities, &gateway_can_write_queue),
+        Err(StorageBootstrapError::UnsafeServiceMemberships)
+    ));
+
     gateway_can_write_queue.gateway_groups =
         vec![identities.gateway_group, identities.ingress_group];
     gateway_can_write_queue.worker_groups = vec![identities.worker_group];

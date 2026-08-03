@@ -191,28 +191,16 @@ fn validate_service_memberships(
     identities: StorageIdentities,
     memberships: &ServiceMemberships,
 ) -> Result<(), StorageBootstrapError> {
-    let role_groups = [
-        identities.worker_group,
-        identities.queue_group,
-        identities.gateway_group,
-        identities.ingress_group,
-    ];
     let valid = memberships.worker_primary == identities.worker_group
         && memberships.queue_primary == identities.queue_group
-        && has_exact_role_groups(
+        && has_exact_groups(
             &memberships.worker_groups,
             &[identities.worker_group, identities.queue_group],
-            &role_groups,
         )
-        && has_exact_role_groups(
-            &memberships.queue_groups,
-            &[identities.queue_group],
-            &role_groups,
-        )
-        && has_exact_role_groups(
+        && has_exact_groups(&memberships.queue_groups, &[identities.queue_group])
+        && has_exact_groups(
             &memberships.gateway_groups,
             &[identities.gateway_group, identities.ingress_group],
-            &role_groups,
         );
     if valid {
         Ok(())
@@ -221,12 +209,9 @@ fn validate_service_memberships(
     }
 }
 
-fn has_exact_role_groups(actual: &[Gid], expected: &[Gid], role_groups: &[Gid]) -> bool {
+fn has_exact_groups(actual: &[Gid], expected: &[Gid]) -> bool {
     expected.iter().all(|group| actual.contains(group))
-        && actual
-            .iter()
-            .filter(|group| role_groups.contains(group))
-            .all(|group| expected.contains(group))
+        && actual.iter().all(|group| expected.contains(group))
 }
 
 fn bootstrap_storage_with_ids(
