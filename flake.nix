@@ -114,6 +114,25 @@
             install -Dm644 ${./deploy/systemd/agent-knowledge.conf.tmpfiles} \
               "$out/lib/tmpfiles.d/agent-knowledge.conf"
           '';
+      gatewayPackageFor =
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          unwrappedPackage = unwrappedPackageFor system;
+        in
+        pkgs.runCommand "agent-knowledge-gateway-${projectVersion}"
+          {
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            pname = "agent-knowledge-gateway";
+            version = projectVersion;
+            meta = unwrappedPackage.meta;
+          }
+          ''
+            mkdir -p "$out/bin"
+            makeWrapper ${unwrappedPackage}/bin/agent-knowledge \
+              "$out/bin/agent-knowledge" \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.gitMinimal ]}
+          '';
       containerRootFilesystemFor =
         system:
         let
@@ -190,6 +209,36 @@
             };
           };
         };
+      gatewayContainerImageFor =
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          package = gatewayPackageFor system;
+          rootFilesystem = containerRootFilesystemFor system;
+        in
+        pkgs.dockerTools.buildLayeredImage {
+          name = "agent-knowledge-gateway";
+          tag = projectVersion;
+          contents = [
+            package
+            rootFilesystem
+          ];
+          config = {
+            User = "agent-knowledge-gateway";
+            WorkingDir = "/var/empty";
+            Entrypoint = [
+              "${package}/bin/agent-knowledge"
+              "gateway"
+            ];
+            Env = [ "HOME=/var/empty" ];
+            StopSignal = "SIGTERM";
+            Labels = {
+              "org.opencontainers.image.title" = "Agent Knowledge Gateway";
+              "org.opencontainers.image.version" = projectVersion;
+              "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+            };
+          };
+        };
     in
     {
       devShells = forAllSystems (
@@ -220,6 +269,7 @@
 
       packages = forLinuxSystems (system: rec {
         agent-knowledge = packageFor system;
+        gateway-container-image = gatewayContainerImageFor system;
         queue-ingress-container-image = queueIngressContainerImageFor system;
         worker-container-image = workerContainerImageFor system;
         default = agent-knowledge;
@@ -304,6 +354,36 @@
                       listen \
                       /var/lib/agent-knowledge \
                       "Agent Knowledge Queue Ingress" \
+                      -
+                    touch "$out"
+              '';
+          gateway-container-image =
+            let
+              gatewayContainerImage = gatewayContainerImageFor system;
+              gatewayPackage = gatewayPackageFor system;
+            in
+            pkgs.runCommand "check-agent-knowledge-gateway-container-image"
+              {
+                nativeBuildInputs = [
+                  pkgs.gnutar
+                  pkgs.gzip
+                  pkgs.jq
+                ];
+              }
+              ''
+                ${pkgs.bash}/bin/bash ${./deploy/container/check-image.sh} \
+                      ${gatewayContainerImage} \
+                      ${containerArchitecture.${system}} \
+                      ${gatewayPackage}/bin/agent-knowledge \
+                      ${projectVersion} \
+                      ${./deploy/container/passwd} \
+                      ${./deploy/container/group} \
+                      agent-knowledge-gateway \
+                      agent-knowledge-gateway \
+                      gateway \
+                      - \
+                      /var/empty \
+                      "Agent Knowledge Gateway" \
                       -
                     touch "$out"
               '';
