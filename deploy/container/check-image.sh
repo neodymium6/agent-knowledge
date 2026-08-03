@@ -73,7 +73,7 @@ jq -e \
     .config.WorkingDir == $working_directory and
     .config.Entrypoint == (
       if $namespace == "openssh-gateway" then
-        [$entrypoint, "-D", "-e", "-f", "/etc/agent-knowledge/sshd_config"]
+        [$entrypoint, "-D", "-e", "-p", "2222", "-f", "/etc/agent-knowledge/sshd_config"]
       elif $action == "-" then
         [$entrypoint, $namespace]
       else

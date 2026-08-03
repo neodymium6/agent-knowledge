@@ -292,6 +292,8 @@
               "/bin/sshd"
               "-D"
               "-e"
+              "-p"
+              "2222"
               "-f"
               "/etc/agent-knowledge/sshd_config"
             ];

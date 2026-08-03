@@ -100,7 +100,7 @@ nix build .#openssh-gateway-container-image
 docker load < result
 ```
 
-The flake builds the image natively for both `x86_64-linux` (`amd64`) and
+The Worker image is built natively for both `x86_64-linux` (`amd64`) and
 `aarch64-linux` (`arm64`). Its entrypoint fixes the wrapped executable and
 `worker run` role; the configuration path is supplied as an argument by the
 deployment. The image resolves the non-root `agent-knowledge` account to
@@ -153,8 +153,9 @@ Podman. It also verifies the Worker's CA bundle, both Gateway variants' local
 Git dependency, and the absence of embedded deployment-specific OpenSSH
 configuration, key material, and role-inappropriate CA artifacts. The OpenSSH
 package's inert upstream default configuration remains in its closure, but the
-image entrypoint ignores it and requires the deployment-specific configuration
-at `/etc/agent-knowledge/sshd_config`. Runtime storage, configuration, secrets,
+image entrypoint ignores it, fixes the listener port to `2222`, and requires
+the deployment-specific configuration at
+`/etc/agent-knowledge/sshd_config`. Runtime storage, configuration, secrets,
 runtime socket directory, and writable paths are deployment-supplied mounts.
 
 ### systemd service

@@ -270,7 +270,7 @@ Pod. It shares the committed repository, content checkout, and queue-ingress
 socket through explicit volumes with the other role containers. Kubernetes
 manifests must assign explicit identities and supplemental groups, mount server
 configuration and keys read-only, and grant only the capabilities required by
-the OpenSSH master to bind its configured non-privileged port and drop to the
+the OpenSSH master to bind the fixed non-privileged port `2222` and drop to the
 Gateway account. Packaging the adapter does not itself define those manifests.
 
 SSH host keys, client public keys, Git credentials, and other secrets are
