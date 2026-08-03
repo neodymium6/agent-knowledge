@@ -1,0 +1,3 @@
+root:*:0:0:root:/var/empty:/sbin/nologin
+agent-knowledge-gateway:NP:10001:10001:Agent Knowledge Gateway:/var/empty:/bin/agent-knowledge-ssh-shell
+sshd:*:10005:10005:OpenSSH privilege separation:/var/empty:/sbin/nologin

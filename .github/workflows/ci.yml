@@ -43,6 +43,7 @@ jobs:
           openssh_bin=${openssh_binary%/sshd}
           sudo deploy/systemd/check-privilege-boundary.sh \
             "$PWD/target/debug/agent-knowledge" \
+            "$PWD/target/debug/agent-knowledge-ssh-shell" \
             "$PWD/deploy/systemd/agent-knowledge.conf.tmpfiles" \
             "$openssh_bin"
 

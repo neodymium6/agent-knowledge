@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 3 || $1 != /* || $2 != /* || $3 != /* || $(id -u) -ne 0 ]]; then
-  echo "usage: sudo $0 <absolute-agent-knowledge-binary> <absolute-tmpfiles-config> <absolute-openssh-bin-directory>" >&2
+if [[ $# -ne 4 || $1 != /* || $2 != /* || $3 != /* || $4 != /* || $(id -u) -ne 0 ]]; then
+  echo "usage: sudo $0 <absolute-agent-knowledge-binary> <absolute-ssh-shell-binary> <absolute-tmpfiles-config> <absolute-openssh-bin-directory>" >&2
   exit 2
 fi
 
 source_binary=$1
-tmpfiles_config=$2
-openssh_bin=$3
+source_ssh_shell=$2
+tmpfiles_config=$3
+openssh_bin=$4
 test_root=$(mktemp -d /tmp/agent-knowledge-e2e.XXXXXX)
 chmod 0711 "$test_root"
 activation_pid=
@@ -96,6 +97,7 @@ for program in ssh ssh-keygen sshd; do
 done
 
 install -m 0755 "$source_binary" "$test_root/agent-knowledge"
+install -m 0755 "$source_ssh_shell" "$test_root/agent-knowledge-ssh-shell"
 
 fresh_root=$test_root/fresh-root
 fresh_config=$test_root/fresh-tmpfiles.conf
@@ -345,7 +347,8 @@ client_group_created=true
 install -d -m 0755 -o 0 -g 0 "$test_root/gateway-home"
 install -d -m 0700 -o "$client_uid" -g "$client_gid" "$test_root/client-home"
 useradd --uid "$gateway_uid" --gid "$gateway_gid" --groups "$ingress_group" \
-  --home-dir "$test_root/gateway-home" --shell /bin/sh --password NP \
+  --home-dir "$test_root/gateway-home" \
+  --shell "$test_root/agent-knowledge-ssh-shell" --password NP \
   --no-create-home "$gateway_account"
 gateway_account_created=true
 useradd --uid "$client_uid" --gid "$client_gid" \
@@ -396,8 +399,8 @@ chown "$client_uid":"$client_gid" "$test_root/client-key" "$test_root/client-key
 client_public_key=$(<"$test_root/client-key.pub")
 install -d -m 0750 -o 0 -g "$gateway_gid" \
   "$test_root/gateway-home/.ssh"
-printf 'restrict,command="%s gateway --config %s --client-id fictional-node-a" %s\n' \
-  "$test_root/agent-knowledge" "$test_root/gateway.yaml" "$client_public_key" \
+printf 'restrict,command="akg-v1 %s fictional-node-a" %s\n' \
+  "$test_root/gateway.yaml" "$client_public_key" \
   >"$test_root/gateway-home/.ssh/authorized_keys"
 chown 0:"$gateway_gid" "$test_root/gateway-home/.ssh/authorized_keys"
 chmod 0640 "$test_root/gateway-home/.ssh/authorized_keys"

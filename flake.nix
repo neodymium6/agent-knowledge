@@ -133,6 +133,27 @@
               "$out/bin/agent-knowledge" \
               --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.gitMinimal ]}
           '';
+      opensshGatewayPackageFor =
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          unwrappedPackage = unwrappedPackageFor system;
+        in
+        pkgs.runCommand "agent-knowledge-openssh-gateway-${projectVersion}"
+          {
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            pname = "agent-knowledge-openssh-gateway";
+            version = projectVersion;
+            meta = unwrappedPackage.meta;
+          }
+          ''
+            mkdir -p "$out/bin"
+            makeWrapper ${unwrappedPackage}/bin/agent-knowledge \
+              "$out/bin/agent-knowledge" \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.gitMinimal ]}
+            install -m755 ${unwrappedPackage}/bin/agent-knowledge-ssh-shell \
+              "$out/bin/agent-knowledge-ssh-shell"
+          '';
       containerRootFilesystemFor =
         system:
         let
@@ -239,6 +260,53 @@
             };
           };
         };
+      opensshGatewayContainerImageFor =
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          package = opensshGatewayPackageFor system;
+          rootFilesystem = pkgs.runCommand "agent-knowledge-openssh-gateway-root" { } ''
+            install -d "$out/bin" "$out/etc" "$out/var/empty"
+            install -m444 ${./deploy/container/openssh-gateway-passwd} \
+              "$out/etc/passwd"
+            install -m444 ${./deploy/container/openssh-gateway-group} \
+              "$out/etc/group"
+            ln -s ${package}/bin/agent-knowledge "$out/bin/agent-knowledge"
+            ln -s ${package}/bin/agent-knowledge-ssh-shell \
+              "$out/bin/agent-knowledge-ssh-shell"
+            ln -s ${pkgs.openssh}/bin/sshd "$out/bin/sshd"
+          '';
+        in
+        pkgs.dockerTools.buildLayeredImage {
+          name = "agent-knowledge-openssh-gateway";
+          tag = projectVersion;
+          contents = [
+            package
+            pkgs.openssh
+            rootFilesystem
+          ];
+          config = {
+            User = "0";
+            WorkingDir = "/var/empty";
+            Entrypoint = [
+              "/bin/sshd"
+              "-D"
+              "-e"
+              "-f"
+              "/etc/agent-knowledge/sshd_config"
+            ];
+            Env = [ "HOME=/var/empty" ];
+            ExposedPorts = {
+              "2222/tcp" = { };
+            };
+            StopSignal = "SIGTERM";
+            Labels = {
+              "org.opencontainers.image.title" = "Agent Knowledge OpenSSH Gateway";
+              "org.opencontainers.image.version" = projectVersion;
+              "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+            };
+          };
+        };
     in
     {
       devShells = forAllSystems (
@@ -273,6 +341,7 @@
       packages = forLinuxSystems (system: rec {
         agent-knowledge = packageFor system;
         gateway-container-image = gatewayContainerImageFor system;
+        openssh-gateway-container-image = opensshGatewayContainerImageFor system;
         queue-ingress-container-image = queueIngressContainerImageFor system;
         worker-container-image = workerContainerImageFor system;
         default = agent-knowledge;
@@ -387,6 +456,35 @@
                       - \
                       /var/empty \
                       "Agent Knowledge Gateway" \
+                      -
+                    touch "$out"
+              '';
+          openssh-gateway-container-image =
+            let
+              opensshGatewayContainerImage = opensshGatewayContainerImageFor system;
+            in
+            pkgs.runCommand "check-agent-knowledge-openssh-gateway-container-image"
+              {
+                nativeBuildInputs = [
+                  pkgs.gnutar
+                  pkgs.gzip
+                  pkgs.jq
+                ];
+              }
+              ''
+                ${pkgs.bash}/bin/bash ${./deploy/container/check-image.sh} \
+                      ${opensshGatewayContainerImage} \
+                      ${containerArchitecture.${system}} \
+                      /bin/sshd \
+                      ${projectVersion} \
+                      ${./deploy/container/openssh-gateway-passwd} \
+                      ${./deploy/container/openssh-gateway-group} \
+                      agent-knowledge-openssh-gateway \
+                      0 \
+                      openssh-gateway \
+                      - \
+                      /var/empty \
+                      "Agent Knowledge OpenSSH Gateway" \
                       -
                     touch "$out"
               '';

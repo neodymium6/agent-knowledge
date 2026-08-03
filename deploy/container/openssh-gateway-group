@@ -1,0 +1,4 @@
+root:x:0:
+agent-knowledge-gateway:x:10001:
+agent-knowledge-ingress:x:10004:agent-knowledge-gateway
+sshd:x:10005:
