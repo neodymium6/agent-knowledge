@@ -21,7 +21,9 @@ packaging, a conventional systemd Worker service, and a systemd-activated local
 queue-ingress broker that isolates the forced-command Gateway from durable queue
 access under distinct service identities. Reproducible Worker, Queue Ingress,
 and one-shot Gateway container packaging is implemented; single-replica
-Kubernetes packaging remains future work.
+Kubernetes packaging remains future work. CI verifies the client and Gateway
+through a real restricted OpenSSH server with fictional ephemeral keys and
+accounts, in addition to exercising the service privilege boundary.
 
 - Rust is the implementation language.
 - OpenSSH forced commands provide the client transport and authentication
