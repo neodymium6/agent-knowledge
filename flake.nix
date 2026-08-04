@@ -542,6 +542,7 @@
               [
                 actionlint
                 cargo
+                cargo-deny
                 clippy
                 curl
                 gh
