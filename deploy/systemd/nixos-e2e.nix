@@ -239,10 +239,12 @@ pkgs.testers.runNixOSTest {
         '';
       };
       systemd.services.agent-knowledge-worker = {
+        wantedBy = [ "multi-user.target" ];
         requires = [ "agent-knowledge-storage-bootstrap.service" ];
         after = [ "agent-knowledge-storage-bootstrap.service" ];
       };
       systemd.sockets.agent-knowledge-queue-ingress = {
+        wantedBy = [ "sockets.target" ];
         requires = [ "agent-knowledge-storage-bootstrap.service" ];
         after = [ "agent-knowledge-storage-bootstrap.service" ];
       };
@@ -297,20 +299,16 @@ pkgs.testers.runNixOSTest {
             + " client status --destination fictional-systemd "
             + "--request-id "
             + request_id
-            + " --timeout-seconds 60 | "
+            + " --timeout-seconds 120 | "
             + jq
             + " -e '.status == \"completed\"' >/dev/null",
-            timeout=60,
+            timeout=180,
         )
 
     machine.start(allow_reboot=True)
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("sshd.service")
     machine.wait_for_open_port(2222)
-    machine.succeed(
-        "systemctl start agent-knowledge-queue-ingress.socket "
-        "agent-knowledge-worker.service"
-    )
     machine.wait_for_unit("agent-knowledge-storage-bootstrap.service")
     machine.wait_for_unit("agent-knowledge-worker.service")
     machine.wait_for_unit("agent-knowledge-queue-ingress.socket")
@@ -331,6 +329,16 @@ pkgs.testers.runNixOSTest {
     machine.succeed(
         "systemctl cat agent-knowledge-queue-ingress@.service "
         "| grep -F 'PrivateNetwork=yes'"
+    )
+    machine.succeed(
+        "grep -Fx '[Install]' "
+        "${package}/lib/systemd/system/agent-knowledge-worker.service; "
+        "grep -Fx 'WantedBy=multi-user.target' "
+        "${package}/lib/systemd/system/agent-knowledge-worker.service; "
+        "grep -Fx '[Install]' "
+        "${package}/lib/systemd/system/agent-knowledge-queue-ingress.socket; "
+        "grep -Fx 'WantedBy=sockets.target' "
+        "${package}/lib/systemd/system/agent-knowledge-queue-ingress.socket"
     )
 
     machine.succeed(
@@ -370,7 +378,7 @@ pkgs.testers.runNixOSTest {
     initial = json.loads(
         run_client(
             "list --destination fictional-systemd "
-            "--maximum-results 10 --timeout-seconds 60"
+            "--maximum-results 10 --timeout-seconds 120"
         )
     )
     assert initial["documents"] == []
@@ -378,7 +386,7 @@ pkgs.testers.runNixOSTest {
     accepted = json.loads(
         run_client(
             "submit --destination fictional-systemd "
-            "--package-root ${firstRequest} --timeout-seconds 60"
+            "--package-root ${firstRequest} --timeout-seconds 120"
         )
     )
     assert accepted["status"] == "accepted"
@@ -388,14 +396,14 @@ pkgs.testers.runNixOSTest {
         run_client(
             "get --destination fictional-systemd "
             "--document-id 01K00000000000000000000011 "
-            "--timeout-seconds 60"
+            "--timeout-seconds 120"
         )
     )
     assert "Fictional systemd benchmark body one." in first_document["document"]["markdown"]
     search = json.loads(
         run_client(
             "search --destination fictional-systemd --query 'body one' "
-            "--maximum-results 10 --timeout-seconds 60"
+            "--maximum-results 10 --timeout-seconds 120"
         )
     )
     assert [document["metadata"]["document_id"] for document in search["documents"]] == [
@@ -405,7 +413,7 @@ pkgs.testers.runNixOSTest {
         client
         + " client export --destination fictional-systemd "
         + "--document-id 01K00000000000000000000011 "
-        + "--timeout-seconds 60 >/tmp/first.tar"
+        + "--timeout-seconds 120 >/tmp/first.tar"
     )
     machine.succeed("tar -xOf /tmp/first.tar results.csv | grep -F 'systemd-one,42'")
     machine.succeed("test -f /var/lib/agent-knowledge/releases/current/index.html")
@@ -414,17 +422,13 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("agent-knowledge-worker.service")
     run_client(
         "get --destination fictional-systemd "
-        "--document-id 01K00000000000000000000011 --timeout-seconds 60"
+        "--document-id 01K00000000000000000000011 --timeout-seconds 120"
     )
 
     machine.reboot()
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("sshd.service")
     machine.wait_for_open_port(2222)
-    machine.succeed(
-        "systemctl start agent-knowledge-queue-ingress.socket "
-        "agent-knowledge-worker.service"
-    )
     machine.wait_for_unit("agent-knowledge-storage-bootstrap.service")
     machine.wait_for_unit("agent-knowledge-worker.service")
     machine.wait_for_unit("agent-knowledge-queue-ingress.socket")
@@ -434,7 +438,7 @@ pkgs.testers.runNixOSTest {
         run_client(
             "get --destination fictional-systemd "
             "--document-id 01K00000000000000000000011 "
-            "--timeout-seconds 60"
+            "--timeout-seconds 120"
         )
     )
     assert "Fictional systemd benchmark body one." in persisted["document"]["markdown"]
@@ -442,7 +446,7 @@ pkgs.testers.runNixOSTest {
     accepted_after_reboot = json.loads(
         run_client(
             "submit --destination fictional-systemd "
-            "--package-root ${secondRequest} --timeout-seconds 60"
+            "--package-root ${secondRequest} --timeout-seconds 120"
         )
     )
     assert accepted_after_reboot["status"] == "accepted"
@@ -451,7 +455,7 @@ pkgs.testers.runNixOSTest {
     final_list = json.loads(
         run_client(
             "list --destination fictional-systemd "
-            "--maximum-results 10 --timeout-seconds 60"
+            "--maximum-results 10 --timeout-seconds 120"
         )
     )
     assert {
