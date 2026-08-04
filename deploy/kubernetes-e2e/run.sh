@@ -73,6 +73,28 @@ run_client() {
   HOME="$temporary_directory/client-home" "$client_program" "$@"
 }
 
+configure_client_ssh() {
+  mkdir -p "$temporary_directory/client-home/.ssh"
+  chmod 0700 "$temporary_directory/client-home/.ssh"
+  read -r host_key_type host_key_data _comment <"$temporary_directory/host-key.pub"
+  printf '[127.0.0.1]:%s %s %s\n' \
+    "$LOCAL_SSH_PORT" "$host_key_type" "$host_key_data" \
+    >"$temporary_directory/client-home/.ssh/known_hosts"
+  cat >"$temporary_directory/client-home/.ssh/config" <<EOF
+Host agent-knowledge-e2e
+  HostName 127.0.0.1
+  Port $LOCAL_SSH_PORT
+  User agent-knowledge-gateway
+  IdentityFile $temporary_directory/client-key
+  IdentitiesOnly yes
+  StrictHostKeyChecking yes
+  UserKnownHostsFile $temporary_directory/client-home/.ssh/known_hosts
+  LogLevel ERROR
+EOF
+  chmod 0600 "$temporary_directory/client-home/.ssh/config" \
+    "$temporary_directory/client-home/.ssh/known_hosts"
+}
+
 start_port_forward() {
   if [ -n "$port_forward_pid" ]; then
     kill "$port_forward_pid" 2>/dev/null || true
@@ -88,6 +110,7 @@ start_port_forward() {
       's/^Forwarding from 127\.0\.0\.1:\([0-9][0-9]*\) -> 2222$/\1/p' \
       "$temporary_directory/port-forward.log" | head -n 1)
     if [ -n "$LOCAL_SSH_PORT" ]; then
+      configure_client_ssh
       return 0
     fi
     if ! kill -0 "$port_forward_pid" 2>/dev/null; then
@@ -183,25 +206,7 @@ kubectl rollout status statefulset/agent-knowledge -n "$NAMESPACE" --timeout=300
 kubectl get node "$CLUSTER_NAME-control-plane" -o json \
   | jq -e '.status.features.supplementalGroupsPolicy == true' >/dev/null
 
-mkdir -p "$temporary_directory/client-home/.ssh"
-chmod 0700 "$temporary_directory/client-home/.ssh"
 start_port_forward
-read -r host_key_type host_key_data _comment <"$temporary_directory/host-key.pub"
-printf '[127.0.0.1]:%s %s %s\n' "$LOCAL_SSH_PORT" "$host_key_type" "$host_key_data" \
-  >"$temporary_directory/client-home/.ssh/known_hosts"
-cat >"$temporary_directory/client-home/.ssh/config" <<EOF
-Host agent-knowledge-e2e
-  HostName 127.0.0.1
-  Port $LOCAL_SSH_PORT
-  User agent-knowledge-gateway
-  IdentityFile $temporary_directory/client-key
-  IdentitiesOnly yes
-  StrictHostKeyChecking yes
-  UserKnownHostsFile $temporary_directory/client-home/.ssh/known_hosts
-  LogLevel ERROR
-EOF
-chmod 0600 "$temporary_directory/client-home/.ssh/config" \
-  "$temporary_directory/client-home/.ssh/known_hosts"
 
 run_client client list --destination agent-knowledge-e2e \
   --maximum-results 10 --timeout-seconds 10 \

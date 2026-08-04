@@ -97,6 +97,7 @@ grep -F 'kubectl wait --for=create pod/agent-knowledge-0' \
 grep -F 'service/agent-knowledge-ssh' "$e2e_directory/run.sh" >/dev/null
 grep -F ':2222 >"$temporary_directory/port-forward.log"' \
   "$e2e_directory/run.sh" >/dev/null
+grep -F 'configure_client_ssh' "$e2e_directory/run.sh" >/dev/null
 test "$(grep -c '@sha256:' "$e2e_directory/deploy-csi.sh")" -eq 8
 if grep -Eq 'curl|wget|https?://' "$e2e_directory/deploy-csi.sh"; then
   echo "CSI deployment must not download runtime resources" >&2
