@@ -54,7 +54,10 @@ cleanup() {
         sed 's/^/  /' "$log" >&2
       fi
     done
-    for diagnostic in "$test_root"/submit-*.json "$test_root"/status-*.json; do
+    for diagnostic in \
+      "$test_root"/submit-*.json \
+      "$test_root"/status-*.json \
+      "$test_root"/unsafe-bootstrap.log; do
       if [[ -s $diagnostic ]]; then
         echo "$(basename "$diagnostic"):" >&2
         sed 's/^/  /' "$diagnostic" >&2
@@ -289,7 +292,9 @@ if "$binary" admin bootstrap-storage \
   echo "normal bootstrap accepted copied storage without explicit rebinding" >&2
   exit 1
 fi
-grep -Fq 'queue validation failed' "$test_root/unsafe-bootstrap.log"
+grep -Eq \
+  '^(queue validation failed: durable queue instance identity is invalid|repository binding validation failed: repository is bound to a different writer configuration|release validation failed: release storage binding changed)$' \
+  "$test_root/unsafe-bootstrap.log"
 
 "$binary" admin rebind-restored-storage \
   --config "$config" \
