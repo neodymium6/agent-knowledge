@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 if [[ $# -ne 1 || $1 != /* || $(id -u) -ne 0 ]]; then
   echo "usage: sudo $0 <absolute-agent-knowledge-binary>" >&2
@@ -13,6 +13,17 @@ runtime_root=/run/$(basename "$storage_root")
 worker_pid=
 created_accounts=()
 created_groups=()
+
+report_error() {
+  local status=$?
+  local line=$1
+  local command=$2
+  trap - ERR
+  printf 'recovery E2E failed at line %s: %s (exit %s)\n' \
+    "$line" "$command" "$status" >&2
+  exit "$status"
+}
+trap 'report_error "$LINENO" "$BASH_COMMAND"' ERR
 
 gateway_account=fictional-ak-recovery-gateway
 queue_account=fictional-ak-recovery-queue
@@ -41,6 +52,12 @@ cleanup() {
       if [[ -s $log ]]; then
         echo "$(basename "$log"):" >&2
         sed 's/^/  /' "$log" >&2
+      fi
+    done
+    for diagnostic in "$test_root"/submit-*.json "$test_root"/status-*.json; do
+      if [[ -s $diagnostic ]]; then
+        echo "$(basename "$diagnostic"):" >&2
+        sed 's/^/  /' "$diagnostic" >&2
       fi
     done
   fi
