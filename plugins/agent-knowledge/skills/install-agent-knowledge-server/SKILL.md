@@ -144,8 +144,15 @@ Do not apply the base directly.
 ## Verify and report
 
 - Confirm the queue socket and Worker are healthy and remain distinct users.
-- Run the profiled `agent-knowledge admin status` against the installed Worker
-  config.
+- On systemd, run the profiled `agent-knowledge admin status` against the
+  installed Worker config. On Kubernetes, run the same read-only check in the
+  Worker container through its exact running executable and mounted config:
+
+  ```sh
+  kubectl exec agent-knowledge-0 -c worker -- \
+    /proc/1/exe admin status --config /etc/agent-knowledge/worker.yaml
+  ```
+
 - Test one restricted SSH client destination with `recent`; arbitrary shell
   access must fail.
 - Confirm a test request reaches `completed`, creates a Git commit, and leaves

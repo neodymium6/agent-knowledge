@@ -115,13 +115,15 @@ codex plugin add agent-knowledge@agent-knowledge
 
 Replace the fictional SHA with a release commit that contains the plugin. A
 semantic tag selects a version but is not itself an immutable pin.
+Release `v0.1.0` predates the plugin; use these commands only after a later
+release includes it.
 
 ## Linux systemd deployment
 
 The Nix package contains hardened Worker and socket-activated Queue Ingress
 units plus `sysusers.d` and `tmpfiles.d` definitions. A normal deployment:
 
-1. installs the tagged package into a stable system profile;
+1. installs the release's exact commit into a stable system profile;
 2. creates the packaged Worker and Queue Ingress accounts;
 3. provisions one dedicated forced-command Gateway account;
 4. installs root-controlled Worker and Gateway configuration;
