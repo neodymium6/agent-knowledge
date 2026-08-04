@@ -1,0 +1,4 @@
+interface:
+  display_name: "Install Agent Knowledge Server"
+  short_description: "Install the server on systemd or Kubernetes"
+  default_prompt: "Use $install-agent-knowledge-server to plan and install a pinned Agent Knowledge server deployment."

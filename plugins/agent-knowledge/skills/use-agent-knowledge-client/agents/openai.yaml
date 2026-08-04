@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use Agent Knowledge Client"
+  short_description: "Read and write knowledge through the SSH client"
+  default_prompt: "Use $use-agent-knowledge-client to read relevant knowledge and record durable results for this task."

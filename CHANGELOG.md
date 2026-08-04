@@ -4,6 +4,9 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add a Codex skills-only plugin for server installation, client installation,
+  and client read/write workflows.
+
 ## 0.1.0
 
 Initial release of the durable SSH gateway, queue ingress, single repository

@@ -101,12 +101,29 @@ and forwarding and enforces bounded request, response, and transfer sizes.
 Request packages contain `request.json` and a `payload/` tree. Their exact
 format and path rules are defined in [DESIGN.md](DESIGN.md#14-change-requests).
 
+Server installation, client installation, and client usage skills are bundled
+in the skills-only plugin at
+[`plugins/agent-knowledge/`](plugins/agent-knowledge/). Resolve the desired
+release tag to its exact approved commit, then install that immutable Git
+revision through the repository marketplace:
+
+```sh
+codex plugin marketplace add neodymium6/agent-knowledge \
+  --ref 0123456789abcdef0123456789abcdef01234567
+codex plugin add agent-knowledge@agent-knowledge
+```
+
+Replace the fictional SHA with a release commit that contains the plugin. A
+semantic tag selects a version but is not itself an immutable pin.
+Release `v0.1.0` predates the plugin; use these commands only after a later
+release includes it.
+
 ## Linux systemd deployment
 
 The Nix package contains hardened Worker and socket-activated Queue Ingress
 units plus `sysusers.d` and `tmpfiles.d` definitions. A normal deployment:
 
-1. installs the tagged package into a stable system profile;
+1. installs the release's exact commit into a stable system profile;
 2. creates the packaged Worker and Queue Ingress accounts;
 3. provisions one dedicated forced-command Gateway account;
 4. installs root-controlled Worker and Gateway configuration;

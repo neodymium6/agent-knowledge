@@ -1,0 +1,34 @@
+{
+  "name": "agent-knowledge",
+  "version": "0.1.0",
+  "description": "Install and use Agent Knowledge from coding-agent nodes.",
+  "author": {
+    "name": "neodymium6",
+    "url": "https://github.com/neodymium6"
+  },
+  "homepage": "https://github.com/neodymium6/agent-knowledge",
+  "repository": "https://github.com/neodymium6/agent-knowledge",
+  "license": "Apache-2.0",
+  "keywords": [
+    "coding-agents",
+    "knowledge-management",
+    "ssh"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Knowledge",
+    "shortDescription": "Install and use Agent Knowledge securely.",
+    "longDescription": "Install an Agent Knowledge server or client, then read and write centralized coding-agent knowledge through its restricted SSH interface.",
+    "developerName": "neodymium6",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Install an Agent Knowledge server.",
+      "Install and configure an Agent Knowledge client.",
+      "Use Agent Knowledge to find and record work."
+    ]
+  }
+}

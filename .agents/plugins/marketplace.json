@@ -1,0 +1,20 @@
+{
+  "name": "agent-knowledge",
+  "interface": {
+    "displayName": "Agent Knowledge"
+  },
+  "plugins": [
+    {
+      "name": "agent-knowledge",
+      "source": {
+        "source": "local",
+        "path": "./plugins/agent-knowledge"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
