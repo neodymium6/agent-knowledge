@@ -17,7 +17,7 @@ flake for `x86_64-linux` and `aarch64-linux`:
 
 ```sh
 nix profile install \
-  github:neodymium6/agent-knowledge/v0.1.0#agent-knowledge
+  github:neodymium6/agent-knowledge/v0.1.1#agent-knowledge
 agent-knowledge --version
 ```
 
@@ -29,11 +29,11 @@ archive for `x86_64-unknown-linux-musl` or
 Server containers are published to GHCR for `linux/amd64` and `linux/arm64`:
 
 ```text
-ghcr.io/neodymium6/agent-knowledge-worker:0.1.0
-ghcr.io/neodymium6/agent-knowledge-queue-ingress:0.1.0
-ghcr.io/neodymium6/agent-knowledge-gateway:0.1.0
-ghcr.io/neodymium6/agent-knowledge-openssh-gateway:0.1.0
-ghcr.io/neodymium6/agent-knowledge-storage-bootstrap:0.1.0
+ghcr.io/neodymium6/agent-knowledge-worker:0.1.1
+ghcr.io/neodymium6/agent-knowledge-queue-ingress:0.1.1
+ghcr.io/neodymium6/agent-knowledge-gateway:0.1.1
+ghcr.io/neodymium6/agent-knowledge-openssh-gateway:0.1.1
+ghcr.io/neodymium6/agent-knowledge-storage-bootstrap:0.1.1
 ```
 
 Images contain no deployment configuration, SSH keys, Git credentials, or
@@ -115,8 +115,7 @@ codex plugin add agent-knowledge@agent-knowledge
 
 Replace the fictional SHA with a release commit that contains the plugin. A
 semantic tag selects a version but is not itself an immutable pin.
-Release `v0.1.0` predates the plugin; use these commands only after a later
-release includes it.
+The plugin is included from release `v0.1.1`.
 
 ## Linux systemd deployment
 
