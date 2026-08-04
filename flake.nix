@@ -495,6 +495,10 @@
         kubernetes-e2e-quartz-container-image = kubernetesE2eQuartzContainerImageFor system;
         storage-bootstrap-container-image = storageBootstrapContainerImageFor system;
         queue-ingress-container-image = queueIngressContainerImageFor system;
+        systemd-e2e = import ./deploy/systemd/nixos-e2e.nix {
+          pkgs = pkgsFor.${system};
+          package = agent-knowledge;
+        };
         worker-container-image = workerContainerImageFor system;
         default = agent-knowledge;
       });
