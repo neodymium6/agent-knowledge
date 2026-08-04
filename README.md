@@ -386,6 +386,7 @@ sudo useradd --system \
   --gid agent-knowledge-gateway \
   --groups agent-knowledge-ingress \
   --home-dir /var/empty \
+  --password NP \
   --shell "$package_path/bin/agent-knowledge-ssh-shell" \
   "$gateway_account"
 sudo "$package_path/bin/agent-knowledge" admin bootstrap-storage \
@@ -405,6 +406,10 @@ sudo systemctl link \
 Sites with centrally managed accounts replace the `useradd` step with their
 provisioning mechanism, preserving the same dedicated primary group, sole
 supplementary group, and restricted login shell.
+
+The `NP` password sentinel keeps OpenSSH public-key authentication available
+without assigning a usable password. Keep password authentication disabled for
+this account and require a forced command on every authorized key.
 
 The `/etc/tmpfiles.d` link points through the stable system profile, so boot
 recreates the volatile runtime directory and profile upgrades select the new
