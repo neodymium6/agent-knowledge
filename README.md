@@ -101,6 +101,18 @@ and forwarding and enforces bounded request, response, and transfer sizes.
 Request packages contain `request.json` and a `payload/` tree. Their exact
 format and path rules are defined in [DESIGN.md](DESIGN.md#14-change-requests).
 
+Server installation, client installation, and client usage skills are bundled
+in the skills-only plugin at
+[`plugins/agent-knowledge/`](plugins/agent-knowledge/). Install a tagged version
+through the repository marketplace:
+
+```sh
+codex plugin marketplace add neodymium6/agent-knowledge --ref vX.Y.Z
+codex plugin add agent-knowledge@agent-knowledge
+```
+
+Replace `vX.Y.Z` with a release tag that contains the plugin.
+
 ## Linux systemd deployment
 
 The Nix package contains hardened Worker and socket-activated Queue Ingress

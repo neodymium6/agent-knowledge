@@ -1,0 +1,4 @@
+interface:
+  display_name: "Install Agent Knowledge Client"
+  short_description: "Install the client and configure restricted SSH"
+  default_prompt: "Use $install-agent-knowledge-client to install the client, configure its SSH destination, and verify connectivity."
