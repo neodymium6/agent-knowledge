@@ -1862,7 +1862,9 @@ The implementation requires:
 - protocol compatibility fixtures; and
 - end-to-end tests through a restricted OpenSSH configuration and the dedicated
   login-shell adapter with ephemeral fictional accounts, host keys, and client
-  keys on Linux (implemented).
+  keys on Linux (implemented); and
+- a disposable Kubernetes cluster test covering CSI-backed startup, SSH
+  submission and committed reads, and Pod-restart persistence (implemented).
 
 Tests and examples use clearly fictional identities and infrastructure values.
 
