@@ -48,6 +48,10 @@ test-kubernetes-e2e:
 test-quartz-e2e quartz_root:
   bash deploy/quartz-e2e/check.sh "{{quartz_root}}"
 
+# Exercise a full cold backup, offline restore, and Worker restart.
+test-recovery-e2e:
+  package_path="$(nix build .#agent-knowledge --no-link --print-out-paths)" && sudo deploy/recovery-e2e/check.sh "$package_path/bin/agent-knowledge"
+
 # Update pinned development-environment inputs.
 update:
   nix flake update
