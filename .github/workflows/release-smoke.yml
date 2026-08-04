@@ -1,0 +1,301 @@
+name: Release smoke
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published semantic release tag to verify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-smoke-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CODEX_CLI_VERSION: "0.146.0"
+  REGISTRY: ghcr.io
+  REGISTRY_NAMESPACE: neodymium6
+
+jobs:
+  resolve:
+    name: Resolve published release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Validate release identity
+        id: release
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must use the form vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+
+          version=${RELEASE_TAG#v}
+          release_commit=$(git rev-parse "$RELEASE_TAG^{commit}")
+          if ! git merge-base --is-ancestor \
+            "$release_commit" refs/remotes/origin/main; then
+            echo "release tag must point to a commit on main" >&2
+            exit 1
+          fi
+
+          workspace_version=$(cargo metadata \
+            --locked --no-deps --format-version 1 \
+            | jq -er '.packages[] | select(.name == "agent-knowledge") | .version')
+          plugin_version=$(jq -er '.version' \
+            plugins/agent-knowledge/.codex-plugin/plugin.json)
+          if [[ "$workspace_version" != "$version" ]]; then
+            echo "workspace version does not match release tag" >&2
+            exit 1
+          fi
+          if [[ "$plugin_version" != "$version" ]]; then
+            echo "plugin version does not match release tag" >&2
+            exit 1
+          fi
+
+          release_json=$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,tagName)
+          jq -e --arg tag "$RELEASE_TAG" \
+            '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not)' \
+            <<<"$release_json" >/dev/null
+
+          {
+            printf 'commit=%s\n' "$release_commit"
+            printf 'tag=%s\n' "$RELEASE_TAG"
+            printf 'version=%s\n' "$version"
+          } >>"$GITHUB_OUTPUT"
+
+  plugin:
+    name: Codex plugin
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+
+    steps:
+      - name: Install pinned Codex CLI
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-smoke
+        run: |
+          npm install --global "@openai/codex@$CODEX_CLI_VERSION"
+          codex --version
+
+      - name: Install plugin from the immutable release commit
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-smoke
+        run: |
+          install -d -m 0700 "$CODEX_HOME"
+          marketplace_json=$(codex plugin marketplace add \
+            "$GITHUB_REPOSITORY" --ref "$RELEASE_COMMIT" --json)
+          marketplace_root=$(jq -er '.installedRoot' <<<"$marketplace_json")
+          if [[ $(git -C "$marketplace_root" rev-parse HEAD) != "$RELEASE_COMMIT" ]]; then
+            echo "marketplace checkout does not match the release commit" >&2
+            exit 1
+          fi
+
+          available_json=$(codex plugin list \
+            --marketplace agent-knowledge --available --json)
+          jq -e --arg version "$VERSION" \
+            '(.available | length) == 1 and
+             .available[0].pluginId == "agent-knowledge@agent-knowledge" and
+             .available[0].version == $version and
+             .available[0].installed == false and
+             .available[0].enabled == false and
+             .available[0].installPolicy == "AVAILABLE" and
+             .available[0].authPolicy == "ON_INSTALL"' \
+            <<<"$available_json" >/dev/null
+
+          installed_json=$(codex plugin add \
+            agent-knowledge@agent-knowledge --json)
+          plugin_root=$(jq -er --arg version "$VERSION" \
+            'select(.version == $version) | .installedPath' \
+            <<<"$installed_json")
+
+          for skill in \
+            install-agent-knowledge-server \
+            install-agent-knowledge-client \
+            use-agent-knowledge-client; do
+            test -f "$plugin_root/skills/$skill/SKILL.md"
+            test -f "$plugin_root/skills/$skill/agents/openai.yaml"
+          done
+
+          codex plugin list --json | jq -e --arg version "$VERSION" \
+            '(.installed | length) == 1 and
+             .installed[0].pluginId == "agent-knowledge@agent-knowledge" and
+             .installed[0].version == $version and
+             .installed[0].installed == true and
+             .installed[0].enabled == true and
+             .installed[0].installPolicy == "AVAILABLE" and
+             .installed[0].authPolicy == "ON_INSTALL" and
+             .available == []' >/dev/null
+
+  client:
+    name: Client (${{ matrix.system }})
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      attestations: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            machine: Advanced Micro Devices X86-64
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            machine: AArch64
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+
+    steps:
+      - name: Download public release assets
+        id: assets
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          release_dir=$(mktemp -d "$RUNNER_TEMP/client-smoke.XXXXXX")
+          archive="agent-knowledge-client-v$VERSION-$TARGET.tar.gz"
+          release_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
+          curl --fail --silent --show-error --location \
+            --output "$release_dir/$archive" "$release_url/$archive"
+          curl --fail --silent --show-error --location \
+            --output "$release_dir/SHA256SUMS" "$release_url/SHA256SUMS"
+          {
+            printf 'archive=%s\n' "$archive"
+            printf 'directory=%s\n' "$release_dir"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Verify checksums and attestations
+        env:
+          ARCHIVE: ${{ steps.assets.outputs.archive }}
+          RELEASE_DIR: ${{ steps.assets.outputs.directory }}
+        run: |
+          cd "$RELEASE_DIR"
+          sha256sum -c SHA256SUMS --ignore-missing
+          gh attestation verify "$ARCHIVE" --repo "$GITHUB_REPOSITORY"
+          if [[ "${{ matrix.system }}" == x86_64-linux ]]; then
+            gh attestation verify SHA256SUMS --repo "$GITHUB_REPOSITORY"
+          fi
+
+      - name: Inspect and run client
+        env:
+          ARCHIVE: ${{ steps.assets.outputs.archive }}
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+          RELEASE_DIR: ${{ steps.assets.outputs.directory }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd "$RELEASE_DIR"
+          archive_root="agent-knowledge-client-v$VERSION-$TARGET"
+          mapfile -t actual < <(tar -tzf "$ARCHIVE" | sort)
+          mapfile -t expected < <(printf '%s\n' \
+            "$archive_root/" \
+            "$archive_root/LICENSE" \
+            "$archive_root/README.md" \
+            "$archive_root/agent-knowledge-client" | sort)
+          if [[ "${actual[*]}" != "${expected[*]}" ]]; then
+            echo "unexpected client archive contents" >&2
+            exit 1
+          fi
+          while IFS= read -r entry_type; do
+            case "$entry_type" in
+              -|d) ;;
+              *) echo "client archive contains a link or special file" >&2; exit 1 ;;
+            esac
+          done < <(tar -tvzf "$ARCHIVE" | cut -c1)
+
+          tar -xzf "$ARCHIVE"
+          binary="$RELEASE_DIR/$archive_root/agent-knowledge-client"
+          file "$binary" | grep -F 'static-pie linked'
+          readelf -h "$binary" | grep -F "Machine:" | grep -F "$EXPECTED_MACHINE"
+          if readelf -l "$binary" | grep -Eq 'INTERP|Requesting program interpreter'; then
+            echo "client binary has a dynamic program interpreter" >&2
+            exit 1
+          fi
+          if [[ $("$binary" --version) != "agent-knowledge-client $VERSION" ]]; then
+            echo "client binary reports an unexpected version" >&2
+            exit 1
+          fi
+
+  distribution:
+    name: Nix and GHCR distribution
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+
+    steps:
+      - name: Inspect public multi-architecture images
+        run: |
+          images=(
+            agent-knowledge-worker
+            agent-knowledge-queue-ingress
+            agent-knowledge-gateway
+            agent-knowledge-openssh-gateway
+            agent-knowledge-storage-bootstrap
+          )
+
+          for image in "${images[@]}"; do
+            registry_token=$(curl --fail --silent --show-error --location \
+              "https://$REGISTRY/token?scope=repository:$REGISTRY_NAMESPACE/$image:pull" \
+              | jq -er .token)
+            manifest=$(mktemp)
+            curl --fail --silent --show-error --location \
+              --header "Authorization: Bearer $registry_token" \
+              --header 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://$REGISTRY/v2/$REGISTRY_NAMESPACE/$image/manifests/$VERSION" \
+              >"$manifest"
+            jq -e \
+              '([.manifests[].platform.architecture] | sort) == ["amd64", "arm64"] and
+               ([.manifests[].platform.os] | unique) == ["linux"]' \
+              "$manifest" >/dev/null
+          done
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
+
+      - name: Build and run public Nix package
+        run: |
+          flake="github:$GITHUB_REPOSITORY/$RELEASE_TAG"
+          nix flake metadata --json "$flake" | jq -e \
+            --arg commit "$RELEASE_COMMIT" '.revision == $commit' >/dev/null
+          package=$(nix build "$flake#agent-knowledge" \
+            --no-link --print-out-paths)
+          if [[ $("$package/bin/agent-knowledge" --version) != \
+            "agent-knowledge $VERSION" ]]; then
+            echo "Nix package reports an unexpected version" >&2
+            exit 1
+          fi
