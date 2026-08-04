@@ -238,6 +238,9 @@ server images, verifies checksums and both architectures, publishes versioned
 GHCR manifests, and prepares a draft GitHub Release. The draft is published
 only after every tag check succeeds.
 
+New GHCR packages start private. Set each package to public once before
+publishing the first release; subsequent versioned images retain that setting.
+
 Pre-1.0 releases may change command and configuration interfaces. Durable
 format changes remain explicit and fail closed; release notes identify any
 required migration. Downgrades are unsupported unless a release says

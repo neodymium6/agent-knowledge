@@ -1,0 +1,280 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  REGISTRY_NAMESPACE: neodymium6
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
+
+      - name: Validate tag, version, and ancestry
+        id: release
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must use the form vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+
+          version=$(nix eval --raw .#packages.x86_64-linux.agent-knowledge.version)
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match workspace version $version" >&2
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "release tag must point to a commit on main" >&2
+            exit 1
+          fi
+
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+
+      - name: Run release checks
+        run: |
+          nix develop --command just check-code
+          nix develop --command just audit
+
+  build:
+    name: Build and push (${{ matrix.system }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+            architecture: amd64
+            rust-target: x86_64-unknown-linux-musl
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+            architecture: arm64
+            rust-target: aarch64-unknown-linux-musl
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
+
+      - name: Build client archive
+        run: |
+          archive=$(nix build .#client-release-archive --no-link --print-out-paths)
+          mkdir -p dist
+          cp "$archive" \
+            "dist/agent-knowledge-client-v$VERSION-${{ matrix.rust-target }}.tar.gz"
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login "$REGISTRY" \
+            --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and push architecture images
+        run: |
+          while read -r attribute image; do
+            archive=$(nix build ".#$attribute" --no-link --print-out-paths)
+            docker load --input "$archive"
+
+            source="$image:$VERSION"
+            destination="$REGISTRY/$REGISTRY_NAMESPACE/$image:$VERSION-${{ matrix.architecture }}"
+            docker tag "$source" "$destination"
+            docker push "$destination"
+          done <<'IMAGES'
+          worker-container-image agent-knowledge-worker
+          queue-ingress-container-image agent-knowledge-queue-ingress
+          gateway-container-image agent-knowledge-gateway
+          openssh-gateway-container-image agent-knowledge-openssh-gateway
+          storage-bootstrap-container-image agent-knowledge-storage-bootstrap
+          IMAGES
+
+      - name: Upload client archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: client-${{ matrix.architecture }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publish draft release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+      packages: write
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+
+    steps:
+      - name: Download client archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: client-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify archives and create checksums
+        run: |
+          expected=(
+            "agent-knowledge-client-v$VERSION-x86_64-unknown-linux-musl.tar.gz"
+            "agent-knowledge-client-v$VERSION-aarch64-unknown-linux-musl.tar.gz"
+          )
+
+          for archive in "${expected[@]}"; do
+            test -f "dist/$archive"
+          done
+
+          mapfile -t actual < <(find dist -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n' | sort)
+          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | sort)
+          if [[ "${actual[*]}" != "${wanted[*]}" ]]; then
+            echo "unexpected client archive set" >&2
+            printf 'expected: %s\n' "${wanted[*]}" >&2
+            printf 'actual: %s\n' "${actual[*]}" >&2
+            exit 1
+          fi
+
+          cd dist
+          sha256sum "${wanted[@]}" >SHA256SUMS
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login "$REGISTRY" \
+            --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Publish and verify multi-architecture manifests
+        id: manifests
+        run: |
+          images=(
+            agent-knowledge-worker
+            agent-knowledge-queue-ingress
+            agent-knowledge-gateway
+            agent-knowledge-openssh-gateway
+            agent-knowledge-storage-bootstrap
+          )
+
+          for image in "${images[@]}"; do
+            repository="$REGISTRY/$REGISTRY_NAMESPACE/$image"
+            docker buildx imagetools create \
+              --tag "$repository:$VERSION" \
+              "$repository:$VERSION-amd64" \
+              "$repository:$VERSION-arm64"
+
+            raw_manifest=$(mktemp)
+            docker buildx imagetools inspect \
+              "$repository:$VERSION" --raw >"$raw_manifest"
+            jq -e \
+              '([.manifests[].platform.architecture] | sort) == ["amd64", "arm64"] and
+               ([.manifests[].platform.os] | unique) == ["linux"]' \
+              "$raw_manifest" >/dev/null
+
+            digest="sha256:$(sha256sum "$raw_manifest" | cut -d ' ' -f1)"
+            output=${image#agent-knowledge-}
+            output=${output//-/_}
+            printf '%s_digest=%s\n' "$output" "$digest" >>"$GITHUB_OUTPUT"
+          done
+
+      - name: Attest client archives
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Attest checksum file
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: dist/SHA256SUMS
+
+      - name: Attest Worker image
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ghcr.io/neodymium6/agent-knowledge-worker
+          subject-digest: ${{ steps.manifests.outputs.worker_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest Queue Ingress image
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ghcr.io/neodymium6/agent-knowledge-queue-ingress
+          subject-digest: ${{ steps.manifests.outputs.queue_ingress_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest Gateway image
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ghcr.io/neodymium6/agent-knowledge-gateway
+          subject-digest: ${{ steps.manifests.outputs.gateway_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest OpenSSH Gateway image
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ghcr.io/neodymium6/agent-knowledge-openssh-gateway
+          subject-digest: ${{ steps.manifests.outputs.openssh_gateway_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest Storage Bootstrap image
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ghcr.io/neodymium6/agent-knowledge-storage-bootstrap
+          subject-digest: ${{ steps.manifests.outputs.storage_bootstrap_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --generate-notes \
+            --title "Agent Knowledge $VERSION" \
+            --verify-tag
