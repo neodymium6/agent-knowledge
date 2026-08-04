@@ -43,6 +43,78 @@
         x86_64-linux = "amd64";
         aarch64-linux = "arm64";
       };
+      clientRustTarget = {
+        x86_64-linux = "x86_64-unknown-linux-musl";
+        aarch64-linux = "aarch64-unknown-linux-musl";
+      };
+      staticClientPackageFor =
+        system:
+        let
+          pkgs = pkgsFor.${system};
+        in
+        pkgs.pkgsStatic.rustPlatform.buildRustPackage {
+          pname = "agent-knowledge-client";
+          version = projectVersion;
+
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              ./Cargo.lock
+              ./Cargo.toml
+              ./crates
+              ./README.md
+              ./src
+            ];
+          };
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [
+            "--package"
+            "agent-knowledge-client"
+            "--bin"
+            "agent-knowledge-client"
+          ];
+          cargoTestFlags = [
+            "--package"
+            "agent-knowledge-client"
+          ];
+          doInstallCheck = true;
+          installCheckPhase = ''
+            runHook preInstallCheck
+            test "$("$out/bin/agent-knowledge-client" --version)" = \
+              "agent-knowledge-client ${projectVersion}"
+            runHook postInstallCheck
+          '';
+
+          meta = {
+            description = "Portable SSH client for Agent Knowledge";
+            license = pkgs.lib.licenses.asl20;
+            mainProgram = "agent-knowledge-client";
+            platforms = linuxSystems;
+          };
+        };
+      clientReleaseArchiveFor =
+        system:
+        let
+          pkgs = pkgsFor.${system};
+          package = staticClientPackageFor system;
+          archiveRoot = "agent-knowledge-client-v${projectVersion}-${clientRustTarget.${system}}";
+        in
+        pkgs.runCommand "${archiveRoot}.tar.gz"
+          {
+            nativeBuildInputs = [
+              pkgs.gnutar
+              pkgs.gzip
+            ];
+          }
+          ''
+            mkdir -p "staging/${archiveRoot}"
+            install -m755 ${package}/bin/agent-knowledge-client \
+              "staging/${archiveRoot}/agent-knowledge-client"
+            install -m644 ${./LICENSE} "staging/${archiveRoot}/LICENSE"
+            install -m644 ${./README.md} "staging/${archiveRoot}/README.md"
+            tar --sort=name --mtime='@1' --owner=0 --group=0 --numeric-owner \
+              -czf "$out" -C staging "${archiveRoot}"
+          '';
       unwrappedPackageForWith =
         {
           system,
@@ -496,6 +568,8 @@
 
       packages = forLinuxSystems (system: rec {
         agent-knowledge = packageFor system;
+        agent-knowledge-client = staticClientPackageFor system;
+        client-release-archive = clientReleaseArchiveFor system;
         gateway-container-image = gatewayContainerImageFor system;
         kubernetes-e2e-client = unwrappedPackageFor system;
         openssh-gateway-package = opensshGatewayPackageFor system;
@@ -516,6 +590,11 @@
           type = "app";
           program = "${packageFor system}/bin/agent-knowledge";
           meta.description = "Run Agent Knowledge";
+        };
+        agent-knowledge-client = {
+          type = "app";
+          program = "${staticClientPackageFor system}/bin/agent-knowledge-client";
+          meta.description = "Run the Agent Knowledge client";
         };
         default = agent-knowledge;
       });
@@ -571,6 +650,49 @@
         in
         {
           package = package;
+          client-static =
+            let
+              client = staticClientPackageFor system;
+            in
+            pkgs.runCommand "check-agent-knowledge-client-static"
+              {
+                nativeBuildInputs = [ pkgs.binutils ];
+              }
+              ''
+                test "$(
+                  ${client}/bin/agent-knowledge-client --version
+                )" = "agent-knowledge-client ${projectVersion}"
+                ! readelf -l ${client}/bin/agent-knowledge-client \
+                  | grep -F 'INTERP'
+                touch "$out"
+              '';
+          client-release-archive =
+            let
+              archive = clientReleaseArchiveFor system;
+              archiveRoot = "agent-knowledge-client-v${projectVersion}-${clientRustTarget.${system}}";
+            in
+            pkgs.runCommand "check-agent-knowledge-client-release-archive"
+              {
+                nativeBuildInputs = [
+                  pkgs.binutils
+                  pkgs.gnutar
+                  pkgs.gzip
+                ];
+              }
+              ''
+                mkdir extracted
+                tar -xzf ${archive} -C extracted
+                test -x "extracted/${archiveRoot}/agent-knowledge-client"
+                test -f "extracted/${archiveRoot}/LICENSE"
+                test -f "extracted/${archiveRoot}/README.md"
+                test "$(
+                  "extracted/${archiveRoot}/agent-knowledge-client" --version
+                )" = "agent-knowledge-client ${projectVersion}"
+                ! readelf -l \
+                  "extracted/${archiveRoot}/agent-knowledge-client" \
+                  | grep -F 'INTERP'
+                touch "$out"
+              '';
           package-metadata =
             assert package.pname == "agent-knowledge";
             assert package.version == projectVersion;
