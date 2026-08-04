@@ -1,0 +1,25 @@
+schema_version: 1
+storage:
+  queue_root: /var/lib/agent-knowledge/queue
+  repository_root: /var/lib/agent-knowledge/repository
+  content_root: /var/lib/agent-knowledge/content
+  work_root: /var/lib/agent-knowledge/work
+  release_root: /var/lib/agent-knowledge/releases
+repository:
+  official_branch: main
+  author_name: Fictional Knowledge Worker
+  author_email: worker@example.invalid
+quartz:
+  program: /opt/agent-knowledge-quartz/bin/build-site
+  integration_root: /opt/agent-knowledge-quartz
+  timeout_seconds: 300
+batch:
+  debounce_seconds: 30
+  maximum_age_seconds: 300
+  maximum_scan_entries: 1024
+  maximum_requests: 100
+  maximum_recovery_requests: 10000
+retention:
+  retained_releases: 10
+  maximum_scan_entries: 10000
+  maximum_removals: 10

@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+generatorOptions:
+  immutable: true
+configMapGenerator:
+  - name: agent-knowledge-config
+    files:
+      - worker.yaml=config/worker.yaml
+      - gateway.yaml=config/gateway.yaml
+      - sshd_config=config/sshd_config
+resources:
+  - resources.yaml

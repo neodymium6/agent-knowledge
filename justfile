@@ -33,7 +33,11 @@ check-package:
   system="$(nix eval --impure --raw --expr builtins.currentSystem)" && nix build ".#checks.$system.worker-container-image" ".#checks.$system.queue-ingress-container-image" ".#checks.$system.gateway-container-image" ".#checks.$system.openssh-gateway-container-image" ".#checks.$system.storage-bootstrap-container-image" --no-link
 
 # CI source-check alias; package jobs build each supported architecture.
-ci: check-code
+ci: check-code check-kubernetes
+
+# Render and validate the single-replica Kubernetes deployment.
+check-kubernetes:
+  nix develop . --command bash deploy/kubernetes/check-manifests.sh deploy/kubernetes
 
 # Update pinned development-environment inputs.
 update:

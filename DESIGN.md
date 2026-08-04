@@ -8,8 +8,8 @@ preserve.
 
 The implementation language is Rust. The initial deployment target is a
 conventional Linux host with a local POSIX-style file system. The design should
-remain deployable on Kubernetes, but Kubernetes deployment manifests and
-horizontal scaling are not part of the initial release.
+remain deployable on Kubernetes. A single-replica Kubernetes packaging base is
+provided, but horizontal scaling is not part of the initial release.
 
 ## 2. Purpose
 
@@ -270,8 +270,8 @@ single-process container is not restarted until its previous container has
 fully stopped. Starting recovery while a Git child from the previous Worker can
 still run is unsupported and must fail closed operationally.
 
-A future Kubernetes deployment uses one StatefulSet replica and one persistent
-volume mounted by a single Pod. The volume must provide the file-system
+The supplied Kubernetes deployment uses one StatefulSet replica and one
+persistent volume mounted by a single Pod. The volume must provide the file-system
 semantics above and preserve inode identity across ordinary Pod restarts.
 Network filesystems that cannot take an exclusive `flock` on a read-only
 directory descriptor, including incompatible NFS configurations, are not
@@ -343,6 +343,26 @@ fail before durable mutation when the runtime changes or augments the packaged
 identity. The deployment must not select `Strict`, which intentionally ignores
 the image account database and would remove the two required container-specific
 memberships.
+
+All containers in the Pod must consume one coherent set of startup inputs.
+Generated configuration uses an immutable, content-addressed ConfigMap name,
+while SSH credentials and Quartz content use immutable, versioned
+deployment-owned objects. Rotating either external input requires a new object
+name in the Pod template so Kubernetes rolls the complete Pod; updating a
+projected object or mounted claim in place is not supported. Secret projection
+is visible only to root init containers that copy the host key and authorized
+keys into a mode-controlled ephemeral volume. The OpenSSH container mounts only
+that staged volume, allowing `StrictModes` to remain enabled without trusting
+the writable-mode directories used by Kubernetes AtomicWriter projection.
+
+The Kubernetes API does not expose a per-Pod PID limit in the Pod
+specification. Eligible nodes must therefore enforce a finite kubelet
+`podPidsLimit` no greater than the deployment's documented bound and carry the
+matching node label required by the Pod. Without that operator attestation the
+Pod remains unscheduled. This cgroup boundary limits the combined OpenSSH,
+Gateway, Worker, Queue Ingress, and Quartz process count; OpenSSH's
+`MaxStartups` and `MaxSessions` are not treated as an aggregate authenticated
+connection limit.
 
 Each socket-activated Queue Ingress process additionally compares its accepted
 standard-input socket's local Unix address with the root-controlled configured
@@ -1868,7 +1888,7 @@ Implementation proceeds in these increments:
    - role-specific one-shot Gateway container (implemented); and
    - dedicated OpenSSH Gateway adapter container (implemented); and
    - root-only storage-bootstrap init container (implemented); and
-   - optional single-replica Kubernetes packaging.
+   - optional single-replica Kubernetes packaging (implemented).
 10. Production Gateway privilege separation through the systemd-activated
     local queue-ingress broker, verified with distinct-UID integration tests
     (implemented).

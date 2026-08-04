@@ -358,6 +358,7 @@
           tag = projectVersion;
           contents = [
             package
+            pkgs.coreutils
             rootFilesystem
           ];
           config = {
@@ -394,11 +395,15 @@
                 clippy
                 gh
                 git
+                jq
                 just
+                kube-linter
+                kustomize
                 nixfmt-tree
                 pre-commit
                 rustc
                 rustfmt
+                yq-go
               ]
               ++ lib.optionals stdenv.isLinux [
                 openssh
@@ -460,6 +465,21 @@
                       ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
                     touch "$out"
               '';
+          kubernetesManifestCheck =
+            pkgs.runCommand "check-agent-knowledge-kubernetes-manifests"
+              {
+                nativeBuildInputs = [
+                  pkgs.jq
+                  pkgs.kube-linter
+                  pkgs.kustomize
+                  pkgs.yq-go
+                ];
+              }
+              ''
+                ${pkgs.bash}/bin/bash ${./deploy/kubernetes/check-manifests.sh} \
+                  ${./deploy/kubernetes}
+                touch "$out"
+              '';
         in
         {
           package = package;
@@ -470,6 +490,7 @@
               touch "$out"
             '';
           container-image = workerContainerImageCheck;
+          kubernetes-manifests = kubernetesManifestCheck;
           worker-container-image = workerContainerImageCheck;
           queue-ingress-container-image =
             let
