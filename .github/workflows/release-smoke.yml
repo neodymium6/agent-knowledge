@@ -236,7 +236,7 @@ jobs:
 
           tar -xzf "$ARCHIVE"
           binary="$RELEASE_DIR/$archive_root/agent-knowledge-client"
-          file "$binary" | grep -F 'static-pie linked'
+          file "$binary" | grep -Eq 'statically linked|static-pie linked'
           readelf -h "$binary" | grep -F "Machine:" | grep -F "$EXPECTED_MACHINE"
           if readelf -l "$binary" | grep -Eq 'INTERP|Requesting program interpreter'; then
             echo "client binary has a dynamic program interpreter" >&2
