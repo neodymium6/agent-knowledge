@@ -221,7 +221,7 @@ jobs:
 
             digest="sha256:$(sha256sum "$raw_manifest" | cut -d ' ' -f1)"
             versions=$(gh api --paginate --slurp \
-              "/users/$REGISTRY_NAMESPACE/packages/container/$image/versions?per_page=100")
+              "/user/packages/container/$image/versions?per_page=100")
             mapfile -t existing < <(
               jq -r --arg tag "$VERSION" \
                 '.[][] | select(.metadata.container.tags | index($tag)) | .name' \
