@@ -48,6 +48,12 @@ cleanup() {
     wait "$worker_pid" 2>/dev/null || true
   fi
   if ((cleanup_status != 0)); then
+    if [[ -d $storage_root ]]; then
+      if ! find "$storage_root" -xdev -type f -links +1 \
+        -printf 'hard-linked storage file: device=%D inode=%i links=%n path=%p\n' >&2; then
+        echo "could not inspect hard-linked storage files" >&2
+      fi
+    fi
     for log in "$test_root"/worker-*.log; do
       if [[ -s $log ]]; then
         echo "$(basename "$log"):" >&2
@@ -76,7 +82,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for program in getent git groupadd groupdel jq setpriv tar useradd userdel; do
+for program in find getent git groupadd groupdel jq setpriv tar useradd userdel; do
   if ! command -v "$program" >/dev/null; then
     echo "recovery E2E requires ${program}" >&2
     exit 1
