@@ -4,6 +4,8 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.1
+
 - Add a Codex skills-only plugin for server installation, client installation,
   and client read/write workflows.
 
