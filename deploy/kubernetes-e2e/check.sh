@@ -98,8 +98,8 @@ jq -e '
   .nodes[0].kubeadmConfigPatches as $patches
   | any($patches[]; contains("podPidsLimit: 512"))
     and any($patches[];
-      contains("- name: node-labels")
-      and contains("value: \"agent-knowledge.io/pod-pids-limit=512\""))
+      contains("apiVersion: kubeadm.k8s.io/v1beta3")
+      and contains("node-labels: \"agent-knowledge.io/pod-pids-limit=512\""))
 ' "$kind_json" >/dev/null
 
 grep -Fx '#!/opt/agent-knowledge-quartz/bin/busybox sh' \
