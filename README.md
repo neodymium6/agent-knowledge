@@ -103,15 +103,18 @@ format and path rules are defined in [DESIGN.md](DESIGN.md#14-change-requests).
 
 Server installation, client installation, and client usage skills are bundled
 in the skills-only plugin at
-[`plugins/agent-knowledge/`](plugins/agent-knowledge/). Install a tagged version
-through the repository marketplace:
+[`plugins/agent-knowledge/`](plugins/agent-knowledge/). Resolve the desired
+release tag to its exact approved commit, then install that immutable Git
+revision through the repository marketplace:
 
 ```sh
-codex plugin marketplace add neodymium6/agent-knowledge --ref vX.Y.Z
+codex plugin marketplace add neodymium6/agent-knowledge \
+  --ref 0123456789abcdef0123456789abcdef01234567
 codex plugin add agent-knowledge@agent-knowledge
 ```
 
-Replace `vX.Y.Z` with a release tag that contains the plugin.
+Replace the fictional SHA with a release commit that contains the plugin. A
+semantic tag selects a version but is not itself an immutable pin.
 
 ## Linux systemd deployment
 

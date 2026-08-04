@@ -18,8 +18,8 @@ directory, then configure and test one restricted SSH destination.
    - `aarch64` or `arm64` -> `aarch64-unknown-linux-musl`
 
 3. Stop on another OS or architecture instead of selecting a near match.
-4. Require `ssh`, `tar`, `sha256sum`, and `gh`; use `curl` or `gh` for
-   download.
+4. Require `ssh`, `tar`, `sha256sum`, `gh`, `file`, and `readelf`; use `curl`
+   or `gh` for download.
 
 The artifact name is:
 
@@ -54,8 +54,10 @@ from a different release.
 3. List the archive before extraction. It must contain one directory with
    `agent-knowledge-client`, `LICENSE`, and `README.md`, and no unexpected links
    or absolute paths.
-4. Extract only into the temporary directory. Confirm the binary is a static
-   executable for the selected architecture.
+4. Extract only into the temporary directory. Inspect the binary with `file`,
+   `readelf -h`, and `readelf -l`. Require the selected ELF machine and no
+   `INTERP` segment or requested program interpreter before treating it as the
+   expected static executable.
 5. Install it as `agent-knowledge-client` in a selected user-owned directory,
    normally `$HOME/.local/bin`. If another binary exists, report its version
    and obtain approval before replacement unless the user explicitly requested
