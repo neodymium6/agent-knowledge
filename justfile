@@ -20,12 +20,20 @@ check: check-code
   if [ "$(uname -s)" = Linux ]; then just check-package; fi
 
 # Run source, test, and flake-schema checks without building a package.
-check-code:
+check-code: check-dependencies
   pre-commit run --all-files
   cargo fmt --all -- --check
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
   cargo test --workspace --all-features --locked
   nix flake check --no-build --all-systems .
+
+# Enforce locked dependency licenses, versions, and source origins.
+check-dependencies:
+  nix develop --command cargo deny check bans licenses sources
+
+# Fetch current RustSec data and audit locked dependencies.
+audit:
+  nix develop --command cargo deny check advisories
 
 # Build and validate the production package for the current Linux system.
 check-package:

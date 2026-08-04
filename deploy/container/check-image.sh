@@ -97,6 +97,7 @@ jq -e \
     ) and
     .config.StopSignal == "SIGTERM" and
     .config.Labels == {
+      "org.opencontainers.image.licenses": "Apache-2.0",
       "org.opencontainers.image.source": "https://github.com/neodymium6/agent-knowledge",
       "org.opencontainers.image.title": $title,
       "org.opencontainers.image.version": $version

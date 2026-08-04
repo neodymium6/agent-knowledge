@@ -8,11 +8,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use agent_knowledge_client::cli as client_cli;
 use agent_knowledge_gateway::IngressServeError;
-use agent_knowledge_protocol::{
-    ExportRequest, GetRequest, LIST_COMMAND, ListRequest, ListResponse, RECENT_COMMAND,
-    ReadFilterRequest, SEARCH_COMMAND, SearchRequest, StatusRequest,
-};
 use agent_knowledge_queue::{
     EnqueueOutcome, FileQueue, PackagePolicy, PackageValidationError, QueueError, validate_package,
 };
@@ -23,7 +20,6 @@ use serde::Serialize;
 use crate::admin::{self, AdminRetentionError, AdminStatusError};
 #[cfg(target_os = "linux")]
 use crate::admin::{StorageMigration, StorageMigrationError};
-use crate::client::{self, ClientCommandError};
 use crate::gateway::{self, GatewayCommandError};
 use crate::queue_ingress::{self, ListenSettings, QueueIngressCommandError};
 use crate::runtime_identity::RuntimeIdentityError;
@@ -32,6 +28,7 @@ use crate::storage_bootstrap::{StorageBootstrap, StorageBootstrapError};
 use crate::worker::{self, WorkerCommandError};
 
 const COMMON_USAGE: &str = "usage:\n\
+    agent-knowledge --version\n\
     agent-knowledge admin submit --queue-root <path> --package-root <path>\n\
     agent-knowledge admin status --config <path> [--maximum-queue-entries <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge admin prune-releases --config <path> [--dry-run] [--timeout-seconds <seconds>]\n\
@@ -51,10 +48,6 @@ const LINUX_USAGE: &str = "\n\
     agent-knowledge admin bootstrap-storage --config <path> --gateway-owner <name-or-id> [--runtime-directory <path>] [--worker-owner <name-or-id>] [--worker-group <name-or-id>] [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>] [--ingress-group <name-or-id>]\n\
     agent-knowledge admin rebind-restored-storage --config <path> --gateway-owner <name-or-id> [--runtime-directory <path>] [--worker-owner <name-or-id>] [--worker-group <name-or-id>] [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>] [--ingress-group <name-or-id>]\n\
     agent-knowledge admin migrate-v1-storage --queue-root <path> --git-directory <path> --content-root <path> [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>]";
-const DEFAULT_CLIENT_TIMEOUT_SECONDS: u64 = 300;
-const MAXIMUM_CLIENT_TIMEOUT_SECONDS: u64 = 3_600;
-const DEFAULT_READ_RESULTS: usize = 100;
-const MAXIMUM_READ_RESULTS: usize = 10_000;
 const DEFAULT_STATUS_QUEUE_ENTRIES: usize = 100_000;
 const MAXIMUM_STATUS_QUEUE_ENTRIES: usize = 1_000_000;
 const DEFAULT_STATUS_TIMEOUT_SECONDS: u64 = 30;
@@ -66,12 +59,16 @@ const MAXIMUM_INGRESS_CONNECTIONS: usize = 1_024;
 const DEFAULT_INGRESS_CONNECTION_TIMEOUT_SECONDS: u64 = 3_900;
 const MAXIMUM_INGRESS_CONNECTION_TIMEOUT_SECONDS: u64 = 3_900;
 
-pub fn run<I, W>(arguments: I, output: W) -> Result<(), CliError>
+pub fn run<I, W>(arguments: I, mut output: W) -> Result<(), CliError>
 where
     I: IntoIterator<Item = OsString>,
     W: Write + Send + 'static,
 {
     match parse_arguments(arguments)? {
+        Command::Version => {
+            writeln!(output, "agent-knowledge {}", env!("CARGO_PKG_VERSION")).map_err(CliError::Io)
+        }
+        Command::Client(command) => client_cli::execute(command, output).map_err(CliError::Client),
         Command::Submit {
             queue_root,
             package_root,
@@ -144,55 +141,12 @@ where
         Command::ListenQueueIngress { settings } => {
             queue_ingress::run(settings, output).map_err(CliError::IngressListen)
         }
-        Command::ClientSubmit {
-            destination,
-            package_root,
-            timeout,
-        } => client::submit(&destination, &package_root, timeout, output).map_err(CliError::Client),
-        Command::ClientList {
-            destination,
-            request,
-            recent,
-            timeout,
-        } => client::control::<_, ListResponse>(
-            &destination,
-            if recent { RECENT_COMMAND } else { LIST_COMMAND },
-            &request,
-            timeout,
-            output,
-        )
-        .map_err(CliError::Client),
-        Command::ClientGet {
-            destination,
-            request,
-            timeout,
-        } => client::get(&destination, &request, timeout, output).map_err(CliError::Client),
-        Command::ClientExport {
-            destination,
-            request,
-            timeout,
-        } => client::export(&destination, &request, timeout, output).map_err(CliError::Client),
-        Command::ClientSearch {
-            destination,
-            request,
-            timeout,
-        } => client::control::<_, ListResponse>(
-            &destination,
-            SEARCH_COMMAND,
-            &request,
-            timeout,
-            output,
-        )
-        .map_err(CliError::Client),
-        Command::ClientStatus {
-            destination,
-            request,
-            timeout,
-        } => client::status(&destination, &request, timeout, output).map_err(CliError::Client),
     }
 }
 
 enum Command {
+    Version,
+    Client(client_cli::Command),
     Submit {
         queue_root: PathBuf,
         package_root: PathBuf,
@@ -234,37 +188,6 @@ enum Command {
     ListenQueueIngress {
         settings: ListenSettings,
     },
-    ClientSubmit {
-        destination: OsString,
-        package_root: PathBuf,
-        timeout: Duration,
-    },
-    ClientList {
-        destination: OsString,
-        request: ListRequest,
-        recent: bool,
-        timeout: Duration,
-    },
-    ClientGet {
-        destination: OsString,
-        request: GetRequest,
-        timeout: Duration,
-    },
-    ClientExport {
-        destination: OsString,
-        request: ExportRequest,
-        timeout: Duration,
-    },
-    ClientSearch {
-        destination: OsString,
-        request: SearchRequest,
-        timeout: Duration,
-    },
-    ClientStatus {
-        destination: OsString,
-        request: StatusRequest,
-        timeout: Duration,
-    },
 }
 
 fn parse_arguments<I>(arguments: I) -> Result<Command, CliError>
@@ -275,49 +198,24 @@ where
     let _program = arguments.next();
     let namespace = arguments.next();
     let action = arguments.next();
+    if namespace.as_deref() == Some(std::ffi::OsStr::new("--version")) {
+        return if action.is_none() && arguments.next().is_none() {
+            Ok(Command::Version)
+        } else {
+            Err(CliError::Usage)
+        };
+    }
     if namespace.as_deref() == Some(std::ffi::OsStr::new("gateway")) {
         return parse_gateway_arguments(action.into_iter().chain(arguments));
+    }
+    if namespace.as_deref() == Some(std::ffi::OsStr::new("client")) {
+        return client_cli::parse_arguments(action.into_iter().chain(arguments))
+            .map(Command::Client)
+            .map_err(|_| CliError::Usage);
     }
     match (namespace.as_deref(), action.as_deref()) {
         (Some(namespace), Some(action)) if namespace == std::ffi::OsStr::new("queue-ingress") => {
             parse_queue_ingress_arguments(arguments, action)
-        }
-        (Some(namespace), Some(action))
-            if namespace == std::ffi::OsStr::new("client")
-                && action == std::ffi::OsStr::new("submit") =>
-        {
-            parse_client_submit_arguments(arguments)
-        }
-        (Some(namespace), Some(action))
-            if namespace == std::ffi::OsStr::new("client")
-                && (action == std::ffi::OsStr::new("list")
-                    || action == std::ffi::OsStr::new("recent")) =>
-        {
-            parse_client_list_arguments(arguments, action == std::ffi::OsStr::new("recent"))
-        }
-        (Some(namespace), Some(action))
-            if namespace == std::ffi::OsStr::new("client")
-                && action == std::ffi::OsStr::new("get") =>
-        {
-            parse_client_document_arguments(arguments, false)
-        }
-        (Some(namespace), Some(action))
-            if namespace == std::ffi::OsStr::new("client")
-                && action == std::ffi::OsStr::new("export") =>
-        {
-            parse_client_document_arguments(arguments, true)
-        }
-        (Some(namespace), Some(action))
-            if namespace == std::ffi::OsStr::new("client")
-                && action == std::ffi::OsStr::new("search") =>
-        {
-            parse_client_search_arguments(arguments)
-        }
-        (Some(namespace), Some(action))
-            if namespace == std::ffi::OsStr::new("client")
-                && action == std::ffi::OsStr::new("status") =>
-        {
-            parse_client_status_arguments(arguments)
         }
         (Some(namespace), Some(action))
             if namespace == std::ffi::OsStr::new("admin")
@@ -366,224 +264,6 @@ where
         }
         _ => Err(CliError::Usage),
     }
-}
-
-fn parse_client_submit_arguments<I>(mut arguments: I) -> Result<Command, CliError>
-where
-    I: Iterator<Item = OsString>,
-{
-    let mut destination = None;
-    let mut package_root = None;
-    let mut timeout_seconds = None;
-    while let Some(flag) = arguments.next() {
-        let value = arguments.next().ok_or(CliError::Usage)?;
-        match flag.to_str() {
-            Some("--destination") if destination.is_none() => destination = Some(value),
-            Some("--package-root") if package_root.is_none() => {
-                package_root = Some(PathBuf::from(value));
-            }
-            Some("--timeout-seconds") if timeout_seconds.is_none() => {
-                let seconds = value
-                    .to_str()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .filter(|seconds| (1..=MAXIMUM_CLIENT_TIMEOUT_SECONDS).contains(seconds))
-                    .ok_or(CliError::Usage)?;
-                timeout_seconds = Some(seconds);
-            }
-            _ => return Err(CliError::Usage),
-        }
-    }
-    Ok(Command::ClientSubmit {
-        destination: destination.ok_or(CliError::Usage)?,
-        package_root: package_root.ok_or(CliError::Usage)?,
-        timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECONDS)),
-    })
-}
-
-struct ParsedReadArguments {
-    destination: OsString,
-    filter: ReadFilterRequest,
-    maximum_results: usize,
-    query: Option<String>,
-    timeout: Duration,
-}
-
-fn parse_client_list_arguments<I>(arguments: I, recent: bool) -> Result<Command, CliError>
-where
-    I: Iterator<Item = OsString>,
-{
-    let parsed = parse_read_arguments(arguments, false)?;
-    Ok(Command::ClientList {
-        destination: parsed.destination,
-        request: ListRequest::new(parsed.filter, parsed.maximum_results),
-        recent,
-        timeout: parsed.timeout,
-    })
-}
-
-fn parse_client_search_arguments<I>(arguments: I) -> Result<Command, CliError>
-where
-    I: Iterator<Item = OsString>,
-{
-    let parsed = parse_read_arguments(arguments, true)?;
-    Ok(Command::ClientSearch {
-        destination: parsed.destination,
-        request: SearchRequest::new(
-            parsed.query.ok_or(CliError::Usage)?,
-            parsed.filter,
-            parsed.maximum_results,
-        ),
-        timeout: parsed.timeout,
-    })
-}
-
-fn parse_read_arguments<I>(
-    mut arguments: I,
-    allow_query: bool,
-) -> Result<ParsedReadArguments, CliError>
-where
-    I: Iterator<Item = OsString>,
-{
-    let mut destination = None;
-    let mut project = None;
-    let mut tag = None;
-    let mut session = None;
-    let mut include_archived = false;
-    let mut maximum_results = None;
-    let mut query = None;
-    let mut timeout_seconds = None;
-    while let Some(flag) = arguments.next() {
-        if flag == std::ffi::OsStr::new("--include-archived") {
-            if include_archived {
-                return Err(CliError::Usage);
-            }
-            include_archived = true;
-            continue;
-        }
-        let value = arguments.next().ok_or(CliError::Usage)?;
-        match flag.to_str() {
-            Some("--destination") if destination.is_none() => destination = Some(value),
-            Some("--project") if project.is_none() => {
-                project = Some(
-                    value
-                        .to_str()
-                        .and_then(|value| value.parse().ok())
-                        .ok_or(CliError::Usage)?,
-                );
-            }
-            Some("--tag") if tag.is_none() => {
-                tag = Some(value.into_string().map_err(|_| CliError::Usage)?);
-            }
-            Some("--session") if session.is_none() => {
-                session = Some(
-                    value
-                        .to_str()
-                        .and_then(|value| value.parse().ok())
-                        .ok_or(CliError::Usage)?,
-                );
-            }
-            Some("--maximum-results") if maximum_results.is_none() => {
-                maximum_results = Some(parse_bounded_usize(&value, MAXIMUM_READ_RESULTS)?);
-            }
-            Some("--query") if allow_query && query.is_none() => {
-                query = Some(value.into_string().map_err(|_| CliError::Usage)?);
-            }
-            Some("--timeout-seconds") if timeout_seconds.is_none() => {
-                timeout_seconds = Some(parse_bounded_u64(&value, MAXIMUM_CLIENT_TIMEOUT_SECONDS)?);
-            }
-            _ => return Err(CliError::Usage),
-        }
-    }
-    if !allow_query && query.is_some() {
-        return Err(CliError::Usage);
-    }
-    Ok(ParsedReadArguments {
-        destination: destination.ok_or(CliError::Usage)?,
-        filter: ReadFilterRequest {
-            project,
-            tag,
-            session,
-            include_archived,
-        },
-        maximum_results: maximum_results.unwrap_or(DEFAULT_READ_RESULTS),
-        query,
-        timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECONDS)),
-    })
-}
-
-fn parse_client_document_arguments<I>(mut arguments: I, export: bool) -> Result<Command, CliError>
-where
-    I: Iterator<Item = OsString>,
-{
-    let mut destination = None;
-    let mut document_id = None;
-    let mut timeout_seconds = None;
-    while let Some(flag) = arguments.next() {
-        let value = arguments.next().ok_or(CliError::Usage)?;
-        match flag.to_str() {
-            Some("--destination") if destination.is_none() => destination = Some(value),
-            Some("--document-id") if document_id.is_none() => {
-                document_id = Some(
-                    value
-                        .to_str()
-                        .and_then(|value| value.parse().ok())
-                        .ok_or(CliError::Usage)?,
-                );
-            }
-            Some("--timeout-seconds") if timeout_seconds.is_none() => {
-                timeout_seconds = Some(parse_bounded_u64(&value, MAXIMUM_CLIENT_TIMEOUT_SECONDS)?);
-            }
-            _ => return Err(CliError::Usage),
-        }
-    }
-    let destination = destination.ok_or(CliError::Usage)?;
-    let document_id = document_id.ok_or(CliError::Usage)?;
-    let timeout = Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECONDS));
-    if export {
-        Ok(Command::ClientExport {
-            destination,
-            request: ExportRequest::new(document_id),
-            timeout,
-        })
-    } else {
-        Ok(Command::ClientGet {
-            destination,
-            request: GetRequest::new(document_id),
-            timeout,
-        })
-    }
-}
-
-fn parse_client_status_arguments<I>(mut arguments: I) -> Result<Command, CliError>
-where
-    I: Iterator<Item = OsString>,
-{
-    let mut destination = None;
-    let mut request_id = None;
-    let mut timeout_seconds = None;
-    while let Some(flag) = arguments.next() {
-        let value = arguments.next().ok_or(CliError::Usage)?;
-        match flag.to_str() {
-            Some("--destination") if destination.is_none() => destination = Some(value),
-            Some("--request-id") if request_id.is_none() => {
-                request_id = Some(
-                    value
-                        .to_str()
-                        .and_then(|value| value.parse().ok())
-                        .ok_or(CliError::Usage)?,
-                );
-            }
-            Some("--timeout-seconds") if timeout_seconds.is_none() => {
-                timeout_seconds = Some(parse_bounded_u64(&value, MAXIMUM_CLIENT_TIMEOUT_SECONDS)?);
-            }
-            _ => return Err(CliError::Usage),
-        }
-    }
-    Ok(Command::ClientStatus {
-        destination: destination.ok_or(CliError::Usage)?,
-        request: StatusRequest::new(request_id.ok_or(CliError::Usage)?),
-        timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECONDS)),
-    })
 }
 
 fn parse_bounded_u64(value: &OsString, maximum: u64) -> Result<u64, CliError> {
@@ -982,7 +662,7 @@ pub enum CliError {
     Gateway(GatewayCommandError),
     IngressServe(IngressServeError),
     IngressListen(QueueIngressCommandError),
-    Client(ClientCommandError),
+    Client(client_cli::CliError),
     Json(serde_json::Error),
 }
 

@@ -1,6 +1,5 @@
 mod admin;
 mod cli;
-mod client;
 mod gateway;
 mod queue_ingress;
 mod runtime_identity;

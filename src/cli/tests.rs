@@ -1,4 +1,5 @@
 use super::{CliError, Command, parse_arguments, run};
+use agent_knowledge_client::cli::Command as ClientCommand;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
@@ -166,6 +167,21 @@ fn rejects_unknown_or_incomplete_command_lines() {
     ] {
         assert!(matches!(run(arguments, Vec::new()), Err(CliError::Usage)));
     }
+}
+
+#[test]
+fn reports_the_package_version() {
+    let output = SharedOutput::default();
+    if let Err(error) = run(
+        ["agent-knowledge".into(), "--version".into()],
+        output.clone(),
+    ) {
+        panic!("version command must succeed: {error}");
+    }
+    assert_eq!(
+        String::from_utf8(output.contents()).ok().as_deref(),
+        Some(concat!("agent-knowledge ", env!("CARGO_PKG_VERSION"), "\n"))
+    );
 }
 
 #[test]
@@ -489,7 +505,7 @@ fn parses_the_ssh_client_submission_command() {
 
     assert!(matches!(
         command,
-        Command::ClientSubmit { destination, package_root, timeout }
+        Command::Client(ClientCommand::Submit { destination, package_root, timeout })
             if destination == "fictional-knowledge"
                 && package_root == Path::new("/tmp/fictional-package")
                 && timeout == std::time::Duration::from_secs(300)
@@ -515,7 +531,7 @@ fn parses_committed_read_and_search_commands() {
     .unwrap_or_else(|error| panic!("client recent command must parse: {error}"));
     assert!(matches!(
         list,
-        Command::ClientList { destination, request, recent: true, timeout }
+        Command::Client(ClientCommand::List { destination, request, recent: true, timeout })
             if destination == "fictional-knowledge"
                 && request.filter.project.is_some()
                 && request.filter.tag.as_deref() == Some("operations")
@@ -536,7 +552,7 @@ fn parses_committed_read_and_search_commands() {
     .unwrap_or_else(|error| panic!("client search command must parse: {error}"));
     assert!(matches!(
         search,
-        Command::ClientSearch { request, .. }
+        Command::Client(ClientCommand::Search { request, .. })
             if request.query == "restart procedure" && request.maximum_results == 100
     ));
 
@@ -550,7 +566,7 @@ fn parses_committed_read_and_search_commands() {
         "01K00000000000000000000001".into(),
     ])
     .unwrap_or_else(|error| panic!("client get command must parse: {error}"));
-    assert!(matches!(get, Command::ClientGet { .. }));
+    assert!(matches!(get, Command::Client(ClientCommand::Get { .. })));
 
     let export = parse_arguments([
         "agent-knowledge".into(),
@@ -562,7 +578,10 @@ fn parses_committed_read_and_search_commands() {
         "01K00000000000000000000001".into(),
     ])
     .unwrap_or_else(|error| panic!("client export command must parse: {error}"));
-    assert!(matches!(export, Command::ClientExport { .. }));
+    assert!(matches!(
+        export,
+        Command::Client(ClientCommand::Export { .. })
+    ));
 }
 
 #[test]
@@ -581,7 +600,7 @@ fn parses_request_status_command() {
     .unwrap_or_else(|error| panic!("client status command must parse: {error}"));
     assert!(matches!(
         command,
-        Command::ClientStatus { destination, request, timeout }
+        Command::Client(ClientCommand::Status { destination, request, timeout })
             if destination == "fictional-knowledge"
                 && request.request_id.to_string() == "01K00000000000000000000000"
                 && timeout == std::time::Duration::from_secs(42)
@@ -658,7 +677,7 @@ fn parses_and_bounds_the_ssh_client_timeout() {
     .unwrap_or_else(|error| panic!("client timeout must parse: {error}"));
     assert!(matches!(
         command,
-        Command::ClientSubmit { timeout, .. }
+        Command::Client(ClientCommand::Submit { timeout, .. })
             if timeout == std::time::Duration::from_secs(42)
     ));
 

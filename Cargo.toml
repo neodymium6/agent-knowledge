@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/client",
     "crates/core",
     "crates/gateway",
     "crates/protocol",
@@ -15,6 +16,8 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
+license = "Apache-2.0"
+repository = "https://github.com/neodymium6/agent-knowledge"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -40,6 +43,10 @@ name = "agent-knowledge"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Centralized file-based knowledge management for coding agents"
+readme = "README.md"
 publish = false
 default-run = "agent-knowledge"
 
@@ -51,6 +58,7 @@ path = "src/bin/agent_knowledge_ssh_shell.rs"
 workspace = true
 
 [dependencies]
+agent-knowledge-client = { path = "crates/client" }
 agent-knowledge-core = { path = "crates/core" }
 agent-knowledge-gateway = { path = "crates/gateway" }
 agent-knowledge-protocol = { path = "crates/protocol" }

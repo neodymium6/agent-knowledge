@@ -25,6 +25,8 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
 
+pub mod cli;
+
 const SSH_PROGRAM: &str = "ssh";
 const MAXIMUM_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
@@ -976,7 +978,7 @@ impl SubmissionExpectation {
 }
 
 #[derive(Debug)]
-pub(crate) enum ClientCommandError {
+pub enum ClientCommandError {
     EmptyDestination,
     PackageValidation(PackageValidationError),
     EncodeRequest(serde_json::Error),
