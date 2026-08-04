@@ -8,8 +8,8 @@ set -euo pipefail
 : "${AGENT_KNOWLEDGE_CSI_RESIZER_RBAC:?run this test through the Nix development shell}"
 : "${AGENT_KNOWLEDGE_CSI_SNAPSHOTTER_RBAC:?run this test through the Nix development shell}"
 
-readonly HOSTPATH_DIRECTORY
 HOSTPATH_DIRECTORY="$AGENT_KNOWLEDGE_CSI_HOSTPATH_SOURCE/deploy/kubernetes-1.35/hostpath"
+readonly HOSTPATH_DIRECTORY
 
 for rbac in \
   "$AGENT_KNOWLEDGE_CSI_PROVISIONER_RBAC" \

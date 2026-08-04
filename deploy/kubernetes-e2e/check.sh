@@ -17,6 +17,18 @@ kind_json=$temporary_directory/kind.json
 
 bash -n "$e2e_directory/run.sh"
 bash -n "$e2e_directory/deploy-csi.sh"
+if ! awk '
+  FNR == 1 { previous = "" }
+  /^readonly [A-Z][A-Z0-9_]*$/ {
+    if (previous !~ "^" $2 "=") {
+      exit 1
+    }
+  }
+  { previous = $0 }
+' "$e2e_directory/run.sh" "$e2e_directory/deploy-csi.sh"; then
+  echo "E2E scripts must assign variables before marking them read-only" >&2
+  exit 1
+fi
 bash "$base_directory/check-manifests.sh" \
   "$e2e_directory" "$base_directory/kube-linter.yaml"
 kube-linter lint --config "$base_directory/kube-linter.yaml" \

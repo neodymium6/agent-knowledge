@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly SCRIPT_DIRECTORY
 SCRIPT_DIRECTORY=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-readonly REPOSITORY_ROOT
+readonly SCRIPT_DIRECTORY
 REPOSITORY_ROOT=$(cd -- "$SCRIPT_DIRECTORY/../.." && pwd)
+readonly REPOSITORY_ROOT
 readonly NAMESPACE=agent-knowledge-e2e
 readonly REQUEST_ID=01K00000000000000000000000
 readonly DOCUMENT_ID=01K00000000000000000000002
