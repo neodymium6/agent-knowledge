@@ -368,6 +368,29 @@ fn parses_the_storage_bootstrap_command() {
     ));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn parses_the_offline_storage_restore_command() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "admin".into(),
+        "rebind-restored-storage".into(),
+        "--config".into(),
+        "/etc/fictional-knowledge/worker.yaml".into(),
+        "--gateway-owner".into(),
+        "61005".into(),
+    ])
+    .unwrap_or_else(|error| panic!("storage restore command must parse: {error}"));
+
+    assert!(matches!(
+        command,
+        Command::AdminRebindRestoredStorage(settings)
+            if settings.config == Path::new("/etc/fictional-knowledge/worker.yaml")
+                && settings.runtime_directory == Path::new("/run/agent-knowledge")
+                && settings.gateway_owner == "61005"
+    ));
+}
+
 #[test]
 fn parses_the_forced_command_gateway_configuration() {
     let command = parse_arguments([

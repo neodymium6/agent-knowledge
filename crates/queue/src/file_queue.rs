@@ -185,6 +185,112 @@ pub struct FileQueue {
     maintenance_scanners: Arc<Mutex<MaintenanceScanners>>,
 }
 
+/// Replaces the filesystem-object binding of an offline restored queue.
+///
+/// The immutable queue instance identifier and all accepted requests are
+/// preserved. Both queue locks must be available, so callers must stop every
+/// Gateway, Queue Ingress, and Repository Worker that can access this copy
+/// before invoking the operation. This function does not authorize a second
+/// live copy of a queue; the source copy must remain offline permanently.
+///
+/// # Errors
+///
+/// Returns an error when required queue state is absent or malformed, either
+/// queue lock is held, the restored directories do not share one filesystem,
+/// or the replacement binding cannot be made durable.
+#[cfg(target_os = "linux")]
+pub fn rebind_restored_queue(queue_root: impl Into<PathBuf>) -> Result<(), QueueError> {
+    let configured_path = queue_root.into();
+    let root_metadata = fs::symlink_metadata(&configured_path).map_err(QueueError::Io)?;
+    if !root_metadata.file_type().is_dir() {
+        return Err(QueueError::InvalidStoragePath(configured_path));
+    }
+    let root_handle = Arc::new(File::open(&configured_path).map_err(QueueError::Io)?);
+    let configured_queue_root = fs::canonicalize(&configured_path).map_err(QueueError::Io)?;
+    let queue_root = stable_file_path(&root_handle, &configured_queue_root)?;
+    validate_pinned_root(&configured_queue_root, &root_handle)?;
+
+    let directories = QueueDirectories {
+        lock: pin_directory(&queue_root.join(LOCK_DIRECTORY_NAME))?,
+        incoming: pin_directory(&queue_root.join("incoming"))?,
+        quarantine: pin_directory(&queue_root.join("quarantine"))?,
+        worker_temporary: pin_directory(&queue_root.join(WORKER_TEMP_DIRECTORY_NAME))?,
+        states: [
+            pin_directory(&queue_root.join(QueueState::Pending.directory_name()))?,
+            pin_directory(&queue_root.join(QueueState::Processing.directory_name()))?,
+            pin_directory(&queue_root.join(QueueState::Completed.directory_name()))?,
+            pin_directory(&queue_root.join(QueueState::Failed.directory_name()))?,
+        ],
+    };
+    validate_common_queue_mount(&root_handle, &directories)?;
+    for directory in directories.all() {
+        validate_pinned_directory(directory)?;
+    }
+
+    let queue_lock_path = directories.lock.stable.join(QUEUE_LOCK_FILE_NAME);
+    let worker_lock_path = directories.lock.stable.join(WORKER_LOCK_FILE_NAME);
+    let queue_lock = open_existing_lock_file(&queue_lock_path)?;
+    let worker_lock = open_existing_lock_file(&worker_lock_path)?;
+    queue_lock.try_lock().map_err(queue_restore_lock_error)?;
+    worker_lock.try_lock().map_err(queue_restore_lock_error)?;
+    validate_pinned_lock(&queue_lock_path, &queue_lock)?;
+    validate_pinned_lock(&worker_lock_path, &worker_lock)?;
+
+    let _identity = read_queue_identity(&queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
+    let _next_sequence = read_next_sequence(&queue_root.join(NEXT_SEQUENCE_FILE_NAME))?;
+    let binding_path = queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME);
+    validate_restored_queue_binding(
+        &binding_path,
+        &configured_queue_root,
+        1 + directories.all().count() + 2,
+    )?;
+    let binding = queue_root_binding(
+        &configured_queue_root,
+        &root_handle,
+        &directories,
+        &queue_lock,
+        &worker_lock,
+    )?;
+    replace_queue_binding(&binding_path, &binding, &queue_root)?;
+    validate_queue_root_binding(
+        &binding_path,
+        &configured_queue_root,
+        &root_handle,
+        &directories,
+        &queue_lock,
+        &worker_lock,
+    )?;
+    sync_directory(&queue_root)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_restored_queue_binding(
+    path: &Path,
+    configured_root: &Path,
+    bound_objects: usize,
+) -> Result<(), QueueError> {
+    const FILESYSTEM_IDENTITY_BYTES: usize = 16;
+
+    let actual = read_identity_file(path, 16 * 1024)?;
+    let prefix = configured_root.as_os_str().as_encoded_bytes();
+    let encoded_identity_bytes = 1 + FILESYSTEM_IDENTITY_BYTES;
+    let expected_length = prefix
+        .len()
+        .checked_add(bound_objects.saturating_mul(encoded_identity_bytes))
+        .ok_or(QueueError::InvalidQueueIdentity)?;
+    if actual.len() != expected_length || !actual.starts_with(prefix) {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    if actual[prefix.len()..]
+        .chunks_exact(encoded_identity_bytes)
+        .all(|identity| identity[0] == 0)
+    {
+        Ok(())
+    } else {
+        Err(QueueError::InvalidQueueIdentity)
+    }
+}
+
 #[derive(Debug)]
 struct QueueDirectories {
     lock: PinnedDirectory,
@@ -1268,6 +1374,72 @@ fn ensure_lock_file(path: &Path) -> Result<(), QueueError> {
         }
         Err(error) => Err(QueueError::Io(error)),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn open_existing_lock_file(path: &Path) -> Result<File, QueueError> {
+    let metadata = fs::symlink_metadata(path).map_err(QueueError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(QueueError::InvalidStoragePath(path.into()));
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(QueueError::Io)
+}
+
+#[cfg(target_os = "linux")]
+fn queue_restore_lock_error(error: TryLockError) -> QueueError {
+    match error {
+        TryLockError::WouldBlock => QueueError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "restored queue is in use",
+        )),
+        TryLockError::Error(error) => QueueError::Io(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn replace_queue_binding(path: &Path, binding: &[u8], root: &Path) -> Result<(), QueueError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use nix::unistd::{Gid, Uid, fchown};
+
+    let old_metadata = fs::symlink_metadata(path).map_err(QueueError::Io)?;
+    if !old_metadata.file_type().is_file() {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    let temporary = root.join(format!(
+        ".{QUEUE_ROOT_BINDING_FILE_NAME}.{}.tmp",
+        Ulid::generate()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(QueueError::Io)?;
+        file.write_all(binding).map_err(QueueError::Io)?;
+        fchown(
+            &file,
+            Some(Uid::from_raw(old_metadata.uid())),
+            Some(Gid::from_raw(old_metadata.gid())),
+        )
+        .map_err(|error| QueueError::Io(io::Error::from_raw_os_error(error as i32)))?;
+        file.set_permissions(fs::Permissions::from_mode(
+            old_metadata.permissions().mode(),
+        ))
+        .map_err(QueueError::Io)?;
+        file.sync_all().map_err(QueueError::Io)?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(QueueError::Io)?;
+        sync_directory(root)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 fn ensure_sequence_file(path: &Path, queue_root: &Path) -> Result<(), QueueError> {

@@ -49,6 +49,7 @@ const COMMON_USAGE: &str = "usage:\n\
 #[cfg(target_os = "linux")]
 const LINUX_USAGE: &str = "\n\
     agent-knowledge admin bootstrap-storage --config <path> --gateway-owner <name-or-id> [--runtime-directory <path>] [--worker-owner <name-or-id>] [--worker-group <name-or-id>] [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>] [--ingress-group <name-or-id>]\n\
+    agent-knowledge admin rebind-restored-storage --config <path> --gateway-owner <name-or-id> [--runtime-directory <path>] [--worker-owner <name-or-id>] [--worker-group <name-or-id>] [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>] [--ingress-group <name-or-id>]\n\
     agent-knowledge admin migrate-v1-storage --queue-root <path> --git-directory <path> --content-root <path> [--queue-owner <name-or-id>] [--queue-group <name-or-id>] [--gateway-group <name-or-id>]";
 const DEFAULT_CLIENT_TIMEOUT_SECONDS: u64 = 300;
 const MAXIMUM_CLIENT_TIMEOUT_SECONDS: u64 = 3_600;
@@ -90,6 +91,11 @@ where
         #[cfg(target_os = "linux")]
         Command::AdminBootstrapStorage(settings) => {
             crate::storage_bootstrap::bootstrap_storage(&settings, output)
+                .map_err(CliError::StorageBootstrap)
+        }
+        #[cfg(target_os = "linux")]
+        Command::AdminRebindRestoredStorage(settings) => {
+            crate::storage_bootstrap::rebind_restored_storage(&settings, output)
                 .map_err(CliError::StorageBootstrap)
         }
         #[cfg(target_os = "linux")]
@@ -203,6 +209,8 @@ enum Command {
     },
     #[cfg(target_os = "linux")]
     AdminBootstrapStorage(StorageBootstrap),
+    #[cfg(target_os = "linux")]
+    AdminRebindRestoredStorage(StorageBootstrap),
     #[cfg(target_os = "linux")]
     AdminMigrateV1Storage {
         queue_root: PathBuf,
@@ -334,7 +342,14 @@ where
             if namespace == std::ffi::OsStr::new("admin")
                 && action == std::ffi::OsStr::new("bootstrap-storage") =>
         {
-            parse_admin_bootstrap_storage_arguments(arguments)
+            parse_admin_storage_arguments(arguments, false)
+        }
+        #[cfg(target_os = "linux")]
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("admin")
+                && action == std::ffi::OsStr::new("rebind-restored-storage") =>
+        {
+            parse_admin_storage_arguments(arguments, true)
         }
         #[cfg(target_os = "linux")]
         (Some(namespace), Some(action))
@@ -797,7 +812,7 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn parse_admin_bootstrap_storage_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+fn parse_admin_storage_arguments<I>(mut arguments: I, restored: bool) -> Result<Command, CliError>
 where
     I: Iterator<Item = OsString>,
 {
@@ -827,7 +842,7 @@ where
             _ => return Err(CliError::Usage),
         }
     }
-    Ok(Command::AdminBootstrapStorage(StorageBootstrap {
+    let settings = StorageBootstrap {
         config: config.ok_or(CliError::Usage)?,
         runtime_directory: runtime_directory
             .unwrap_or_else(|| PathBuf::from("/run/agent-knowledge")),
@@ -838,7 +853,12 @@ where
         gateway_owner: gateway_owner.ok_or(CliError::Usage)?,
         gateway_group: gateway_group.unwrap_or_else(|| "agent-knowledge-gateway".into()),
         ingress_group: ingress_group.unwrap_or_else(|| "agent-knowledge-ingress".into()),
-    }))
+    };
+    if restored {
+        Ok(Command::AdminRebindRestoredStorage(settings))
+    } else {
+        Ok(Command::AdminBootstrapStorage(settings))
+    }
 }
 
 fn parse_worker_arguments<I>(mut arguments: I) -> Result<Command, CliError>

@@ -17,6 +17,8 @@ use super::{
     QueueReader, QueueRequestStatus, QueueState, StaleAgeSource, WorkerQueueError,
     inactive_stale_directories,
 };
+#[cfg(target_os = "linux")]
+use crate::rebind_restored_queue;
 use crate::{PackageLimits, PackagePolicy, validate_accepted_package};
 
 const REQUEST_JSON: &str = r#"{
@@ -616,6 +618,71 @@ fn rejects_a_copied_queue_as_a_second_live_instance() {
     assert!(matches!(
         FileQueue::initialize(&copied, PackagePolicy::default()),
         Err(QueueError::InvalidQueueIdentity)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn explicitly_rebinds_an_offline_restored_queue() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    let queue_path = root.path().join("queue");
+    let original_identity = fs::read(queue_path.join("queue-id"))
+        .unwrap_or_else(|error| panic!("queue identity must be readable: {error}"));
+    let backup = root.path().join("cold-backup");
+    copy_tree(&queue_path, &backup);
+    drop(queue);
+    fs::remove_dir_all(&queue_path)
+        .unwrap_or_else(|error| panic!("original queue must be removed: {error}"));
+    copy_tree(&backup, &queue_path);
+
+    rebind_restored_queue(&queue_path)
+        .unwrap_or_else(|error| panic!("offline restored queue must be rebound: {error}"));
+    let reader = QueueReader::open_until(&queue_path, None)
+        .unwrap_or_else(|error| panic!("rebound queue must open: {error}"));
+
+    assert_eq!(
+        reader
+            .status_until(request_id("01K00000000000000000000000"), None)
+            .unwrap_or_else(|error| panic!("restored request must be readable: {error}")),
+        Some(QueueRequestStatus::Pending)
+    );
+    assert_eq!(
+        fs::read(queue_path.join("queue-id"))
+            .unwrap_or_else(|error| panic!("restored identity must be readable: {error}")),
+        original_identity
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn refuses_to_rebind_a_queue_with_a_malformed_prior_binding() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let queue_path = root.path().join("queue");
+    drop(queue);
+    fs::write(queue_path.join("queue-root-binding-v1"), b"invalid")
+        .unwrap_or_else(|error| panic!("malformed queue binding must be written: {error}"));
+
+    assert!(matches!(
+        rebind_restored_queue(queue_path),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn refuses_to_rebind_a_queue_with_an_active_writer() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let _worker = queue
+        .try_worker_session()
+        .unwrap_or_else(|error| panic!("fixture Worker lock must be acquired: {error}"));
+
+    assert!(matches!(
+        rebind_restored_queue(root.path().join("queue")),
+        Err(QueueError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
     ));
 }
 

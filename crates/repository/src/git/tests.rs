@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use agent_knowledge_core::{BatchId, ErrorCode, PayloadPath, RequestId, Revision};
 use agent_knowledge_queue::{
@@ -24,7 +26,10 @@ use super::{
     select_working_directory, staged_stats, validate_journal_structure,
 };
 #[cfg(target_os = "linux")]
-use super::{run_git_for_read_with_output_limit, run_git_until_controlled};
+use super::{
+    ensure_canonical_worktree_clean, run_git_for_read, run_git_for_read_with_output_limit,
+    run_git_until_controlled,
+};
 use crate::ContentPolicy;
 use crate::apply::AppliedMove;
 
@@ -92,6 +97,51 @@ fn bounds_read_only_git_output_without_a_deadline() {
     );
 
     assert!(matches!(result, Err(GitTransactionError::InvalidGitOutput)));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_only_git_commands_disable_optional_locks() {
+    let output = run_git_for_read(
+        None,
+        None,
+        [
+            OsStr::new("-c"),
+            OsStr::new("alias.fictional-environment=!printf %s \"$GIT_OPTIONAL_LOCKS\""),
+            OsStr::new("fictional-environment"),
+        ],
+        None,
+    )
+    .unwrap_or_else(|error| panic!("read-only Git command must succeed: {error}"));
+
+    assert_eq!(output.stdout, b"0");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_only_status_preserves_the_canonical_index_mode() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let tracked = fixture.canonical.join("index.md");
+    fs::write(&tracked, b"fictional content\n")
+        .unwrap_or_else(|error| panic!("tracked fixture must be written: {error}"));
+    commit_canonical_fixture(&fixture.canonical, "Add fictional content");
+    let index = fixture.repository.join("worktrees/content/index");
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o640))
+        .unwrap_or_else(|error| panic!("index permissions must be restricted: {error}"));
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(&tracked, b"fictional content\n")
+        .unwrap_or_else(|error| panic!("tracked fixture timestamp must change: {error}"));
+
+    ensure_canonical_worktree_clean(&fixture.canonical)
+        .unwrap_or_else(|error| panic!("unchanged worktree must remain clean: {error}"));
+
+    let mode = fs::metadata(index)
+        .unwrap_or_else(|error| panic!("index metadata must be readable: {error}"))
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o640);
 }
 
 #[cfg(target_os = "linux")]
@@ -408,6 +458,29 @@ fn directory_entry_count(path: &Path) -> usize {
     fs::read_dir(path)
         .map(|entries| entries.count())
         .unwrap_or(usize::MAX)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir(destination)
+        .unwrap_or_else(|error| panic!("restored directory must be created: {error}"));
+    for entry in fs::read_dir(source)
+        .unwrap_or_else(|error| panic!("backup directory must be readable: {error}"))
+    {
+        let entry = entry.unwrap_or_else(|error| panic!("backup entry must be readable: {error}"));
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)
+            .unwrap_or_else(|error| panic!("backup metadata must be readable: {error}"));
+        if metadata.file_type().is_dir() {
+            copy_tree(&source_path, &destination_path);
+        } else if metadata.file_type().is_file() {
+            fs::copy(&source_path, &destination_path)
+                .unwrap_or_else(|error| panic!("backup file must be copied: {error}"));
+        } else {
+            panic!("repository fixture must contain only directories and regular files");
+        }
+    }
 }
 
 fn git<const N: usize>(
@@ -1279,6 +1352,158 @@ fn rejects_a_work_root_bound_to_another_repository() {
         ),
         Err(GitTransactionError::RepositoryBindingMismatch)
     ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rebinds_an_offline_repository_restored_at_its_configured_paths() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let repository = fixture.open();
+    let original_commit = fixture.official_commit();
+    drop(repository);
+
+    let backup = root.path().join("cold-backup");
+    fs::create_dir(&backup).unwrap_or_else(|error| panic!("backup root must be created: {error}"));
+    for (source, name) in [
+        (&fixture.repository, "repository"),
+        (&fixture.canonical, "content"),
+        (&fixture.work, "work"),
+    ] {
+        copy_tree(source, &backup.join(name));
+        fs::remove_dir_all(source)
+            .unwrap_or_else(|error| panic!("original fixture must be removed: {error}"));
+        copy_tree(&backup.join(name), source);
+    }
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+
+    assert!(matches!(
+        GitRepository::open_existing(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity.clone(),
+        ),
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+    let restored = GitRepository::rebind_restored(
+        &fixture.repository,
+        &fixture.canonical,
+        &fixture.work,
+        "main",
+        identity,
+    )
+    .unwrap_or_else(|error| panic!("offline restored repository must be rebound: {error}"));
+    drop(restored);
+
+    assert_eq!(fixture.official_commit(), original_commit);
+    drop(fixture.open());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn refuses_to_rebind_a_repository_with_disagreeing_prior_bindings() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    drop(fixture.open());
+    fs::write(
+        fixture.repository.join("agent-knowledge/binding-v2"),
+        b"invalid",
+    )
+    .unwrap_or_else(|error| panic!("malformed repository binding must be written: {error}"));
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+
+    assert!(matches!(
+        GitRepository::rebind_restored(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity,
+        ),
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn refuses_to_rebind_a_repository_with_a_dirty_canonical_worktree() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    drop(fixture.open());
+    fs::write(fixture.canonical.join("untracked.md"), "fictional change\n")
+        .unwrap_or_else(|error| panic!("dirty worktree fixture must be written: {error}"));
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+
+    assert!(matches!(
+        GitRepository::rebind_restored(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity,
+        ),
+        Err(GitTransactionError::CanonicalWorktreeDirty)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn resumes_rebinding_after_only_one_repository_binding_was_replaced() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    drop(fixture.open());
+    let old_work_root_binding =
+        fs::read(fixture.work.join(".agent-knowledge-repository-binding-v2"))
+            .unwrap_or_else(|error| panic!("old work-root binding must be readable: {error}"));
+
+    let backup = root.path().join("cold-backup-for-retry");
+    fs::create_dir(&backup).unwrap_or_else(|error| panic!("backup root must be created: {error}"));
+    for (source, name) in [
+        (&fixture.repository, "repository"),
+        (&fixture.canonical, "content"),
+        (&fixture.work, "work"),
+    ] {
+        copy_tree(source, &backup.join(name));
+        fs::remove_dir_all(source)
+            .unwrap_or_else(|error| panic!("original fixture must be removed: {error}"));
+        copy_tree(&backup.join(name), source);
+    }
+    let identity = || {
+        GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+            .unwrap_or_else(|error| panic!("identity must be valid: {error}"))
+    };
+    drop(
+        GitRepository::rebind_restored(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity(),
+        )
+        .unwrap_or_else(|error| panic!("first restore binding must succeed: {error}")),
+    );
+    fs::write(
+        fixture.work.join(".agent-knowledge-repository-binding-v2"),
+        old_work_root_binding,
+    )
+    .unwrap_or_else(|error| panic!("interrupted binding state must be created: {error}"));
+
+    drop(
+        GitRepository::rebind_restored(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity(),
+        )
+        .unwrap_or_else(|error| panic!("interrupted restore must resume: {error}")),
+    );
+    drop(fixture.open());
 }
 
 #[cfg(unix)]
