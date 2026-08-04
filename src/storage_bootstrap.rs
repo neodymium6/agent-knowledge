@@ -256,6 +256,7 @@ fn rebind_restored_storage_with_ids(
     let settings = WorkerSettings::load(&request.config).map_err(StorageBootstrapError::Config)?;
     let storage_root = common_storage_root(&settings)?;
     validate_trusted_parent(&storage_root, identities.administrative_owner)?;
+    validate_trusted_parent(&request.runtime_directory, identities.administrative_owner)?;
     validate_parent_no_posix_acl(&storage_root)?;
     validate_runtime_directory(&request.runtime_directory, &storage_root)?;
     validate_official_branch(settings.official_branch())?;
@@ -334,15 +335,6 @@ fn rebind_restored_storage_with_ids(
         Mode::from_bits_truncate(0o640),
     )
     .map_err(|error| StorageBootstrapError::Permissions(settings.work_root().into(), error))?;
-    normalize_storage_tree(
-        settings.release_root(),
-        identities.worker_owner,
-        identities.worker_group,
-        Mode::from_bits_truncate(0o750),
-        Mode::from_bits_truncate(0o640),
-    )
-    .map_err(|error| StorageBootstrapError::Permissions(settings.release_root().into(), error))?;
-
     validate_durable_initialized(&settings, identities)?;
     initialize_runtime_directory(&request.runtime_directory, identities)?;
     validate_initialized(&settings, &request.runtime_directory, identities)?;

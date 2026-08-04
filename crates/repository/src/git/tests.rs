@@ -1401,6 +1401,61 @@ fn refuses_to_rebind_a_repository_with_a_dirty_canonical_worktree() {
     ));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn resumes_rebinding_after_only_one_repository_binding_was_replaced() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    drop(fixture.open());
+    let old_work_root_binding =
+        fs::read(fixture.work.join(".agent-knowledge-repository-binding-v2"))
+            .unwrap_or_else(|error| panic!("old work-root binding must be readable: {error}"));
+
+    let backup = root.path().join("cold-backup-for-retry");
+    fs::create_dir(&backup).unwrap_or_else(|error| panic!("backup root must be created: {error}"));
+    for (source, name) in [
+        (&fixture.repository, "repository"),
+        (&fixture.canonical, "content"),
+        (&fixture.work, "work"),
+    ] {
+        copy_tree(source, &backup.join(name));
+        fs::remove_dir_all(source)
+            .unwrap_or_else(|error| panic!("original fixture must be removed: {error}"));
+        copy_tree(&backup.join(name), source);
+    }
+    let identity = || {
+        GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+            .unwrap_or_else(|error| panic!("identity must be valid: {error}"))
+    };
+    drop(
+        GitRepository::rebind_restored(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity(),
+        )
+        .unwrap_or_else(|error| panic!("first restore binding must succeed: {error}")),
+    );
+    fs::write(
+        fixture.work.join(".agent-knowledge-repository-binding-v2"),
+        old_work_root_binding,
+    )
+    .unwrap_or_else(|error| panic!("interrupted binding state must be created: {error}"));
+
+    drop(
+        GitRepository::rebind_restored(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity(),
+        )
+        .unwrap_or_else(|error| panic!("interrupted restore must resume: {error}")),
+    );
+    drop(fixture.open());
+}
+
 #[cfg(unix)]
 #[test]
 fn preserves_non_utf8_git_directory_arguments() {

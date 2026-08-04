@@ -571,7 +571,7 @@ impl GitRepository {
         let expected_binding = repository_binding(&binding_directories, &official_ref)?;
         let binding_file = repository_state.join("binding-v2");
         let work_root_binding_file = work_root.join(".agent-knowledge-repository-binding-v2");
-        if matches!(binding_mode, BindingMode::RebindRestored) {
+        let prior_bindings = if matches!(binding_mode, BindingMode::RebindRestored) {
             ensure_canonical_worktree_clean(&canonical_worktree)?;
             let official_commit = resolve_in_worktree(&canonical_worktree, &official_ref)?;
             let checked_out_commit = resolve_in_worktree(&canonical_worktree, "HEAD")?;
@@ -580,20 +580,36 @@ impl GitRepository {
             }
             let prior_repository_binding = read_binding(&binding_file)?;
             let prior_work_root_binding = read_binding(&work_root_binding_file)?;
-            if prior_repository_binding != prior_work_root_binding {
-                return Err(GitTransactionError::RepositoryBindingMismatch);
-            }
             validate_restored_repository_binding(
                 &prior_repository_binding,
                 binding_directories.map(|(path, _handle)| path),
                 &official_ref,
             )?;
-        }
+            validate_restored_repository_binding(
+                &prior_work_root_binding,
+                binding_directories.map(|(path, _handle)| path),
+                &official_ref,
+            )?;
+            if prior_repository_binding != prior_work_root_binding
+                && prior_repository_binding != expected_binding
+                && prior_work_root_binding != expected_binding
+            {
+                return Err(GitTransactionError::RepositoryBindingMismatch);
+            }
+            Some((prior_repository_binding, prior_work_root_binding))
+        } else {
+            None
+        };
         match binding_mode {
             BindingMode::Initialize => ensure_binding(&binding_file, &expected_binding)?,
             BindingMode::Existing => validate_binding(&binding_file, &expected_binding)?,
             BindingMode::RebindRestored => {
-                replace_existing_binding(&binding_file, &expected_binding)?;
+                if prior_bindings
+                    .as_ref()
+                    .is_none_or(|(repository, _work_root)| repository != &expected_binding)
+                {
+                    replace_existing_binding(&binding_file, &expected_binding)?;
+                }
             }
         }
         match binding_mode {
@@ -604,7 +620,12 @@ impl GitRepository {
                 validate_binding(&work_root_binding_file, &expected_binding)?;
             }
             BindingMode::RebindRestored => {
-                replace_existing_binding(&work_root_binding_file, &expected_binding)?;
+                if prior_bindings
+                    .as_ref()
+                    .is_none_or(|(_repository, work_root)| work_root != &expected_binding)
+                {
+                    replace_existing_binding(&work_root_binding_file, &expected_binding)?;
+                }
             }
         }
         drop(writer);

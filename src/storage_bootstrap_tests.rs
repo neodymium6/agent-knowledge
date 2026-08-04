@@ -1,9 +1,14 @@
 use std::ffi::OsString;
 use std::fs::{self, File};
+use std::os::unix::fs::symlink;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use agent_knowledge_core::BatchId;
+use agent_knowledge_release::{QuartzBuilder, ReleasePolicy, ReleaseStore};
 use nix::unistd::{Gid, Uid};
+use time::OffsetDateTime;
 use ulid::Ulid;
 use xattr::FileExt as _;
 
@@ -60,8 +65,13 @@ fn copy_tree(source: &Path, destination: &Path) {
         } else if metadata.file_type().is_file() {
             fs::copy(&source_path, &destination_path)
                 .unwrap_or_else(|error| panic!("source file must be copied: {error}"));
+        } else if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&source_path)
+                .unwrap_or_else(|error| panic!("source symlink must be readable: {error}"));
+            symlink(target, &destination_path)
+                .unwrap_or_else(|error| panic!("restored symlink must be created: {error}"));
         } else {
-            panic!("storage fixture must contain only directories and regular files");
+            panic!("storage fixture contains an unsupported filesystem object");
         }
     }
     fs::set_permissions(
@@ -69,6 +79,37 @@ fn copy_tree(source: &Path, destination: &Path) {
         fs::Permissions::from_mode(source_metadata.permissions().mode()),
     )
     .unwrap_or_else(|error| panic!("restored directory mode must be copied: {error}"));
+}
+
+fn write_executable(path: &Path, script: &str) {
+    fs::write(path, script)
+        .unwrap_or_else(|error| panic!("fake Quartz command must be written: {error}"));
+    fs::set_permissions(path, fs::Permissions::from_mode(0o500))
+        .unwrap_or_else(|error| panic!("fake Quartz command must be executable: {error}"));
+}
+
+fn normalize_release_fixture(path: &Path) {
+    let metadata = fs::symlink_metadata(path)
+        .unwrap_or_else(|error| panic!("release fixture metadata must be readable: {error}"));
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    if metadata.file_type().is_dir() {
+        for entry in fs::read_dir(path)
+            .unwrap_or_else(|error| panic!("release fixture directory must be readable: {error}"))
+        {
+            let entry = entry
+                .unwrap_or_else(|error| panic!("release fixture entry must be readable: {error}"));
+            normalize_release_fixture(&entry.path());
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o750))
+            .unwrap_or_else(|error| panic!("release fixture directory mode must be set: {error}"));
+    } else if metadata.file_type().is_file() {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o640))
+            .unwrap_or_else(|error| panic!("release fixture file mode must be set: {error}"));
+    } else {
+        panic!("release fixture contains an unsupported filesystem object");
+    }
 }
 
 fn fixture(root: &Path) -> (StorageBootstrap, StorageIdentities) {
@@ -287,6 +328,41 @@ fn rebinds_a_cold_copy_restored_at_the_configured_storage_root() {
     bootstrap_storage_with_ids(&request, identities, Vec::new())
         .unwrap_or_else(|error| panic!("storage fixture must initialize: {error}"));
     let storage = root.path().join("storage");
+    let integration = root.path().join("quartz-integration");
+    fs::create_dir(&integration)
+        .unwrap_or_else(|error| panic!("Quartz integration fixture must be created: {error}"));
+    let program = root.path().join("fictional-quartz");
+    write_executable(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' '<p>fictional release</p>' > \"$5/index.html\"\n",
+    );
+    let release_store =
+        ReleaseStore::open_existing(storage.join("releases"), ReleasePolicy::default())
+            .unwrap_or_else(|error| panic!("release store fixture must open: {error}"));
+    let batch_id: BatchId = "01K00000000000000000000042"
+        .parse()
+        .unwrap_or_else(|error| panic!("batch ID fixture must parse: {error}"));
+    let build = release_store
+        .begin_build(batch_id)
+        .unwrap_or_else(|error| panic!("release build fixture must begin: {error}"));
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("Quartz builder fixture must open: {error}"));
+    let built = builder
+        .build(&storage.join("content"), build)
+        .unwrap_or_else(|error| panic!("release fixture must build: {error}"));
+    let prepared = release_store
+        .prepare(
+            built,
+            "1111111111111111111111111111111111111111",
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap_or_else(|error| panic!("release fixture must prepare: {error}"));
+    release_store
+        .activate(&prepared)
+        .unwrap_or_else(|error| panic!("release fixture must activate: {error}"));
+    drop(release_store);
+    normalize_release_fixture(&storage.join("releases"));
+    assert!(storage.join("releases/current").is_symlink());
     let backup = root.path().join("cold-backup");
     copy_tree(&storage, &backup);
     fs::remove_dir_all(&storage)
@@ -295,15 +371,20 @@ fn rebinds_a_cold_copy_restored_at_the_configured_storage_root() {
     fs::remove_dir_all(&request.runtime_directory)
         .unwrap_or_else(|error| panic!("ephemeral runtime directory must be removed: {error}"));
 
-    assert!(matches!(
-        bootstrap_storage_with_ids(&request, identities, Vec::new()),
-        Err(StorageBootstrapError::Component("queue validation", _))
-    ));
+    let normal_start = bootstrap_storage_with_ids(&request, identities, Vec::new());
+    assert!(
+        matches!(
+            normal_start,
+            Err(StorageBootstrapError::Component("queue validation", _))
+        ),
+        "copied binding must block normal startup: {normal_start:?}"
+    );
     let mut output = Vec::new();
     rebind_restored_storage_with_ids(&request, identities, &mut output)
         .unwrap_or_else(|error| panic!("cold restored storage must be rebound: {error}"));
 
     assert_eq!(output, b"{\"status\":\"rebound\"}\n");
+    assert!(storage.join("releases/current").is_symlink());
     bootstrap_storage_with_ids(&request, identities, Vec::new())
         .unwrap_or_else(|error| panic!("rebound storage must pass normal bootstrap: {error}"));
 }
