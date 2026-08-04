@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/client",
     "crates/core",
     "crates/gateway",
     "crates/protocol",
@@ -57,6 +58,7 @@ path = "src/bin/agent_knowledge_ssh_shell.rs"
 workspace = true
 
 [dependencies]
+agent-knowledge-client = { path = "crates/client" }
 agent-knowledge-core = { path = "crates/core" }
 agent-knowledge-gateway = { path = "crates/gateway" }
 agent-knowledge-protocol = { path = "crates/protocol" }

@@ -1,0 +1,25 @@
+[package]
+name = "agent-knowledge-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable SSH client for Agent Knowledge"
+readme = "../../README.md"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-knowledge-core = { path = "../core" }
+agent-knowledge-protocol = { path = "../protocol" }
+agent-knowledge-queue = { path = "../queue" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30.1", features = ["process", "signal"] }
