@@ -2836,7 +2836,7 @@ where
             stdout: maximum_stdout_bytes,
             stderr: MAXIMUM_TIMED_GIT_OUTPUT_BYTES,
         },
-        None,
+        Some((OsStr::new("GIT_OPTIONAL_LOCKS"), OsStr::new("0"))),
     )
 }
 
@@ -2851,15 +2851,23 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let optional_locks = Some((OsStr::new("GIT_OPTIONAL_LOCKS"), OsStr::new("0")));
     match deadline {
-        Some(deadline) => run_git_until_controlled(
+        Some(deadline) => run_git_until_controlled_with_environment(
             working_directory,
             git_directory,
             arguments,
             deadline,
             cancelled,
+            optional_locks,
         ),
-        None => run_git(working_directory, git_directory, arguments),
+        None => run_git_with_input_and_environment(
+            working_directory,
+            git_directory,
+            arguments,
+            &[],
+            optional_locks,
+        ),
     }
 }
 
@@ -3140,7 +3148,24 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_git_with_input_and_environment(working_directory, git_directory, arguments, input, None)
+}
+
+fn run_git_with_input_and_environment<I, S>(
+    working_directory: Option<&Path>,
+    git_directory: Option<&Path>,
+    arguments: I,
+    input: &[u8],
+    environment: Option<(&OsStr, &OsStr)>,
+) -> Result<Output, GitTransactionError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = git_command();
+    if let Some((name, value)) = environment {
+        command.env(name, value);
+    }
     if let Some(working_directory) = working_directory {
         select_working_directory(&mut command, working_directory);
     }

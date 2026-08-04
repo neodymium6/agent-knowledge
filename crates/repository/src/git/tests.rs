@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use agent_knowledge_core::{BatchId, ErrorCode, PayloadPath, RequestId, Revision};
 use agent_knowledge_queue::{
@@ -24,7 +26,10 @@ use super::{
     select_working_directory, staged_stats, validate_journal_structure,
 };
 #[cfg(target_os = "linux")]
-use super::{run_git_for_read_with_output_limit, run_git_until_controlled};
+use super::{
+    ensure_canonical_worktree_clean, run_git_for_read, run_git_for_read_with_output_limit,
+    run_git_until_controlled,
+};
 use crate::ContentPolicy;
 use crate::apply::AppliedMove;
 
@@ -92,6 +97,51 @@ fn bounds_read_only_git_output_without_a_deadline() {
     );
 
     assert!(matches!(result, Err(GitTransactionError::InvalidGitOutput)));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_only_git_commands_disable_optional_locks() {
+    let output = run_git_for_read(
+        None,
+        None,
+        [
+            OsStr::new("-c"),
+            OsStr::new("alias.fictional-environment=!printf %s \"$GIT_OPTIONAL_LOCKS\""),
+            OsStr::new("fictional-environment"),
+        ],
+        None,
+    )
+    .unwrap_or_else(|error| panic!("read-only Git command must succeed: {error}"));
+
+    assert_eq!(output.stdout, b"0");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_only_status_preserves_the_canonical_index_mode() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let tracked = fixture.canonical.join("index.md");
+    fs::write(&tracked, b"fictional content\n")
+        .unwrap_or_else(|error| panic!("tracked fixture must be written: {error}"));
+    commit_canonical_fixture(&fixture.canonical, "Add fictional content");
+    let index = fixture.repository.join("worktrees/content/index");
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o640))
+        .unwrap_or_else(|error| panic!("index permissions must be restricted: {error}"));
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(&tracked, b"fictional content\n")
+        .unwrap_or_else(|error| panic!("tracked fixture timestamp must change: {error}"));
+
+    ensure_canonical_worktree_clean(&fixture.canonical)
+        .unwrap_or_else(|error| panic!("unchanged worktree must remain clean: {error}"));
+
+    let mode = fs::metadata(index)
+        .unwrap_or_else(|error| panic!("index metadata must be readable: {error}"))
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o640);
 }
 
 #[cfg(target_os = "linux")]
