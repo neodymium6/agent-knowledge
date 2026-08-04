@@ -1,10 +1,25 @@
 {
   description = "Agent Knowledge package and development environment";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    csi-driver-host-path = {
+      url = "github:kubernetes-csi/csi-driver-host-path/cc78ee78ae23908c9e0607df2fe09c7ecfa52597";
+      flake = false;
+    };
+    external-snapshotter = {
+      url = "github:kubernetes-csi/external-snapshotter/78e32cd84e0abec2621924a30e38c755f93e180a";
+      flake = false;
+    };
+  };
 
   outputs =
-    { nixpkgs, ... }:
+    {
+      csi-driver-host-path,
+      external-snapshotter,
+      nixpkgs,
+      ...
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -378,6 +393,34 @@
             };
           };
         };
+      kubernetesE2eQuartzContainerImageFor =
+        system:
+        let
+          pkgs = pkgsFor.${system};
+          fixture = pkgs.runCommand "agent-knowledge-kubernetes-e2e-quartz-root" { } ''
+            install -d "$out/fixture"
+            install -m555 ${./deploy/kubernetes-e2e/build-site} \
+              "$out/fixture/build-site"
+          '';
+        in
+        pkgs.dockerTools.buildLayeredImage {
+          name = "agent-knowledge-kubernetes-e2e-quartz";
+          tag = projectVersion;
+          contents = [
+            pkgs.pkgsStatic.busybox
+            fixture
+          ];
+          config = {
+            User = "0";
+            WorkingDir = "/";
+            Entrypoint = [ "/bin/sh" ];
+            Labels = {
+              "org.opencontainers.image.title" = "Agent Knowledge Kubernetes E2E Quartz Fixture";
+              "org.opencontainers.image.version" = projectVersion;
+              "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+            };
+          };
+        };
     in
     {
       devShells = forAllSystems (
@@ -387,12 +430,15 @@
         in
         {
           default = pkgs.mkShell {
+            AGENT_KNOWLEDGE_CSI_HOSTPATH_SOURCE = csi-driver-host-path;
+            AGENT_KNOWLEDGE_EXTERNAL_SNAPSHOTTER_SOURCE = external-snapshotter;
             packages =
               with pkgs;
               [
                 actionlint
                 cargo
                 clippy
+                curl
                 gh
                 git
                 jq
@@ -406,6 +452,8 @@
                 yq-go
               ]
               ++ lib.optionals stdenv.isLinux [
+                kind
+                kubectl
                 openssh
                 systemd
               ];
@@ -418,6 +466,7 @@
         gateway-container-image = gatewayContainerImageFor system;
         openssh-gateway-package = opensshGatewayPackageFor system;
         openssh-gateway-container-image = opensshGatewayContainerImageFor system;
+        kubernetes-e2e-quartz-container-image = kubernetesE2eQuartzContainerImageFor system;
         storage-bootstrap-container-image = storageBootstrapContainerImageFor system;
         queue-ingress-container-image = queueIngressContainerImageFor system;
         worker-container-image = workerContainerImageFor system;
@@ -480,6 +529,7 @@
                   ${./deploy/kubernetes}
                 touch "$out"
               '';
+          kubernetesE2eQuartzContainerImage = kubernetesE2eQuartzContainerImageFor system;
         in
         {
           package = package;
@@ -491,6 +541,22 @@
             '';
           container-image = workerContainerImageCheck;
           kubernetes-manifests = kubernetesManifestCheck;
+          kubernetes-e2e-quartz-container-image =
+            pkgs.runCommand "check-agent-knowledge-kubernetes-e2e-quartz-container-image"
+              {
+                nativeBuildInputs = [
+                  pkgs.gnutar
+                  pkgs.gzip
+                  pkgs.jq
+                ];
+              }
+              ''
+                ${pkgs.bash}/bin/bash ${./deploy/kubernetes-e2e/check-quartz-image.sh} \
+                  ${kubernetesE2eQuartzContainerImage} \
+                  ${containerArchitecture.${system}} \
+                  ${projectVersion}
+                touch "$out"
+              '';
           worker-container-image = workerContainerImageCheck;
           queue-ingress-container-image =
             let

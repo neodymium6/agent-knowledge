@@ -1,0 +1,12 @@
+#!/opt/agent-knowledge-quartz/bin/busybox sh
+set -eu
+
+if [ "$#" -ne 5 ] || [ "$1" != "build" ] || [ "$2" != "-d" ] || [ "$4" != "-o" ]; then
+  exit 2
+fi
+
+content_directory=$3
+output_directory=$5
+test -d "$content_directory"
+test -d "$output_directory"
+printf '%s\n' '<p>fictional Kubernetes E2E site</p>' >"$output_directory/index.html"

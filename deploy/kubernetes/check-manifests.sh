@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 1 ]; then
-  echo "usage: $0 <kustomize-directory>" >&2
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  echo "usage: $0 <kustomize-directory> [kube-linter-config]" >&2
   exit 2
 fi
 
 manifest_directory=$1
+lint_config=${2:-$manifest_directory/kube-linter.yaml}
 temporary_directory=$(mktemp -d "${TMPDIR:-/tmp}/agent-knowledge-kubernetes.XXXXXX")
 trap 'rm -rf -- "$temporary_directory"' EXIT
 rendered_manifest=$temporary_directory/rendered.yaml
@@ -14,7 +15,7 @@ resources_json=$temporary_directory/resources.json
 
 kustomize build --load-restrictor LoadRestrictionsRootOnly \
   "$manifest_directory" >"$rendered_manifest"
-kube-linter lint --config "$manifest_directory/kube-linter.yaml" \
+kube-linter lint --config "$lint_config" \
   "$rendered_manifest"
 yq eval-all -o=json -I=0 '[.]' "$rendered_manifest" >"$resources_json"
 
