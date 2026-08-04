@@ -282,6 +282,8 @@ test "$(tar -xOf "$temporary_directory/bundle-before.tar" results.csv)" = \
   $'step,value\n1,42'
 
 kubectl delete pod/agent-knowledge-0 -n "$NAMESPACE" --wait=true
+kubectl wait --for=create pod/agent-knowledge-0 \
+  -n "$NAMESPACE" --timeout=60s
 kubectl wait --for=condition=Ready pod/agent-knowledge-0 \
   -n "$NAMESPACE" --timeout=300s
 start_port_forward

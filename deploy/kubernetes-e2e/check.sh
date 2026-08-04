@@ -85,8 +85,11 @@ jq -e '
   .nodes[0].kubeadmConfigPatches as $patches
   | any($patches[]; contains("podPidsLimit: 512"))
     and any($patches[];
-      contains("node-labels: \"agent-knowledge.io/pod-pids-limit=512\""))
+      contains("- name: node-labels")
+      and contains("value: \"agent-knowledge.io/pod-pids-limit=512\""))
 ' "$kind_json" >/dev/null
 
 grep -Fx '#!/opt/agent-knowledge-quartz/bin/busybox sh' \
   "$e2e_directory/build-site" >/dev/null
+grep -F 'kubectl wait --for=create pod/agent-knowledge-0' \
+  "$e2e_directory/run.sh" >/dev/null
