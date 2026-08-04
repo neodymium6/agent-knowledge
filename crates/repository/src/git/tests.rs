@@ -1352,6 +1352,55 @@ fn rebinds_an_offline_repository_restored_at_its_configured_paths() {
     drop(fixture.open());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn refuses_to_rebind_a_repository_with_disagreeing_prior_bindings() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    drop(fixture.open());
+    fs::write(
+        fixture.repository.join("agent-knowledge/binding-v2"),
+        b"invalid",
+    )
+    .unwrap_or_else(|error| panic!("malformed repository binding must be written: {error}"));
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+
+    assert!(matches!(
+        GitRepository::rebind_restored(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity,
+        ),
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn refuses_to_rebind_a_repository_with_a_dirty_canonical_worktree() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    drop(fixture.open());
+    fs::write(fixture.canonical.join("untracked.md"), "fictional change\n")
+        .unwrap_or_else(|error| panic!("dirty worktree fixture must be written: {error}"));
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+
+    assert!(matches!(
+        GitRepository::rebind_restored(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity,
+        ),
+        Err(GitTransactionError::CanonicalWorktreeDirty)
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn preserves_non_utf8_git_directory_arguments() {

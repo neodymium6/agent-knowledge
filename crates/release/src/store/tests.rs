@@ -1777,6 +1777,24 @@ fn missing_binding_does_not_rebind_a_populated_store() {
     ));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn malformed_binding_does_not_rebind_a_release_store() {
+    let root = TestDirectory::new();
+    let releases = root.0.join("releases");
+    drop(
+        ReleaseStore::open(&releases, ReleasePolicy::default())
+            .unwrap_or_else(|error| panic!("release store must open: {error}")),
+    );
+    fs::write(releases.join(BINDING_FILE), b"invalid")
+        .unwrap_or_else(|error| panic!("malformed release binding must be written: {error}"));
+
+    assert!(matches!(
+        ReleaseStore::rebind_restored(&releases, ReleasePolicy::default()),
+        Err(ReleaseError::StorageBindingMismatch)
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn legacy_binding_migrates_by_stable_inode_identity() {

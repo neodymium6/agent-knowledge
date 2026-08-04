@@ -239,7 +239,11 @@ pub fn rebind_restored_queue(queue_root: impl Into<PathBuf>) -> Result<(), Queue
     let _identity = read_queue_identity(&queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
     let _next_sequence = read_next_sequence(&queue_root.join(NEXT_SEQUENCE_FILE_NAME))?;
     let binding_path = queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME);
-    let _old_binding = read_identity_file(&binding_path, 16 * 1024)?;
+    validate_restored_queue_binding(
+        &binding_path,
+        &configured_queue_root,
+        1 + directories.all().count() + 2,
+    )?;
     let binding = queue_root_binding(
         &configured_queue_root,
         &root_handle,
@@ -257,6 +261,34 @@ pub fn rebind_restored_queue(queue_root: impl Into<PathBuf>) -> Result<(), Queue
         &worker_lock,
     )?;
     sync_directory(&queue_root)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_restored_queue_binding(
+    path: &Path,
+    configured_root: &Path,
+    bound_objects: usize,
+) -> Result<(), QueueError> {
+    const FILESYSTEM_IDENTITY_BYTES: usize = 16;
+
+    let actual = read_identity_file(path, 16 * 1024)?;
+    let prefix = configured_root.as_os_str().as_encoded_bytes();
+    let encoded_identity_bytes = 1 + FILESYSTEM_IDENTITY_BYTES;
+    let expected_length = prefix
+        .len()
+        .checked_add(bound_objects.saturating_mul(encoded_identity_bytes))
+        .ok_or(QueueError::InvalidQueueIdentity)?;
+    if actual.len() != expected_length || !actual.starts_with(prefix) {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    if actual[prefix.len()..]
+        .chunks_exact(encoded_identity_bytes)
+        .all(|identity| identity[0] == 0)
+    {
+        Ok(())
+    } else {
+        Err(QueueError::InvalidQueueIdentity)
+    }
 }
 
 #[derive(Debug)]

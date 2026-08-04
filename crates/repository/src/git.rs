@@ -570,6 +570,25 @@ impl GitRepository {
         ];
         let expected_binding = repository_binding(&binding_directories, &official_ref)?;
         let binding_file = repository_state.join("binding-v2");
+        let work_root_binding_file = work_root.join(".agent-knowledge-repository-binding-v2");
+        if matches!(binding_mode, BindingMode::RebindRestored) {
+            ensure_canonical_worktree_clean(&canonical_worktree)?;
+            let official_commit = resolve_in_worktree(&canonical_worktree, &official_ref)?;
+            let checked_out_commit = resolve_in_worktree(&canonical_worktree, "HEAD")?;
+            if checked_out_commit != official_commit {
+                return Err(GitTransactionError::CanonicalWorktreeMismatch);
+            }
+            let prior_repository_binding = read_binding(&binding_file)?;
+            let prior_work_root_binding = read_binding(&work_root_binding_file)?;
+            if prior_repository_binding != prior_work_root_binding {
+                return Err(GitTransactionError::RepositoryBindingMismatch);
+            }
+            validate_restored_repository_binding(
+                &prior_repository_binding,
+                binding_directories.map(|(path, _handle)| path),
+                &official_ref,
+            )?;
+        }
         match binding_mode {
             BindingMode::Initialize => ensure_binding(&binding_file, &expected_binding)?,
             BindingMode::Existing => validate_binding(&binding_file, &expected_binding)?,
@@ -577,7 +596,6 @@ impl GitRepository {
                 replace_existing_binding(&binding_file, &expected_binding)?;
             }
         }
-        let work_root_binding_file = work_root.join(".agent-knowledge-repository-binding-v2");
         match binding_mode {
             BindingMode::Initialize => {
                 ensure_binding(&work_root_binding_file, &expected_binding)?;
@@ -2337,6 +2355,14 @@ fn ensure_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionErro
 }
 
 fn validate_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionError> {
+    if read_binding(path)? == expected {
+        Ok(())
+    } else {
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    }
+}
+
+fn read_binding(path: &Path) -> Result<Vec<u8>, GitTransactionError> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             GitTransactionError::RepositoryBindingMismatch
@@ -2354,7 +2380,34 @@ fn validate_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionEr
                 .read_to_end(&mut actual)
         })
         .map_err(GitTransactionError::Io)?;
-    if actual == expected {
+    Ok(actual)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_restored_repository_binding<'a>(
+    actual: &[u8],
+    configured_paths: impl IntoIterator<Item = &'a Path>,
+    official_ref: &str,
+) -> Result<(), GitTransactionError> {
+    const PREFIX: &[u8] = b"agent-knowledge-repository-binding-v2\0";
+    const FILESYSTEM_IDENTITY_BYTES: usize = 16;
+
+    let mut remaining = actual
+        .strip_prefix(PREFIX)
+        .ok_or(GitTransactionError::RepositoryBindingMismatch)?;
+    for path in configured_paths {
+        remaining = remaining
+            .strip_prefix(path.as_os_str().as_encoded_bytes())
+            .ok_or(GitTransactionError::RepositoryBindingMismatch)?;
+        if remaining.len() < FILESYSTEM_IDENTITY_BYTES + 2
+            || remaining[0] != 0
+            || remaining[FILESYSTEM_IDENTITY_BYTES + 1] != 0
+        {
+            return Err(GitTransactionError::RepositoryBindingMismatch);
+        }
+        remaining = &remaining[FILESYSTEM_IDENTITY_BYTES + 2..];
+    }
+    if remaining == official_ref.as_bytes() {
         Ok(())
     } else {
         Err(GitTransactionError::RepositoryBindingMismatch)

@@ -339,7 +339,7 @@ impl ReleaseStore {
             Err(TryLockError::Error(error)) => return Err(ReleaseError::Io(error)),
         }
         let binding_path = self.root.join(BINDING_FILE);
-        let _old_binding = read_binding_file(&binding_path)?;
+        validate_restored_binding(&binding_path, &self.configured_root, 6)?;
         let expected = binding_bytes(
             &self.configured_root,
             &self.root_handle,
@@ -2145,6 +2145,35 @@ fn binding_bytes<'a>(
 
 fn validate_binding(path: &Path, expected: &[u8]) -> Result<(), ReleaseError> {
     if read_binding_file(path)? == expected {
+        Ok(())
+    } else {
+        Err(ReleaseError::StorageBindingMismatch)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_restored_binding(
+    path: &Path,
+    configured_root: &Path,
+    bound_objects: usize,
+) -> Result<(), ReleaseError> {
+    const PREFIX: &[u8] = b"agent-knowledge-release-store-v5\0";
+    const ENCODED_IDENTITY_BYTES: usize = 9;
+
+    let actual = read_binding_file(path)?;
+    let mut expected_prefix = PREFIX.to_vec();
+    expected_prefix.extend_from_slice(configured_root.as_os_str().as_encoded_bytes());
+    let expected_length = expected_prefix
+        .len()
+        .checked_add(bound_objects.saturating_mul(ENCODED_IDENTITY_BYTES))
+        .ok_or(ReleaseError::StorageBindingMismatch)?;
+    if actual.len() != expected_length || !actual.starts_with(&expected_prefix) {
+        return Err(ReleaseError::StorageBindingMismatch);
+    }
+    if actual[expected_prefix.len()..]
+        .chunks_exact(ENCODED_IDENTITY_BYTES)
+        .all(|identity| identity[0] == 0)
+    {
         Ok(())
     } else {
         Err(ReleaseError::StorageBindingMismatch)
