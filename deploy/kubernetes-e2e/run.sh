@@ -15,12 +15,14 @@ LOCAL_SSH_PORT=
 : "${AGENT_KNOWLEDGE_CSI_HOSTPATH_SOURCE:?run this test through the Nix development shell}"
 : "${AGENT_KNOWLEDGE_EXTERNAL_SNAPSHOTTER_SOURCE:?run this test through the Nix development shell}"
 
-for program in docker jq kind kubectl kustomize nix ssh-keygen tar; do
+for program in docker jq kind kubectl kustomize nix ssh ssh-keygen tar; do
   command -v "$program" >/dev/null || {
     echo "required E2E program is unavailable: $program" >&2
     exit 2
   }
 done
+ssh_program=$(command -v ssh)
+readonly ssh_program
 
 test -d "$AGENT_KNOWLEDGE_CSI_HOSTPATH_SOURCE/deploy/kubernetes-1.35"
 test -d "$AGENT_KNOWLEDGE_EXTERNAL_SNAPSHOTTER_SOURCE/client/config/crd"
@@ -70,17 +72,16 @@ load_image() {
 }
 
 run_client() {
-  HOME="$temporary_directory/client-home" "$client_program" "$@"
+  PATH="$temporary_directory/client-bin:$PATH" "$client_program" "$@"
 }
 
 configure_client_ssh() {
-  mkdir -p "$temporary_directory/client-home/.ssh"
-  chmod 0700 "$temporary_directory/client-home/.ssh"
+  mkdir -p "$temporary_directory/client-bin" "$temporary_directory/client-ssh"
   read -r host_key_type host_key_data _comment <"$temporary_directory/host-key.pub"
   printf '[127.0.0.1]:%s %s %s\n' \
     "$LOCAL_SSH_PORT" "$host_key_type" "$host_key_data" \
-    >"$temporary_directory/client-home/.ssh/known_hosts"
-  cat >"$temporary_directory/client-home/.ssh/config" <<EOF
+    >"$temporary_directory/client-ssh/known_hosts"
+  cat >"$temporary_directory/client-ssh/config" <<EOF
 Host agent-knowledge-e2e
   HostName 127.0.0.1
   Port $LOCAL_SSH_PORT
@@ -88,11 +89,15 @@ Host agent-knowledge-e2e
   IdentityFile $temporary_directory/client-key
   IdentitiesOnly yes
   StrictHostKeyChecking yes
-  UserKnownHostsFile $temporary_directory/client-home/.ssh/known_hosts
+  UserKnownHostsFile $temporary_directory/client-ssh/known_hosts
   LogLevel ERROR
 EOF
-  chmod 0600 "$temporary_directory/client-home/.ssh/config" \
-    "$temporary_directory/client-home/.ssh/known_hosts"
+  printf '#!/usr/bin/env bash\nexec %q -F %q "$@"\n' \
+    "$ssh_program" "$temporary_directory/client-ssh/config" \
+    >"$temporary_directory/client-bin/ssh"
+  chmod 0700 "$temporary_directory/client-bin/ssh"
+  chmod 0600 "$temporary_directory/client-ssh/config" \
+    "$temporary_directory/client-ssh/known_hosts"
 }
 
 start_port_forward() {
@@ -147,7 +152,7 @@ wait_for_completed_request() {
 cd "$REPOSITORY_ROOT"
 docker info >/dev/null
 
-client_package=$(build_output .#agent-knowledge)
+client_package=$(build_output .#kubernetes-e2e-client)
 worker_image=$(build_output .#worker-container-image)
 queue_ingress_image=$(build_output .#queue-ingress-container-image)
 openssh_gateway_image=$(build_output .#openssh-gateway-container-image)

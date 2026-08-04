@@ -489,6 +489,7 @@
       packages = forLinuxSystems (system: rec {
         agent-knowledge = packageFor system;
         gateway-container-image = gatewayContainerImageFor system;
+        kubernetes-e2e-client = unwrappedPackageFor system;
         openssh-gateway-package = opensshGatewayPackageFor system;
         openssh-gateway-container-image = opensshGatewayContainerImageFor system;
         kubernetes-e2e-quartz-container-image = kubernetesE2eQuartzContainerImageFor system;
