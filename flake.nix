@@ -34,6 +34,7 @@
       forLinuxSystems = nixpkgs.lib.genAttrs linuxSystems;
       pkgsFor = forAllSystems (system: import nixpkgs { inherit system; });
       projectVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+      projectLicense = "Apache-2.0";
       queueIngressService = builtins.path {
         path = ./deploy/systemd + "/agent-knowledge-queue-ingress@.service";
         name = "agent-knowledge-queue-ingress-instance.service";
@@ -91,6 +92,7 @@
 
             meta = {
               description = "Centralized file-based knowledge management for coding agents";
+              license = pkgs.lib.licenses.asl20;
               mainProgram = "agent-knowledge";
               platforms = linuxSystems;
             };
@@ -248,6 +250,7 @@
               "org.opencontainers.image.title" = "Agent Knowledge Worker";
               "org.opencontainers.image.version" = projectVersion;
               "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+              "org.opencontainers.image.licenses" = projectLicense;
             };
           };
         };
@@ -279,6 +282,7 @@
               "org.opencontainers.image.title" = "Agent Knowledge Queue Ingress";
               "org.opencontainers.image.version" = projectVersion;
               "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+              "org.opencontainers.image.licenses" = projectLicense;
             };
           };
         };
@@ -309,6 +313,7 @@
               "org.opencontainers.image.title" = "Agent Knowledge Gateway";
               "org.opencontainers.image.version" = projectVersion;
               "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+              "org.opencontainers.image.licenses" = projectLicense;
             };
           };
         };
@@ -358,6 +363,7 @@
               "org.opencontainers.image.title" = "Agent Knowledge OpenSSH Gateway";
               "org.opencontainers.image.version" = projectVersion;
               "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+              "org.opencontainers.image.licenses" = projectLicense;
             };
           };
         };
@@ -390,6 +396,7 @@
               "org.opencontainers.image.title" = "Agent Knowledge Storage Bootstrap";
               "org.opencontainers.image.version" = projectVersion;
               "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+              "org.opencontainers.image.licenses" = projectLicense;
             };
           };
         };
@@ -418,6 +425,7 @@
               "org.opencontainers.image.title" = "Agent Knowledge Kubernetes E2E Quartz Fixture";
               "org.opencontainers.image.version" = projectVersion;
               "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+              "org.opencontainers.image.licenses" = projectLicense;
             };
           };
         };
