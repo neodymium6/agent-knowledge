@@ -48,10 +48,11 @@ cleanup() {
     wait "$worker_pid" 2>/dev/null || true
   fi
   if ((cleanup_status != 0)); then
-    if [[ -d $storage_root ]]; then
-      if ! find "$storage_root" -xdev -type f -links +1 \
-        -printf 'hard-linked storage file: device=%D inode=%i links=%n path=%p\n' >&2; then
-        echo "could not inspect hard-linked storage files" >&2
+    worktree_metadata=$storage_root/repository/worktrees
+    if [[ -d $worktree_metadata ]]; then
+      if ! find "$worktree_metadata" -xdev \
+        -printf 'repository worktree metadata: type=%y mode=%m device=%D inode=%i links=%n target=%l path=%p\n' >&2; then
+        echo "could not inspect repository worktree metadata" >&2
       fi
     fi
     for log in "$test_root"/worker-*.log; do
