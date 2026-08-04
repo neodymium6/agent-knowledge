@@ -335,7 +335,7 @@ test "$(git --git-dir="$storage_root/repository" rev-parse refs/heads/main)" = \
 test "$(readlink "$storage_root/releases/current")" = "$release_before"
 grep -Fq 'Pre-backup durable body.' \
   "$storage_root/content/projects/fictional-recovery/experiments/2026-08-04-$first_document/index.md"
-test -f "$storage_root/releases/current/site/index.html"
+test -f "$storage_root/releases/current/index.html"
 wait_for_counts 1 1 "$test_root/status-after-restore.json"
 
 start_worker "$test_root/worker-after-restore.log"
