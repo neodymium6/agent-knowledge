@@ -68,6 +68,17 @@ program path and integration directory. The package does not contain
 deployment-specific Worker or Gateway configuration, credentials, host keys,
 client keys, or Quartz content.
 
+The independent Quartz Integration workflow checks the Worker's fixed
+`build -d <content> -o <output>` launcher contract against an exact upstream
+Quartz revision and its locked npm dependencies. It builds a fictional
+Markdown page and verifies that the generated site preserves its SVG, CSV, and
+HTML attachments. With dependencies already installed in a Quartz checkout,
+the same check can be run locally:
+
+```sh
+just test-quartz-e2e /absolute/path/to/quartz
+```
+
 ### Container image
 
 Build the Docker-compatible Worker image archive without a container daemon:
