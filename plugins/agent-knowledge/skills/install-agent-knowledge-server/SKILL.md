@@ -5,43 +5,34 @@ description: Install or prepare a fresh Agent Knowledge server on a conventional
 
 # Install Agent Knowledge Server
 
-Install a version-selected, commit-pinned release without weakening its
-single-writer, privilege, or storage boundaries. Prefer conventional Linux
-with systemd; use Kubernetes when the deployment already has the required
-cluster facilities. Stop on an existing deployment: upgrades require a
-release-specific quiesce, backup, migration, cutover, and rollback plan that
-this fresh-install skill does not provide.
+Install a commit-pinned release without weakening single-writer, privilege, or
+storage boundaries. Prefer systemd; use Kubernetes only when its prerequisites
+already exist. Stop on an existing deployment: this fresh-install skill does
+not provide the release-specific upgrade and rollback plan it requires.
 
 ## Gather deployment inputs
 
-Obtain these values before changing the target:
+Before changing the target, obtain:
 
-- release version, exact approved source commit, and deployment type
-  (`systemd` or `kubernetes`);
+- release version, exact approved commit, and `systemd` or `kubernetes`;
 - target host or cluster and supported architecture;
 - durable storage location, capacity, backup plan, and filesystem semantics;
-- immutable Quartz program and integration root;
-- SSH endpoint, one public key and client ID per client, and host-key plan;
-- optional Git remote and a separate Worker-only credential plan; and
-- release-site serving path. Web authentication and TLS are external.
+- immutable Quartz program/root, release-site path, and external Web/TLS plan;
+- SSH endpoint, host-key plan, and one public key/client ID per client; and
+- optional Git remote with separate Worker-only credentials.
 
-Do not invent infrastructure values. Never copy private keys, tokens, or Git
-credentials into the repository, logs, ConfigMaps, or generated examples. Ask
-before installing packages, changing accounts, applying manifests, or starting
-services on a live target.
+Do not invent values or put secrets in repositories, logs, ConfigMaps, or
+examples. Ask before changing a live target.
 
 ## Preflight
 
-1. Select one semantic version, resolve its tag to an exact commit, and record
-   operator approval of that binding. Treat the tag as a version selector, not
-   an immutable pin. If cryptographic source provenance is required, stop: the
-   current release attests client archives and container digests, not the Nix
-   source package.
+1. Resolve the approved version tag to an exact approved commit; a tag is not
+   an immutable pin. Stop if cryptographic Nix-source provenance is required:
+   releases attest client archives and container digests, not that source.
 2. Confirm Linux `x86_64`/`amd64` or `aarch64`/`arm64`.
-3. Inspect the approved commit and matching release notes for migrations.
-4. Verify that no Worker is already using the selected storage. Treat a
-   nonempty unmarked storage root as an operator review condition.
-5. Preserve the five sibling durable roots together: `queue`, `repository`,
+3. Check its release notes for migrations and ensure no Worker uses the target.
+   Require operator review for a nonempty, unmarked storage root.
+4. Preserve the five sibling durable roots together: `queue`, `repository`,
    `content`, `work`, and `releases`.
 
 ## Install on systemd Linux
@@ -59,38 +50,32 @@ services on a live target.
 
    Replace the fictional commit with the approved release commit.
 
-2. Install the packaged `sysusers.d`, `tmpfiles.d`, Worker unit, queue-ingress
-   socket, and instantiated queue-ingress service as root. Use the files from
-   the same package version; do not reconstruct their hardening manually.
-3. Apply the packaged sysusers definition and verify that it created the
-   Worker and Queue Ingress users plus the Gateway and ingress groups.
-4. Install the pinned Quartz launcher at the configured immutable path before
+2. As root, install the packaged `sysusers.d`, `tmpfiles.d`, Worker unit,
+   queue-ingress socket, and service from that same package; do not recreate
+   their hardening. Apply sysusers and verify all packaged users and groups.
+3. Install the pinned Quartz launcher at the configured immutable path before
    starting the Worker. Quartz content is not included in the server package.
-5. Provision one dedicated Gateway account. Its primary group is
-   `agent-knowledge-gateway`, its only supplementary group is
-   `agent-knowledge-ingress`, and its shell is the packaged
-   `agent-knowledge-ssh-shell`. Give it no usable password, but verify that the
-   selected PAM and `UsePAM` policy still permits public-key login. Never use
-   the Worker or queue accounts for SSH.
-   Record its actual numeric UID.
-6. Create root-owned `/etc/agent-knowledge/worker.yaml` and `gateway.yaml` from
+4. Provision a no-password Gateway account with primary group
+   `agent-knowledge-gateway`, only supplementary group
+   `agent-knowledge-ingress`, and the packaged `agent-knowledge-ssh-shell`.
+   Verify PAM/`UsePAM` permits key login; never use Worker or queue accounts.
+   Record its numeric UID.
+5. Create root-owned `/etc/agent-knowledge/worker.yaml` and `gateway.yaml` from
    the approved commit. Set `identity.gateway_uid` to the actual Gateway
    account UID; the Kubernetes sample value is not valid for a conventional
    host. Keep the default `/var/lib/agent-knowledge` layout unless there is a
    reviewed systemd sandbox override.
-7. Configure OpenSSH public-key-only access. Give every key a root-controlled
+6. Configure OpenSSH public-key-only access. Give every key a root-controlled
    forced command:
 
    ```text
    restrict,command="akg-v1 /etc/agent-knowledge/gateway.yaml fictional-node-a" ssh-ed25519 <public-key>
    ```
 
-   Keep the authorized-keys file and every parent root-controlled and
-   non-writable by the Gateway account. Disable `AuthorizedKeysCommand`,
-   `TrustedUserCAKeys`, password and keyboard-interactive authentication,
-   forwarding, PTY, and user startup features for that account. Apply finite
-   SSH connection limits and an OS-enforced process/resource limit covering
-   its forced-command processes.
+   Keep authorized keys and its parents root-controlled and Gateway read-only.
+   Disable alternate key sources, password/interactive authentication,
+   forwarding, PTY, and user startup features. Enforce finite SSH connection
+   and OS process/resource limits for forced commands.
 
    Run `sshd -t`, then inspect the effective Match configuration with a
    deployment-specific command shaped like:
@@ -100,11 +85,9 @@ services on a live target.
      user=fictional-agent-knowledge-gateway,host=knowledge.example.invalid,addr=192.0.2.10
    ```
 
-   Require public-key-only authentication, disabled alternate key sources and
-   forwarding, the expected authorized-keys path, and the reviewed connection
-   limits before reload. Audit every non-comment authorized-key entry for
-   `restrict` and the expected root-controlled `command` and client ID.
-8. Apply the packaged tmpfiles definition, then initialize fresh storage once:
+   Before reload, verify those controls and the expected keys path and limits.
+   Audit every key for `restrict`, the forced command, and its client ID.
+7. Apply packaged tmpfiles, then initialize fresh storage once:
 
    ```sh
    sudo /nix/var/nix/profiles/agent-knowledge/bin/agent-knowledge \
@@ -113,29 +96,26 @@ services on a live target.
      --gateway-owner fictional-agent-knowledge-gateway
    ```
 
-9. Enable the queue-ingress socket and Worker only after configuration,
+8. Enable the queue-ingress socket and Worker only after configuration,
    Quartz, storage, and SSH validation succeed.
 
 ## Install on Kubernetes
 
-Use the matching `deploy/kubernetes` directory as a base and create an overlay.
-Do not apply the base directly.
+Create an overlay from the matching `deploy/kubernetes`; never apply the base.
 
 1. Require Kubernetes 1.33 or newer with `supplementalGroupsPolicy`, a
    single replica, and the documented PID/cgroup isolation.
-2. Resolve the released multi-platform digest and verify the GitHub attestation
-   for each of these four images: `storage-bootstrap`, `worker`,
-   `queue-ingress`, and `openssh-gateway`. Replace every `example.invalid`
-   image through the overlay with the corresponding immutable
+2. Resolve and attest the released multi-platform digest for
+   `storage-bootstrap`, `worker`, `queue-ingress`, and `openssh-gateway`.
+   Through the overlay, replace every sample image with its immutable
    `ghcr.io/neodymium6/agent-knowledge-<name>@sha256:<digest>` reference. The
    standalone `gateway` image is not part of this Kubernetes base.
 3. Supply one `ReadWriteOncePod` volume with POSIX rename, sync, inode, and
    `flock` semantics. Retain it when the StatefulSet is removed.
-4. Supply immutable Quartz content, Worker and Gateway configuration, SSH host
-   keys, and forced-command authorized keys. Put SSH material in Secrets, not
-   ConfigMaps or image layers. Rotate SSH or Quartz inputs by creating new
-   versioned objects and changing their names in the Pod template so Kubernetes
-   replaces the complete Pod; in-place Secret or claim updates are unsupported.
+4. Supply immutable Quartz, configuration, SSH host keys, and forced-command
+   keys. SSH material belongs in Secrets, not ConfigMaps/images. Rotate SSH or
+   Quartz with new versioned objects referenced by the Pod template, forcing a
+   complete replacement; in-place Secret or claim updates are unsupported.
 5. Preserve the provided UIDs, GIDs, security contexts, NetworkPolicy,
    read-only roots, and storage-bootstrap init container.
 6. Run `kubectl kustomize` and review the complete render before an explicitly
@@ -155,8 +135,7 @@ Do not apply the base directly.
 
 - Test one restricted SSH client destination with `recent`; arbitrary shell
   access must fail.
-- Confirm a test request reaches `completed`, creates a Git commit, and leaves
-  `current` pointing to the complete release for that commit. Use the project's
-  recovery tests, not this smoke test, as evidence of atomic switching.
+- Confirm a test request reaches `completed`, commits, and points `current` to
+  that complete release. Only project recovery tests establish atomicity.
 - Report the version, exact commit, deployment type, validation performed, and
   any site-owned follow-up. Do not print credentials or private infrastructure.

@@ -5,19 +5,18 @@ description: Install or upgrade the static Agent Knowledge client on a Linux cod
 
 # Install Agent Knowledge Client
 
-Install one pinned, verified static binary into a user-owned executable
-directory, then configure and test one restricted SSH destination.
+Install a pinned, verified static binary, then configure and test a restricted
+SSH destination.
 
 ## Select the artifact
 
-1. Obtain the desired semantic version. Prefer an explicit deployment-approved
-   version over an implicit latest release.
+1. Obtain an explicit, deployment-approved semantic version; avoid `latest`.
 2. Require Linux and map the architecture exactly:
 
    - `x86_64` -> `x86_64-unknown-linux-musl`
    - `aarch64` or `arm64` -> `aarch64-unknown-linux-musl`
 
-3. Stop on another OS or architecture instead of selecting a near match.
+3. Stop on any other platform rather than selecting a near match.
 4. Require `ssh`, `tar`, `sha256sum`, `gh`, `file`, and `readelf`; use `curl`
    or `gh` for download.
 
@@ -33,35 +32,29 @@ Download that archive and `SHA256SUMS` from the exact GitHub tag:
 https://github.com/neodymium6/agent-knowledge/releases/download/v<version>/
 ```
 
-Use a new temporary directory. Do not use mutable URLs or accept a checksum
-from a different release.
+Use a new temporary directory and only that release's immutable URL/checksums.
 
 ## Verify and install
 
-1. Verify the selected archive with the downloaded checksum file. On GNU
-   systems, `sha256sum -c SHA256SUMS --ignore-missing` checks only downloaded
-   entries. Require an `OK` result.
+1. Require `sha256sum -c SHA256SUMS --ignore-missing` to report the selected
+   archive `OK` (this option checks only downloaded entries).
 2. Verify provenance with the GitHub artifact attestation:
 
    ```sh
    gh attestation verify <archive> --repo neodymium6/agent-knowledge
    ```
 
-   Require success. If attestation lookup is unavailable, stop unless the
-   operator supplies a checksum or signature pinned through an independent
-   trusted channel; the checksum file beside the archive is not independent.
+   Require success. Otherwise stop unless an independently trusted channel
+   supplied a pinned checksum/signature; the adjacent checksum is not one.
 
-3. List the archive before extraction. It must contain one directory with
-   `agent-knowledge-client`, `LICENSE`, and `README.md`, and no unexpected links
-   or absolute paths.
-4. Extract only into the temporary directory. Inspect the binary with `file`,
-   `readelf -h`, and `readelf -l`. Require the selected ELF machine and no
-   `INTERP` segment or requested program interpreter before treating it as the
-   expected static executable.
-5. Install it as `agent-knowledge-client` in a selected user-owned directory,
-   normally `$HOME/.local/bin`. If another binary exists, report its version
-   and obtain approval before replacement unless the user explicitly requested
-   an upgrade.
+3. Before extraction, require one directory containing only the expected
+   `agent-knowledge-client`, `LICENSE`, and `README.md`, with no links or
+   absolute paths.
+4. Extract only there. With `file`, `readelf -h`, and `readelf -l`, require the
+   selected ELF machine and no `INTERP` segment/program interpreter.
+5. Install as `agent-knowledge-client` in a selected user-owned directory,
+   normally `$HOME/.local/bin`. Before unrequested replacement, report the old
+   version and obtain approval.
 6. Run the newly installed binary by its absolute path, not through `PATH`:
 
    ```sh
@@ -69,8 +62,8 @@ from a different release.
    command -v ssh
    ```
 
-7. Ensure the selected binary directory is on `PATH`, then require
-   `command -v agent-knowledge-client` to resolve to that same installed file.
+7. Put that directory on `PATH`; require `command -v agent-knowledge-client`
+   to resolve to the installed file.
 
 ## Configure OpenSSH
 
@@ -82,11 +75,9 @@ Obtain the following deployment-specific values instead of guessing them:
 - the server host-key fingerprint from a trusted channel; and
 - an optional `ProxyJump` or proxy command when the deployment requires one.
 
-Inspect the existing `~/.ssh/config` before editing it. Preserve existing
-entries and permissions, reject a conflicting alias, and add one specific Host
-block. Require mode `0700` on `~/.ssh`, `0600` on the private key and
-`~/.ssh/config`, and no broader than `0644` on public keys and `known_hosts`.
-An example shape is:
+Preserve the existing SSH config and permissions, reject a conflicting alias,
+and add one specific Host block. Require `0700` on `~/.ssh`, `0600` on private
+keys/config, and at most `0644` on public keys/`known_hosts`:
 
 ```sshconfig
 Host fictional-knowledge
@@ -106,29 +97,23 @@ Host fictional-knowledge
     RequestTTY no
 ```
 
-Use an existing deployment-approved key when available. Generate a dedicated
-Ed25519 key only with explicit approval, using the user's passphrase or agent
-policy. Keep the private key mode `0600`, never print or transmit it, and send
-only the `.pub` file to the server operator. The operator must install that
-public key with a forced command bound to the intended client ID before the
-connection can succeed.
+Prefer an approved key. Generate a dedicated Ed25519 key only with explicit
+approval and the user's passphrase/agent policy. Never expose the `0600`
+private key; send only `.pub`. The server must bind it by forced command to the
+intended client ID.
 
-`BatchMode yes` forbids passphrase prompts. When the approved private key is
-encrypted, load it into an approved `ssh-agent` before unattended use and
-confirm the intended key is present. Do not remove its passphrase merely to
-make the smoke test pass.
+Because `BatchMode yes` forbids prompts, preload an encrypted key into an
+approved `ssh-agent` and confirm it is present. Do not remove its passphrase.
 
-Obtain the SSH host key or fingerprint independently. If `ssh-keyscan` is used,
-write its output to a temporary file and compare it with the trusted fingerprint
-using `ssh-keygen -lf` before appending it to `known_hosts`; keyscan output alone
-is not proof of identity. Never use `StrictHostKeyChecking no`,
-`UserKnownHostsFile /dev/null`, or an unverified `accept-new` shortcut.
+Obtain the host key/fingerprint independently. If using `ssh-keyscan`, compare
+its temporary output with the trusted fingerprint via `ssh-keygen -lf` before
+adding it; keyscan alone proves nothing. Never disable checking or use
+`/dev/null` or unverified `accept-new`.
 
 ## Verify the complete setup
 
-1. Run `ssh -G <alias>` and inspect the resolved hostname, port, user,
-   identity file, host-key policy, and forwarding settings. This does not
-   connect.
+1. Use `ssh -G <alias>` to inspect the resolved endpoint, identity, host-key
+   policy, and forwarding without connecting.
 2. After the public key is registered and `known_hosts` is verified, test the
    restricted protocol rather than requesting a shell:
 
@@ -138,9 +123,7 @@ is not proof of identity. Never use `StrictHostKeyChecking no`,
      --maximum-results 1
    ```
 
-3. Treat arbitrary shell access as a deployment failure; the account must run
-   only the forced Gateway command. Run a harmless command such as
-   `ssh fictional-knowledge true` and require it to fail without returning
-   shell command output.
+3. Require `ssh fictional-knowledge true` to fail without shell output;
+   arbitrary shell access is a deployment failure.
 4. Report the installed client version and path, SSH alias, authenticated
    client ID, and successful protocol check without exposing private material.
