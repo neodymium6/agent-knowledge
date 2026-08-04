@@ -116,6 +116,10 @@ Other operations use these exact fields:
 - `archive_document`: `document_id` and `expected_revision`;
 - `add_attachment`: `document_id`, payload `source`, and destination `name`.
 
+An attachment destination name must end in one of these lowercase extensions:
+`png`, `jpg`, `jpeg`, `svg`, `csv`, `json`, `pdf`, or `html`. Validation uses
+the destination `name`, not the payload source name.
+
 Obtain every `expected_revision` from a fresh `get`. Preserve immutable front
 matter fields when updating; set a strictly later `updated` timestamp and the
 new `request_id`, and keep optional node, agent, and session metadata consistent

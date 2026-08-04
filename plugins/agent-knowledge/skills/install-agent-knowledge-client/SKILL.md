@@ -18,7 +18,8 @@ directory, then configure and test one restricted SSH destination.
    - `aarch64` or `arm64` -> `aarch64-unknown-linux-musl`
 
 3. Stop on another OS or architecture instead of selecting a near match.
-4. Require `ssh`, `tar`, and `sha256sum`; use `curl` or `gh` for download.
+4. Require `ssh`, `tar`, `sha256sum`, and `gh`; use `curl` or `gh` for
+   download.
 
 The artifact name is:
 
@@ -40,11 +41,15 @@ from a different release.
 1. Verify the selected archive with the downloaded checksum file. On GNU
    systems, `sha256sum -c SHA256SUMS --ignore-missing` checks only downloaded
    entries. Require an `OK` result.
-2. When GitHub CLI is available, also verify provenance:
+2. Verify provenance with the GitHub artifact attestation:
 
    ```sh
    gh attestation verify <archive> --repo neodymium6/agent-knowledge
    ```
+
+   Require success. If attestation lookup is unavailable, stop unless the
+   operator supplies a checksum or signature pinned through an independent
+   trusted channel; the checksum file beside the archive is not independent.
 
 3. List the archive before extraction. It must contain one directory with
    `agent-knowledge-client`, `LICENSE`, and `README.md`, and no unexpected links
@@ -55,14 +60,15 @@ from a different release.
    normally `$HOME/.local/bin`. If another binary exists, report its version
    and obtain approval before replacement unless the user explicitly requested
    an upgrade.
-6. Run:
+6. Run the newly installed binary by its absolute path, not through `PATH`:
 
    ```sh
-   agent-knowledge-client --version
+   /home/fictional-agent/.local/bin/agent-knowledge-client --version
    command -v ssh
    ```
 
-7. Ensure the binary directory is on `PATH`.
+7. Ensure the selected binary directory is on `PATH`, then require
+   `command -v agent-knowledge-client` to resolve to that same installed file.
 
 ## Configure OpenSSH
 
