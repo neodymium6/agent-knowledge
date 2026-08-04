@@ -57,6 +57,7 @@ cleanup() {
     for diagnostic in \
       "$test_root"/submit-*.json \
       "$test_root"/status-*.json \
+      "$test_root"/pre-backup-bootstrap.log \
       "$test_root"/unsafe-bootstrap.log; do
       if [[ -s $diagnostic ]]; then
         echo "$(basename "$diagnostic"):" >&2
@@ -269,6 +270,19 @@ make_package "$test_root/package-two" "$second_request" "$second_document" \
   "Fictional pending result" "Post-restore durable body."
 submit_package "$test_root/package-two" "$test_root/submit-two.json"
 wait_for_counts 1 1 "$test_root/status-at-backup.json"
+
+"$binary" admin bootstrap-storage \
+  --config "$config" \
+  --runtime-directory "$runtime_root" \
+  --worker-owner "$worker_account" \
+  --worker-group "$worker_group" \
+  --queue-owner "$queue_account" \
+  --queue-group "$queue_group" \
+  --gateway-owner "$gateway_account" \
+  --gateway-group "$gateway_group" \
+  --ingress-group "$ingress_group" >"$test_root/pre-backup-bootstrap.log"
+jq -e '.status == "already_initialized"' \
+  "$test_root/pre-backup-bootstrap.log" >/dev/null
 
 queue_identity_before=$(<"$storage_root/queue/queue-id")
 commit_before=$(git --git-dir="$storage_root/repository" rev-parse refs/heads/main)
