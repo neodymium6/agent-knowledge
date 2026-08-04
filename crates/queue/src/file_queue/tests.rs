@@ -17,6 +17,8 @@ use super::{
     QueueReader, QueueRequestStatus, QueueState, StaleAgeSource, WorkerQueueError,
     inactive_stale_directories,
 };
+#[cfg(target_os = "linux")]
+use crate::rebind_restored_queue;
 use crate::{PackageLimits, PackagePolicy, validate_accepted_package};
 
 const REQUEST_JSON: &str = r#"{
@@ -616,6 +618,51 @@ fn rejects_a_copied_queue_as_a_second_live_instance() {
     assert!(matches!(
         FileQueue::initialize(&copied, PackagePolicy::default()),
         Err(QueueError::InvalidQueueIdentity)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn explicitly_rebinds_an_offline_restored_queue() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    let original_identity = fs::read(root.path().join("queue/queue-id"))
+        .unwrap_or_else(|error| panic!("queue identity must be readable: {error}"));
+    let restored = root.path().join("restored-queue");
+    copy_tree(&root.path().join("queue"), &restored);
+    drop(queue);
+
+    rebind_restored_queue(&restored)
+        .unwrap_or_else(|error| panic!("offline restored queue must be rebound: {error}"));
+    let reader = QueueReader::open_until(&restored, None)
+        .unwrap_or_else(|error| panic!("rebound queue must open: {error}"));
+
+    assert_eq!(
+        reader
+            .status_until(request_id("01K00000000000000000000000"), None)
+            .unwrap_or_else(|error| panic!("restored request must be readable: {error}")),
+        Some(QueueRequestStatus::Pending)
+    );
+    assert_eq!(
+        fs::read(restored.join("queue-id"))
+            .unwrap_or_else(|error| panic!("restored identity must be readable: {error}")),
+        original_identity
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn refuses_to_rebind_a_queue_with_an_active_writer() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let _worker = queue
+        .try_worker_session()
+        .unwrap_or_else(|error| panic!("fixture Worker lock must be acquired: {error}"));
+
+    assert!(matches!(
+        rebind_restored_queue(root.path().join("queue")),
+        Err(QueueError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
     ));
 }
 

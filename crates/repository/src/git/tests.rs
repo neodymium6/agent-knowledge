@@ -410,6 +410,29 @@ fn directory_entry_count(path: &Path) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+#[cfg(target_os = "linux")]
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir(destination)
+        .unwrap_or_else(|error| panic!("restored directory must be created: {error}"));
+    for entry in fs::read_dir(source)
+        .unwrap_or_else(|error| panic!("backup directory must be readable: {error}"))
+    {
+        let entry = entry.unwrap_or_else(|error| panic!("backup entry must be readable: {error}"));
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)
+            .unwrap_or_else(|error| panic!("backup metadata must be readable: {error}"));
+        if metadata.file_type().is_dir() {
+            copy_tree(&source_path, &destination_path);
+        } else if metadata.file_type().is_file() {
+            fs::copy(&source_path, &destination_path)
+                .unwrap_or_else(|error| panic!("backup file must be copied: {error}"));
+        } else {
+            panic!("repository fixture must contain only directories and regular files");
+        }
+    }
+}
+
 fn git<const N: usize>(
     working_directory: Option<&Path>,
     arguments: [&str; N],
@@ -1279,6 +1302,54 @@ fn rejects_a_work_root_bound_to_another_repository() {
         ),
         Err(GitTransactionError::RepositoryBindingMismatch)
     ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rebinds_an_offline_repository_restored_at_its_configured_paths() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    let repository = fixture.open();
+    let original_commit = fixture.official_commit();
+    drop(repository);
+
+    let backup = root.path().join("cold-backup");
+    fs::create_dir(&backup).unwrap_or_else(|error| panic!("backup root must be created: {error}"));
+    for (source, name) in [
+        (&fixture.repository, "repository"),
+        (&fixture.canonical, "content"),
+        (&fixture.work, "work"),
+    ] {
+        copy_tree(source, &backup.join(name));
+        fs::remove_dir_all(source)
+            .unwrap_or_else(|error| panic!("original fixture must be removed: {error}"));
+        copy_tree(&backup.join(name), source);
+    }
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+
+    assert!(matches!(
+        GitRepository::open_existing(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity.clone(),
+        ),
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+    let restored = GitRepository::rebind_restored(
+        &fixture.repository,
+        &fixture.canonical,
+        &fixture.work,
+        "main",
+        identity,
+    )
+    .unwrap_or_else(|error| panic!("offline restored repository must be rebound: {error}"));
+    drop(restored);
+
+    assert_eq!(fixture.official_commit(), original_commit);
+    drop(fixture.open());
 }
 
 #[cfg(unix)]

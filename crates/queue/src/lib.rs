@@ -3,6 +3,8 @@
 mod file_queue;
 mod package;
 
+#[cfg(target_os = "linux")]
+pub use file_queue::rebind_restored_queue;
 pub use file_queue::{
     BatchClaimOutcome, BatchReconciliation, CURRENT_WORKER_PHASE_SCHEMA_VERSION,
     CURRENT_WORKER_RESULT_SCHEMA_VERSION, ClaimToken, ClaimedPackage, EnqueueOutcome, FileQueue,

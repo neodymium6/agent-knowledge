@@ -1186,9 +1186,14 @@ path and the filesystem device/inode identities of the root, fixed lock files,
 and fixed child directories. A byte-for-byte copy is not accepted as a second
 live queue even when it preserves `queue-id`. On first initialization, fixed
 directory entries and both lock entries are synchronized before this binding is
-created. Restoring storage onto a different filesystem identity is not accepted
-by the initial implementation; a future offline migration procedure must
-deliberately rewrite the binding before such restores are supported.
+created. A cold restore onto a different filesystem identity requires the
+root-only `admin rebind-restored-storage` procedure. The procedure requires the
+same configured absolute paths, bootstrap marker, service identities, and
+repository configuration, takes every storage writer lock, and validates the
+queue, Git repository, canonical worktree, release store, and permission model
+after atomically replacing their filesystem bindings. The source storage must
+remain offline permanently; the procedure deliberately does not make cloned
+stores safe to run concurrently.
 
 Pending selection takes a fixed acceptance-sequence snapshot and incrementally
 walks the pending directory. Each call has a maximum number of directory

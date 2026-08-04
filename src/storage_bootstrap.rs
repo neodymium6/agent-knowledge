@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use agent_knowledge_core::{PathAttestation, PathAttestationError};
-use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueReader};
+use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueReader, rebind_restored_queue};
 use agent_knowledge_release::{ReleasePolicy, ReleaseReader, ReleaseStore};
 use agent_knowledge_repository::{
     CommittedStore, GitRepository, GitTransactionError, trusted_git_program,
@@ -95,7 +95,31 @@ pub(crate) fn bootstrap_storage(
     }
     #[cfg(not(test))]
     nix::sys::stat::umask(Mode::from_bits_truncate(STORAGE_BOOTSTRAP_UMASK));
-    let identities = StorageIdentities {
+    let identities = resolve_storage_identities(request)?;
+    validate_service_identities(identities)?;
+    validate_system_service_memberships(identities)?;
+    bootstrap_storage_with_ids(request, identities, output)
+}
+
+pub(crate) fn rebind_restored_storage(
+    request: &StorageBootstrap,
+    output: impl Write,
+) -> Result<(), StorageBootstrapError> {
+    if !Uid::effective().is_root() {
+        return Err(StorageBootstrapError::RootRequired);
+    }
+    #[cfg(not(test))]
+    nix::sys::stat::umask(Mode::from_bits_truncate(STORAGE_BOOTSTRAP_UMASK));
+    let identities = resolve_storage_identities(request)?;
+    validate_service_identities(identities)?;
+    validate_system_service_memberships(identities)?;
+    rebind_restored_storage_with_ids(request, identities, output)
+}
+
+fn resolve_storage_identities(
+    request: &StorageBootstrap,
+) -> Result<StorageIdentities, StorageBootstrapError> {
+    Ok(StorageIdentities {
         administrative_owner: Uid::effective(),
         administrative_group: bootstrap_administrative_group(),
         worker_owner: resolve_user(&request.worker_owner)
@@ -111,10 +135,7 @@ pub(crate) fn bootstrap_storage(
             .map_err(StorageBootstrapError::Identity)?,
         ingress_group: resolve_group(&request.ingress_group)
             .map_err(StorageBootstrapError::Identity)?,
-    };
-    validate_service_identities(identities)?;
-    validate_system_service_memberships(identities)?;
-    bootstrap_storage_with_ids(request, identities, output)
+    })
 }
 
 fn bootstrap_administrative_group() -> Gid {
@@ -225,6 +246,110 @@ fn bootstrap_storage_with_ids(
     bootstrap_storage_with_ids_and_git_check(request, identities, output, || {
         validate_git_compatibility().map_err(Box::new)
     })
+}
+
+fn rebind_restored_storage_with_ids(
+    request: &StorageBootstrap,
+    identities: StorageIdentities,
+    mut output: impl Write,
+) -> Result<(), StorageBootstrapError> {
+    let settings = WorkerSettings::load(&request.config).map_err(StorageBootstrapError::Config)?;
+    let storage_root = common_storage_root(&settings)?;
+    validate_trusted_parent(&storage_root, identities.administrative_owner)?;
+    validate_parent_no_posix_acl(&storage_root)?;
+    validate_runtime_directory(&request.runtime_directory, &storage_root)?;
+    validate_official_branch(settings.official_branch())?;
+    validate_git_compatibility().map_err(|error| {
+        StorageBootstrapError::Component("Git compatibility validation", error.to_string())
+    })?;
+    preflight_runtime_directory(&request.runtime_directory)?;
+
+    let storage_lock = lock_storage_root(&storage_root)?;
+    revalidate_storage_lock(&storage_root, &storage_lock)?;
+    validate_storage_directory_no_posix_acl(&storage_root)
+        .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
+    require_directory_metadata(
+        &storage_root,
+        identities.administrative_owner,
+        identities.queue_group,
+        0o751,
+    )?;
+    let marker_path = storage_root.join(MARKER_NAME);
+    validate_storage_file_mount(&storage_root, &marker_path)
+        .map_err(|_| StorageBootstrapError::InvalidMarker)?;
+    let marker = read_marker(
+        &marker_path,
+        identities.administrative_owner,
+        identities.administrative_group,
+    )?;
+    if marker != BootstrapMarker::new(&settings, identities) {
+        return Err(StorageBootstrapError::MarkerMismatch);
+    }
+    validate_same_storage_mount(&storage_root, &storage_paths(&settings))
+        .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
+    validate_durable_permissions(&settings, identities)?;
+    revalidate_storage_lock(&storage_root, &storage_lock)?;
+
+    rebind_restored_queue(settings.queue_root()).map_err(|error| {
+        StorageBootstrapError::Component("queue restore binding", error.to_string())
+    })?;
+    GitRepository::rebind_restored(
+        settings.repository_root(),
+        settings.content_root(),
+        settings.work_root(),
+        settings.official_branch(),
+        settings.identity().clone(),
+    )
+    .map_err(|error| {
+        StorageBootstrapError::Component("repository restore binding", error.to_string())
+    })?;
+    ReleaseStore::rebind_restored(settings.release_root(), ReleasePolicy::default()).map_err(
+        |error| StorageBootstrapError::Component("release restore binding", error.to_string()),
+    )?;
+    revalidate_storage_lock(&storage_root, &storage_lock)?;
+
+    normalize_storage_tree(
+        settings.queue_root(),
+        identities.queue_owner,
+        identities.queue_group,
+        Mode::from_bits_truncate(0o2770),
+        Mode::from_bits_truncate(0o660),
+    )
+    .map_err(|error| StorageBootstrapError::Permissions(settings.queue_root().into(), error))?;
+    for path in [settings.repository_root(), settings.content_root()] {
+        normalize_storage_tree(
+            path,
+            identities.worker_owner,
+            identities.gateway_group,
+            Mode::from_bits_truncate(0o2750),
+            Mode::from_bits_truncate(0o640),
+        )
+        .map_err(|error| StorageBootstrapError::Permissions(path.into(), error))?;
+    }
+    normalize_storage_tree(
+        settings.work_root(),
+        identities.worker_owner,
+        identities.worker_group,
+        Mode::from_bits_truncate(0o750),
+        Mode::from_bits_truncate(0o640),
+    )
+    .map_err(|error| StorageBootstrapError::Permissions(settings.work_root().into(), error))?;
+    normalize_storage_tree(
+        settings.release_root(),
+        identities.worker_owner,
+        identities.worker_group,
+        Mode::from_bits_truncate(0o750),
+        Mode::from_bits_truncate(0o640),
+    )
+    .map_err(|error| StorageBootstrapError::Permissions(settings.release_root().into(), error))?;
+
+    validate_durable_initialized(&settings, identities)?;
+    initialize_runtime_directory(&request.runtime_directory, identities)?;
+    validate_initialized(&settings, &request.runtime_directory, identities)?;
+    sync_storage_filesystem(&storage_root)?;
+    revalidate_storage_lock(&storage_root, &storage_lock)?;
+    drop(storage_lock);
+    write_output(&mut output, "rebound")
 }
 
 fn bootstrap_storage_with_ids_and_git_check(
@@ -800,6 +925,37 @@ fn validate_durable_initialized(
     settings: &WorkerSettings,
     ids: StorageIdentities,
 ) -> Result<(), StorageBootstrapError> {
+    validate_durable_permissions(settings, ids)?;
+    QueueReader::open_until(settings.queue_root().to_path_buf(), None)
+        .map_err(|error| StorageBootstrapError::Component("queue validation", error.to_string()))?;
+    CommittedStore::open(
+        settings.repository_root(),
+        settings.content_root(),
+        settings.official_branch(),
+    )
+    .map_err(|error| {
+        StorageBootstrapError::Component("repository validation", error.to_string())
+    })?;
+    GitRepository::open_existing(
+        settings.repository_root(),
+        settings.content_root(),
+        settings.work_root(),
+        settings.official_branch(),
+        settings.identity().clone(),
+    )
+    .map_err(|error| {
+        StorageBootstrapError::Component("repository binding validation", error.to_string())
+    })?;
+    ReleaseReader::open(settings.release_root(), ReleasePolicy::default()).map_err(|error| {
+        StorageBootstrapError::Component("release validation", error.to_string())
+    })?;
+    Ok(())
+}
+
+fn validate_durable_permissions(
+    settings: &WorkerSettings,
+    ids: StorageIdentities,
+) -> Result<(), StorageBootstrapError> {
     let storage_root = common_storage_root(settings)?;
     validate_storage_directory_no_posix_acl(&storage_root)
         .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
@@ -880,29 +1036,6 @@ fn validate_durable_initialized(
         Mode::from_bits_truncate(0o640),
     )
     .map_err(|error| StorageBootstrapError::Permissions(settings.release_root().into(), error))?;
-    QueueReader::open_until(settings.queue_root().to_path_buf(), None)
-        .map_err(|error| StorageBootstrapError::Component("queue validation", error.to_string()))?;
-    CommittedStore::open(
-        settings.repository_root(),
-        settings.content_root(),
-        settings.official_branch(),
-    )
-    .map_err(|error| {
-        StorageBootstrapError::Component("repository validation", error.to_string())
-    })?;
-    GitRepository::open_existing(
-        settings.repository_root(),
-        settings.content_root(),
-        settings.work_root(),
-        settings.official_branch(),
-        settings.identity().clone(),
-    )
-    .map_err(|error| {
-        StorageBootstrapError::Component("repository binding validation", error.to_string())
-    })?;
-    ReleaseReader::open(settings.release_root(), ReleasePolicy::default()).map_err(|error| {
-        StorageBootstrapError::Component("release validation", error.to_string())
-    })?;
     Ok(())
 }
 

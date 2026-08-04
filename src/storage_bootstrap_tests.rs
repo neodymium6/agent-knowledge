@@ -10,8 +10,8 @@ use xattr::FileExt as _;
 use super::{
     MARKER_NAME, ServiceMemberships, StorageBootstrap, StorageBootstrapError, StorageIdentities,
     StorageMigrationError, bootstrap_administrative_group, bootstrap_storage_with_ids,
-    bootstrap_storage_with_ids_and_git_check, validate_service_identities,
-    validate_service_memberships,
+    bootstrap_storage_with_ids_and_git_check, rebind_restored_storage_with_ids,
+    validate_service_identities, validate_service_memberships,
 };
 
 struct TestDirectory {
@@ -40,6 +40,35 @@ impl Drop for TestDirectory {
             eprintln!("failed to remove storage bootstrap test directory: {error}");
         }
     }
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    let source_metadata = fs::symlink_metadata(source)
+        .unwrap_or_else(|error| panic!("source metadata must be readable: {error}"));
+    fs::create_dir(destination)
+        .unwrap_or_else(|error| panic!("restored directory must be created: {error}"));
+    for entry in fs::read_dir(source)
+        .unwrap_or_else(|error| panic!("source directory must be readable: {error}"))
+    {
+        let entry = entry.unwrap_or_else(|error| panic!("source entry must be readable: {error}"));
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)
+            .unwrap_or_else(|error| panic!("source entry metadata must be readable: {error}"));
+        if metadata.file_type().is_dir() {
+            copy_tree(&source_path, &destination_path);
+        } else if metadata.file_type().is_file() {
+            fs::copy(&source_path, &destination_path)
+                .unwrap_or_else(|error| panic!("source file must be copied: {error}"));
+        } else {
+            panic!("storage fixture must contain only directories and regular files");
+        }
+    }
+    fs::set_permissions(
+        destination,
+        fs::Permissions::from_mode(source_metadata.permissions().mode()),
+    )
+    .unwrap_or_else(|error| panic!("restored directory mode must be copied: {error}"));
 }
 
 fn fixture(root: &Path) -> (StorageBootstrap, StorageIdentities) {
@@ -249,6 +278,34 @@ fn initializes_fresh_storage_and_is_idempotent() {
         .unwrap_or_else(|error| panic!("ephemeral runtime must be recreated: {error}"));
     assert_eq!(after_restart, b"{\"status\":\"already_initialized\"}\n");
     assert!(request.runtime_directory.is_dir());
+}
+
+#[test]
+fn rebinds_a_cold_copy_restored_at_the_configured_storage_root() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("storage fixture must initialize: {error}"));
+    let storage = root.path().join("storage");
+    let backup = root.path().join("cold-backup");
+    copy_tree(&storage, &backup);
+    fs::remove_dir_all(&storage)
+        .unwrap_or_else(|error| panic!("original storage must be removed: {error}"));
+    copy_tree(&backup, &storage);
+    fs::remove_dir_all(&request.runtime_directory)
+        .unwrap_or_else(|error| panic!("ephemeral runtime directory must be removed: {error}"));
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::Component("queue validation", _))
+    ));
+    let mut output = Vec::new();
+    rebind_restored_storage_with_ids(&request, identities, &mut output)
+        .unwrap_or_else(|error| panic!("cold restored storage must be rebound: {error}"));
+
+    assert_eq!(output, b"{\"status\":\"rebound\"}\n");
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("rebound storage must pass normal bootstrap: {error}"));
 }
 
 #[test]

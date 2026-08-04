@@ -433,6 +433,40 @@ startup failures are limited to five attempts in five minutes. Inspect a failed
 start with `systemctl status` and `journalctl -u agent-knowledge-worker` rather
 than repeatedly restarting an incompletely provisioned deployment.
 
+### Cold storage restore
+
+Back up the complete durable storage root only while the Worker, queue-ingress
+socket, and existing Gateway sessions are stopped. The backup must preserve
+ownership, modes, links, and all five sibling roots; copying only `content/` or
+the bare Git repository does not preserve request status or the current static
+release. Configuration, Quartz, SSH keys, and credentials remain separate
+deployment inputs.
+
+Restore the complete tree at the same configured absolute path and provision
+the same service identities before starting any service. A copied filesystem
+has new object identities and is intentionally rejected by normal startup. With
+the source storage permanently offline, explicitly replace those bindings and
+validate the restored store:
+
+```sh
+package_path=/nix/var/nix/profiles/agent-knowledge
+# Replace this fictional name with the dedicated forced-command SSH account.
+gateway_account=fictional-agent-knowledge-gateway
+sudo "$package_path/bin/agent-knowledge" admin rebind-restored-storage \
+  --config /etc/agent-knowledge/worker.yaml \
+  --gateway-owner "$gateway_account"
+sudo systemd-tmpfiles --create agent-knowledge.conf
+sudo systemctl start agent-knowledge-queue-ingress.socket
+sudo systemctl start agent-knowledge-worker.service
+```
+
+The command is root-only, requires the original bootstrap marker and exact
+configuration, takes the queue, repository, work-root, and release-root locks,
+and preserves the queue instance ID, accepted requests, Git history, and
+release manifests. It does not relocate storage or authorize a cloned source
+and restore to run concurrently. If validation fails, keep all services stopped
+and repair or replace the restored copy before retrying.
+
 The packaged `agent-knowledge` and `agent-knowledge-queue` accounts are locked,
 non-login accounts for the Worker and queue ingress broker respectively. Never
 use either for OpenSSH. Create the deployment-specific SSH account according to

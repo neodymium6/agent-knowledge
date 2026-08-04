@@ -157,6 +157,13 @@ pub struct ReleaseReader {
     store: ReleaseStore,
 }
 
+#[derive(Clone, Copy)]
+enum OpenMode {
+    Initialize,
+    Existing,
+    RebindRestored,
+}
+
 impl ReleaseReader {
     /// Opens and validates an existing release store without creating or
     /// repairing files.
@@ -166,7 +173,8 @@ impl ReleaseReader {
     /// Returns an error when the store is absent, structurally invalid,
     /// replaced while opening, or contains an invalid active release.
     pub fn open(root: impl AsRef<Path>, policy: ReleasePolicy) -> Result<Self, ReleaseError> {
-        ReleaseStore::open_internal(root.as_ref(), policy, false).map(|store| Self { store })
+        ReleaseStore::open_internal(root.as_ref(), policy, OpenMode::Existing)
+            .map(|store| Self { store })
     }
 
     /// Attests the release root selected and pinned while opening.
@@ -218,7 +226,7 @@ impl ReleaseStore {
 
     /// Creates fixed release directories and binds them to this storage root.
     pub fn open(root: impl AsRef<Path>, policy: ReleasePolicy) -> Result<Self, ReleaseError> {
-        Self::open_internal(root.as_ref(), policy, true)
+        Self::open_internal(root.as_ref(), policy, OpenMode::Initialize)
     }
 
     /// Opens an existing release store for administrative mutation without
@@ -232,14 +240,35 @@ impl ReleaseStore {
         root: impl AsRef<Path>,
         policy: ReleasePolicy,
     ) -> Result<Self, ReleaseError> {
-        Self::open_internal(root.as_ref(), policy, false)
+        Self::open_internal(root.as_ref(), policy, OpenMode::Existing)
+    }
+
+    /// Opens an offline restored release store and replaces its binding.
+    ///
+    /// All fixed directories and the active release are validated. The release
+    /// root lock must be available, so every Repository Worker that can access
+    /// this copy must be stopped. The source copy must remain offline
+    /// permanently after the operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prior binding is absent or malformed, the
+    /// store is active, release state is invalid, or the replacement binding
+    /// cannot be made durable.
+    #[cfg(target_os = "linux")]
+    pub fn rebind_restored(
+        root: impl AsRef<Path>,
+        policy: ReleasePolicy,
+    ) -> Result<Self, ReleaseError> {
+        Self::open_internal(root.as_ref(), policy, OpenMode::RebindRestored)
     }
 
     fn open_internal(
         root_path: &Path,
         policy: ReleasePolicy,
-        initialize: bool,
+        mode: OpenMode,
     ) -> Result<Self, ReleaseError> {
+        let initialize = matches!(mode, OpenMode::Initialize);
         let policy = policy.validate()?;
         if initialize {
             ensure_or_create_directory(root_path)?;
@@ -292,12 +321,43 @@ impl ReleaseStore {
             policy,
             mutation_available: Arc::new(AtomicBool::new(true)),
         };
-        if initialize {
-            store.ensure_binding()?;
+        match mode {
+            OpenMode::Initialize => store.ensure_binding()?,
+            OpenMode::Existing => {}
+            OpenMode::RebindRestored => store.rebind_restored_binding()?,
         }
         store.validate_live_storage()?;
         store.active_release()?;
         Ok(store)
+    }
+
+    fn rebind_restored_binding(&self) -> Result<(), ReleaseError> {
+        let root_lock = File::open(&self.root).map_err(ReleaseError::Io)?;
+        match root_lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(ReleaseError::ReleaseStoreBusy),
+            Err(TryLockError::Error(error)) => return Err(ReleaseError::Io(error)),
+        }
+        let binding_path = self.root.join(BINDING_FILE);
+        let _old_binding = read_binding_file(&binding_path)?;
+        let expected = binding_bytes(
+            &self.configured_root,
+            &self.root_handle,
+            [
+                &self.by_id,
+                &self.by_commit,
+                &self.by_batch,
+                &self.cleanup_intent,
+                &self.staging,
+            ],
+        )?;
+        replace_regular_file_preserving_metadata(
+            &self.root,
+            &binding_path,
+            &expected,
+            "restore-binding",
+        )?;
+        validate_binding(&binding_path, &expected)
     }
 
     /// Creates an empty, batch-scoped directory for one Quartz build.
@@ -2244,6 +2304,59 @@ fn replace_regular_file(
         return Err(ReleaseError::Io(error));
     }
     sync_directory(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn replace_regular_file_preserving_metadata(
+    directory: &Path,
+    destination: &Path,
+    contents: &[u8],
+    kind: &str,
+) -> Result<(), ReleaseError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use nix::unistd::{Gid, Uid, fchown};
+
+    let metadata = fs::symlink_metadata(destination).map_err(ReleaseError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(ReleaseError::StorageBindingMismatch);
+    }
+    let temporary = directory.join(format!(".{kind}-{}", Ulid::generate()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(ReleaseError::Io)?;
+    let result = file
+        .write_all(contents)
+        .and_then(|()| {
+            fchown(
+                &file,
+                Some(Uid::from_raw(metadata.uid())),
+                Some(Gid::from_raw(metadata.gid())),
+            )
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))
+        })
+        .and_then(|()| {
+            file.set_permissions(fs::Permissions::from_mode(metadata.permissions().mode()))
+        })
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&temporary, destination));
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(ReleaseError::Io(error));
+    }
+    sync_directory(directory)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn replace_regular_file_preserving_metadata(
+    directory: &Path,
+    destination: &Path,
+    contents: &[u8],
+    kind: &str,
+) -> Result<(), ReleaseError> {
+    replace_regular_file(directory, destination, contents, kind)
 }
 
 fn replace_symlink(

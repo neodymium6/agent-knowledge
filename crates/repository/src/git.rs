@@ -251,6 +251,13 @@ pub struct GitRepository {
     identity: GitIdentity,
 }
 
+#[derive(Clone, Copy)]
+enum BindingMode {
+    Initialize,
+    Existing,
+    RebindRestored,
+}
+
 /// Durable repository work that must be resumed before a new batch starts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepositoryTransaction {
@@ -417,7 +424,7 @@ impl GitRepository {
             work_root,
             official_branch,
             identity,
-            true,
+            BindingMode::Initialize,
         )
     }
 
@@ -441,7 +448,37 @@ impl GitRepository {
             work_root,
             official_branch,
             identity,
-            false,
+            BindingMode::Existing,
+        )
+    }
+
+    /// Opens an offline restored repository and replaces its filesystem binding.
+    ///
+    /// Git history, the official branch, and the canonical worktree are
+    /// validated before the two binding files are replaced. The repository and
+    /// work-root locks must be available. Callers must keep the source storage
+    /// offline permanently; this operation does not authorize two live writers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid repository layout, unsafe Git
+    /// configuration, dirty canonical worktree, missing prior bindings,
+    /// contended writer locks, or a durability failure.
+    #[cfg(target_os = "linux")]
+    pub fn rebind_restored(
+        git_directory: &Path,
+        canonical_worktree: &Path,
+        work_root: &Path,
+        official_branch: &str,
+        identity: GitIdentity,
+    ) -> Result<Self, GitTransactionError> {
+        Self::open_with_mode(
+            git_directory,
+            canonical_worktree,
+            work_root,
+            official_branch,
+            identity,
+            BindingMode::RebindRestored,
         )
     }
 
@@ -451,8 +488,9 @@ impl GitRepository {
         work_root: &Path,
         official_branch: &str,
         identity: GitIdentity,
-        initialize: bool,
+        binding_mode: BindingMode,
     ) -> Result<Self, GitTransactionError> {
+        let initialize = matches!(binding_mode, BindingMode::Initialize);
         ensure_supported_git()?;
         ensure_real_directory(git_directory)?;
         let configured_git_directory =
@@ -532,16 +570,24 @@ impl GitRepository {
         ];
         let expected_binding = repository_binding(&binding_directories, &official_ref)?;
         let binding_file = repository_state.join("binding-v2");
-        if initialize {
-            ensure_binding(&binding_file, &expected_binding)?;
-        } else {
-            validate_binding(&binding_file, &expected_binding)?;
+        match binding_mode {
+            BindingMode::Initialize => ensure_binding(&binding_file, &expected_binding)?,
+            BindingMode::Existing => validate_binding(&binding_file, &expected_binding)?,
+            BindingMode::RebindRestored => {
+                replace_existing_binding(&binding_file, &expected_binding)?;
+            }
         }
         let work_root_binding_file = work_root.join(".agent-knowledge-repository-binding-v2");
-        if initialize {
-            ensure_binding(&work_root_binding_file, &expected_binding)?;
-        } else {
-            validate_binding(&work_root_binding_file, &expected_binding)?;
+        match binding_mode {
+            BindingMode::Initialize => {
+                ensure_binding(&work_root_binding_file, &expected_binding)?;
+            }
+            BindingMode::Existing => {
+                validate_binding(&work_root_binding_file, &expected_binding)?;
+            }
+            BindingMode::RebindRestored => {
+                replace_existing_binding(&work_root_binding_file, &expected_binding)?;
+            }
         }
         drop(writer);
         sync_directory(&repository_state).map_err(GitTransactionError::Io)?;
@@ -2313,6 +2359,60 @@ fn validate_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionEr
     } else {
         Err(GitTransactionError::RepositoryBindingMismatch)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn replace_existing_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionError> {
+    use nix::unistd::{Gid, Uid, fchown};
+
+    if expected.len() > MAXIMUM_BINDING_BYTES {
+        return Err(GitTransactionError::RepositoryBindingMismatch);
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            GitTransactionError::RepositoryBindingMismatch
+        } else {
+            GitTransactionError::Io(error)
+        }
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() > MAXIMUM_BINDING_BYTES as u64 {
+        return Err(GitTransactionError::RepositoryBindingMismatch);
+    }
+    let parent = path
+        .parent()
+        .ok_or(GitTransactionError::RepositoryBindingMismatch)?;
+    let file_name = path
+        .file_name()
+        .ok_or(GitTransactionError::RepositoryBindingMismatch)?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", Ulid::generate()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(expected)?;
+        fchown(
+            &file,
+            Some(Uid::from_raw(metadata.uid())),
+            Some(Gid::from_raw(metadata.gid())),
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        file.set_permissions(fs::Permissions::from_mode(metadata.permissions().mode()))?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result.map_err(GitTransactionError::Io)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn replace_existing_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionError> {
+    validate_binding(path, expected)
 }
 
 fn repository_binding(
