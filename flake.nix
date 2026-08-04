@@ -427,10 +427,35 @@
         system:
         let
           pkgs = pkgsFor.${system};
+          csiAttacherRbac = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/kubernetes-csi/external-attacher/v4.12.0/deploy/kubernetes/rbac.yaml";
+            hash = "sha256-Oji1GYsElpJ8DOJsY+cdQ+ImPi27uTqDrN7HHXyQp2Y=";
+          };
+          csiExternalHealthMonitorRbac = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/kubernetes-csi/external-health-monitor/v0.18.0/deploy/kubernetes/external-health-monitor-controller/rbac.yaml";
+            hash = "sha256-MgVZntqaJS4nN6yr4iWRr9jaNzwaq1J1zlQiOt/i0Sc=";
+          };
+          csiProvisionerRbac = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/kubernetes-csi/external-provisioner/v6.3.0/deploy/kubernetes/rbac.yaml";
+            hash = "sha256-DuhCe3RqHTtpVwW3TC1/sWUSERCxoQwLbiBJGNk+gU8=";
+          };
+          csiResizerRbac = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/kubernetes-csi/external-resizer/v2.2.1/deploy/kubernetes/rbac.yaml";
+            hash = "sha256-NhWvDQB9UeAuU81vdBX/e0GMOiHTO7bOUGY5IjYZzYI=";
+          };
+          csiSnapshotterRbac = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.6.0/deploy/kubernetes/csi-snapshotter/rbac-csi-snapshotter.yaml";
+            hash = "sha256-3mf2ZBLxf6uYaElPZX/tQxnUwTd3uSEEWvwEEAvcnJg=";
+          };
         in
         {
           default = pkgs.mkShell {
+            AGENT_KNOWLEDGE_CSI_ATTACHER_RBAC = csiAttacherRbac;
+            AGENT_KNOWLEDGE_CSI_EXTERNAL_HEALTH_MONITOR_RBAC = csiExternalHealthMonitorRbac;
             AGENT_KNOWLEDGE_CSI_HOSTPATH_SOURCE = csi-driver-host-path;
+            AGENT_KNOWLEDGE_CSI_PROVISIONER_RBAC = csiProvisionerRbac;
+            AGENT_KNOWLEDGE_CSI_RESIZER_RBAC = csiResizerRbac;
+            AGENT_KNOWLEDGE_CSI_SNAPSHOTTER_RBAC = csiSnapshotterRbac;
             AGENT_KNOWLEDGE_EXTERNAL_SNAPSHOTTER_SOURCE = external-snapshotter;
             packages =
               with pkgs;

@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly SCRIPT_DIRECTORY=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-readonly REPOSITORY_ROOT=$(cd -- "$SCRIPT_DIRECTORY/../.." && pwd)
+readonly SCRIPT_DIRECTORY
+SCRIPT_DIRECTORY=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly REPOSITORY_ROOT
+REPOSITORY_ROOT=$(cd -- "$SCRIPT_DIRECTORY/../.." && pwd)
 readonly NAMESPACE=agent-knowledge-e2e
 readonly REQUEST_ID=01K00000000000000000000000
 readonly DOCUMENT_ID=01K00000000000000000000002
 readonly KIND_NODE_IMAGE=kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95
 readonly CLUSTER_NAME="agent-knowledge-e2e-$$"
-readonly LOCAL_SSH_PORT=$((32000 + ($$ % 10000)))
+LOCAL_SSH_PORT=
 
 : "${AGENT_KNOWLEDGE_CSI_HOSTPATH_SOURCE:?run this test through the Nix development shell}"
 : "${AGENT_KNOWLEDGE_EXTERNAL_SNAPSHOTTER_SOURCE:?run this test through the Nix development shell}"
 
-for program in curl docker jq kind kubectl kustomize nix ssh-keygen ssh-keyscan tar; do
+for program in docker jq kind kubectl kustomize nix ssh-keygen tar; do
   command -v "$program" >/dev/null || {
     echo "required E2E program is unavailable: $program" >&2
     exit 2
@@ -76,14 +78,22 @@ start_port_forward() {
     kill "$port_forward_pid" 2>/dev/null || true
     wait "$port_forward_pid" 2>/dev/null || true
   fi
-  kubectl port-forward -n "$NAMESPACE" service/agent-knowledge-ssh \
-    "$LOCAL_SSH_PORT:2222" >"$temporary_directory/port-forward.log" 2>&1 &
+  : >"$temporary_directory/port-forward.log"
+  kubectl port-forward --address 127.0.0.1 \
+    -n "$NAMESPACE" service/agent-knowledge-ssh \
+    :2222 >"$temporary_directory/port-forward.log" 2>&1 &
   port_forward_pid=$!
   for _attempt in $(seq 1 30); do
-    if ssh-keyscan -T 1 -p "$LOCAL_SSH_PORT" 127.0.0.1 >/dev/null 2>&1; then
+    LOCAL_SSH_PORT=$(sed -n \
+      's/^Forwarding from 127\.0\.0\.1:\([0-9][0-9]*\) -> 2222$/\1/p' \
+      "$temporary_directory/port-forward.log" | head -n 1)
+    if [ -n "$LOCAL_SSH_PORT" ]; then
       return 0
     fi
-    kill -0 "$port_forward_pid"
+    if ! kill -0 "$port_forward_pid" 2>/dev/null; then
+      cat "$temporary_directory/port-forward.log" >&2
+      return 1
+    fi
     sleep 1
   done
   echo "SSH port-forward did not become ready" >&2
@@ -136,7 +146,7 @@ for crd in \
     "$AGENT_KNOWLEDGE_EXTERNAL_SNAPSHOTTER_SOURCE/client/config/crd/$crd"
 done
 
-bash "$AGENT_KNOWLEDGE_CSI_HOSTPATH_SOURCE/deploy/kubernetes-1.35/deploy.sh"
+bash "$SCRIPT_DIRECTORY/deploy-csi.sh"
 
 load_image "$worker_image"
 load_image "$queue_ingress_image"
@@ -175,6 +185,7 @@ kubectl get node "$CLUSTER_NAME-control-plane" -o json \
 
 mkdir -p "$temporary_directory/client-home/.ssh"
 chmod 0700 "$temporary_directory/client-home/.ssh"
+start_port_forward
 read -r host_key_type host_key_data _comment <"$temporary_directory/host-key.pub"
 printf '[127.0.0.1]:%s %s %s\n' "$LOCAL_SSH_PORT" "$host_key_type" "$host_key_data" \
   >"$temporary_directory/client-home/.ssh/known_hosts"
@@ -191,8 +202,6 @@ Host agent-knowledge-e2e
 EOF
 chmod 0600 "$temporary_directory/client-home/.ssh/config" \
   "$temporary_directory/client-home/.ssh/known_hosts"
-
-start_port_forward
 
 run_client client list --destination agent-knowledge-e2e \
   --maximum-results 10 --timeout-seconds 10 \

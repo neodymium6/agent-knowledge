@@ -16,6 +16,7 @@ setup_json=$temporary_directory/setup.json
 kind_json=$temporary_directory/kind.json
 
 bash -n "$e2e_directory/run.sh"
+bash -n "$e2e_directory/deploy-csi.sh"
 bash "$base_directory/check-manifests.sh" \
   "$e2e_directory" "$base_directory/kube-linter.yaml"
 kube-linter lint --config "$base_directory/kube-linter.yaml" \
@@ -93,3 +94,11 @@ grep -Fx '#!/opt/agent-knowledge-quartz/bin/busybox sh' \
   "$e2e_directory/build-site" >/dev/null
 grep -F 'kubectl wait --for=create pod/agent-knowledge-0' \
   "$e2e_directory/run.sh" >/dev/null
+grep -F 'service/agent-knowledge-ssh' "$e2e_directory/run.sh" >/dev/null
+grep -F ':2222 >"$temporary_directory/port-forward.log"' \
+  "$e2e_directory/run.sh" >/dev/null
+test "$(grep -c '@sha256:' "$e2e_directory/deploy-csi.sh")" -eq 8
+if grep -Eq 'curl|wget|https?://' "$e2e_directory/deploy-csi.sh"; then
+  echo "CSI deployment must not download runtime resources" >&2
+  exit 1
+fi
