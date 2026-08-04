@@ -94,6 +94,9 @@ jobs:
 
       - name: Build client archive
         run: |
+          nix build \
+            ".#checks.${{ matrix.system }}.client-release-archive" \
+            --no-link
           archive=$(nix build .#client-release-archive --no-link --print-out-paths)
           mkdir -p dist
           cp "$archive" \
@@ -109,11 +112,12 @@ jobs:
       - name: Build and push architecture images
         run: |
           while read -r attribute image; do
+            nix build ".#checks.${{ matrix.system }}.$attribute" --no-link
             archive=$(nix build ".#$attribute" --no-link --print-out-paths)
             docker load --input "$archive"
 
             source="$image:$VERSION"
-            destination="$REGISTRY/$REGISTRY_NAMESPACE/$image:$VERSION-${{ matrix.architecture }}"
+            destination="$REGISTRY/$REGISTRY_NAMESPACE/$image:$VERSION-$GITHUB_SHA-${{ matrix.architecture }}"
             docker tag "$source" "$destination"
             docker push "$destination"
           done <<'IMAGES'
@@ -188,6 +192,8 @@ jobs:
 
       - name: Publish and verify multi-architecture manifests
         id: manifests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           images=(
             agent-knowledge-worker
@@ -199,20 +205,53 @@ jobs:
 
           for image in "${images[@]}"; do
             repository="$REGISTRY/$REGISTRY_NAMESPACE/$image"
+            candidate="$repository:$VERSION-$GITHUB_SHA"
             docker buildx imagetools create \
-              --tag "$repository:$VERSION" \
-              "$repository:$VERSION-amd64" \
-              "$repository:$VERSION-arm64"
+              --tag "$candidate" \
+              "$repository:$VERSION-$GITHUB_SHA-amd64" \
+              "$repository:$VERSION-$GITHUB_SHA-arm64"
 
             raw_manifest=$(mktemp)
             docker buildx imagetools inspect \
-              "$repository:$VERSION" --raw >"$raw_manifest"
+              "$candidate" --raw >"$raw_manifest"
             jq -e \
               '([.manifests[].platform.architecture] | sort) == ["amd64", "arm64"] and
                ([.manifests[].platform.os] | unique) == ["linux"]' \
               "$raw_manifest" >/dev/null
 
             digest="sha256:$(sha256sum "$raw_manifest" | cut -d ' ' -f1)"
+            versions=$(gh api --paginate --slurp \
+              "/users/$REGISTRY_NAMESPACE/packages/container/$image/versions?per_page=100")
+            mapfile -t existing < <(
+              jq -r --arg tag "$VERSION" \
+                '.[][] | select(.metadata.container.tags | index($tag)) | .name' \
+                <<<"$versions" | sort -u
+            )
+
+            if (( ${#existing[@]} > 1 )); then
+              echo "$repository:$VERSION resolves to multiple digests" >&2
+              exit 1
+            fi
+            if (( ${#existing[@]} == 1 )); then
+              if [[ "${existing[0]}" != "$digest" ]]; then
+                echo "$repository:$VERSION already exists with a different digest" >&2
+                exit 1
+              fi
+            else
+              docker buildx imagetools create \
+                --tag "$repository:$VERSION" \
+                "$repository@$digest"
+            fi
+
+            published_manifest=$(mktemp)
+            docker buildx imagetools inspect \
+              "$repository:$VERSION" --raw >"$published_manifest"
+            published_digest="sha256:$(sha256sum "$published_manifest" | cut -d ' ' -f1)"
+            if [[ "$published_digest" != "$digest" ]]; then
+              echo "$repository:$VERSION changed while it was being published" >&2
+              exit 1
+            fi
+
             output=${image#agent-knowledge-}
             output=${output//-/_}
             printf '%s_digest=%s\n' "$output" "$digest" >>"$GITHUB_OUTPUT"
