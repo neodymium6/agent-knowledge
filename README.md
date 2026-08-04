@@ -289,8 +289,9 @@ mixture of old and new startup inputs.
 The projected Secret is mounted only by short-lived staging init containers.
 They copy the host key and authorized keys with fixed modes into a
 root-controlled `emptyDir`; OpenSSH mounts only that staged directory. This
-preserves `StrictModes yes` despite the writable-mode AtomicWriter directories
-used by projected Kubernetes volumes.
+directory is mounted at `/etc/agent-knowledge-ssh`, outside the configuration
+ConfigMap mount, so `StrictModes yes` can verify every parent directory despite
+the writable-mode AtomicWriter directories used by Kubernetes volumes.
 
 Do not place Secret data, host keys, client keys, Git credentials, or private
 infrastructure values in the overlay repository. The default StorageClass must

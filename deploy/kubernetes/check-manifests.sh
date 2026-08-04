@@ -124,6 +124,8 @@ jq -e '
     and (volume("sshd-runtime") | has("emptyDir"))
     and (volume("ssh-credentials").emptyDir.medium == "Memory")
     and (mount(container("openssh-gateway"); "ssh-credentials").readOnly == true)
+    and (mount(container("openssh-gateway"); "ssh-credentials").mountPath
+      == "/etc/agent-knowledge-ssh")
     and (container("openssh-gateway").volumeMounts
       | any(.[]; .name == "ssh-credentials-source") | not)
     and (volume("ssh-credentials-source").secret.secretName
@@ -138,4 +140,8 @@ jq -e '
     and (pod_spec.volumes | all(.[]; has("hostPath") | not))
     and (resources("ConfigMap")[0].data | keys | sort
       == ["gateway.yaml", "sshd_config", "worker.yaml"])
+    and (resources("ConfigMap")[0].data.sshd_config
+      | contains("HostKey /etc/agent-knowledge-ssh/ssh_host_ed25519_key"))
+    and (resources("ConfigMap")[0].data.sshd_config
+      | contains("AuthorizedKeysFile /etc/agent-knowledge-ssh/authorized_keys"))
 ' "$resources_json" >/dev/null
