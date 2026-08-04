@@ -1,10 +1,25 @@
 {
   description = "Agent Knowledge package and development environment";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    csi-driver-host-path = {
+      url = "github:kubernetes-csi/csi-driver-host-path/cc78ee78ae23908c9e0607df2fe09c7ecfa52597";
+      flake = false;
+    };
+    external-snapshotter = {
+      url = "github:kubernetes-csi/external-snapshotter/78e32cd84e0abec2621924a30e38c755f93e180a";
+      flake = false;
+    };
+  };
 
   outputs =
-    { nixpkgs, ... }:
+    {
+      csi-driver-host-path,
+      external-snapshotter,
+      nixpkgs,
+      ...
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -378,21 +393,77 @@
             };
           };
         };
+      kubernetesE2eQuartzContainerImageFor =
+        system:
+        let
+          pkgs = pkgsFor.${system};
+          fixture = pkgs.runCommand "agent-knowledge-kubernetes-e2e-quartz-root" { } ''
+            install -d "$out/fixture"
+            install -m555 ${./deploy/kubernetes-e2e/build-site} \
+              "$out/fixture/build-site"
+          '';
+        in
+        pkgs.dockerTools.buildLayeredImage {
+          name = "agent-knowledge-kubernetes-e2e-quartz";
+          tag = projectVersion;
+          contents = [
+            pkgs.pkgsStatic.busybox
+            fixture
+          ];
+          config = {
+            User = "0";
+            WorkingDir = "/";
+            Entrypoint = [ "/bin/sh" ];
+            Labels = {
+              "org.opencontainers.image.title" = "Agent Knowledge Kubernetes E2E Quartz Fixture";
+              "org.opencontainers.image.version" = projectVersion;
+              "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+            };
+          };
+        };
     in
     {
       devShells = forAllSystems (
         system:
         let
           pkgs = pkgsFor.${system};
+          csiAttacherRbac = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/kubernetes-csi/external-attacher/v4.12.0/deploy/kubernetes/rbac.yaml";
+            hash = "sha256-Oji1GYsElpJ8DOJsY+cdQ+ImPi27uTqDrN7HHXyQp2Y=";
+          };
+          csiExternalHealthMonitorRbac = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/kubernetes-csi/external-health-monitor/v0.18.0/deploy/kubernetes/external-health-monitor-controller/rbac.yaml";
+            hash = "sha256-MgVZntqaJS4nN6yr4iWRr9jaNzwaq1J1zlQiOt/i0Sc=";
+          };
+          csiProvisionerRbac = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/kubernetes-csi/external-provisioner/v6.3.0/deploy/kubernetes/rbac.yaml";
+            hash = "sha256-DuhCe3RqHTtpVwW3TC1/sWUSERCxoQwLbiBJGNk+gU8=";
+          };
+          csiResizerRbac = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/kubernetes-csi/external-resizer/v2.2.1/deploy/kubernetes/rbac.yaml";
+            hash = "sha256-NhWvDQB9UeAuU81vdBX/e0GMOiHTO7bOUGY5IjYZzYI=";
+          };
+          csiSnapshotterRbac = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.6.0/deploy/kubernetes/csi-snapshotter/rbac-csi-snapshotter.yaml";
+            hash = "sha256-3mf2ZBLxf6uYaElPZX/tQxnUwTd3uSEEWvwEEAvcnJg=";
+          };
         in
         {
           default = pkgs.mkShell {
+            AGENT_KNOWLEDGE_CSI_ATTACHER_RBAC = csiAttacherRbac;
+            AGENT_KNOWLEDGE_CSI_EXTERNAL_HEALTH_MONITOR_RBAC = csiExternalHealthMonitorRbac;
+            AGENT_KNOWLEDGE_CSI_HOSTPATH_SOURCE = csi-driver-host-path;
+            AGENT_KNOWLEDGE_CSI_PROVISIONER_RBAC = csiProvisionerRbac;
+            AGENT_KNOWLEDGE_CSI_RESIZER_RBAC = csiResizerRbac;
+            AGENT_KNOWLEDGE_CSI_SNAPSHOTTER_RBAC = csiSnapshotterRbac;
+            AGENT_KNOWLEDGE_EXTERNAL_SNAPSHOTTER_SOURCE = external-snapshotter;
             packages =
               with pkgs;
               [
                 actionlint
                 cargo
                 clippy
+                curl
                 gh
                 git
                 jq
@@ -406,6 +477,8 @@
                 yq-go
               ]
               ++ lib.optionals stdenv.isLinux [
+                kind
+                kubectl
                 openssh
                 systemd
               ];
@@ -416,8 +489,10 @@
       packages = forLinuxSystems (system: rec {
         agent-knowledge = packageFor system;
         gateway-container-image = gatewayContainerImageFor system;
+        kubernetes-e2e-client = unwrappedPackageFor system;
         openssh-gateway-package = opensshGatewayPackageFor system;
         openssh-gateway-container-image = opensshGatewayContainerImageFor system;
+        kubernetes-e2e-quartz-container-image = kubernetesE2eQuartzContainerImageFor system;
         storage-bootstrap-container-image = storageBootstrapContainerImageFor system;
         queue-ingress-container-image = queueIngressContainerImageFor system;
         worker-container-image = workerContainerImageFor system;
@@ -480,6 +555,7 @@
                   ${./deploy/kubernetes}
                 touch "$out"
               '';
+          kubernetesE2eQuartzContainerImage = kubernetesE2eQuartzContainerImageFor system;
         in
         {
           package = package;
@@ -491,6 +567,22 @@
             '';
           container-image = workerContainerImageCheck;
           kubernetes-manifests = kubernetesManifestCheck;
+          kubernetes-e2e-quartz-container-image =
+            pkgs.runCommand "check-agent-knowledge-kubernetes-e2e-quartz-container-image"
+              {
+                nativeBuildInputs = [
+                  pkgs.gnutar
+                  pkgs.gzip
+                  pkgs.jq
+                ];
+              }
+              ''
+                ${pkgs.bash}/bin/bash ${./deploy/kubernetes-e2e/check-quartz-image.sh} \
+                  ${kubernetesE2eQuartzContainerImage} \
+                  ${containerArchitecture.${system}} \
+                  ${projectVersion}
+                touch "$out"
+              '';
           worker-container-image = workerContainerImageCheck;
           queue-ingress-container-image =
             let

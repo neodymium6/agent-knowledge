@@ -1,5 +1,39 @@
 {
   "nodes": {
+    "csi-driver-host-path": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784147483,
+        "narHash": "sha256-ErBsQ29vhTEhks3qQ31uqN1Z6DtyEacLmc8tZkVLoho=",
+        "owner": "kubernetes-csi",
+        "repo": "csi-driver-host-path",
+        "rev": "cc78ee78ae23908c9e0607df2fe09c7ecfa52597",
+        "type": "github"
+      },
+      "original": {
+        "owner": "kubernetes-csi",
+        "repo": "csi-driver-host-path",
+        "rev": "cc78ee78ae23908c9e0607df2fe09c7ecfa52597",
+        "type": "github"
+      }
+    },
+    "external-snapshotter": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1779957289,
+        "narHash": "sha256-9WSflI44XhecRqBWGKDfeMMHqOBwyInX9w2qMLDPylA=",
+        "owner": "kubernetes-csi",
+        "repo": "external-snapshotter",
+        "rev": "78e32cd84e0abec2621924a30e38c755f93e180a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "kubernetes-csi",
+        "repo": "external-snapshotter",
+        "rev": "78e32cd84e0abec2621924a30e38c755f93e180a",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1785318670,
@@ -18,6 +52,8 @@
     },
     "root": {
       "inputs": {
+        "csi-driver-host-path": "csi-driver-host-path",
+        "external-snapshotter": "external-snapshotter",
         "nixpkgs": "nixpkgs"
       }
     }

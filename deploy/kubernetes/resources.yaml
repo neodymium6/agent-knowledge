@@ -326,7 +326,7 @@ spec:
               mountPath: /etc/agent-knowledge
               readOnly: true
             - name: ssh-credentials
-              mountPath: /etc/agent-knowledge/ssh
+              mountPath: /etc/agent-knowledge-ssh
               readOnly: true
             - name: knowledge
               mountPath: /var/lib/agent-knowledge

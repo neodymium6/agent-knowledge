@@ -38,6 +38,11 @@ ci: check-code check-kubernetes
 # Render and validate the single-replica Kubernetes deployment.
 check-kubernetes:
   nix develop . --command bash deploy/kubernetes/check-manifests.sh deploy/kubernetes
+  nix develop . --command bash deploy/kubernetes-e2e/check.sh deploy/kubernetes-e2e
+
+# Run the disposable kind cluster and full SSH persistence test.
+test-kubernetes-e2e:
+  nix develop . --command bash deploy/kubernetes-e2e/run.sh
 
 # Update pinned development-environment inputs.
 update:

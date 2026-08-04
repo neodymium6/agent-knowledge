@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 1 ]; then
-  echo "usage: $0 <kustomize-directory>" >&2
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  echo "usage: $0 <kustomize-directory> [kube-linter-config]" >&2
   exit 2
 fi
 
 manifest_directory=$1
+lint_config=${2:-$manifest_directory/kube-linter.yaml}
 temporary_directory=$(mktemp -d "${TMPDIR:-/tmp}/agent-knowledge-kubernetes.XXXXXX")
 trap 'rm -rf -- "$temporary_directory"' EXIT
 rendered_manifest=$temporary_directory/rendered.yaml
@@ -14,7 +15,7 @@ resources_json=$temporary_directory/resources.json
 
 kustomize build --load-restrictor LoadRestrictionsRootOnly \
   "$manifest_directory" >"$rendered_manifest"
-kube-linter lint --config "$manifest_directory/kube-linter.yaml" \
+kube-linter lint --config "$lint_config" \
   "$rendered_manifest"
 yq eval-all -o=json -I=0 '[.]' "$rendered_manifest" >"$resources_json"
 
@@ -123,6 +124,8 @@ jq -e '
     and (volume("sshd-runtime") | has("emptyDir"))
     and (volume("ssh-credentials").emptyDir.medium == "Memory")
     and (mount(container("openssh-gateway"); "ssh-credentials").readOnly == true)
+    and (mount(container("openssh-gateway"); "ssh-credentials").mountPath
+      == "/etc/agent-knowledge-ssh")
     and (container("openssh-gateway").volumeMounts
       | any(.[]; .name == "ssh-credentials-source") | not)
     and (volume("ssh-credentials-source").secret.secretName
@@ -137,4 +140,8 @@ jq -e '
     and (pod_spec.volumes | all(.[]; has("hostPath") | not))
     and (resources("ConfigMap")[0].data | keys | sort
       == ["gateway.yaml", "sshd_config", "worker.yaml"])
+    and (resources("ConfigMap")[0].data.sshd_config
+      | contains("HostKey /etc/agent-knowledge-ssh/ssh_host_ed25519_key"))
+    and (resources("ConfigMap")[0].data.sshd_config
+      | contains("AuthorizedKeysFile /etc/agent-knowledge-ssh/authorized_keys"))
 ' "$resources_json" >/dev/null

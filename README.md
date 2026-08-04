@@ -9,8 +9,8 @@ restricted gateway; they do not synchronize the repository with Git.
 
 ## Status
 
-The architecture is defined, delivery increments 1 through 8 and the Linux
-portion of increment 9 are implemented. The current executable can accept
+The architecture and delivery increments 1 through 10 are implemented. The
+current executable can accept
 requests locally or through an OpenSSH forced command, process them through the
 single Writer, and publish immutable Quartz releases. Coding agents can list,
 retrieve, and search an exact committed content snapshot and inspect durable
@@ -33,8 +33,8 @@ exercising the service privilege boundary.
 - A single Repository Worker applies atomic changes and commits them with Git.
 - A bounded Quartz runner and pinned release store publish immutable static
   releases through an atomically replaced `current` symlink.
-- A conventional Linux host is the initial target. The design remains
-  compatible with a future single-replica Kubernetes deployment.
+- A conventional Linux host is the initial target. A single-replica Kubernetes
+  deployment base is also supplied and exercised in CI.
 
 See [DESIGN.md](DESIGN.md) for the complete architecture, invariants,
 protocol, persistence, recovery, and delivery plan.
@@ -289,8 +289,9 @@ mixture of old and new startup inputs.
 The projected Secret is mounted only by short-lived staging init containers.
 They copy the host key and authorized keys with fixed modes into a
 root-controlled `emptyDir`; OpenSSH mounts only that staged directory. This
-preserves `StrictModes yes` despite the writable-mode AtomicWriter directories
-used by projected Kubernetes volumes.
+directory is mounted at `/etc/agent-knowledge-ssh`, outside the configuration
+ConfigMap mount, so `StrictModes yes` can verify every parent directory despite
+the writable-mode AtomicWriter directories used by Kubernetes volumes.
 
 Do not place Secret data, host keys, client keys, Git credentials, or private
 infrastructure values in the overlay repository. The default StorageClass must
@@ -326,6 +327,28 @@ Render and run the pinned static validation without contacting a cluster:
 just check-kubernetes
 kustomize build deploy/kubernetes
 ```
+
+Run the full Kubernetes packaging test on a Linux host with a working Docker
+daemon:
+
+```sh
+just test-kubernetes-e2e
+```
+
+The test creates a disposable kind cluster using a digest-pinned Kubernetes
+node image, configures the kubelet PID bound required by the deployment, and
+installs the upstream CSI hostpath driver intended for CI testing. It builds and
+loads the role-specific images plus a static BusyBox-based Quartz fixture,
+generates ephemeral fictional SSH keys, and applies the E2E overlay. The client
+then submits, searches, retrieves, and exports a Markdown document and
+attachment over the restricted SSH transport. Finally, it recreates the Pod
+and verifies that the same committed content remains available from the
+persistent volume. The cluster and keys are removed when the test exits.
+
+This proves the Kubernetes process, identity, transport, and persistence
+integration. The CSI hostpath fixture is not a qualification of any production
+StorageClass; operators must still validate the filesystem guarantees listed
+above on their target cluster.
 
 After supplying the external inputs and reviewing the rendered overlay, apply
 that overlay with `kubectl apply -k <overlay-directory>`. Do not apply the base

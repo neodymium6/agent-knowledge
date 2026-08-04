@@ -1,9 +1,9 @@
 ListenAddress 0.0.0.0
 ListenAddress ::
 AddressFamily any
-HostKey /etc/agent-knowledge/ssh/ssh_host_ed25519_key
+HostKey /etc/agent-knowledge-ssh/ssh_host_ed25519_key
 PidFile /run/sshd/sshd.pid
-AuthorizedKeysFile /etc/agent-knowledge/ssh/authorized_keys
+AuthorizedKeysFile /etc/agent-knowledge-ssh/authorized_keys
 AuthorizedKeysCommand none
 TrustedUserCAKeys none
 AuthenticationMethods publickey

@@ -73,3 +73,22 @@ jobs:
 
       - name: Validate package, systemd integration, and container image
         run: nix develop --command just check-package
+
+  kubernetes-e2e:
+    name: Kubernetes E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
+        with:
+          determinate: false
+
+      - name: Exercise the Kubernetes deployment through SSH
+        run: nix develop --command just test-kubernetes-e2e

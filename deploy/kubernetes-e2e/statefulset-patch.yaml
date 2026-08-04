@@ -1,0 +1,16 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: agent-knowledge
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: knowledge
+      spec:
+        accessModes:
+          - ReadWriteOncePod
+        resources:
+          requests:
+            storage: 256Mi
+        storageClassName: csi-hostpath-sc
+        volumeMode: Filesystem
