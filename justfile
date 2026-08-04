@@ -52,6 +52,10 @@ test-quartz-e2e quartz_root:
 test-recovery-e2e:
   package_path="$(nix build .#agent-knowledge --no-link --print-out-paths)" && sudo deploy/recovery-e2e/check.sh "$package_path/bin/agent-knowledge"
 
+# Exercise the packaged systemd services in a disposable NixOS VM.
+test-systemd-e2e:
+  nix build .#systemd-e2e --no-link -L
+
 # Update pinned development-environment inputs.
 update:
   nix flake update
