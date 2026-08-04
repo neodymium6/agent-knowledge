@@ -44,6 +44,10 @@ check-kubernetes:
 test-kubernetes-e2e:
   nix develop . --command bash deploy/kubernetes-e2e/run.sh
 
+# Validate the Worker build contract against an installed Quartz checkout.
+test-quartz-e2e quartz_root:
+  bash deploy/quartz-e2e/check.sh "{{quartz_root}}"
+
 # Update pinned development-environment inputs.
 update:
   nix flake update

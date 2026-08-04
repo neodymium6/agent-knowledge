@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="120" viewBox="0 0 320 120" role="img" aria-labelledby="title description">
+  <title id="title">Fictional memory usage</title>
+  <desc id="description">A fictional two-bar memory usage chart.</desc>
+  <rect width="320" height="120" fill="#f7f7f7"/>
+  <rect x="40" y="50" width="90" height="50" fill="#284b63"/>
+  <rect x="180" y="25" width="90" height="75" fill="#84a59d"/>
+  <text x="62" y="115" font-family="sans-serif" font-size="12">before</text>
+  <text x="205" y="115" font-family="sans-serif" font-size="12">after</text>
+</svg>
