@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use agent_knowledge_core::{PathAttestation, PathAttestationError};
-use agent_knowledge_queue::{FileQueue, PackagePolicy, QueueReader, rebind_restored_queue};
+use agent_knowledge_queue::{
+    FileQueue, PackagePolicy, QueueReader, migrate_legacy_queue_binding, rebind_restored_queue,
+};
 use agent_knowledge_release::{ReleasePolicy, ReleaseReader, ReleaseStore};
 use agent_knowledge_repository::{
     CommittedStore, GitRepository, GitTransactionError, trusted_git_program,
@@ -389,6 +391,9 @@ fn bootstrap_storage_with_ids_and_git_check(
         validate_same_storage_mount(&storage_root, &storage_paths(&settings))
             .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
         validate_durable_initialized(&settings, identities)?;
+        migrate_legacy_queue_binding(settings.queue_root()).map_err(|error| {
+            StorageBootstrapError::Component("queue binding migration", error.to_string())
+        })?;
         initialize_runtime_directory(&request.runtime_directory, identities)?;
         revalidate_storage_lock(&storage_root, &storage_lock)?;
         validate_initialized(&settings, &request.runtime_directory, identities)?;

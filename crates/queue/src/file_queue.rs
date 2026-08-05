@@ -280,6 +280,73 @@ pub fn rebind_restored_queue(queue_root: impl Into<PathBuf>) -> Result<(), Queue
     sync_directory(&queue_root)
 }
 
+/// Migrates an offline queue's legacy root binding to the current format.
+///
+/// Existing queue state is opened without creating or repairing any files. Both
+/// queue locks must be available, and the caller must be able to preserve the
+/// legacy binding's ownership and mode on the replacement file. Deployments
+/// with separate queue and Worker identities should therefore invoke this from
+/// their privileged storage bootstrap before starting either service.
+///
+/// A queue that already has a valid current binding is left unchanged.
+///
+/// # Errors
+///
+/// Returns an error when required queue state is absent or malformed, either
+/// queue lock is held, the legacy binding does not describe the current queue,
+/// or the replacement binding cannot be made durable.
+#[cfg(target_os = "linux")]
+pub fn migrate_legacy_queue_binding(queue_root: impl Into<PathBuf>) -> Result<(), QueueError> {
+    let configured_path = queue_root.into();
+    let root_metadata = fs::symlink_metadata(&configured_path).map_err(QueueError::Io)?;
+    if !root_metadata.file_type().is_dir() {
+        return Err(QueueError::InvalidStoragePath(configured_path));
+    }
+    let root_handle = Arc::new(File::open(&configured_path).map_err(QueueError::Io)?);
+    let configured_queue_root = fs::canonicalize(&configured_path).map_err(QueueError::Io)?;
+    let queue_root = stable_file_path(&root_handle, &configured_queue_root)?;
+    validate_pinned_root(&configured_queue_root, &root_handle)?;
+
+    let directories = QueueDirectories {
+        lock: pin_directory(&queue_root.join(LOCK_DIRECTORY_NAME))?,
+        incoming: pin_directory(&queue_root.join("incoming"))?,
+        quarantine: pin_directory(&queue_root.join("quarantine"))?,
+        worker_temporary: pin_directory(&queue_root.join(WORKER_TEMP_DIRECTORY_NAME))?,
+        states: [
+            pin_directory(&queue_root.join(QueueState::Pending.directory_name()))?,
+            pin_directory(&queue_root.join(QueueState::Processing.directory_name()))?,
+            pin_directory(&queue_root.join(QueueState::Completed.directory_name()))?,
+            pin_directory(&queue_root.join(QueueState::Failed.directory_name()))?,
+        ],
+    };
+    validate_common_queue_mount(&root_handle, &directories)?;
+    for directory in directories.all() {
+        validate_pinned_directory(directory)?;
+    }
+
+    let queue_lock_path = directories.lock.stable.join(QUEUE_LOCK_FILE_NAME);
+    let worker_lock_path = directories.lock.stable.join(WORKER_LOCK_FILE_NAME);
+    let queue_lock = open_existing_lock_file(&queue_lock_path)?;
+    let worker_lock = open_existing_lock_file(&worker_lock_path)?;
+    queue_lock.try_lock().map_err(queue_restore_lock_error)?;
+    worker_lock.try_lock().map_err(queue_restore_lock_error)?;
+    validate_pinned_lock(&queue_lock_path, &queue_lock)?;
+    validate_pinned_lock(&worker_lock_path, &worker_lock)?;
+
+    let _identity = read_queue_identity(&queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
+    let _next_sequence = read_next_sequence(&queue_root.join(NEXT_SEQUENCE_FILE_NAME))?;
+    ensure_queue_root_binding(
+        &queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
+        &configured_queue_root,
+        &root_handle,
+        &directories,
+        &queue_lock,
+        &worker_lock,
+        &queue_root,
+    )?;
+    sync_directory(&queue_root)
+}
+
 #[cfg(target_os = "linux")]
 fn validate_restored_queue_binding(
     path: &Path,

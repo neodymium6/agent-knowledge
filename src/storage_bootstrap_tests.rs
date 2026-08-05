@@ -158,6 +158,40 @@ fn fixture(root: &Path) -> (StorageBootstrap, StorageIdentities) {
     )
 }
 
+fn install_legacy_queue_binding(queue_root: &Path) {
+    let binding = queue_root.join("queue-root-binding-v1");
+    let current_binding = queue_root.join("queue-root-binding-v2");
+    let current_permissions = fs::symlink_metadata(&current_binding)
+        .unwrap_or_else(|error| panic!("current queue binding must be readable: {error}"))
+        .permissions();
+    let mut contents = queue_root.as_os_str().as_encoded_bytes().to_vec();
+    for path in [
+        queue_root.to_path_buf(),
+        queue_root.join(".locks"),
+        queue_root.join("incoming"),
+        queue_root.join("quarantine"),
+        queue_root.join("worker-tmp"),
+        queue_root.join("pending"),
+        queue_root.join("processing"),
+        queue_root.join("completed"),
+        queue_root.join("failed"),
+        queue_root.join(".locks/queue.lock"),
+        queue_root.join(".locks/repository-writer.lock"),
+    ] {
+        let metadata = fs::symlink_metadata(&path)
+            .unwrap_or_else(|error| panic!("queue binding fixture must be readable: {error}"));
+        contents.push(0);
+        contents.extend_from_slice(&metadata.dev().to_le_bytes());
+        contents.extend_from_slice(&metadata.ino().to_le_bytes());
+    }
+    fs::write(&binding, contents)
+        .unwrap_or_else(|error| panic!("legacy queue binding fixture must be written: {error}"));
+    fs::set_permissions(&binding, current_permissions)
+        .unwrap_or_else(|error| panic!("legacy queue binding mode must be preserved: {error}"));
+    fs::remove_file(current_binding)
+        .unwrap_or_else(|error| panic!("current queue binding fixture must be removed: {error}"));
+}
+
 fn publish_release_fixture(root: &Path, storage: &Path, output_mode: u32) -> PathBuf {
     let integration = root.join("quartz-integration");
     fs::create_dir(&integration)
@@ -370,6 +404,23 @@ fn initializes_fresh_storage_and_is_idempotent() {
         .unwrap_or_else(|error| panic!("ephemeral runtime must be recreated: {error}"));
     assert_eq!(after_restart, b"{\"status\":\"already_initialized\"}\n");
     assert!(request.runtime_directory.is_dir());
+}
+
+#[test]
+fn marked_storage_migrates_a_legacy_queue_binding() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("fresh bootstrap must succeed: {error}"));
+    let queue_root = root.path().join("storage/queue");
+    install_legacy_queue_binding(&queue_root);
+
+    let mut output = Vec::new();
+    bootstrap_storage_with_ids(&request, identities, &mut output)
+        .unwrap_or_else(|error| panic!("legacy queue migration must succeed: {error}"));
+
+    assert_eq!(output, b"{\"status\":\"already_initialized\"}\n");
+    assert!(queue_root.join("queue-root-binding-v2").is_file());
 }
 
 #[test]
