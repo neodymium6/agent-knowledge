@@ -23,7 +23,6 @@ serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
 tokio = { version = "1", features = ["io-std", "rt", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["rt"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30.1", features = ["process", "signal"] }

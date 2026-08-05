@@ -38,15 +38,6 @@ status: active\n\
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
-#[test]
-fn full_binary_usage_includes_the_mcp_client() {
-    assert!(
-        CliError::Usage
-            .to_string()
-            .contains("agent-knowledge client mcp --destination")
-    );
-}
-
 struct TestDirectory(PathBuf);
 
 #[derive(Clone, Default)]

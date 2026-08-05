@@ -16,5 +16,5 @@ pub use file_queue::{migrate_legacy_queue_binding, rebind_restored_queue};
 pub use package::{
     AcceptanceMetadata, MarkdownValidationError, PackageDigest, PackageLimit, PackageLimits,
     PackagePolicy, PackagePolicyError, PackageValidationError, PayloadMetadata, ValidatedPackage,
-    validate_accepted_package, validate_package, validate_package_with_deadline,
+    validate_accepted_package, validate_package,
 };

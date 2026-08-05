@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
-use std::fs::File;
-use std::io::{self, Read};
+use std::fs;
+use std::io;
 use std::path::Path;
 #[cfg(test)]
 use std::{cell::Cell, thread_local};
 
-use crate::QueueOperationDeadline;
 use agent_knowledge_core::{
     ChangeRequest, DocumentId, DocumentLimits, DocumentMetadata, DocumentParseError,
     DocumentValidationError, Operation, PayloadPath, RequestId, decode_document_metadata,
@@ -23,7 +22,6 @@ pub(super) fn validate_documents(
     payload_root: &Path,
     limits: DocumentLimits,
     maximum_front_matter_bytes: usize,
-    deadline: Option<&QueueOperationDeadline>,
 ) -> Result<(), MarkdownValidationError> {
     let mut documents = HashMap::new();
     for operation in &request.operations {
@@ -49,7 +47,6 @@ pub(super) fn validate_documents(
                 request,
                 limits,
                 maximum_front_matter_bytes,
-                deadline,
             )?),
         };
         validate_operation_metadata(metadata, content, document_id, updated_required)?;
@@ -64,25 +61,12 @@ fn parse_document(
     request: &ChangeRequest,
     limits: DocumentLimits,
     maximum_front_matter_bytes: usize,
-    deadline: Option<&QueueOperationDeadline>,
 ) -> Result<DocumentMetadata, MarkdownValidationError> {
     #[cfg(test)]
     DOCUMENT_PARSE_COUNT.set(DOCUMENT_PARSE_COUNT.get() + 1);
 
-    let mut source = File::open(payload_root.join(payload_path.as_str()))
-        .map_err(MarkdownValidationError::Io)?;
-    let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        ensure_operation_active(deadline)?;
-        let read = source
-            .read(&mut buffer)
-            .map_err(MarkdownValidationError::Io)?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-    }
+    let bytes =
+        fs::read(payload_root.join(payload_path.as_str())).map_err(MarkdownValidationError::Io)?;
     let metadata = decode_document_metadata(&bytes, maximum_front_matter_bytes)
         .map_err(|error| map_parse_error(payload_path, error))?;
     metadata
@@ -120,19 +104,6 @@ fn parse_document(
         });
     }
     Ok(metadata)
-}
-
-fn ensure_operation_active(
-    deadline: Option<&QueueOperationDeadline>,
-) -> Result<(), MarkdownValidationError> {
-    deadline.map_or(Ok(()), |deadline| {
-        deadline.ensure_active().map_err(|_| {
-            MarkdownValidationError::Io(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Markdown validation deadline expired or was cancelled",
-            ))
-        })
-    })
 }
 
 fn map_parse_error(path: &PayloadPath, error: DocumentParseError) -> MarkdownValidationError {
