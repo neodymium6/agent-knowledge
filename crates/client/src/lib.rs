@@ -34,6 +34,7 @@ const MAXIMUM_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_STATUS_RESPONSE_BYTES: u64 = 4 * 1024;
+const MAXIMUM_MCP_DIAGNOSTIC_CHARACTERS: usize = 4 * 1024;
 
 /// Typed SSH transport for Agent Knowledge Gateway operations.
 #[derive(Clone, Debug)]
@@ -1211,6 +1212,28 @@ pub enum ClientCommandError {
 }
 
 impl ClientCommandError {
+    pub(crate) fn mcp_message(&self) -> String {
+        match self {
+            Self::GatewayRejected(response) => {
+                serde_json::to_string(response).unwrap_or_else(|_| self.to_string())
+            }
+            Self::SshFailed { diagnostic, .. } => {
+                let diagnostic = String::from_utf8_lossy(diagnostic)
+                    .chars()
+                    .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+                    .take(MAXIMUM_MCP_DIAGNOSTIC_CHARACTERS)
+                    .collect::<String>();
+                let diagnostic = diagnostic.trim();
+                if diagnostic.is_empty() {
+                    self.to_string()
+                } else {
+                    format!("{diagnostic}\n{self}")
+                }
+            }
+            _ => self.to_string(),
+        }
+    }
+
     pub fn write_diagnostic(&self, mut output: impl Write) -> io::Result<()> {
         match self {
             Self::GatewayRejected(response) => {

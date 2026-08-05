@@ -23,6 +23,10 @@ const MAXIMUM_RESULTS: usize = 10_000;
 trait KnowledgeBackend: Clone + Send + Sync + 'static {
     type Error: fmt::Display + Send + 'static;
 
+    fn format_error(error: &Self::Error) -> String {
+        error.to_string()
+    }
+
     fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error>;
     fn list(&self, request: &ListRequest) -> Result<ListResponse, Self::Error>;
     fn recent(&self, request: &ListRequest) -> Result<ListResponse, Self::Error>;
@@ -33,6 +37,10 @@ trait KnowledgeBackend: Clone + Send + Sync + 'static {
 
 impl KnowledgeBackend for SshClient {
     type Error = ClientCommandError;
+
+    fn format_error(error: &Self::Error) -> String {
+        error.mcp_message()
+    }
 
     fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error> {
         SshClient::submit(self, package_root)
@@ -76,6 +84,7 @@ struct ReadParameters {
     include_archived: bool,
     /// Maximum number of results, from 1 through 10000. Defaults to 100.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 10000))]
     maximum_results: Option<usize>,
 }
 
@@ -137,6 +146,7 @@ struct SearchParameters {
     include_archived: bool,
     /// Maximum number of results, from 1 through 10000. Defaults to 100.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 10000))]
     maximum_results: Option<usize>,
 }
 
@@ -207,7 +217,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     ) -> Result<CallToolResult, String> {
         let request = parameters.into_request()?;
         let client = self.client.clone();
-        structured(run_blocking(move || client.list(&request)).await?)
+        structured(run_blocking(move || client.list(&request), C::format_error).await?)
     }
 
     #[tool(
@@ -221,7 +231,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     ) -> Result<CallToolResult, String> {
         let request = parameters.into_request()?;
         let client = self.client.clone();
-        structured(run_blocking(move || client.recent(&request)).await?)
+        structured(run_blocking(move || client.recent(&request), C::format_error).await?)
     }
 
     #[tool(
@@ -235,7 +245,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     ) -> Result<CallToolResult, String> {
         let request = parameters.into_request()?;
         let client = self.client.clone();
-        structured(run_blocking(move || client.search(&request)).await?)
+        structured(run_blocking(move || client.search(&request), C::format_error).await?)
     }
 
     #[tool(
@@ -253,7 +263,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
             .map_err(|_| "document_id must be a canonical ULID".to_owned())?;
         let request = GetRequest::new(document_id);
         let client = self.client.clone();
-        structured(run_blocking(move || client.get(&request)).await?)
+        structured(run_blocking(move || client.get(&request), C::format_error).await?)
     }
 
     #[tool(
@@ -271,7 +281,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
             .map_err(|_| "request_id must be a canonical ULID".to_owned())?;
         let request = StatusRequest::new(request_id);
         let client = self.client.clone();
-        structured(run_blocking(move || client.status(&request)).await?)
+        structured(run_blocking(move || client.status(&request), C::format_error).await?)
     }
 
     #[tool(
@@ -279,7 +289,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
         description = "Validate and submit one local immutable Agent Knowledge request package over SSH.",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = true
         )
@@ -293,7 +303,13 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
         }
         let package_root = parameters.package_root;
         let client = self.client.clone();
-        structured(run_blocking(move || client.submit(Path::new(&package_root))).await?)
+        structured(
+            run_blocking(
+                move || client.submit(Path::new(&package_root)),
+                C::format_error,
+            )
+            .await?,
+        )
     }
 }
 
@@ -313,6 +329,7 @@ impl<C: KnowledgeBackend> ServerHandler for KnowledgeMcpServer<C> {
 
 async fn run_blocking<T, E>(
     operation: impl FnOnce() -> Result<T, E> + Send + 'static,
+    format_error: fn(&E) -> String,
 ) -> Result<T, String>
 where
     T: Send + 'static,
@@ -321,7 +338,7 @@ where
     tokio::task::spawn_blocking(operation)
         .await
         .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
-        .map_err(|error| error.to_string())
+        .map_err(|error| format_error(&error))
 }
 
 fn structured(value: impl Serialize) -> Result<CallToolResult, String> {
@@ -430,6 +447,29 @@ mod tests {
                 .and_then(|annotations| annotations.idempotent_hint),
             Some(false)
         );
+        assert_eq!(
+            submit
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.destructive_hint),
+            Some(true)
+        );
+        for name in ["knowledge_list", "knowledge_search"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} tool must be advertised"));
+            let schema = serde_json::to_value(&tool.input_schema)
+                .unwrap_or_else(|error| panic!("{name} schema must encode: {error}"));
+            assert_eq!(
+                schema["properties"]["maximum_results"]["minimum"],
+                serde_json::json!(1)
+            );
+            assert_eq!(
+                schema["properties"]["maximum_results"]["maximum"],
+                serde_json::json!(10000)
+            );
+        }
         let names = tools
             .into_iter()
             .map(|tool| tool.name.into_owned())
