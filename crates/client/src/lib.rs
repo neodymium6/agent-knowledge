@@ -3,6 +3,8 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,11 +37,33 @@ const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_STATUS_RESPONSE_BYTES: u64 = 4 * 1024;
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CancellationFlag(Arc<AtomicBool>);
+
+impl CancellationFlag {
+    pub(crate) fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn check(&self) -> Result<(), ClientCommandError> {
+        if self.is_cancelled() {
+            Err(ClientCommandError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Typed SSH transport for Agent Knowledge Gateway operations.
 #[derive(Clone, Debug)]
 pub struct SshClient {
     destination: OsString,
     timeout: Duration,
+    cancellation: CancellationFlag,
 }
 
 impl SshClient {
@@ -57,7 +81,13 @@ impl SshClient {
         Ok(Self {
             destination,
             timeout,
+            cancellation: CancellationFlag::default(),
         })
+    }
+
+    pub(crate) fn with_cancellation(mut self, cancellation: CancellationFlag) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     /// Submits one validated request package.
@@ -71,6 +101,7 @@ impl SshClient {
             &self.destination,
             package_root,
             self.timeout,
+            &self.cancellation,
         )
         .map(|(response, _diagnostic)| response)
     }
@@ -105,6 +136,7 @@ impl SshClient {
             ControlOperation::new(SEARCH_COMMAND, MAXIMUM_CONTROL_RESPONSE_BYTES),
             request,
             self.timeout,
+            &self.cancellation,
         )
         .map(|(response, _diagnostic)| response)
     }
@@ -120,6 +152,7 @@ impl SshClient {
             &self.destination,
             request,
             self.timeout,
+            &self.cancellation,
         )
         .map(|(response, _diagnostic)| response)
     }
@@ -135,6 +168,7 @@ impl SshClient {
             &self.destination,
             request,
             self.timeout,
+            &self.cancellation,
         )
         .map(|(response, _diagnostic)| response)
     }
@@ -150,6 +184,7 @@ impl SshClient {
             ControlOperation::new(remote_command, MAXIMUM_CONTROL_RESPONSE_BYTES),
             request,
             self.timeout,
+            &self.cancellation,
         )
         .map(|(response, _diagnostic)| response)
     }
@@ -264,8 +299,13 @@ fn status_with_program(
     mut output: impl Write,
     mut diagnostic_output: impl Write,
 ) -> Result<(), ClientCommandError> {
-    let (response, diagnostic) =
-        status_response_with_program(program, destination, request, timeout)?;
+    let (response, diagnostic) = status_response_with_program(
+        program,
+        destination,
+        request,
+        timeout,
+        &CancellationFlag::default(),
+    )?;
     diagnostic_output
         .write_all(&diagnostic)
         .map_err(ClientCommandError::DiagnosticOutput)?;
@@ -277,6 +317,7 @@ fn status_response_with_program(
     destination: &OsStr,
     request: &StatusRequest,
     timeout: Duration,
+    cancellation: &CancellationFlag,
 ) -> Result<(StatusResponse, Vec<u8>), ClientCommandError> {
     let (response, diagnostic) = control_response_with_program::<_, StatusResponse>(
         program,
@@ -284,6 +325,7 @@ fn status_response_with_program(
         ControlOperation::new(STATUS_COMMAND, MAXIMUM_STATUS_RESPONSE_BYTES),
         request,
         timeout,
+        cancellation,
     )?;
     if response.request_id() != request.request_id {
         return Err(ClientCommandError::RequestStatusResponseMismatch);
@@ -299,7 +341,13 @@ fn get_with_program(
     mut output: impl Write,
     mut diagnostic_output: impl Write,
 ) -> Result<(), ClientCommandError> {
-    let (response, diagnostic) = get_response_with_program(program, destination, request, timeout)?;
+    let (response, diagnostic) = get_response_with_program(
+        program,
+        destination,
+        request,
+        timeout,
+        &CancellationFlag::default(),
+    )?;
     diagnostic_output
         .write_all(&diagnostic)
         .map_err(ClientCommandError::DiagnosticOutput)?;
@@ -311,6 +359,7 @@ fn get_response_with_program(
     destination: &OsStr,
     request: &GetRequest,
     timeout: Duration,
+    cancellation: &CancellationFlag,
 ) -> Result<(GetResponse, Vec<u8>), ClientCommandError> {
     let (response, diagnostic) = control_response_with_program::<_, GetResponse>(
         program,
@@ -318,6 +367,7 @@ fn get_response_with_program(
         ControlOperation::new(GET_COMMAND, MAXIMUM_CONTROL_RESPONSE_BYTES),
         request,
         timeout,
+        cancellation,
     )?;
     if response.document.summary.metadata.document_id != request.document_id {
         return Err(ClientCommandError::DocumentResponseMismatch);
@@ -344,6 +394,7 @@ where
         operation,
         request,
         timeout,
+        &CancellationFlag::default(),
     )?;
     diagnostic_output
         .write_all(&diagnostic)
@@ -357,13 +408,20 @@ fn control_response_with_program<Request, Response>(
     operation: ControlOperation<'_>,
     request: &Request,
     timeout: Duration,
+    cancellation: &CancellationFlag,
 ) -> Result<(Response, Vec<u8>), ClientCommandError>
 where
     Request: Serialize,
     Response: DeserializeOwned,
 {
-    let (response, diagnostic) =
-        execute_control_with_program(program, destination, operation, request, timeout)?;
+    let (response, diagnostic) = execute_control_with_program(
+        program,
+        destination,
+        operation,
+        request,
+        timeout,
+        cancellation,
+    )?;
     let protocol_version =
         decode_protocol_version(&response).map_err(ClientCommandError::InvalidResponse)?;
     require_current_protocol(protocol_version)?;
@@ -378,11 +436,13 @@ fn execute_control_with_program<Request>(
     operation: ControlOperation<'_>,
     request: &Request,
     timeout: Duration,
+    cancellation: &CancellationFlag,
 ) -> Result<(Vec<u8>, Vec<u8>), ClientCommandError>
 where
     Request: Serialize,
 {
     validate_connection(destination, timeout)?;
+    cancellation.check()?;
     let request = serde_json::to_vec(request).map_err(ClientCommandError::EncodeControlRequest)?;
     if request.len() as u64 > MAXIMUM_CONTROL_REQUEST_BYTES {
         return Err(ClientCommandError::ControlRequestTooLarge);
@@ -435,7 +495,7 @@ where
         result
     });
 
-    let wait_result = supervise_transfer(&mut child, timeout, &event_receiver);
+    let wait_result = supervise_transfer(&mut child, timeout, &event_receiver, cancellation);
     let input_result = input
         .join()
         .map_err(|_| ClientCommandError::ControlRequestThreadPanicked)
@@ -491,6 +551,7 @@ fn export_with_program(
         ControlOperation::new(EXPORT_COMMAND, MAXIMUM_CONTROL_RESPONSE_BYTES),
         request,
         timeout,
+        &CancellationFlag::default(),
     )?;
     validate_export_archive(&archive, request.document_id)?;
     diagnostic_output
@@ -701,8 +762,13 @@ fn submit_with_program(
     mut output: impl Write,
     mut diagnostic_output: impl Write,
 ) -> Result<(), ClientCommandError> {
-    let (response, diagnostic) =
-        submit_response_with_program(program, destination, package_root, timeout)?;
+    let (response, diagnostic) = submit_response_with_program(
+        program,
+        destination,
+        package_root,
+        timeout,
+        &CancellationFlag::default(),
+    )?;
     diagnostic_output
         .write_all(&diagnostic)
         .map_err(ClientCommandError::DiagnosticOutput)?;
@@ -714,10 +780,13 @@ fn submit_response_with_program(
     destination: &OsStr,
     package_root: &Path,
     timeout: Duration,
+    cancellation: &CancellationFlag,
 ) -> Result<(SubmitResponse, Vec<u8>), ClientCommandError> {
     validate_connection(destination, timeout)?;
+    cancellation.check()?;
 
     let package = PreparedPackage::open(package_root)?;
+    cancellation.check()?;
     let expectation = package.expectation();
     let mut command = Command::new(program);
     configure_ssh_command(&mut command, destination, SUBMIT_COMMAND);
@@ -763,7 +832,7 @@ fn submit_response_with_program(
         );
         result
     });
-    let wait_result = supervise_transfer(&mut child, timeout, &event_receiver);
+    let wait_result = supervise_transfer(&mut child, timeout, &event_receiver, cancellation);
     let archive_result = archive
         .join()
         .map_err(|_| ClientCommandError::ArchiveThreadPanicked)
@@ -848,6 +917,7 @@ fn supervise_transfer(
     child: &mut Child,
     timeout: Duration,
     events: &Receiver<TransferEvent>,
+    cancellation: &CancellationFlag,
 ) -> Result<ExitStatus, ClientCommandError> {
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -855,6 +925,10 @@ fn supervise_transfer(
     let mut progress = TransferProgress::default();
     let mut exit_status = None;
     loop {
+        if cancellation.is_cancelled() {
+            terminate_process_group(child);
+            return Err(ClientCommandError::Cancelled);
+        }
         if exit_status.is_none() {
             match child.try_wait() {
                 Ok(status) => exit_status = status,
@@ -1185,6 +1259,7 @@ pub enum ClientCommandError {
     ReadDiagnostic(io::Error),
     DiagnosticTooLarge,
     TransferCancelled,
+    Cancelled,
     TransferState,
     WaitForSsh(io::Error),
     InvalidTimeout,
@@ -1300,6 +1375,7 @@ impl fmt::Display for ClientCommandError {
             Self::TransferCancelled => {
                 formatter.write_str("ssh transfer was cancelled after a stream failure")
             }
+            Self::Cancelled => formatter.write_str("Agent Knowledge operation was cancelled"),
             Self::TransferState => formatter.write_str("ssh transfer state became inconsistent"),
             Self::WaitForSsh(error) => write!(formatter, "could not wait for ssh: {error}"),
             Self::InvalidTimeout => formatter.write_str("SSH timeout must be positive"),
@@ -1383,6 +1459,7 @@ impl std::error::Error for ClientCommandError {
             | Self::ControlResponseTooLarge { .. }
             | Self::DiagnosticTooLarge
             | Self::TransferCancelled
+            | Self::Cancelled
             | Self::TransferState
             | Self::InvalidTimeout
             | Self::SshTimedOut { .. }

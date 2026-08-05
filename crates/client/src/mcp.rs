@@ -7,15 +7,16 @@ use agent_knowledge_protocol::{
     StatusRequest, StatusResponse, SubmitResponse,
 };
 use rmcp::{
-    ServerHandler, ServiceExt,
+    RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo},
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{ClientCommandError, SshClient};
+use crate::{CancellationFlag, ClientCommandError, SshClient};
 
 const DEFAULT_MAXIMUM_RESULTS: usize = 100;
 const MAXIMUM_RESULTS: usize = 10_000;
@@ -23,6 +24,7 @@ const MAXIMUM_RESULTS: usize = 10_000;
 trait KnowledgeBackend: Clone + Send + Sync + 'static {
     type Error: fmt::Display + Send + 'static;
 
+    fn with_cancellation(self, cancellation: CancellationFlag) -> Self;
     fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error>;
     fn list(&self, request: &ListRequest) -> Result<ListResponse, Self::Error>;
     fn recent(&self, request: &ListRequest) -> Result<ListResponse, Self::Error>;
@@ -33,6 +35,10 @@ trait KnowledgeBackend: Clone + Send + Sync + 'static {
 
 impl KnowledgeBackend for SshClient {
     type Error = ClientCommandError;
+
+    fn with_cancellation(self, cancellation: CancellationFlag) -> Self {
+        SshClient::with_cancellation(self, cancellation)
+    }
 
     fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error> {
         SshClient::submit(self, package_root)
@@ -179,6 +185,20 @@ struct SubmitParameters {
     package_root: String,
 }
 
+fn get_request(document_id: String) -> Result<GetRequest, String> {
+    document_id
+        .parse::<DocumentId>()
+        .map(GetRequest::new)
+        .map_err(|_| "document_id must be a canonical ULID".to_owned())
+}
+
+fn status_request(request_id: String) -> Result<StatusRequest, String> {
+    request_id
+        .parse::<RequestId>()
+        .map(StatusRequest::new)
+        .map_err(|_| "request_id must be a canonical ULID".to_owned())
+}
+
 #[derive(Clone, Debug)]
 struct KnowledgeMcpServer<C: KnowledgeBackend> {
     client: C,
@@ -204,10 +224,16 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     async fn list(
         &self,
         Parameters(parameters): Parameters<ReadParameters>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, String> {
         let request = parameters.into_request()?;
         let client = self.client.clone();
-        structured(run_blocking(move || client.list(&request)).await?)
+        structured(
+            run_blocking(context, move |cancellation| {
+                client.with_cancellation(cancellation).list(&request)
+            })
+            .await?,
+        )
     }
 
     #[tool(
@@ -218,10 +244,16 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     async fn recent(
         &self,
         Parameters(parameters): Parameters<ReadParameters>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, String> {
         let request = parameters.into_request()?;
         let client = self.client.clone();
-        structured(run_blocking(move || client.recent(&request)).await?)
+        structured(
+            run_blocking(context, move |cancellation| {
+                client.with_cancellation(cancellation).recent(&request)
+            })
+            .await?,
+        )
     }
 
     #[tool(
@@ -232,10 +264,16 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     async fn search(
         &self,
         Parameters(parameters): Parameters<SearchParameters>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, String> {
         let request = parameters.into_request()?;
         let client = self.client.clone();
-        structured(run_blocking(move || client.search(&request)).await?)
+        structured(
+            run_blocking(context, move |cancellation| {
+                client.with_cancellation(cancellation).search(&request)
+            })
+            .await?,
+        )
     }
 
     #[tool(
@@ -246,14 +284,16 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     async fn get(
         &self,
         Parameters(parameters): Parameters<DocumentParameters>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, String> {
-        let document_id = parameters
-            .document_id
-            .parse::<DocumentId>()
-            .map_err(|_| "document_id must be a canonical ULID".to_owned())?;
-        let request = GetRequest::new(document_id);
+        let request = get_request(parameters.document_id)?;
         let client = self.client.clone();
-        structured(run_blocking(move || client.get(&request)).await?)
+        structured(
+            run_blocking(context, move |cancellation| {
+                client.with_cancellation(cancellation).get(&request)
+            })
+            .await?,
+        )
     }
 
     #[tool(
@@ -264,14 +304,16 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     async fn request_status(
         &self,
         Parameters(parameters): Parameters<StatusParameters>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, String> {
-        let request_id = parameters
-            .request_id
-            .parse::<RequestId>()
-            .map_err(|_| "request_id must be a canonical ULID".to_owned())?;
-        let request = StatusRequest::new(request_id);
+        let request = status_request(parameters.request_id)?;
         let client = self.client.clone();
-        structured(run_blocking(move || client.status(&request)).await?)
+        structured(
+            run_blocking(context, move |cancellation| {
+                client.with_cancellation(cancellation).status(&request)
+            })
+            .await?,
+        )
     }
 
     #[tool(
@@ -280,20 +322,28 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
         annotations(
             read_only_hint = false,
             destructive_hint = false,
-            idempotent_hint = true,
+            idempotent_hint = false,
             open_world_hint = true
         )
     )]
     async fn submit_package(
         &self,
         Parameters(parameters): Parameters<SubmitParameters>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, String> {
         if parameters.package_root.is_empty() {
             return Err("package_root must not be empty".to_owned());
         }
         let package_root = parameters.package_root;
         let client = self.client.clone();
-        structured(run_blocking(move || client.submit(Path::new(&package_root))).await?)
+        structured(
+            run_blocking(context, move |cancellation| {
+                client
+                    .with_cancellation(cancellation)
+                    .submit(Path::new(&package_root))
+            })
+            .await?,
+        )
     }
 }
 
@@ -312,16 +362,28 @@ impl<C: KnowledgeBackend> ServerHandler for KnowledgeMcpServer<C> {
 }
 
 async fn run_blocking<T, E>(
-    operation: impl FnOnce() -> Result<T, E> + Send + 'static,
+    context: RequestContext<RoleServer>,
+    operation: impl FnOnce(CancellationFlag) -> Result<T, E> + Send + 'static,
 ) -> Result<T, String>
 where
     T: Send + 'static,
     E: fmt::Display + Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
-        .await
-        .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
-        .map_err(|error| error.to_string())
+    let cancellation = CancellationFlag::default();
+    let worker_cancellation = cancellation.clone();
+    let mut task = tokio::task::spawn_blocking(move || operation(worker_cancellation));
+    tokio::select! {
+        result = &mut task => result
+            .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
+            .map_err(|error| error.to_string()),
+        () = context.ct.cancelled() => {
+            cancellation.cancel();
+            task.await
+                .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
+                .map_err(|error| error.to_string())?;
+            Err("Agent Knowledge operation was cancelled".to_owned())
+        }
+    }
 }
 
 fn structured(value: impl Serialize) -> Result<CallToolResult, String> {
@@ -377,7 +439,8 @@ mod tests {
     use std::convert::Infallible;
 
     use super::{
-        DocumentParameters, KnowledgeBackend, KnowledgeMcpServer, Parameters, ReadParameters,
+        CancellationFlag, KnowledgeBackend, KnowledgeMcpServer, ReadParameters, get_request,
+        structured,
     };
     use agent_knowledge_protocol::{
         GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest, StatusRequest,
@@ -389,6 +452,10 @@ mod tests {
 
     impl KnowledgeBackend for FakeBackend {
         type Error = Infallible;
+
+        fn with_cancellation(self, _cancellation: CancellationFlag) -> Self {
+            self
+        }
 
         fn submit(&self, _package_root: &std::path::Path) -> Result<SubmitResponse, Self::Error> {
             unreachable!()
@@ -418,9 +485,19 @@ mod tests {
     #[test]
     fn advertises_the_expected_tool_set() {
         let server = KnowledgeMcpServer::new(FakeBackend);
-        let names = server
-            .tool_router
-            .list_all()
+        let tools = server.tool_router.list_all();
+        let submit = tools
+            .iter()
+            .find(|tool| tool.name == "knowledge_submit_package")
+            .unwrap_or_else(|| panic!("submit tool must be advertised"));
+        assert_eq!(
+            submit
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.idempotent_hint),
+            Some(false)
+        );
+        let names = tools
             .into_iter()
             .map(|tool| tool.name.into_owned())
             .collect::<Vec<_>>();
@@ -439,20 +516,20 @@ mod tests {
 
     #[test]
     fn returns_structured_read_results() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap_or_else(|error| panic!("test runtime must start: {error}"));
-        let result = runtime
-            .block_on(
-                KnowledgeMcpServer::new(FakeBackend).list(Parameters(ReadParameters {
-                    project: None,
-                    tag: None,
-                    session: None,
-                    include_archived: false,
-                    maximum_results: None,
-                })),
-            )
-            .unwrap_or_else(|error| panic!("list tool must succeed: {error}"));
+        let request = ReadParameters {
+            project: None,
+            tag: None,
+            session: None,
+            include_archived: false,
+            maximum_results: None,
+        }
+        .into_request()
+        .unwrap_or_else(|error| panic!("list parameters must be valid: {error}"));
+        let response = FakeBackend
+            .list(&request)
+            .unwrap_or_else(|error| match error {});
+        let result =
+            structured(response).unwrap_or_else(|error| panic!("list result must encode: {error}"));
         assert_eq!(
             result
                 .structured_content
@@ -466,14 +543,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_identifiers_before_ssh() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap_or_else(|error| panic!("test runtime must start: {error}"));
-        let result = runtime.block_on(KnowledgeMcpServer::new(FakeBackend).get(Parameters(
-            DocumentParameters {
-                document_id: "not-a-ulid".to_owned(),
-            },
-        )));
+        let result = get_request("not-a-ulid".to_owned());
         assert_eq!(
             result.err().as_deref(),
             Some("document_id must be a canonical ULID")
