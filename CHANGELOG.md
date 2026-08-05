@@ -4,6 +4,8 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.5
+
 - Add a local STDIO MCP mode to the client for committed reads, search,
   request status, and immutable package submission over the node's existing
   restricted SSH configuration.
