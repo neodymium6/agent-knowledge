@@ -385,6 +385,8 @@ pub(crate) fn validate_release_tree(
         Path::new(""),
         &mut fingerprint,
         TreeValidation {
+            allow_read_only_files: true,
+            alternate_file_mode: Some(Mode::from_bits_truncate(0o444)),
             allow_symlinks: true,
             ..TreeValidation::strict()
         },
@@ -817,6 +819,7 @@ struct TreePermissions {
 struct TreeValidation {
     allow_read_only_files: bool,
     allow_symlinks: bool,
+    alternate_file_mode: Option<Mode>,
     alternate_file: Option<(Uid, Mode)>,
 }
 
@@ -826,6 +829,7 @@ impl TreeValidation {
         Self {
             allow_read_only_files: false,
             allow_symlinks: false,
+            alternate_file_mode: None,
             alternate_file: None,
         }
     }
@@ -927,8 +931,7 @@ fn validate_directory_permissions(
                 permissions.group,
                 permissions.file_mode,
                 &path,
-                validation.allow_read_only_files,
-                validation.alternate_file,
+                validation,
             )?;
             fingerprint.record(&path, identity)?;
         } else if validation.allow_symlinks
@@ -1002,13 +1005,20 @@ fn require_file_metadata(
     group: Gid,
     mode: Mode,
     path: &Path,
-    allow_owner_write_missing: bool,
-    alternate: Option<(Uid, Mode)>,
+    validation: TreeValidation,
 ) -> Result<(), StorageMigrationError> {
     let metadata = file.metadata().map_err(StorageMigrationError::Io)?;
-    if metadata_matches(&metadata, owner, group, mode, allow_owner_write_missing)
+    if metadata_matches(
+        &metadata,
+        owner,
+        group,
+        mode,
+        validation.allow_read_only_files,
+    ) || validation
+        .alternate_file_mode
+        .is_some_and(|mode| metadata_matches(&metadata, owner, group, mode, false))
         || (worker_owned_queue_file(path)
-            && alternate.is_some_and(|(owner, mode)| {
+            && validation.alternate_file.is_some_and(|(owner, mode)| {
                 metadata_matches(&metadata, Some(owner), group, mode, false)
             }))
     {

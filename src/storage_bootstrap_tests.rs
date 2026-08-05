@@ -105,8 +105,12 @@ fn normalize_release_fixture(path: &Path) {
         fs::set_permissions(path, fs::Permissions::from_mode(0o750))
             .unwrap_or_else(|error| panic!("release fixture directory mode must be set: {error}"));
     } else if metadata.file_type().is_file() {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o640))
-            .unwrap_or_else(|error| panic!("release fixture file mode must be set: {error}"));
+        // Preserve immutable build output so restart validation exercises the
+        // mode accepted by Release Store publication.
+        if !matches!(metadata.permissions().mode() & 0o7777, 0o440 | 0o444) {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o640))
+                .unwrap_or_else(|error| panic!("release fixture file mode must be set: {error}"));
+        }
     } else {
         panic!("release fixture contains an unsupported filesystem object");
     }
@@ -152,6 +156,53 @@ fn fixture(root: &Path) -> (StorageBootstrap, StorageIdentities) {
             ingress_group: gid,
         },
     )
+}
+
+fn publish_release_fixture(root: &Path, storage: &Path, output_mode: u32) -> PathBuf {
+    let integration = root.join("quartz-integration");
+    fs::create_dir(&integration)
+        .unwrap_or_else(|error| panic!("Quartz integration fixture must be created: {error}"));
+    let program = root.join("fictional-quartz");
+    write_executable(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' '<p>fictional release</p>' > \"$5/index.html\"\n",
+    );
+    let release_root = storage.join("releases");
+    let release_store = ReleaseStore::open_existing(&release_root, ReleasePolicy::default())
+        .unwrap_or_else(|error| panic!("release store fixture must open: {error}"));
+    let batch_id: BatchId = "01K00000000000000000000042"
+        .parse()
+        .unwrap_or_else(|error| panic!("batch ID fixture must parse: {error}"));
+    let build = release_store
+        .begin_build(batch_id)
+        .unwrap_or_else(|error| panic!("release build fixture must begin: {error}"));
+    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("Quartz builder fixture must open: {error}"));
+    let built = builder
+        .build(&storage.join("content"), build)
+        .unwrap_or_else(|error| panic!("release fixture must build: {error}"));
+    fs::set_permissions(
+        built.path().join("index.html"),
+        fs::Permissions::from_mode(output_mode),
+    )
+    .unwrap_or_else(|error| panic!("built output must be made read-only: {error}"));
+    let prepared = release_store
+        .prepare(
+            built,
+            "1111111111111111111111111111111111111111",
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap_or_else(|error| panic!("release fixture must prepare: {error}"));
+    release_store
+        .activate(&prepared)
+        .unwrap_or_else(|error| panic!("release fixture must activate: {error}"));
+    let output = release_root
+        .join("by-id")
+        .join(prepared.release_id())
+        .join("index.html");
+    drop(release_store);
+    normalize_release_fixture(&release_root);
+    output
 }
 
 fn separated_service_identities() -> StorageIdentities {
@@ -322,46 +373,67 @@ fn initializes_fresh_storage_and_is_idempotent() {
 }
 
 #[test]
+fn marked_storage_accepts_published_read_only_release_files() {
+    for mode in [0o440, 0o444] {
+        let root = TestDirectory::new();
+        let (request, identities) = fixture(root.path());
+        bootstrap_storage_with_ids(&request, identities, Vec::new())
+            .unwrap_or_else(|error| panic!("fresh bootstrap must succeed: {error}"));
+        let storage = root.path().join("storage");
+        let output = publish_release_fixture(root.path(), &storage, mode);
+        assert_eq!(
+            fs::symlink_metadata(&output)
+                .unwrap_or_else(|error| panic!("published output metadata must exist: {error}"))
+                .permissions()
+                .mode()
+                & 0o7777,
+            mode
+        );
+        fs::remove_dir(&request.runtime_directory)
+            .unwrap_or_else(|error| panic!("runtime fixture must be removed: {error}"));
+
+        let mut after_restart = Vec::new();
+        bootstrap_storage_with_ids(&request, identities, &mut after_restart)
+            .unwrap_or_else(|error| panic!("read-only release must survive bootstrap: {error}"));
+
+        assert_eq!(after_restart, b"{\"status\":\"already_initialized\"}\n");
+        assert_eq!(
+            fs::symlink_metadata(output)
+                .unwrap_or_else(|error| panic!("published output metadata must exist: {error}"))
+                .permissions()
+                .mode()
+                & 0o7777,
+            mode
+        );
+    }
+}
+
+#[test]
+fn marked_storage_rejects_a_writable_published_release_file() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("fresh bootstrap must succeed: {error}"));
+    let storage = root.path().join("storage");
+    let output = publish_release_fixture(root.path(), &storage, 0o444);
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o464))
+        .unwrap_or_else(|error| panic!("published output mode must change: {error}"));
+
+    assert!(matches!(
+        bootstrap_storage_with_ids(&request, identities, Vec::new()),
+        Err(StorageBootstrapError::Permissions(path, _))
+            if path == storage.join("releases")
+    ));
+}
+
+#[test]
 fn rebinds_a_cold_copy_restored_at_the_configured_storage_root() {
     let root = TestDirectory::new();
     let (request, identities) = fixture(root.path());
     bootstrap_storage_with_ids(&request, identities, Vec::new())
         .unwrap_or_else(|error| panic!("storage fixture must initialize: {error}"));
     let storage = root.path().join("storage");
-    let integration = root.path().join("quartz-integration");
-    fs::create_dir(&integration)
-        .unwrap_or_else(|error| panic!("Quartz integration fixture must be created: {error}"));
-    let program = root.path().join("fictional-quartz");
-    write_executable(
-        &program,
-        "#!/bin/sh\nprintf '%s\\n' '<p>fictional release</p>' > \"$5/index.html\"\n",
-    );
-    let release_store =
-        ReleaseStore::open_existing(storage.join("releases"), ReleasePolicy::default())
-            .unwrap_or_else(|error| panic!("release store fixture must open: {error}"));
-    let batch_id: BatchId = "01K00000000000000000000042"
-        .parse()
-        .unwrap_or_else(|error| panic!("batch ID fixture must parse: {error}"));
-    let build = release_store
-        .begin_build(batch_id)
-        .unwrap_or_else(|error| panic!("release build fixture must begin: {error}"));
-    let builder = QuartzBuilder::new(&program, &integration, Duration::from_secs(2))
-        .unwrap_or_else(|error| panic!("Quartz builder fixture must open: {error}"));
-    let built = builder
-        .build(&storage.join("content"), build)
-        .unwrap_or_else(|error| panic!("release fixture must build: {error}"));
-    let prepared = release_store
-        .prepare(
-            built,
-            "1111111111111111111111111111111111111111",
-            OffsetDateTime::UNIX_EPOCH,
-        )
-        .unwrap_or_else(|error| panic!("release fixture must prepare: {error}"));
-    release_store
-        .activate(&prepared)
-        .unwrap_or_else(|error| panic!("release fixture must activate: {error}"));
-    drop(release_store);
-    normalize_release_fixture(&storage.join("releases"));
+    let _output = publish_release_fixture(root.path(), &storage, 0o444);
     assert!(storage.join("releases/current").is_symlink());
     let backup = root.path().join("cold-backup");
     copy_tree(&storage, &backup);
