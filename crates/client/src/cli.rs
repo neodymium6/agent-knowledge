@@ -38,6 +38,12 @@ pub enum Command {
         package_root: PathBuf,
         timeout: Duration,
     },
+    #[doc(hidden)]
+    InternalMcpSubmit {
+        destination: OsString,
+        package_root: PathBuf,
+        timeout: Duration,
+    },
     List {
         destination: OsString,
         request: ListRequest,
@@ -101,6 +107,12 @@ where
             package_root,
             timeout,
         } => crate::submit(&destination, &package_root, timeout, output).map_err(CliError::Command),
+        Command::InternalMcpSubmit {
+            destination,
+            package_root,
+            timeout,
+        } => crate::submit_inherited_process_group(&destination, &package_root, timeout, output)
+            .map_err(CliError::Command),
         Command::List {
             destination,
             request,
@@ -159,6 +171,7 @@ where
     }
     match action.to_str() {
         Some("submit") => parse_submit_arguments(arguments),
+        Some("__mcp-submit") => parse_internal_mcp_submit_arguments(arguments),
         Some("mcp") => parse_mcp_arguments(arguments),
         Some("list") => parse_list_arguments(arguments, false),
         Some("recent") => parse_list_arguments(arguments, true),
@@ -168,6 +181,39 @@ where
         Some("status") => parse_status_arguments(arguments),
         _ => Err(ParseError),
     }
+}
+
+fn parse_internal_mcp_submit_arguments<I>(mut arguments: I) -> Result<Command, ParseError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut destination = None;
+    let mut package_root = None;
+    let mut timeout_milliseconds = None;
+    while let Some(flag) = arguments.next() {
+        let value = arguments.next().ok_or(ParseError)?;
+        match flag.to_str() {
+            Some("--destination") if destination.is_none() => destination = Some(value),
+            Some("--package-root") if package_root.is_none() => {
+                package_root = Some(PathBuf::from(value));
+            }
+            Some("--timeout-milliseconds") if timeout_milliseconds.is_none() => {
+                timeout_milliseconds = Some(
+                    value
+                        .to_str()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .filter(|value| *value > 0)
+                        .ok_or(ParseError)?,
+                );
+            }
+            _ => return Err(ParseError),
+        }
+    }
+    Ok(Command::InternalMcpSubmit {
+        destination: destination.ok_or(ParseError)?,
+        package_root: package_root.ok_or(ParseError)?,
+        timeout: Duration::from_millis(timeout_milliseconds.ok_or(ParseError)?),
+    })
 }
 
 fn parse_mcp_arguments<I>(mut arguments: I) -> Result<Command, ParseError>

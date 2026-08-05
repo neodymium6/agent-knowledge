@@ -4,8 +4,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use agent_knowledge_queue::{PackagePolicy, validate_package};
+
 #[cfg(unix)]
 use std::{fs, io};
+
+#[cfg(unix)]
+const REQUEST_JSON: &str = r#"{
+  "protocol_version": 1,
+  "request_id": "01K00000000000000000000000",
+  "title": "Record a fictional MCP test",
+  "project": "fictional-project",
+  "document_type": "experiment",
+  "created_at": "2026-07-31T03:50:00Z",
+  "operations": [{
+    "type": "create_document",
+    "document_id": "01K00000000000000000000001",
+    "content": "run/index.md"
+  }]
+}"#;
+
+#[cfg(unix)]
+const MARKDOWN: &str = "---\n\
+schema_version: 1\n\
+document_id: 01K00000000000000000000001\n\
+title: Fictional MCP test\n\
+created: 2026-07-31T03:50:00Z\n\
+request_id: 01K00000000000000000000000\n\
+tags: []\n\
+status: active\n\
+---\n";
 
 #[test]
 fn initializes_the_stdio_mcp_server() {
@@ -243,21 +271,43 @@ fn bounds_parallel_ssh_operations() {
     wait_for_file_count(&process_ids, 4, Duration::from_secs(2));
     thread::sleep(Duration::from_millis(200));
     assert_eq!(directory_entry_count(&process_ids), 4);
-    for _ in 0..4 {
-        let mut response = String::new();
-        output
-            .read_line(&mut response)
-            .unwrap_or_else(|error| panic!("overload response must be readable: {error}"));
-        assert!(
-            response.contains("MCP server is busy; retry the operation later"),
-            "unexpected overload response: {response}"
-        );
-    }
 
     drop(input);
     let status = wait_for_process(&mut child, Duration::from_secs(2))
         .unwrap_or_else(|| panic!("MCP client did not stop after standard input closed"));
     assert!(status.success(), "MCP client failed");
+}
+
+#[test]
+fn rejects_an_oversized_input_line() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-knowledge-client"))
+        .args(["mcp", "--destination", "fictional-knowledge"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("MCP client process must start: {error}"));
+    let mut input = child
+        .stdin
+        .take()
+        .unwrap_or_else(|| panic!("MCP client stdin must be available"));
+    let mut output = BufReader::new(
+        child
+            .stdout
+            .take()
+            .unwrap_or_else(|| panic!("MCP client stdout must be available")),
+    );
+    initialize(&mut input, &mut output);
+    let oversized = vec![b'x'; 1024 * 1024 + 1];
+    let _ = input.write_all(&oversized);
+    drop(input);
+
+    let status = wait_for_process(&mut child, Duration::from_secs(2))
+        .unwrap_or_else(|| panic!("MCP client did not reject an oversized input line"));
+    assert!(
+        status.success(),
+        "MCP client failed while closing the connection"
+    );
 }
 
 #[cfg(unix)]
@@ -302,6 +352,76 @@ fn reports_sanitized_ssh_diagnostics() {
     assert!(response.contains("fictional host key rejected[31m"));
     assert!(!response.contains("\\u001b"));
     assert!(response.contains("ssh exited unsuccessfully"));
+
+    drop(input);
+    let status = wait_for_process(&mut child, Duration::from_secs(2))
+        .unwrap_or_else(|| panic!("MCP client did not stop after standard input closed"));
+    assert!(status.success(), "MCP client failed");
+}
+
+#[cfg(unix)]
+#[test]
+fn submits_through_the_isolated_helper() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDirectory::create();
+    let package = root.path().join("package");
+    fs::create_dir_all(package.join("payload/run"))
+        .unwrap_or_else(|error| panic!("package directories must be created: {error}"));
+    fs::write(package.join("request.json"), REQUEST_JSON)
+        .unwrap_or_else(|error| panic!("request fixture must be written: {error}"));
+    fs::write(package.join("payload/run/index.md"), MARKDOWN)
+        .unwrap_or_else(|error| panic!("Markdown fixture must be written: {error}"));
+    let digest = validate_package(&package, &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("package fixture must validate: {error}"))
+        .digest();
+    let ssh = root.path().join("ssh");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nset -eu\ncat > /dev/null\nprintf '%s\\n' '{{\"protocol_version\":1,\"status\":\"accepted\",\"request_id\":\"01K00000000000000000000000\",\"digest\":\"{digest}\"}}'\n",
+        ),
+    )
+    .unwrap_or_else(|error| panic!("fake ssh must be written: {error}"));
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("fake ssh must be executable: {error}"));
+
+    let mut child = start_mcp_process(root.path());
+    let mut input = child
+        .stdin
+        .take()
+        .unwrap_or_else(|| panic!("MCP client stdin must be available"));
+    let mut output = BufReader::new(
+        child
+            .stdout
+            .take()
+            .unwrap_or_else(|| panic!("MCP client stdout must be available")),
+    );
+    initialize(&mut input, &mut output);
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "knowledge_submit_package",
+            "arguments": { "package_root": package }
+        }
+    });
+    writeln!(input, "{request}")
+        .unwrap_or_else(|error| panic!("submit request must be written: {error}"));
+    input
+        .flush()
+        .unwrap_or_else(|error| panic!("submit request must flush: {error}"));
+    let mut response = String::new();
+    output
+        .read_line(&mut response)
+        .unwrap_or_else(|error| panic!("submit response must be readable: {error}"));
+    let response: serde_json::Value = serde_json::from_str(response.trim())
+        .unwrap_or_else(|error| panic!("submit response must be JSON: {error}"));
+    assert_eq!(
+        response["result"]["structuredContent"]["status"],
+        "accepted"
+    );
 
     drop(input);
     let status = wait_for_process(&mut child, Duration::from_secs(2))

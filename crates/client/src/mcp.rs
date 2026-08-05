@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use agent_knowledge_core::{DocumentId, ProjectId, RequestId, SessionId};
@@ -12,9 +13,13 @@ use agent_knowledge_protocol::{
 use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo},
-    service::RequestContext,
+    model::{
+        CallToolResult, Implementation, JsonRpcMessage, RequestId as McpRequestId,
+        ServerCapabilities, ServerInfo,
+    },
+    service::{RequestContext, RxJsonRpcMessage, TxJsonRpcMessage},
     tool, tool_handler, tool_router,
+    transport::{Transport, async_rw::AsyncRwTransport},
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,6 +32,8 @@ use crate::{CancellationFlag, ClientCommandError, SshClient};
 const DEFAULT_MAXIMUM_RESULTS: usize = 100;
 const MAXIMUM_RESULTS: usize = 10_000;
 const MAXIMUM_CONCURRENT_OPERATIONS: usize = 4;
+const MAXIMUM_INFLIGHT_REQUESTS: usize = 16;
+const MAXIMUM_INPUT_LINE_BYTES: usize = 1024 * 1024;
 const CANCELLATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
 
 trait KnowledgeBackend: Clone + Send + Sync + 'static {
@@ -53,7 +60,7 @@ impl KnowledgeBackend for SshClient {
     }
 
     fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error> {
-        SshClient::submit(self, package_root)
+        SshClient::submit_for_mcp(self, package_root)
     }
 
     fn list(&self, request: &ListRequest) -> Result<ListResponse, Self::Error> {
@@ -443,7 +450,11 @@ where
 
 fn structured(value: impl Serialize) -> Result<CallToolResult, String> {
     serde_json::to_value(value)
-        .map(CallToolResult::structured)
+        .map(|value| {
+            let mut result = CallToolResult::structured(value);
+            result.content.clear();
+            result
+        })
         .map_err(|_| "could not encode the Agent Knowledge response".to_owned())
 }
 
@@ -454,9 +465,16 @@ pub(crate) fn run(client: SshClient) -> Result<(), McpServerError> {
         .map_err(McpServerError::Runtime)?;
     let result = runtime.block_on(async move {
         let shutdown = CancellationToken::new();
-        let input = CancelOnEof::new(tokio::io::stdin(), shutdown.clone());
-        let service = KnowledgeMcpServer::new(client, shutdown.clone())
-            .serve((input, tokio::io::stdout()))
+        let input = BoundedLineReader::new(
+            CancelOnEof::new(tokio::io::stdin(), shutdown.clone()),
+            MAXIMUM_INPUT_LINE_BYTES,
+        );
+        let transport = McpTransport::new(
+            AsyncRwTransport::<RoleServer, _, _>::new_server(input, tokio::io::stdout()),
+            MAXIMUM_INFLIGHT_REQUESTS,
+        );
+        let service = KnowledgeMcpServer::new(client.for_mcp(), shutdown.clone())
+            .serve(transport)
             .await
             .map_err(|error| McpServerError::Initialize(Box::new(error)))?;
         let result = service.waiting().await.map_err(McpServerError::Service);
@@ -466,6 +484,117 @@ pub(crate) fn run(client: SshClient) -> Result<(), McpServerError> {
     });
     runtime.shutdown_timeout(CANCELLATION_GRACE_PERIOD);
     result
+}
+
+struct BoundedLineReader<R> {
+    reader: R,
+    current_line_bytes: usize,
+    maximum_line_bytes: usize,
+}
+
+impl<R> BoundedLineReader<R> {
+    fn new(reader: R, maximum_line_bytes: usize) -> Self {
+        Self {
+            reader,
+            current_line_bytes: 0,
+            maximum_line_bytes,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for BoundedLineReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled = buffer.filled().len();
+        match Pin::new(&mut self.reader).poll_read(context, buffer) {
+            Poll::Ready(Ok(())) => {
+                for byte in &buffer.filled()[filled..] {
+                    if *byte == b'\n' {
+                        self.current_line_bytes = 0;
+                    } else {
+                        self.current_line_bytes = self.current_line_bytes.saturating_add(1);
+                        if self.current_line_bytes > self.maximum_line_bytes {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "MCP input line exceeds its byte limit",
+                            )));
+                        }
+                    }
+                }
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+}
+
+struct McpTransport<T> {
+    inner: T,
+    inflight: Arc<Semaphore>,
+    pending: Arc<Mutex<HashMap<McpRequestId, tokio::sync::OwnedSemaphorePermit>>>,
+}
+
+impl<T> McpTransport<T> {
+    fn new(inner: T, maximum_inflight: usize) -> Self {
+        Self {
+            inner,
+            inflight: Arc::new(Semaphore::new(maximum_inflight)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<T> Transport<RoleServer> for McpTransport<T>
+where
+    T: Transport<RoleServer>,
+{
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: TxJsonRpcMessage<RoleServer>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        let response_id = match &item {
+            JsonRpcMessage::Response(response) => Some(response.id.clone()),
+            JsonRpcMessage::Error(error) => error.id.clone(),
+            JsonRpcMessage::Request(_) | JsonRpcMessage::Notification(_) => None,
+        };
+        let send = self.inner.send(item);
+        let pending = self.pending.clone();
+        async move {
+            let result = send.await;
+            if let Some(response_id) = response_id {
+                pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&response_id);
+            }
+            result
+        }
+    }
+
+    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
+        let message = self.inner.receive().await?;
+        if let JsonRpcMessage::Request(request) = &message {
+            let permit = self.inflight.clone().try_acquire_owned().ok()?;
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.contains_key(&request.id) {
+                return None;
+            }
+            pending.insert(request.id.clone(), permit);
+        }
+        Some(message)
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close()
+    }
 }
 
 struct CancelOnEof<R> {

@@ -214,6 +214,11 @@ where
             .map(Command::Client)
             .map_err(|_| CliError::Usage);
     }
+    if namespace.as_deref() == Some(std::ffi::OsStr::new("__mcp-submit")) {
+        return client_cli::parse_arguments(namespace.into_iter().chain(action).chain(arguments))
+            .map(Command::Client)
+            .map_err(|_| CliError::Usage);
+    }
     match (namespace.as_deref(), action.as_deref()) {
         (Some(namespace), Some(action)) if namespace == std::ffi::OsStr::new("queue-ingress") => {
             parse_queue_ingress_arguments(arguments, action)

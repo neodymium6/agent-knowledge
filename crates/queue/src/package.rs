@@ -382,6 +382,7 @@ fn validate_package_contents(
         &payload_root,
         policy.limits.document,
         policy.limits.maximum_front_matter_bytes,
+        deadline,
     )
     .map_err(PackageValidationError::InvalidFrontMatter)?;
 

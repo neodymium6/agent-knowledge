@@ -36,6 +36,7 @@ const SSH_PROGRAM: &str = "ssh";
 const MAXIMUM_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+const MAXIMUM_MCP_CONTROL_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAXIMUM_STATUS_RESPONSE_BYTES: u64 = 4 * 1024;
 const MAXIMUM_MCP_DIAGNOSTIC_CHARACTERS: usize = 4 * 1024;
 
@@ -92,6 +93,7 @@ pub struct SshClient {
     destination: OsString,
     timeout: Duration,
     cancellation: CancellationFlag,
+    maximum_control_response_bytes: u64,
 }
 
 impl SshClient {
@@ -110,11 +112,17 @@ impl SshClient {
             destination,
             timeout,
             cancellation: CancellationFlag::default(),
+            maximum_control_response_bytes: MAXIMUM_CONTROL_RESPONSE_BYTES,
         })
     }
 
     pub(crate) fn with_cancellation(mut self, cancellation: CancellationFlag) -> Self {
         self.cancellation = cancellation;
+        self
+    }
+
+    pub(crate) fn for_mcp(mut self) -> Self {
+        self.maximum_control_response_bytes = MAXIMUM_MCP_CONTROL_RESPONSE_BYTES;
         self
     }
 
@@ -129,9 +137,22 @@ impl SshClient {
             &self.destination,
             package_root,
             self.timeout,
+            true,
             &self.cancellation,
         )
         .map(|(response, _diagnostic)| response)
+    }
+
+    pub(crate) fn submit_for_mcp(
+        &self,
+        package_root: &Path,
+    ) -> Result<SubmitResponse, ClientCommandError> {
+        execute_mcp_submit_helper(
+            &self.destination,
+            package_root,
+            self.timeout,
+            &self.cancellation,
+        )
     }
 
     /// Lists committed documents in canonical path order.
@@ -161,7 +182,7 @@ impl SshClient {
         control_response_with_program::<_, ListResponse>(
             OsStr::new(SSH_PROGRAM),
             &self.destination,
-            ControlOperation::new(SEARCH_COMMAND, MAXIMUM_CONTROL_RESPONSE_BYTES),
+            ControlOperation::new(SEARCH_COMMAND, self.maximum_control_response_bytes),
             request,
             self.timeout,
             &self.cancellation,
@@ -180,6 +201,7 @@ impl SshClient {
             &self.destination,
             request,
             self.timeout,
+            self.maximum_control_response_bytes,
             &self.cancellation,
         )
         .map(|(response, _diagnostic)| response)
@@ -209,13 +231,87 @@ impl SshClient {
         control_response_with_program::<_, ListResponse>(
             OsStr::new(SSH_PROGRAM),
             &self.destination,
-            ControlOperation::new(remote_command, MAXIMUM_CONTROL_RESPONSE_BYTES),
+            ControlOperation::new(remote_command, self.maximum_control_response_bytes),
             request,
             self.timeout,
             &self.cancellation,
         )
         .map(|(response, _diagnostic)| response)
     }
+}
+
+fn execute_mcp_submit_helper(
+    destination: &OsStr,
+    package_root: &Path,
+    timeout: Duration,
+    cancellation: &CancellationFlag,
+) -> Result<SubmitResponse, ClientCommandError> {
+    validate_connection(destination, timeout)?;
+    cancellation.check()?;
+    let executable = std::env::current_exe().map_err(ClientCommandError::LocateSubmitHelper)?;
+    let timeout_milliseconds = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    let mut command = Command::new(executable);
+    command
+        .arg("__mcp-submit")
+        .arg("--destination")
+        .arg(destination)
+        .arg("--package-root")
+        .arg(package_root)
+        .arg("--timeout-milliseconds")
+        .arg(timeout_milliseconds.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_process_group(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(ClientCommandError::StartSubmitHelper)?;
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate_process_group(&mut child);
+        return Err(ClientCommandError::MissingSubmitHelperPipe);
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        terminate_process_group(&mut child);
+        return Err(ClientCommandError::MissingSubmitHelperPipe);
+    };
+
+    let (events, event_receiver) = mpsc::sync_channel(3);
+    notify_transfer(&events, TransferEvent::Archive);
+    let response_events = events.clone();
+    let response = thread::spawn(move || {
+        let result = read_bounded_response(&mut stdout);
+        notify_transfer(
+            &response_events,
+            TransferEvent::Response {
+                failed: result.is_err(),
+            },
+        );
+        result
+    });
+    let diagnostic = thread::spawn(move || {
+        let result = read_bounded_diagnostic(&mut stderr);
+        notify_transfer(
+            &events,
+            TransferEvent::Diagnostic {
+                failed: result.is_err(),
+            },
+        );
+        result
+    });
+    let wait_result = supervise_transfer(&mut child, timeout, &event_receiver, cancellation);
+    let response = response
+        .join()
+        .map_err(|_| ClientCommandError::ResponseThreadPanicked)
+        .and_then(std::convert::identity)?;
+    let diagnostic = diagnostic
+        .join()
+        .map_err(|_| ClientCommandError::DiagnosticThreadPanicked)
+        .and_then(std::convert::identity)?;
+    let status = wait_result?;
+    if !status.success() {
+        return Err(ClientCommandError::SubmitHelperFailed { status, diagnostic });
+    }
+    serde_json::from_slice(&response).map_err(ClientCommandError::InvalidResponse)
 }
 
 #[derive(Clone, Copy)]
@@ -244,6 +340,24 @@ pub(crate) fn submit(
         destination,
         package_root,
         timeout,
+        true,
+        output,
+        io::stderr(),
+    )
+}
+
+pub(crate) fn submit_inherited_process_group(
+    destination: &OsStr,
+    package_root: &Path,
+    timeout: Duration,
+    output: impl Write,
+) -> Result<(), ClientCommandError> {
+    submit_with_program(
+        OsStr::new(SSH_PROGRAM),
+        destination,
+        package_root,
+        timeout,
+        false,
         output,
         io::stderr(),
     )
@@ -374,6 +488,7 @@ fn get_with_program(
         destination,
         request,
         timeout,
+        MAXIMUM_CONTROL_RESPONSE_BYTES,
         &CancellationFlag::default(),
     )?;
     diagnostic_output
@@ -387,12 +502,13 @@ fn get_response_with_program(
     destination: &OsStr,
     request: &GetRequest,
     timeout: Duration,
+    maximum_response_bytes: u64,
     cancellation: &CancellationFlag,
 ) -> Result<(GetResponse, Vec<u8>), ClientCommandError> {
     let (response, diagnostic) = control_response_with_program::<_, GetResponse>(
         program,
         destination,
-        ControlOperation::new(GET_COMMAND, MAXIMUM_CONTROL_RESPONSE_BYTES),
+        ControlOperation::new(GET_COMMAND, maximum_response_bytes),
         request,
         timeout,
         cancellation,
@@ -477,7 +593,7 @@ where
     }
 
     let mut command = Command::new(program);
-    configure_ssh_command(&mut command, destination, operation.remote_command);
+    configure_ssh_command(&mut command, destination, operation.remote_command, true);
     let mut child = command.spawn().map_err(ClientCommandError::StartSsh)?;
     let Some(mut stdin) = child.stdin.take() else {
         terminate_process_group(&mut child);
@@ -758,7 +874,12 @@ impl Write for CanonicalArchiveWriter<'_> {
     }
 }
 
-fn configure_ssh_command(command: &mut Command, destination: &OsStr, remote_command: &str) {
+fn configure_ssh_command(
+    command: &mut Command,
+    destination: &OsStr,
+    remote_command: &str,
+    separate_process_group: bool,
+) {
     command
         .arg("-T")
         .arg("-o")
@@ -779,7 +900,9 @@ fn configure_ssh_command(command: &mut Command, destination: &OsStr, remote_comm
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_process_group(command);
+    if separate_process_group {
+        configure_process_group(command);
+    }
 }
 
 fn submit_with_program(
@@ -787,6 +910,7 @@ fn submit_with_program(
     destination: &OsStr,
     package_root: &Path,
     timeout: Duration,
+    separate_process_group: bool,
     mut output: impl Write,
     mut diagnostic_output: impl Write,
 ) -> Result<(), ClientCommandError> {
@@ -795,6 +919,7 @@ fn submit_with_program(
         destination,
         package_root,
         timeout,
+        separate_process_group,
         &CancellationFlag::default(),
     )?;
     diagnostic_output
@@ -808,6 +933,7 @@ fn submit_response_with_program(
     destination: &OsStr,
     package_root: &Path,
     timeout: Duration,
+    separate_process_group: bool,
     cancellation: &CancellationFlag,
 ) -> Result<(SubmitResponse, Vec<u8>), ClientCommandError> {
     validate_connection(destination, timeout)?;
@@ -824,7 +950,12 @@ fn submit_response_with_program(
     }
     let expectation = package.expectation();
     let mut command = Command::new(program);
-    configure_ssh_command(&mut command, destination, SUBMIT_COMMAND);
+    configure_ssh_command(
+        &mut command,
+        destination,
+        SUBMIT_COMMAND,
+        separate_process_group,
+    );
     let mut child = command.spawn().map_err(ClientCommandError::StartSsh)?;
     let Some(stdin) = child.stdin.take() else {
         terminate_process_group(&mut child);
@@ -1339,6 +1470,13 @@ pub enum ClientCommandError {
         path: PathBuf,
     },
     StartSsh(io::Error),
+    LocateSubmitHelper(io::Error),
+    StartSubmitHelper(io::Error),
+    MissingSubmitHelperPipe,
+    SubmitHelperFailed {
+        status: ExitStatus,
+        diagnostic: Vec<u8>,
+    },
     MissingSshPipe,
     WriteArchive(io::Error),
     ArchiveThreadPanicked,
@@ -1388,12 +1526,10 @@ impl ClientCommandError {
             Self::GatewayRejected(response) => {
                 serde_json::to_string(response).unwrap_or_else(|_| self.to_string())
             }
-            Self::SshFailed { diagnostic, .. } => {
+            Self::SshFailed { diagnostic, .. } | Self::SubmitHelperFailed { diagnostic, .. } => {
                 let sanitized = String::from_utf8_lossy(diagnostic)
                     .chars()
-                    .filter(|character| {
-                        !character.is_control() || matches!(character, '\n' | '\t')
-                    })
+                    .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
                     .take(MAXIMUM_MCP_DIAGNOSTIC_CHARACTERS)
                     .collect::<String>();
                 let sanitized = sanitized.trim();
@@ -1413,7 +1549,7 @@ impl ClientCommandError {
                 serde_json::to_writer(&mut output, response).map_err(io::Error::other)?;
                 output.write_all(b"\n")
             }
-            Self::SshFailed { diagnostic, .. } => {
+            Self::SshFailed { diagnostic, .. } | Self::SubmitHelperFailed { diagnostic, .. } => {
                 output.write_all(diagnostic)?;
                 if !diagnostic.is_empty() && !diagnostic.ends_with(b"\n") {
                     output.write_all(b"\n")?;
@@ -1452,6 +1588,21 @@ impl fmt::Display for ClientCommandError {
                 path.display()
             ),
             Self::StartSsh(error) => write!(formatter, "could not start ssh: {error}"),
+            Self::LocateSubmitHelper(error) => {
+                write!(formatter, "could not locate the MCP submit helper: {error}")
+            }
+            Self::StartSubmitHelper(error) => {
+                write!(formatter, "could not start the MCP submit helper: {error}")
+            }
+            Self::MissingSubmitHelperPipe => {
+                formatter.write_str("MCP submit helper did not provide a requested pipe")
+            }
+            Self::SubmitHelperFailed { status, .. } => {
+                write!(
+                    formatter,
+                    "MCP submit helper exited unsuccessfully ({status})"
+                )
+            }
             Self::MissingSshPipe => formatter.write_str("ssh did not provide a requested pipe"),
             Self::WriteArchive(error) => {
                 write!(formatter, "could not stream package archive: {error}")
@@ -1560,6 +1711,8 @@ impl std::error::Error for ClientCommandError {
             Self::OpenPayload { source, .. } => Some(source),
             Self::ReadPayload { source, .. }
             | Self::StartSsh(source)
+            | Self::LocateSubmitHelper(source)
+            | Self::StartSubmitHelper(source)
             | Self::WriteArchive(source)
             | Self::WriteControlRequest(source)
             | Self::ReadResponse(source)
@@ -1570,6 +1723,8 @@ impl std::error::Error for ClientCommandError {
             | Self::Output(source) => Some(source),
             Self::EmptyDestination
             | Self::PackageChanged { .. }
+            | Self::MissingSubmitHelperPipe
+            | Self::SubmitHelperFailed { .. }
             | Self::MissingSshPipe
             | Self::ArchiveThreadPanicked
             | Self::ControlRequestTooLarge
