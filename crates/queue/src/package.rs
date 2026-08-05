@@ -283,6 +283,20 @@ pub fn validate_package(
     validate_package_until(package_root, policy, None)
 }
 
+/// Validates an extracted request package while enforcing a shared deadline.
+///
+/// # Errors
+///
+/// Returns the first deterministic validation failure, an I/O error, or a
+/// timed-out I/O error when the deadline expires or is cancelled.
+pub fn validate_package_with_deadline(
+    package_root: &Path,
+    policy: &PackagePolicy,
+    deadline: &QueueOperationDeadline,
+) -> Result<ValidatedPackage, PackageValidationError> {
+    validate_package_until(package_root, policy, Some(deadline))
+}
+
 pub(crate) fn validate_package_until(
     package_root: &Path,
     policy: &PackagePolicy,

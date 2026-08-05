@@ -243,6 +243,65 @@ fn bounds_parallel_ssh_operations() {
     wait_for_file_count(&process_ids, 4, Duration::from_secs(2));
     thread::sleep(Duration::from_millis(200));
     assert_eq!(directory_entry_count(&process_ids), 4);
+    for _ in 0..4 {
+        let mut response = String::new();
+        output
+            .read_line(&mut response)
+            .unwrap_or_else(|error| panic!("overload response must be readable: {error}"));
+        assert!(
+            response.contains("MCP server is busy; retry the operation later"),
+            "unexpected overload response: {response}"
+        );
+    }
+
+    drop(input);
+    let status = wait_for_process(&mut child, Duration::from_secs(2))
+        .unwrap_or_else(|| panic!("MCP client did not stop after standard input closed"));
+    assert!(status.success(), "MCP client failed");
+}
+
+#[cfg(unix)]
+#[test]
+fn reports_sanitized_ssh_diagnostics() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDirectory::create();
+    let ssh = root.path().join("ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\nset -eu\ncat > /dev/null\nprintf 'fictional host key rejected\\033[31m\\n' >&2\nexit 255\n",
+    )
+    .unwrap_or_else(|error| panic!("fake ssh must be written: {error}"));
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("fake ssh must be executable: {error}"));
+
+    let mut child = start_mcp_process(root.path());
+    let mut input = child
+        .stdin
+        .take()
+        .unwrap_or_else(|| panic!("MCP client stdin must be available"));
+    let mut output = BufReader::new(
+        child
+            .stdout
+            .take()
+            .unwrap_or_else(|| panic!("MCP client stdout must be available")),
+    );
+    initialize(&mut input, &mut output);
+    writeln!(
+        input,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"knowledge_list","arguments":{{}}}}}}"#
+    )
+    .unwrap_or_else(|error| panic!("tool request must be written: {error}"));
+    input
+        .flush()
+        .unwrap_or_else(|error| panic!("tool request must flush: {error}"));
+    let mut response = String::new();
+    output
+        .read_line(&mut response)
+        .unwrap_or_else(|error| panic!("tool response must be readable: {error}"));
+    assert!(response.contains("fictional host key rejected[31m"));
+    assert!(!response.contains("\\u001b"));
+    assert!(response.contains("ssh exited unsuccessfully"));
 
     drop(input);
     let status = wait_for_process(&mut child, Duration::from_secs(2))

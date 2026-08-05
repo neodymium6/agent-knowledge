@@ -27,6 +27,7 @@ use crate::{CancellationFlag, ClientCommandError, SshClient};
 const DEFAULT_MAXIMUM_RESULTS: usize = 100;
 const MAXIMUM_RESULTS: usize = 10_000;
 const MAXIMUM_CONCURRENT_OPERATIONS: usize = 4;
+const CANCELLATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
 
 trait KnowledgeBackend: Clone + Send + Sync + 'static {
     type Error: fmt::Display + Send + 'static;
@@ -38,6 +39,10 @@ trait KnowledgeBackend: Clone + Send + Sync + 'static {
     fn search(&self, request: &SearchRequest) -> Result<ListResponse, Self::Error>;
     fn get(&self, request: &GetRequest) -> Result<GetResponse, Self::Error>;
     fn status(&self, request: &StatusRequest) -> Result<StatusResponse, Self::Error>;
+
+    fn format_error(error: &Self::Error) -> String {
+        error.to_string()
+    }
 }
 
 impl KnowledgeBackend for SshClient {
@@ -69,6 +74,10 @@ impl KnowledgeBackend for SshClient {
 
     fn status(&self, request: &StatusRequest) -> Result<StatusResponse, Self::Error> {
         SshClient::status(self, request)
+    }
+
+    fn format_error(error: &Self::Error) -> String {
+        error.mcp_message()
     }
 }
 
@@ -359,28 +368,27 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
 }
 
 impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
-    async fn run_blocking<T, E>(
+    async fn run_blocking<T>(
         &self,
         context: RequestContext<RoleServer>,
-        operation: impl FnOnce(CancellationFlag) -> Result<T, E> + Send + 'static,
+        operation: impl FnOnce(CancellationFlag) -> Result<T, C::Error> + Send + 'static,
     ) -> Result<T, String>
     where
         T: Send + 'static,
-        E: fmt::Display + Send + 'static,
     {
         let request_cancellation = context.ct;
         let shutdown = self.shutdown.clone();
         let concurrency = self.concurrency.clone();
-        let permit = tokio::select! {
-            permit = concurrency.acquire_owned() => permit
-                .map_err(|_| "MCP operation admission closed unexpectedly".to_owned())?,
-            () = request_cancellation.cancelled() => {
-                return Err("Agent Knowledge operation was cancelled".to_owned());
-            }
-            () = shutdown.cancelled() => {
-                return Err("Agent Knowledge operation was cancelled".to_owned());
-            }
-        };
+        let permit = concurrency
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::Closed => {
+                    "MCP operation admission closed unexpectedly".to_owned()
+                }
+                tokio::sync::TryAcquireError::NoPermits => {
+                    "MCP server is busy; retry the operation later".to_owned()
+                }
+            })?;
 
         if request_cancellation.is_cancelled() || shutdown.is_cancelled() {
             return Err("Agent Knowledge operation was cancelled".to_owned());
@@ -395,7 +403,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
         tokio::select! {
             result = &mut task => result
                 .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
-                .map_err(|error| error.to_string()),
+                .map_err(|error| C::format_error(&error)),
             () = request_cancellation.cancelled() => {
                 cancel_operation(cancellation, task).await
             }
@@ -426,12 +434,10 @@ async fn cancel_operation<T, E>(
 ) -> Result<T, String>
 where
     T: Send + 'static,
-    E: fmt::Display + Send + 'static,
+    E: Send + 'static,
 {
     cancellation.cancel();
-    task.await
-        .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
-        .map_err(|error| error.to_string())?;
+    let _ = tokio::time::timeout(CANCELLATION_GRACE_PERIOD, task).await;
     Err("Agent Knowledge operation was cancelled".to_owned())
 }
 
@@ -442,22 +448,24 @@ fn structured(value: impl Serialize) -> Result<CallToolResult, String> {
 }
 
 pub(crate) fn run(client: SshClient) -> Result<(), McpServerError> {
-    tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
-        .map_err(McpServerError::Runtime)?
-        .block_on(async move {
-            let shutdown = CancellationToken::new();
-            let input = CancelOnEof::new(tokio::io::stdin(), shutdown.clone());
-            let service = KnowledgeMcpServer::new(client, shutdown.clone())
-                .serve((input, tokio::io::stdout()))
-                .await
-                .map_err(|error| McpServerError::Initialize(Box::new(error)))?;
-            let result = service.waiting().await.map_err(McpServerError::Service);
-            shutdown.cancel();
-            result?;
-            Ok(())
-        })
+        .map_err(McpServerError::Runtime)?;
+    let result = runtime.block_on(async move {
+        let shutdown = CancellationToken::new();
+        let input = CancelOnEof::new(tokio::io::stdin(), shutdown.clone());
+        let service = KnowledgeMcpServer::new(client, shutdown.clone())
+            .serve((input, tokio::io::stdout()))
+            .await
+            .map_err(|error| McpServerError::Initialize(Box::new(error)))?;
+        let result = service.waiting().await.map_err(McpServerError::Service);
+        shutdown.cancel();
+        result?;
+        Ok(())
+    });
+    runtime.shutdown_timeout(CANCELLATION_GRACE_PERIOD);
+    result
 }
 
 struct CancelOnEof<R> {
@@ -528,8 +536,8 @@ mod tests {
     use std::convert::Infallible;
 
     use super::{
-        CancellationFlag, CancellationToken, KnowledgeBackend, KnowledgeMcpServer, ReadParameters,
-        get_request, structured,
+        CANCELLATION_GRACE_PERIOD, CancellationFlag, CancellationToken, KnowledgeBackend,
+        KnowledgeMcpServer, ReadParameters, cancel_operation, get_request, structured,
     };
     use agent_knowledge_protocol::{
         GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest, StatusRequest,
@@ -637,5 +645,27 @@ mod tests {
             result.err().as_deref(),
             Some("document_id must be a canonical ULID")
         );
+    }
+
+    #[test]
+    fn bounds_waiting_for_a_stalled_blocking_operation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap_or_else(|error| panic!("test runtime must start: {error}"));
+        let started_at = std::time::Instant::now();
+        runtime.block_on(async {
+            let task = tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                Ok::<(), std::convert::Infallible>(())
+            });
+            let result = cancel_operation(CancellationFlag::default(), task).await;
+            assert_eq!(
+                result.err().as_deref(),
+                Some("Agent Knowledge operation was cancelled")
+            );
+        });
+        assert!(started_at.elapsed() < std::time::Duration::from_secs(1));
+        runtime.shutdown_timeout(CANCELLATION_GRACE_PERIOD);
     }
 }

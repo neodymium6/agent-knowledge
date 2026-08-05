@@ -3,9 +3,9 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,8 @@ use agent_knowledge_protocol::{
     SubmitOutcome, SubmitResponse,
 };
 use agent_knowledge_queue::{
-    PackagePolicy, PackageValidationError, PayloadMetadata, ValidatedPackage, validate_package,
+    PackagePolicy, PackageValidationError, PayloadMetadata, QueueOperationDeadline,
+    ValidatedPackage, validate_package_with_deadline,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -36,17 +37,32 @@ const MAXIMUM_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_STATUS_RESPONSE_BYTES: u64 = 4 * 1024;
+const MAXIMUM_MCP_DIAGNOSTIC_CHARACTERS: usize = 4 * 1024;
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    deadlines: Mutex<Vec<QueueOperationDeadline>>,
+}
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct CancellationFlag(Arc<AtomicBool>);
+pub(crate) struct CancellationFlag(Arc<CancellationState>);
 
 impl CancellationFlag {
     pub(crate) fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
+        let deadlines = self
+            .0
+            .deadlines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for deadline in deadlines.iter() {
+            deadline.cancel();
+        }
     }
 
     fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
     }
 
     fn check(&self) -> Result<(), ClientCommandError> {
@@ -55,6 +71,18 @@ impl CancellationFlag {
         } else {
             Ok(())
         }
+    }
+
+    fn register_deadline(&self, deadline: QueueOperationDeadline) {
+        let mut deadlines = self
+            .0
+            .deadlines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_cancelled() {
+            deadline.cancel();
+        }
+        deadlines.push(deadline);
     }
 }
 
@@ -784,9 +812,16 @@ fn submit_response_with_program(
 ) -> Result<(SubmitResponse, Vec<u8>), ClientCommandError> {
     validate_connection(destination, timeout)?;
     cancellation.check()?;
-
-    let package = PreparedPackage::open(package_root)?;
-    cancellation.check()?;
+    let preparation = PackagePreparation::new(timeout, cancellation.clone())?;
+    let package = PreparedPackage::open(package_root, &preparation)?;
+    preparation.check()?;
+    let remaining = preparation
+        .deadline
+        .expires_at()
+        .saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ClientCommandError::SshTimedOut { timeout });
+    }
     let expectation = package.expectation();
     let mut command = Command::new(program);
     configure_ssh_command(&mut command, destination, SUBMIT_COMMAND);
@@ -832,7 +867,11 @@ fn submit_response_with_program(
         );
         result
     });
-    let wait_result = supervise_transfer(&mut child, timeout, &event_receiver, cancellation);
+    let wait_result = supervise_transfer(&mut child, remaining, &event_receiver, cancellation)
+        .map_err(|error| match error {
+            ClientCommandError::SshTimedOut { .. } => ClientCommandError::SshTimedOut { timeout },
+            error => error,
+        });
     let archive_result = archive
         .join()
         .map_err(|_| ClientCommandError::ArchiveThreadPanicked)
@@ -1075,13 +1114,26 @@ struct PreparedPackage {
 }
 
 impl PreparedPackage {
-    fn open(package_root: &Path) -> Result<Self, ClientCommandError> {
-        let validated = validate_package(package_root, &PackagePolicy::default())
-            .map_err(ClientCommandError::PackageValidation)?;
+    fn open(
+        package_root: &Path,
+        preparation: &PackagePreparation,
+    ) -> Result<Self, ClientCommandError> {
+        let validated = validate_package_with_deadline(
+            package_root,
+            &PackagePolicy::default(),
+            &preparation.deadline,
+        )
+        .map_err(|error| {
+            preparation
+                .check()
+                .err()
+                .unwrap_or(ClientCommandError::PackageValidation(error))
+        })?;
+        preparation.check()?;
         let request =
             serde_json::to_vec(validated.request()).map_err(ClientCommandError::EncodeRequest)?;
         let root = PinnedDirectory::open(package_root).map_err(ClientCommandError::OpenPackage)?;
-        let payload = prepare_payload(&root, &validated)?;
+        let payload = prepare_payload(&root, &validated, preparation)?;
         Ok(Self {
             request,
             payload,
@@ -1122,18 +1174,21 @@ struct PreparedPayload {
 fn prepare_payload(
     package_root: &PinnedDirectory,
     package: &ValidatedPackage,
+    preparation: &PackagePreparation,
 ) -> Result<Vec<PreparedPayload>, ClientCommandError> {
     package
         .payload()
         .iter()
-        .map(|metadata| open_payload(package_root, metadata))
+        .map(|metadata| open_payload(package_root, metadata, preparation))
         .collect()
 }
 
 fn open_payload(
     package_root: &PinnedDirectory,
     metadata: &PayloadMetadata,
+    preparation: &PackagePreparation,
 ) -> Result<PreparedPayload, ClientCommandError> {
+    preparation.check()?;
     let relative = PathBuf::from(metadata.path().as_str());
     let mut file = package_root
         .open_regular_beneath(Path::new("payload").join(&relative))
@@ -1146,13 +1201,23 @@ fn open_payload(
     }
     let capacity = usize::try_from(metadata.byte_length()).unwrap_or(usize::MAX);
     let mut bytes = Vec::with_capacity(capacity);
-    file.by_ref()
-        .take(metadata.byte_length().saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|source| ClientCommandError::ReadPayload {
-            path: relative.clone(),
-            source,
-        })?;
+    let mut buffer = [0_u8; 64 * 1024];
+    let maximum = metadata.byte_length().saturating_add(1);
+    while (bytes.len() as u64) < maximum {
+        preparation.check()?;
+        let remaining = maximum.saturating_sub(bytes.len() as u64);
+        let length = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read =
+            file.read(&mut buffer[..length])
+                .map_err(|source| ClientCommandError::ReadPayload {
+                    path: relative.clone(),
+                    source,
+                })?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
     let revision = Revision::from_bytes(Sha256::digest(&bytes).into());
     if bytes.len() as u64 != metadata.byte_length() || revision != metadata.revision() {
         return Err(ClientCommandError::PackageChanged { path: relative });
@@ -1161,6 +1226,38 @@ fn open_payload(
         path: relative,
         bytes,
     })
+}
+
+struct PackagePreparation {
+    cancellation: CancellationFlag,
+    deadline: QueueOperationDeadline,
+    timeout: Duration,
+}
+
+impl PackagePreparation {
+    fn new(timeout: Duration, cancellation: CancellationFlag) -> Result<Self, ClientCommandError> {
+        let expires_at = Instant::now()
+            .checked_add(timeout)
+            .ok_or(ClientCommandError::InvalidTimeout)?;
+        let deadline = QueueOperationDeadline::new(expires_at);
+        cancellation.register_deadline(deadline.clone());
+        Ok(Self {
+            cancellation,
+            deadline,
+            timeout,
+        })
+    }
+
+    fn check(&self) -> Result<(), ClientCommandError> {
+        self.cancellation.check()?;
+        if Instant::now() >= self.deadline.expires_at() {
+            Err(ClientCommandError::SshTimedOut {
+                timeout: self.timeout,
+            })
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn regular_header(size: u64) -> Header {
@@ -1286,6 +1383,30 @@ pub enum ClientCommandError {
 }
 
 impl ClientCommandError {
+    pub(crate) fn mcp_message(&self) -> String {
+        match self {
+            Self::GatewayRejected(response) => {
+                serde_json::to_string(response).unwrap_or_else(|_| self.to_string())
+            }
+            Self::SshFailed { diagnostic, .. } => {
+                let sanitized = String::from_utf8_lossy(diagnostic)
+                    .chars()
+                    .filter(|character| {
+                        !character.is_control() || matches!(character, '\n' | '\t')
+                    })
+                    .take(MAXIMUM_MCP_DIAGNOSTIC_CHARACTERS)
+                    .collect::<String>();
+                let sanitized = sanitized.trim();
+                if sanitized.is_empty() {
+                    self.to_string()
+                } else {
+                    format!("{sanitized}\n{self}")
+                }
+            }
+            _ => self.to_string(),
+        }
+    }
+
     pub fn write_diagnostic(&self, mut output: impl Write) -> io::Result<()> {
         match self {
             Self::GatewayRejected(response) => {

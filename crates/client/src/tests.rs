@@ -14,10 +14,11 @@ use agent_knowledge_queue::{PackagePolicy, validate_package};
 use tar::Archive;
 
 use super::{
-    ClientCommandError, ControlOperation, MAXIMUM_CONTROL_RESPONSE_BYTES, MAXIMUM_RESPONSE_BYTES,
-    PreparedPackage, control_with_program, decode_protocol_version, export_with_program,
-    get_with_program, open_payload, read_bounded_diagnostic, read_bounded_response,
-    status_with_program, submit_with_program, validate_export_archive,
+    CancellationFlag, ClientCommandError, ControlOperation, MAXIMUM_CONTROL_RESPONSE_BYTES,
+    MAXIMUM_RESPONSE_BYTES, PackagePreparation, PreparedPackage, control_with_program,
+    decode_protocol_version, export_with_program, get_with_program, open_payload,
+    read_bounded_diagnostic, read_bounded_response, status_with_program, submit_with_program,
+    validate_export_archive,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -43,6 +44,11 @@ status: active\n\
 ---\n\
 Fictional client body.\n";
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+fn package_preparation() -> PackagePreparation {
+    PackagePreparation::new(Duration::from_secs(30), CancellationFlag::default())
+        .unwrap_or_else(|error| panic!("package preparation must initialize: {error}"))
+}
 
 struct TestDirectory(PathBuf);
 
@@ -441,7 +447,7 @@ fn bounds_gateway_responses_before_decoding() {
 fn prepared_package_uses_an_immutable_payload_snapshot() {
     let root = TestDirectory::create();
     let package = write_package(root.path());
-    let prepared = PreparedPackage::open(&package)
+    let prepared = PreparedPackage::open(&package, &package_preparation())
         .unwrap_or_else(|error| panic!("package snapshot must succeed: {error}"));
     fs::write(
         package.join("payload/run/index.md"),
@@ -476,6 +482,21 @@ fn prepared_package_uses_an_immutable_payload_snapshot() {
 }
 
 #[test]
+fn package_preparation_honors_cancellation() {
+    let root = TestDirectory::create();
+    let package = write_package(root.path());
+    let cancellation = CancellationFlag::default();
+    let preparation = PackagePreparation::new(Duration::from_secs(30), cancellation.clone())
+        .unwrap_or_else(|error| panic!("package preparation must initialize: {error}"));
+    cancellation.cancel();
+
+    assert!(matches!(
+        PreparedPackage::open(&package, &preparation),
+        Err(ClientCommandError::Cancelled)
+    ));
+}
+
+#[test]
 fn rejects_a_same_length_change_before_network_output() {
     let root = TestDirectory::create();
     let package = write_package(root.path());
@@ -490,7 +511,7 @@ fn rejects_a_same_length_change_before_network_output() {
         .unwrap_or_else(|error| panic!("package root must be pinned: {error}"));
 
     assert!(matches!(
-        open_payload(&pinned, &validated.payload()[0]),
+        open_payload(&pinned, &validated.payload()[0], &package_preparation()),
         Err(ClientCommandError::PackageChanged { .. })
     ));
 }
@@ -516,7 +537,7 @@ fn rejects_a_payload_path_replaced_by_a_symbolic_link() {
         .unwrap_or_else(|error| panic!("package root must be pinned: {error}"));
 
     assert!(matches!(
-        open_payload(&pinned, &validated.payload()[0]),
+        open_payload(&pinned, &validated.payload()[0], &package_preparation()),
         Err(ClientCommandError::OpenPayload { .. })
     ));
 }
@@ -543,7 +564,7 @@ fn rejects_a_payload_parent_replaced_by_a_symbolic_link() {
         .unwrap_or_else(|error| panic!("package root must be pinned: {error}"));
 
     assert!(matches!(
-        open_payload(&pinned, &validated.payload()[0]),
+        open_payload(&pinned, &validated.payload()[0], &package_preparation()),
         Err(ClientCommandError::OpenPayload { .. })
     ));
 }
@@ -773,7 +794,7 @@ fn rejects_duplicate_protocol_version_fields() {
 fn rejects_success_responses_for_a_different_package() {
     let root = TestDirectory::create();
     let package = write_package(root.path());
-    let prepared = PreparedPackage::open(&package)
+    let prepared = PreparedPackage::open(&package, &package_preparation())
         .unwrap_or_else(|error| panic!("package expectation must be prepared: {error}"));
     for response in [
         "{\"protocol_version\":1,\"status\":\"accepted\",\"request_id\":\"01K00000000000000000000009\",\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"}",
