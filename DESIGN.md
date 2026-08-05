@@ -1333,8 +1333,12 @@ directory inodes serialize every repository instance and prevent replaceable
 lock files from creating a second writer universe. Reciprocal immutable
 bindings connect the bare repository and disposable work root to the same
 canonical worktree and official branch, including the configured paths and
-device/inode identities of all three roots and the journal and disposable
-worktree directories. Recovery never
+durable filesystem and inode identities of all three roots and the journal and
+disposable worktree directories. Live device identities remain part of pinned
+path validation but are not persisted, so the same filesystem can be
+reattached with a different Linux device number. The previous binding schema
+is migrated only after both reciprocal files, configured paths, inode
+identities, and official branch have been validated. Recovery never
 guesses that a Git `.lock` file is stale:
 an orphaned but still-running Git child may own it, so automated recovery
 fails closed and requires verified operator intervention. The process
