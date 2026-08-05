@@ -4,6 +4,9 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add an optional loopback-only Streamable HTTP MCP transport for same-Pod
+  sidecars while retaining the default STDIO transport.
+
 ## 0.1.5
 
 - Add a local STDIO MCP mode to the client for committed reads, search,

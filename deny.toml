@@ -30,6 +30,7 @@ wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
 skip = [
+  { crate = "base64@0.23.1", reason = "rmcp uses base64 0.23 while its HTTP dependencies still use 0.22" },
   { crate = "getrandom@0.3.4", reason = "serde-saphyr still uses ahash's older getrandom line while ulid uses 0.4" },
   { crate = "syn@2.0.119", reason = "rmcp dependencies currently require both syn 2 and syn 3" },
 ]

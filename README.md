@@ -111,6 +111,19 @@ codex mcp list
 Restart the MCP client after changing its configuration. Attachment export
 remains a CLI operation.
 
+For a same-Pod sidecar, listen only on Pod loopback. MCP is served at `/mcp`
+and readiness at `/healthz`; the listener has no authentication and must not be
+exposed through a Service or Ingress:
+
+```sh
+agent-knowledge-client mcp \
+  --destination fictional-knowledge \
+  --listen 127.0.0.1:8090
+```
+
+Package submission paths are local to the MCP process, so sidecar submission
+requires an explicitly shared volume. Read tools do not.
+
 Request packages contain `request.json` and a `payload/` tree. Their exact
 format and path rules are defined in [DESIGN.md](DESIGN.md#14-change-requests).
 

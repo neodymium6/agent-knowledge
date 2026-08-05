@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use crate::ClientCommandError;
 
 const USAGE: &str = "usage:\n\
     agent-knowledge-client --version\n\
-    agent-knowledge-client mcp --destination <ssh-destination> [--timeout-seconds <seconds>]\n\
+    agent-knowledge-client mcp --destination <ssh-destination> [--listen <loopback-address>] [--timeout-seconds <seconds>]\n\
     agent-knowledge-client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
     agent-knowledge-client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge-client recent --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
@@ -31,6 +32,7 @@ pub enum Command {
     Version,
     Mcp {
         destination: OsString,
+        listen: Option<SocketAddr>,
         timeout: Duration,
     },
     Submit {
@@ -91,10 +93,11 @@ where
         .map_err(CliError::Output),
         Command::Mcp {
             destination,
+            listen,
             timeout,
         } => {
             let client = crate::SshClient::new(destination, timeout).map_err(CliError::Command)?;
-            crate::mcp::run(client).map_err(CliError::Mcp)
+            crate::mcp::run(client, listen).map_err(CliError::Mcp)
         }
         Command::Submit {
             destination,
@@ -175,11 +178,21 @@ where
     I: Iterator<Item = OsString>,
 {
     let mut destination = None;
+    let mut listen = None;
     let mut timeout_seconds = None;
     while let Some(flag) = arguments.next() {
         let value = arguments.next().ok_or(ParseError)?;
         match flag.to_str() {
             Some("--destination") if destination.is_none() => destination = Some(value),
+            Some("--listen") if listen.is_none() => {
+                listen = Some(
+                    value
+                        .to_str()
+                        .and_then(|value| value.parse::<SocketAddr>().ok())
+                        .filter(|address| address.ip().is_loopback() && address.port() != 0)
+                        .ok_or(ParseError)?,
+                );
+            }
             Some("--timeout-seconds") if timeout_seconds.is_none() => {
                 timeout_seconds = Some(parse_bounded_u64(&value, MAXIMUM_TIMEOUT_SECONDS)?);
             }
@@ -188,6 +201,7 @@ where
     }
     Ok(Command::Mcp {
         destination: destination.ok_or(ParseError)?,
+        listen,
         timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS)),
     })
 }
@@ -509,9 +523,23 @@ mod tests {
         .unwrap_or_else(|_| panic!("client MCP command must parse"));
         assert!(matches!(
             mcp,
-            Command::Mcp { destination, timeout }
+            Command::Mcp { destination, listen: None, timeout }
                 if destination == "fictional-knowledge"
                     && timeout == Duration::from_secs(60)
+        ));
+
+        let http_mcp = parse_arguments([
+            "mcp".into(),
+            "--destination".into(),
+            "fictional-knowledge".into(),
+            "--listen".into(),
+            "127.0.0.1:8090".into(),
+        ])
+        .unwrap_or_else(|_| panic!("loopback MCP listener must parse"));
+        assert!(matches!(
+            http_mcp,
+            Command::Mcp { listen: Some(address), .. }
+                if address.to_string() == "127.0.0.1:8090"
         ));
 
         let recent = parse_arguments([
@@ -553,6 +581,13 @@ mod tests {
                 "/tmp/fictional-package".into(),
                 "--timeout-seconds".into(),
                 "3601".into(),
+            ],
+            vec![
+                "mcp".into(),
+                "--destination".into(),
+                "fictional-knowledge".into(),
+                "--listen".into(),
+                "0.0.0.0:8090".into(),
             ],
         ] {
             assert!(parse_arguments(arguments).is_err());
