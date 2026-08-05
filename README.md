@@ -98,6 +98,19 @@ SSH host aliases, identities, host-key policy, and proxies belong in the
 client's OpenSSH configuration. The client disables interactive prompts, TTYs,
 and forwarding and enforces bounded request, response, and transfer sizes.
 
+The same binary can run as a local STDIO MCP server. It keeps the SSH
+configuration and private key on the coding-agent node and exposes committed
+list, recent, search, get, request-status, and package-submit tools:
+
+```sh
+codex mcp add agent-knowledge -- \
+  agent-knowledge-client mcp --destination fictional-knowledge
+codex mcp list
+```
+
+Restart the MCP client after changing its configuration. Attachment export
+remains a CLI operation.
+
 Request packages contain `request.json` and a `payload/` tree. Their exact
 format and path rules are defined in [DESIGN.md](DESIGN.md#14-change-requests).
 
