@@ -147,6 +147,12 @@ impl SshClient {
         &self,
         package_root: &Path,
     ) -> Result<SubmitResponse, ClientCommandError> {
+        #[cfg(not(unix))]
+        {
+            let _ = package_root;
+            return Err(ClientCommandError::McpSubmitUnsupported);
+        }
+        #[cfg(unix)]
         execute_mcp_submit_helper(
             &self.destination,
             package_root,
@@ -240,6 +246,7 @@ impl SshClient {
     }
 }
 
+#[cfg(unix)]
 fn execute_mcp_submit_helper(
     destination: &OsStr,
     package_root: &Path,
@@ -1473,6 +1480,7 @@ pub enum ClientCommandError {
     LocateSubmitHelper(io::Error),
     StartSubmitHelper(io::Error),
     MissingSubmitHelperPipe,
+    McpSubmitUnsupported,
     SubmitHelperFailed {
         status: ExitStatus,
         diagnostic: Vec<u8>,
@@ -1596,6 +1604,9 @@ impl fmt::Display for ClientCommandError {
             }
             Self::MissingSubmitHelperPipe => {
                 formatter.write_str("MCP submit helper did not provide a requested pipe")
+            }
+            Self::McpSubmitUnsupported => {
+                formatter.write_str("MCP package submission requires a Unix client host")
             }
             Self::SubmitHelperFailed { status, .. } => {
                 write!(
@@ -1724,6 +1735,7 @@ impl std::error::Error for ClientCommandError {
             Self::EmptyDestination
             | Self::PackageChanged { .. }
             | Self::MissingSubmitHelperPipe
+            | Self::McpSubmitUnsupported
             | Self::SubmitHelperFailed { .. }
             | Self::MissingSshPipe
             | Self::ArchiveThreadPanicked

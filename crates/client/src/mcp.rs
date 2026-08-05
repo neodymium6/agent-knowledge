@@ -11,7 +11,7 @@ use agent_knowledge_protocol::{
     StatusRequest, StatusResponse, SubmitResponse,
 };
 use rmcp::{
-    RoleServer, ServerHandler, ServiceExt,
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
         CallToolResult, Implementation, JsonRpcMessage, RequestId as McpRequestId,
@@ -577,19 +577,41 @@ where
     }
 
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
-        let message = self.inner.receive().await?;
-        if let JsonRpcMessage::Request(request) = &message {
-            let permit = self.inflight.clone().try_acquire_owned().ok()?;
-            let mut pending = self
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if pending.contains_key(&request.id) {
-                return None;
+        loop {
+            let message = self.inner.receive().await?;
+            if let JsonRpcMessage::Request(request) = &message {
+                let request_id = request.id.clone();
+                let duplicate = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&request_id);
+                if duplicate {
+                    let error = ErrorData::invalid_request("duplicate request ID", None);
+                    self.inner
+                        .send(JsonRpcMessage::error(error, Some(request_id)))
+                        .await
+                        .ok()?;
+                    continue;
+                }
+                let Ok(permit) = self.inflight.clone().try_acquire_owned() else {
+                    let error = ErrorData::internal_error(
+                        "too many in-flight MCP requests; retry later",
+                        None,
+                    );
+                    self.inner
+                        .send(JsonRpcMessage::error(error, Some(request_id)))
+                        .await
+                        .ok()?;
+                    continue;
+                };
+                self.pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(request_id, permit);
             }
-            pending.insert(request.id.clone(), permit);
+            return Some(message);
         }
-        Some(message)
     }
 
     fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
@@ -662,11 +684,14 @@ impl std::error::Error for McpServerError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::convert::Infallible;
+    use std::sync::{Arc, Mutex};
 
     use super::{
         CANCELLATION_GRACE_PERIOD, CancellationFlag, CancellationToken, KnowledgeBackend,
-        KnowledgeMcpServer, ReadParameters, cancel_operation, get_request, structured,
+        KnowledgeMcpServer, McpTransport, ReadParameters, RoleServer, RxJsonRpcMessage, Transport,
+        TxJsonRpcMessage, cancel_operation, get_request, structured,
     };
     use agent_knowledge_protocol::{
         GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest, StatusRequest,
@@ -675,6 +700,36 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct FakeBackend;
+
+    struct FakeTransport {
+        incoming: VecDeque<RxJsonRpcMessage<RoleServer>>,
+        sent: Arc<Mutex<Vec<TxJsonRpcMessage<RoleServer>>>>,
+    }
+
+    impl Transport<RoleServer> for FakeTransport {
+        type Error = std::io::Error;
+
+        fn send(
+            &mut self,
+            item: TxJsonRpcMessage<RoleServer>,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+            let sent = self.sent.clone();
+            async move {
+                sent.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(item);
+                Ok(())
+            }
+        }
+
+        async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
+            self.incoming.pop_front()
+        }
+
+        async fn close(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
 
     impl KnowledgeBackend for FakeBackend {
         type Error = Infallible;
@@ -796,5 +851,94 @@ mod tests {
         });
         assert!(started_at.elapsed() < std::time::Duration::from_secs(1));
         runtime.shutdown_timeout(CANCELLATION_GRACE_PERIOD);
+    }
+
+    #[test]
+    fn rejects_transport_overload_without_closing_the_session() {
+        let mut incoming = (1..=17)
+            .map(|id| {
+                incoming_message(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "ping"
+                }))
+            })
+            .collect::<VecDeque<_>>();
+        incoming.push_back(incoming_message(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        })));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut transport = McpTransport::new(
+            FakeTransport {
+                incoming,
+                sent: sent.clone(),
+            },
+            16,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap_or_else(|error| panic!("test runtime must start: {error}"));
+        runtime.block_on(async {
+            for _ in 0..16 {
+                assert!(transport.receive().await.is_some());
+            }
+            let next = transport
+                .receive()
+                .await
+                .unwrap_or_else(|| panic!("transport must remain open after overload"));
+            assert!(matches!(next, super::JsonRpcMessage::Notification(_)));
+        });
+        let sent = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let error = serde_json::to_value(&sent[0])
+            .unwrap_or_else(|error| panic!("error response must encode: {error}"));
+        assert_eq!(error["id"], 17);
+        assert_eq!(error["error"]["code"], -32603);
+    }
+
+    #[test]
+    fn rejects_duplicate_request_ids_without_closing_the_session() {
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        let incoming = VecDeque::from([
+            incoming_message(request.clone()),
+            incoming_message(request),
+            incoming_message(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            })),
+        ]);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut transport = McpTransport::new(
+            FakeTransport {
+                incoming,
+                sent: sent.clone(),
+            },
+            16,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap_or_else(|error| panic!("test runtime must start: {error}"));
+        runtime.block_on(async {
+            assert!(transport.receive().await.is_some());
+            let next = transport
+                .receive()
+                .await
+                .unwrap_or_else(|| panic!("transport must remain open after a duplicate ID"));
+            assert!(matches!(next, super::JsonRpcMessage::Notification(_)));
+        });
+        let sent = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let error = serde_json::to_value(&sent[0])
+            .unwrap_or_else(|error| panic!("error response must encode: {error}"));
+        assert_eq!(error["id"], 1);
+        assert_eq!(error["error"]["code"], -32600);
+    }
+
+    fn incoming_message(value: serde_json::Value) -> RxJsonRpcMessage<RoleServer> {
+        serde_json::from_value(value)
+            .unwrap_or_else(|error| panic!("incoming MCP fixture must decode: {error}"))
     }
 }
