@@ -83,7 +83,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for program in find getent git groupadd groupdel jq setpriv tar useradd userdel; do
+for program in find getent git groupadd groupdel jq setpriv stat tar useradd userdel; do
   if ! command -v "$program" >/dev/null; then
     echo "recovery E2E requires ${program}" >&2
     exit 1
@@ -262,6 +262,45 @@ wait_for_counts() {
   return 1
 }
 
+append_u64_le() {
+  local value=$1
+  local output=$2
+  local byte
+  local octal
+  for _ in {1..8}; do
+    byte=$((value & 255))
+    printf -v octal '%03o' "$byte"
+    printf '%b' "\\$octal" >>"$output"
+    value=$((value >> 8))
+  done
+}
+
+install_legacy_queue_binding() {
+  local queue_root=$1
+  local binding=$queue_root/queue-root-binding-v1
+  local object
+  printf '%s' "$queue_root" >"$binding"
+  for object in \
+    "$queue_root" \
+    "$queue_root/.locks" \
+    "$queue_root/incoming" \
+    "$queue_root/quarantine" \
+    "$queue_root/worker-tmp" \
+    "$queue_root/pending" \
+    "$queue_root/processing" \
+    "$queue_root/completed" \
+    "$queue_root/failed" \
+    "$queue_root/.locks/queue.lock" \
+    "$queue_root/.locks/repository-writer.lock"; do
+    printf '\0' >>"$binding"
+    append_u64_le "$(stat -c %d "$object")" "$binding"
+    append_u64_le "$(stat -c %i "$object")" "$binding"
+  done
+  chown "$queue_uid:$queue_gid" "$binding"
+  chmod 0660 "$binding"
+  rm "$queue_root/queue-root-binding-v2"
+}
+
 first_request=01K00000000000000000000010
 first_document=01K00000000000000000000011
 second_request=01K00000000000000000000020
@@ -278,6 +317,8 @@ make_package "$test_root/package-two" "$second_request" "$second_document" \
 submit_package "$test_root/package-two" "$test_root/submit-two.json"
 wait_for_counts 1 1 "$test_root/status-at-backup.json"
 
+install_legacy_queue_binding "$storage_root/queue"
+
 "$binary" admin bootstrap-storage \
   --config "$config" \
   --runtime-directory "$runtime_root" \
@@ -290,6 +331,10 @@ wait_for_counts 1 1 "$test_root/status-at-backup.json"
   --ingress-group "$ingress_group" >"$test_root/pre-backup-bootstrap.log"
 jq -e '.status == "already_initialized"' \
   "$test_root/pre-backup-bootstrap.log" >/dev/null
+test -f "$storage_root/queue/queue-root-binding-v2"
+test "$(stat -c %u "$storage_root/queue/queue-root-binding-v2")" = "$queue_uid"
+test "$(stat -c %g "$storage_root/queue/queue-root-binding-v2")" = "$queue_gid"
+test "$(stat -c %a "$storage_root/queue/queue-root-binding-v2")" = 660
 
 queue_identity_before=$(<"$storage_root/queue/queue-id")
 commit_before=$(git --git-dir="$storage_root/repository" rev-parse refs/heads/main)

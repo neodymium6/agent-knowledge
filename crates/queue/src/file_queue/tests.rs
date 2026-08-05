@@ -707,6 +707,8 @@ fn legacy_binding_migrates_when_only_the_device_identity_changes() {
     );
     drop(reader);
 
+    super::migrate_legacy_queue_binding(root.path().join("queue"))
+        .unwrap_or_else(|error| panic!("privileged bootstrap migration must succeed: {error}"));
     let reopened = initialize_queue(root.path(), PackagePolicy::default());
     let reader = QueueReader::open_until(root.path().join("queue"), None)
         .unwrap_or_else(|error| panic!("migrated queue must open for reading: {error}"));
