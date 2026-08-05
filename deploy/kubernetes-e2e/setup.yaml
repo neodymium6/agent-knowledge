@@ -46,7 +46,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: seed
-          image: agent-knowledge-kubernetes-e2e-quartz:0.1.6
+          image: agent-knowledge-kubernetes-e2e-quartz:0.1.7
           imagePullPolicy: IfNotPresent
           command:
             - /bin/sh
