@@ -13,6 +13,7 @@ use crate::ClientCommandError;
 
 const USAGE: &str = "usage:\n\
     agent-knowledge-client --version\n\
+    agent-knowledge-client mcp --destination <ssh-destination> [--timeout-seconds <seconds>]\n\
     agent-knowledge-client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
     agent-knowledge-client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge-client recent --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
@@ -28,6 +29,10 @@ const MAXIMUM_READ_RESULTS: usize = 10_000;
 #[derive(Debug)]
 pub enum Command {
     Version,
+    Mcp {
+        destination: OsString,
+        timeout: Duration,
+    },
     Submit {
         destination: OsString,
         package_root: PathBuf,
@@ -84,6 +89,13 @@ where
             env!("CARGO_PKG_VERSION")
         )
         .map_err(CliError::Output),
+        Command::Mcp {
+            destination,
+            timeout,
+        } => {
+            let client = crate::SshClient::new(destination, timeout).map_err(CliError::Command)?;
+            crate::mcp::run(client).map_err(CliError::Mcp)
+        }
         Command::Submit {
             destination,
             package_root,
@@ -147,6 +159,7 @@ where
     }
     match action.to_str() {
         Some("submit") => parse_submit_arguments(arguments),
+        Some("mcp") => parse_mcp_arguments(arguments),
         Some("list") => parse_list_arguments(arguments, false),
         Some("recent") => parse_list_arguments(arguments, true),
         Some("get") => parse_document_arguments(arguments, false),
@@ -155,6 +168,28 @@ where
         Some("status") => parse_status_arguments(arguments),
         _ => Err(ParseError),
     }
+}
+
+fn parse_mcp_arguments<I>(mut arguments: I) -> Result<Command, ParseError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut destination = None;
+    let mut timeout_seconds = None;
+    while let Some(flag) = arguments.next() {
+        let value = arguments.next().ok_or(ParseError)?;
+        match flag.to_str() {
+            Some("--destination") if destination.is_none() => destination = Some(value),
+            Some("--timeout-seconds") if timeout_seconds.is_none() => {
+                timeout_seconds = Some(parse_bounded_u64(&value, MAXIMUM_TIMEOUT_SECONDS)?);
+            }
+            _ => return Err(ParseError),
+        }
+    }
+    Ok(Command::Mcp {
+        destination: destination.ok_or(ParseError)?,
+        timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS)),
+    })
 }
 
 fn parse_submit_arguments<I>(mut arguments: I) -> Result<Command, ParseError>
@@ -387,6 +422,7 @@ fn parse_bounded_usize(value: &OsString, maximum: usize) -> Result<usize, ParseE
 pub enum CliError {
     Usage,
     Command(ClientCommandError),
+    Mcp(crate::mcp::McpServerError),
     Output(io::Error),
 }
 
@@ -404,6 +440,7 @@ impl fmt::Display for CliError {
         match self {
             Self::Usage => formatter.write_str(USAGE),
             Self::Command(error) => error.fmt(formatter),
+            Self::Mcp(error) => error.fmt(formatter),
             Self::Output(error) => write!(formatter, "could not write command output: {error}"),
         }
     }
@@ -413,6 +450,7 @@ impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Command(error) => Some(error),
+            Self::Mcp(error) => Some(error),
             Self::Output(error) => Some(error),
             Self::Usage => None,
         }
@@ -459,6 +497,21 @@ mod tests {
                 if destination == "fictional-knowledge"
                     && package_root == Path::new("/tmp/fictional-package")
                     && timeout == Duration::from_secs(42)
+        ));
+
+        let mcp = parse_arguments([
+            "mcp".into(),
+            "--destination".into(),
+            "fictional-knowledge".into(),
+            "--timeout-seconds".into(),
+            "60".into(),
+        ])
+        .unwrap_or_else(|_| panic!("client MCP command must parse"));
+        assert!(matches!(
+            mcp,
+            Command::Mcp { destination, timeout }
+                if destination == "fictional-knowledge"
+                    && timeout == Duration::from_secs(60)
         ));
 
         let recent = parse_arguments([

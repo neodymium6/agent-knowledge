@@ -622,6 +622,24 @@ fn extracts_a_gateway_rejection_after_ssh_warnings() {
 
 #[cfg(unix)]
 #[test]
+fn formats_bounded_sanitized_ssh_diagnostics_for_mcp() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let error = ClientCommandError::SshFailed {
+        status: std::process::ExitStatus::from_raw(256),
+        diagnostic: [b"fictional warning\x00\n".as_slice(), &vec![b'x'; 8 * 1024]].concat(),
+    };
+    let message = error.mcp_message();
+    let suffix = "ssh exited unsuccessfully (exit status: 1)";
+
+    assert!(message.starts_with("fictional warning\n"));
+    assert!(!message.contains('\0'));
+    assert!(message.ends_with(suffix));
+    assert!(message.chars().count() <= 4 * 1024 + 1 + suffix.chars().count());
+}
+
+#[cfg(unix)]
+#[test]
 fn terminates_a_stalled_ssh_process_at_the_deadline() {
     let root = TestDirectory::create();
     let package = write_package(root.path());

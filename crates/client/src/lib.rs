@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -13,8 +13,9 @@ use agent_knowledge_core::{
 };
 use agent_knowledge_protocol::{
     CURRENT_GATEWAY_PROTOCOL_VERSION, EXPORT_COMMAND, ExportRequest, GET_COMMAND, GetRequest,
-    GetResponse, ProtocolErrorResponse, STATUS_COMMAND, SUBMIT_COMMAND, StatusRequest,
-    StatusResponse, SubmitOutcome, SubmitResponse,
+    GetResponse, LIST_COMMAND, ListRequest, ListResponse, ProtocolErrorResponse, RECENT_COMMAND,
+    SEARCH_COMMAND, STATUS_COMMAND, SUBMIT_COMMAND, SearchRequest, StatusRequest, StatusResponse,
+    SubmitOutcome, SubmitResponse,
 };
 use agent_knowledge_queue::{
     PackagePolicy, PackageValidationError, PayloadMetadata, ValidatedPackage, validate_package,
@@ -26,12 +27,134 @@ use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
 
 pub mod cli;
+mod mcp;
 
 const SSH_PROGRAM: &str = "ssh";
 const MAXIMUM_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_REQUEST_BYTES: u64 = 64 * 1024;
 const MAXIMUM_CONTROL_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_STATUS_RESPONSE_BYTES: u64 = 4 * 1024;
+const MAXIMUM_MCP_DIAGNOSTIC_CHARACTERS: usize = 4 * 1024;
+
+/// Typed SSH transport for Agent Knowledge Gateway operations.
+#[derive(Clone, Debug)]
+pub struct SshClient {
+    destination: OsString,
+    timeout: Duration,
+}
+
+impl SshClient {
+    /// Creates a client using the local OpenSSH configuration and credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the destination is empty or the timeout is zero.
+    pub fn new(
+        destination: impl Into<OsString>,
+        timeout: Duration,
+    ) -> Result<Self, ClientCommandError> {
+        let destination = destination.into();
+        validate_connection(&destination, timeout)?;
+        Ok(Self {
+            destination,
+            timeout,
+        })
+    }
+
+    /// Submits one validated request package.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the package is invalid or the SSH submission fails.
+    pub fn submit(&self, package_root: &Path) -> Result<SubmitResponse, ClientCommandError> {
+        submit_response_with_program(
+            OsStr::new(SSH_PROGRAM),
+            &self.destination,
+            package_root,
+            self.timeout,
+        )
+        .map(|(response, _diagnostic)| response)
+    }
+
+    /// Lists committed documents in canonical path order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Gateway request fails or its response is invalid.
+    pub fn list(&self, request: &ListRequest) -> Result<ListResponse, ClientCommandError> {
+        self.read_list(LIST_COMMAND, request)
+    }
+
+    /// Lists recently committed documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Gateway request fails or its response is invalid.
+    pub fn recent(&self, request: &ListRequest) -> Result<ListResponse, ClientCommandError> {
+        self.read_list(RECENT_COMMAND, request)
+    }
+
+    /// Searches committed Markdown and permitted metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Gateway request fails or its response is invalid.
+    pub fn search(&self, request: &SearchRequest) -> Result<ListResponse, ClientCommandError> {
+        control_response_with_program::<_, ListResponse>(
+            OsStr::new(SSH_PROGRAM),
+            &self.destination,
+            ControlOperation::new(SEARCH_COMMAND, MAXIMUM_CONTROL_RESPONSE_BYTES),
+            request,
+            self.timeout,
+        )
+        .map(|(response, _diagnostic)| response)
+    }
+
+    /// Gets one committed Markdown document by permanent identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Gateway request fails or identifies another document.
+    pub fn get(&self, request: &GetRequest) -> Result<GetResponse, ClientCommandError> {
+        get_response_with_program(
+            OsStr::new(SSH_PROGRAM),
+            &self.destination,
+            request,
+            self.timeout,
+        )
+        .map(|(response, _diagnostic)| response)
+    }
+
+    /// Gets the durable state of one accepted request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Gateway request fails or identifies another request.
+    pub fn status(&self, request: &StatusRequest) -> Result<StatusResponse, ClientCommandError> {
+        status_response_with_program(
+            OsStr::new(SSH_PROGRAM),
+            &self.destination,
+            request,
+            self.timeout,
+        )
+        .map(|(response, _diagnostic)| response)
+    }
+
+    fn read_list(
+        &self,
+        remote_command: &str,
+        request: &ListRequest,
+    ) -> Result<ListResponse, ClientCommandError> {
+        control_response_with_program::<_, ListResponse>(
+            OsStr::new(SSH_PROGRAM),
+            &self.destination,
+            ControlOperation::new(remote_command, MAXIMUM_CONTROL_RESPONSE_BYTES),
+            request,
+            self.timeout,
+        )
+        .map(|(response, _diagnostic)| response)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ControlOperation<'a> {
@@ -140,26 +263,33 @@ fn status_with_program(
     request: &StatusRequest,
     timeout: Duration,
     mut output: impl Write,
-    diagnostic_output: impl Write,
+    mut diagnostic_output: impl Write,
 ) -> Result<(), ClientCommandError> {
-    let mut encoded = Vec::new();
-    control_with_program::<_, StatusResponse>(
+    let (response, diagnostic) =
+        status_response_with_program(program, destination, request, timeout)?;
+    diagnostic_output
+        .write_all(&diagnostic)
+        .map_err(ClientCommandError::DiagnosticOutput)?;
+    write_json_response(&mut output, &response)
+}
+
+fn status_response_with_program(
+    program: &OsStr,
+    destination: &OsStr,
+    request: &StatusRequest,
+    timeout: Duration,
+) -> Result<(StatusResponse, Vec<u8>), ClientCommandError> {
+    let (response, diagnostic) = control_response_with_program::<_, StatusResponse>(
         program,
         destination,
         ControlOperation::new(STATUS_COMMAND, MAXIMUM_STATUS_RESPONSE_BYTES),
         request,
         timeout,
-        &mut encoded,
-        diagnostic_output,
     )?;
-    let response: StatusResponse =
-        serde_json::from_slice(&encoded).map_err(ClientCommandError::InvalidResponse)?;
     if response.request_id() != request.request_id {
         return Err(ClientCommandError::RequestStatusResponseMismatch);
     }
-    output
-        .write_all(&encoded)
-        .map_err(ClientCommandError::Output)
+    Ok((response, diagnostic))
 }
 
 fn get_with_program(
@@ -168,26 +298,32 @@ fn get_with_program(
     request: &GetRequest,
     timeout: Duration,
     mut output: impl Write,
-    diagnostic_output: impl Write,
+    mut diagnostic_output: impl Write,
 ) -> Result<(), ClientCommandError> {
-    let mut encoded = Vec::new();
-    control_with_program::<_, GetResponse>(
+    let (response, diagnostic) = get_response_with_program(program, destination, request, timeout)?;
+    diagnostic_output
+        .write_all(&diagnostic)
+        .map_err(ClientCommandError::DiagnosticOutput)?;
+    write_json_response(&mut output, &response)
+}
+
+fn get_response_with_program(
+    program: &OsStr,
+    destination: &OsStr,
+    request: &GetRequest,
+    timeout: Duration,
+) -> Result<(GetResponse, Vec<u8>), ClientCommandError> {
+    let (response, diagnostic) = control_response_with_program::<_, GetResponse>(
         program,
         destination,
         ControlOperation::new(GET_COMMAND, MAXIMUM_CONTROL_RESPONSE_BYTES),
         request,
         timeout,
-        &mut encoded,
-        diagnostic_output,
     )?;
-    let response: GetResponse =
-        serde_json::from_slice(&encoded).map_err(ClientCommandError::InvalidResponse)?;
     if response.document.summary.metadata.document_id != request.document_id {
         return Err(ClientCommandError::DocumentResponseMismatch);
     }
-    output
-        .write_all(&encoded)
-        .map_err(ClientCommandError::Output)
+    Ok((response, diagnostic))
 }
 
 fn control_with_program<Request, Response>(
@@ -203,18 +339,38 @@ where
     Request: Serialize,
     Response: DeserializeOwned + Serialize,
 {
+    let (response, diagnostic) = control_response_with_program::<Request, Response>(
+        program,
+        destination,
+        operation,
+        request,
+        timeout,
+    )?;
+    diagnostic_output
+        .write_all(&diagnostic)
+        .map_err(ClientCommandError::DiagnosticOutput)?;
+    write_json_response(&mut output, &response)
+}
+
+fn control_response_with_program<Request, Response>(
+    program: &OsStr,
+    destination: &OsStr,
+    operation: ControlOperation<'_>,
+    request: &Request,
+    timeout: Duration,
+) -> Result<(Response, Vec<u8>), ClientCommandError>
+where
+    Request: Serialize,
+    Response: DeserializeOwned,
+{
     let (response, diagnostic) =
         execute_control_with_program(program, destination, operation, request, timeout)?;
     let protocol_version =
         decode_protocol_version(&response).map_err(ClientCommandError::InvalidResponse)?;
     require_current_protocol(protocol_version)?;
-    let response: Response =
+    let response =
         serde_json::from_slice(&response).map_err(ClientCommandError::InvalidResponse)?;
-    diagnostic_output
-        .write_all(&diagnostic)
-        .map_err(ClientCommandError::DiagnosticOutput)?;
-    serde_json::to_writer(&mut output, &response).map_err(ClientCommandError::EncodeResponse)?;
-    output.write_all(b"\n").map_err(ClientCommandError::Output)
+    Ok((response, diagnostic))
 }
 
 fn execute_control_with_program<Request>(
@@ -227,12 +383,7 @@ fn execute_control_with_program<Request>(
 where
     Request: Serialize,
 {
-    if destination.is_empty() {
-        return Err(ClientCommandError::EmptyDestination);
-    }
-    if timeout.is_zero() {
-        return Err(ClientCommandError::InvalidTimeout);
-    }
+    validate_connection(destination, timeout)?;
     let request = serde_json::to_vec(request).map_err(ClientCommandError::EncodeControlRequest)?;
     if request.len() as u64 > MAXIMUM_CONTROL_REQUEST_BYTES {
         return Err(ClientCommandError::ControlRequestTooLarge);
@@ -307,6 +458,24 @@ where
     }
     input_result?;
     Ok((response, diagnostic))
+}
+
+fn validate_connection(destination: &OsStr, timeout: Duration) -> Result<(), ClientCommandError> {
+    if destination.is_empty() {
+        Err(ClientCommandError::EmptyDestination)
+    } else if timeout.is_zero() {
+        Err(ClientCommandError::InvalidTimeout)
+    } else {
+        Ok(())
+    }
+}
+
+fn write_json_response(
+    mut output: impl Write,
+    response: &impl Serialize,
+) -> Result<(), ClientCommandError> {
+    serde_json::to_writer(&mut output, response).map_err(ClientCommandError::EncodeResponse)?;
+    output.write_all(b"\n").map_err(ClientCommandError::Output)
 }
 
 fn export_with_program(
@@ -533,12 +702,21 @@ fn submit_with_program(
     mut output: impl Write,
     mut diagnostic_output: impl Write,
 ) -> Result<(), ClientCommandError> {
-    if destination.is_empty() {
-        return Err(ClientCommandError::EmptyDestination);
-    }
-    if timeout.is_zero() {
-        return Err(ClientCommandError::InvalidTimeout);
-    }
+    let (response, diagnostic) =
+        submit_response_with_program(program, destination, package_root, timeout)?;
+    diagnostic_output
+        .write_all(&diagnostic)
+        .map_err(ClientCommandError::DiagnosticOutput)?;
+    write_json_response(&mut output, &response)
+}
+
+fn submit_response_with_program(
+    program: &OsStr,
+    destination: &OsStr,
+    package_root: &Path,
+    timeout: Duration,
+) -> Result<(SubmitResponse, Vec<u8>), ClientCommandError> {
+    validate_connection(destination, timeout)?;
 
     let package = PreparedPackage::open(package_root)?;
     let expectation = package.expectation();
@@ -615,11 +793,7 @@ fn submit_with_program(
     let response: SubmitResponse =
         serde_json::from_slice(&response).map_err(ClientCommandError::InvalidResponse)?;
     expectation.verify(&response)?;
-    diagnostic_output
-        .write_all(&diagnostic)
-        .map_err(ClientCommandError::DiagnosticOutput)?;
-    serde_json::to_writer(&mut output, &response).map_err(ClientCommandError::EncodeResponse)?;
-    output.write_all(b"\n").map_err(ClientCommandError::Output)
+    Ok((response, diagnostic))
 }
 
 #[cfg(unix)]
@@ -1038,6 +1212,28 @@ pub enum ClientCommandError {
 }
 
 impl ClientCommandError {
+    pub(crate) fn mcp_message(&self) -> String {
+        match self {
+            Self::GatewayRejected(response) => {
+                serde_json::to_string(response).unwrap_or_else(|_| self.to_string())
+            }
+            Self::SshFailed { diagnostic, .. } => {
+                let diagnostic = String::from_utf8_lossy(diagnostic)
+                    .chars()
+                    .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+                    .take(MAXIMUM_MCP_DIAGNOSTIC_CHARACTERS)
+                    .collect::<String>();
+                let diagnostic = diagnostic.trim();
+                if diagnostic.is_empty() {
+                    self.to_string()
+                } else {
+                    format!("{diagnostic}\n{self}")
+                }
+            }
+            _ => self.to_string(),
+        }
+    }
+
     pub fn write_diagnostic(&self, mut output: impl Write) -> io::Result<()> {
         match self {
             Self::GatewayRejected(response) => {
