@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-knowledge"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "agent-knowledge-client",
  "agent-knowledge-core",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "agent-knowledge-client"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "agent-knowledge-core",
  "agent-knowledge-protocol",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agent-knowledge-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "nix",
  "serde",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "agent-knowledge-gateway"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "agent-knowledge-core",
  "agent-knowledge-protocol",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "agent-knowledge-protocol"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "agent-knowledge-core",
  "serde",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "agent-knowledge-queue"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "agent-knowledge-core",
  "agent-knowledge-protocol",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "agent-knowledge-release"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "agent-knowledge-core",
  "nix",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "agent-knowledge-repository"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "agent-knowledge-core",
  "agent-knowledge-queue",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "agent-knowledge-worker"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "agent-knowledge-core",
  "agent-knowledge-queue",
