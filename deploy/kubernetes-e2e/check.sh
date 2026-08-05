@@ -50,12 +50,12 @@ jq -e '
     ($resources | all(.[]; .metadata.namespace == "agent-knowledge-e2e"))
     and (stateful_set.spec.template.spec.containers
       | map(.image) | sort == [
-        "agent-knowledge-openssh-gateway:0.1.1",
-        "agent-knowledge-queue-ingress:0.1.1",
-        "agent-knowledge-worker:0.1.1"
+        "agent-knowledge-openssh-gateway:0.1.2",
+        "agent-knowledge-queue-ingress:0.1.2",
+        "agent-knowledge-worker:0.1.2"
       ])
     and (stateful_set.spec.template.spec.initContainers
-      | all(.[]; .image == "agent-knowledge-storage-bootstrap:0.1.1"))
+      | all(.[]; .image == "agent-knowledge-storage-bootstrap:0.1.2"))
     and (stateful_set.spec.volumeClaimTemplates[0].spec.storageClassName
       == "csi-hostpath-sc")
     and (stateful_set.spec.volumeClaimTemplates[0].spec.resources.requests.storage
@@ -81,7 +81,7 @@ jq -e '
     and (resource("Job"; "seed-agent-knowledge-quartz-v1").spec.template.spec
       .automountServiceAccountToken == false)
     and (resource("Job"; "seed-agent-knowledge-quartz-v1").spec.template.spec.containers[0]
-      .image == "agent-knowledge-kubernetes-e2e-quartz:0.1.1")
+      .image == "agent-knowledge-kubernetes-e2e-quartz:0.1.2")
     and (resource("Job"; "seed-agent-knowledge-quartz-v1").spec.template.spec.containers[0]
       .securityContext.allowPrivilegeEscalation == false)
     and (resource("Job"; "seed-agent-knowledge-quartz-v1").spec.template.spec.containers[0]
