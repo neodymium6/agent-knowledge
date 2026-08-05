@@ -4,6 +4,14 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.3
+
+- Allow reciprocal repository bindings to survive reattaching the same
+  persistent filesystem with a different Linux device ID. Version 2 bindings
+  migrate automatically to filesystem-ID-based version 3 bindings on the next
+  writable open while retaining path, inode, official-branch, and live storage
+  replacement checks.
+
 ## 0.1.2
 
 - Allow a durable queue binding to survive remounting the same persistent
