@@ -9,16 +9,16 @@ resources:
 images:
   - name: example.invalid/agent-knowledge-worker
     newName: agent-knowledge-worker
-    newTag: 0.1.5
+    newTag: 0.1.6
   - name: example.invalid/agent-knowledge-queue-ingress
     newName: agent-knowledge-queue-ingress
-    newTag: 0.1.5
+    newTag: 0.1.6
   - name: example.invalid/agent-knowledge-openssh-gateway
     newName: agent-knowledge-openssh-gateway
-    newTag: 0.1.5
+    newTag: 0.1.6
   - name: example.invalid/agent-knowledge-storage-bootstrap
     newName: agent-knowledge-storage-bootstrap
-    newTag: 0.1.5
+    newTag: 0.1.6
 
 patches:
   - path: statefulset-patch.yaml
