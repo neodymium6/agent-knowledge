@@ -4,6 +4,12 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.7
+
+- Add structured MCP document creation over STDIO or Streamable HTTP without a
+  shared filesystem, while retaining local package submission for advanced
+  operations.
+
 ## 0.1.6
 
 - Add an optional loopback-only Streamable HTTP MCP transport for same-Pod
