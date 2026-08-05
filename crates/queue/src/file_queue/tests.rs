@@ -177,6 +177,43 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
+#[cfg(unix)]
+fn install_legacy_binding(queue: &FileQueue, encoded_device: u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut legacy = queue
+        .configured_queue_root
+        .as_os_str()
+        .as_encoded_bytes()
+        .to_vec();
+    for handle in super::queue_binding_handles(
+        &queue.root_handle,
+        &queue.directories,
+        &queue.queue_lock_handle,
+        &queue.worker_lock_handle,
+    ) {
+        let metadata = handle
+            .metadata()
+            .unwrap_or_else(|error| panic!("bound object metadata must be readable: {error}"));
+        legacy.push(0);
+        legacy.extend_from_slice(&encoded_device.to_le_bytes());
+        legacy.extend_from_slice(&metadata.ino().to_le_bytes());
+    }
+    fs::write(
+        queue
+            .configured_queue_root
+            .join(super::LEGACY_QUEUE_ROOT_BINDING_FILE_NAME),
+        legacy,
+    )
+    .unwrap_or_else(|error| panic!("legacy queue binding must be written: {error}"));
+    fs::remove_file(
+        queue
+            .configured_queue_root
+            .join(super::QUEUE_ROOT_BINDING_FILE_NAME),
+    )
+    .unwrap_or_else(|error| panic!("current queue binding must be removed: {error}"));
+}
+
 fn request_id(value: &str) -> RequestId {
     value
         .parse()
@@ -608,7 +645,7 @@ fn a_replaced_queue_invalidates_gateway_staging_and_acceptance() {
 }
 
 #[test]
-fn rejects_a_copied_queue_as_a_second_live_instance() {
+fn rejects_a_file_copied_queue_as_a_second_live_instance() {
     let root = TestDirectory::create();
     let queue = initialize_queue(root.path(), PackagePolicy::default());
     accept(stage_package(&queue, RESULTS));
@@ -617,6 +654,93 @@ fn rejects_a_copied_queue_as_a_second_live_instance() {
 
     assert!(matches!(
         FileQueue::initialize(&copied, PackagePolicy::default()),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn current_binding_rejects_a_different_filesystem_identity() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    let queue_path = root.path().join("queue");
+    let binding_path = queue_path.join(super::QUEUE_ROOT_BINDING_FILE_NAME);
+    let filesystem_id_offset = super::QUEUE_ROOT_BINDING_PREFIX.len()
+        + queue
+            .configured_queue_root
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+        + 1;
+    drop(queue);
+
+    let mut binding = fs::read(&binding_path)
+        .unwrap_or_else(|error| panic!("queue binding must be readable: {error}"));
+    for byte in &mut binding[filesystem_id_offset..filesystem_id_offset + 8] {
+        *byte ^= 0xff;
+    }
+    fs::write(binding_path, binding)
+        .unwrap_or_else(|error| panic!("queue binding must be writable: {error}"));
+
+    assert!(matches!(
+        FileQueue::initialize(queue_path, PackagePolicy::default()),
+        Err(QueueError::InvalidQueueIdentity)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_binding_migrates_when_only_the_device_identity_changes() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    accept(stage_package(&queue, RESULTS));
+    install_legacy_binding(&queue, u64::MAX);
+    drop(queue);
+
+    let reader = QueueReader::open_until(root.path().join("queue"), None)
+        .unwrap_or_else(|error| panic!("legacy queue must open for bootstrap validation: {error}"));
+    assert_eq!(
+        reader
+            .status_until(request_id("01K00000000000000000000000"), None)
+            .unwrap_or_else(|error| panic!("legacy request must be readable: {error}")),
+        Some(QueueRequestStatus::Pending)
+    );
+    drop(reader);
+
+    let reopened = initialize_queue(root.path(), PackagePolicy::default());
+    let reader = QueueReader::open_until(root.path().join("queue"), None)
+        .unwrap_or_else(|error| panic!("migrated queue must open for reading: {error}"));
+
+    assert!(
+        root.path()
+            .join("queue")
+            .join(super::QUEUE_ROOT_BINDING_FILE_NAME)
+            .is_file()
+    );
+    assert_eq!(
+        reader
+            .status_until(request_id("01K00000000000000000000000"), None)
+            .unwrap_or_else(|error| panic!("migrated request must be readable: {error}")),
+        Some(QueueRequestStatus::Pending)
+    );
+    drop(reopened);
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_binding_rejects_a_replaced_fixed_directory() {
+    let root = TestDirectory::create();
+    let queue = initialize_queue(root.path(), PackagePolicy::default());
+    install_legacy_binding(&queue, u64::MAX);
+    let pending = root.path().join("queue/pending");
+    fs::rename(&pending, root.path().join("detached-pending"))
+        .unwrap_or_else(|error| panic!("pending directory must be moved aside: {error}"));
+    fs::create_dir(&pending)
+        .unwrap_or_else(|error| panic!("replacement pending directory must be created: {error}"));
+    drop(queue);
+
+    assert!(matches!(
+        FileQueue::initialize(root.path().join("queue"), PackagePolicy::default()),
         Err(QueueError::InvalidQueueIdentity)
     ));
 }
@@ -662,8 +786,11 @@ fn refuses_to_rebind_a_queue_with_a_malformed_prior_binding() {
     let queue = initialize_queue(root.path(), PackagePolicy::default());
     let queue_path = root.path().join("queue");
     drop(queue);
-    fs::write(queue_path.join("queue-root-binding-v1"), b"invalid")
-        .unwrap_or_else(|error| panic!("malformed queue binding must be written: {error}"));
+    fs::write(
+        queue_path.join(super::QUEUE_ROOT_BINDING_FILE_NAME),
+        b"invalid",
+    )
+    .unwrap_or_else(|error| panic!("malformed queue binding must be written: {error}"));
 
     assert!(matches!(
         rebind_restored_queue(queue_path),
