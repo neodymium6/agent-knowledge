@@ -101,7 +101,8 @@ and forwarding and enforces bounded request, response, and transfer sizes.
 
 The same binary can run as a local STDIO MCP server. It keeps the SSH
 configuration and private key on the coding-agent node and exposes committed
-list, recent, search, get, request-status, and package-submit tools:
+list, recent, search, get, request-status, structured-create, and package-submit
+tools:
 
 ```sh
 codex mcp add agent-knowledge -- \
@@ -109,8 +110,11 @@ codex mcp add agent-knowledge -- \
 codex mcp list
 ```
 
-Restart the MCP client after changing its configuration. Attachment export
-remains a CLI operation.
+`knowledge_create_document` accepts Markdown and metadata directly, so it works
+over HTTP without a shared filesystem. `knowledge_submit_package` remains the
+low-level interface for advanced callers that already have a complete package
+directory local to the MCP process. Restart the MCP client after changing its
+configuration. Attachment export remains a CLI operation.
 
 For a same-Pod sidecar, listen only on Pod loopback. MCP is served at `/mcp`
 and readiness at `/healthz`; the listener has no authentication and must not be
@@ -122,8 +126,8 @@ agent-knowledge-client mcp \
   --listen 127.0.0.1:8090
 ```
 
-Package submission paths are local to the MCP process, so sidecar submission
-requires an explicitly shared volume. Read tools do not.
+Only low-level package submission paths are local to the MCP process. Structured
+document creation and read tools require no shared volume.
 
 A minimal sidecar container is:
 
