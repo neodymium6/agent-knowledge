@@ -4,6 +4,12 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.4
+
+- Migrate legacy queue bindings from the privileged storage bootstrap so
+  retained deployments with separate queue and Worker identities can upgrade
+  without granting `CAP_CHOWN` to the Worker.
+
 ## 0.1.3
 
 - Allow reciprocal repository bindings to survive reattaching the same

@@ -79,7 +79,7 @@ spec:
         supplementalGroupsPolicy: Merge
       initContainers:
         - name: prepare-ssh-directory
-          image: example.invalid/agent-knowledge-storage-bootstrap:0.1.3
+          image: example.invalid/agent-knowledge-storage-bootstrap:0.1.4
           imagePullPolicy: IfNotPresent
           command:
             - /bin/install
@@ -106,7 +106,7 @@ spec:
             - name: ssh-credentials
               mountPath: /staged
         - name: stage-ssh-host-key
-          image: example.invalid/agent-knowledge-storage-bootstrap:0.1.3
+          image: example.invalid/agent-knowledge-storage-bootstrap:0.1.4
           imagePullPolicy: IfNotPresent
           command:
             - /bin/install
@@ -136,7 +136,7 @@ spec:
             - name: ssh-credentials
               mountPath: /staged
         - name: stage-ssh-authorized-keys
-          image: example.invalid/agent-knowledge-storage-bootstrap:0.1.3
+          image: example.invalid/agent-knowledge-storage-bootstrap:0.1.4
           imagePullPolicy: IfNotPresent
           command:
             - /bin/install
@@ -166,7 +166,7 @@ spec:
             - name: ssh-credentials
               mountPath: /staged
         - name: storage-bootstrap
-          image: example.invalid/agent-knowledge-storage-bootstrap:0.1.3
+          image: example.invalid/agent-knowledge-storage-bootstrap:0.1.4
           imagePullPolicy: IfNotPresent
           args:
             - --config
@@ -217,7 +217,7 @@ spec:
               mountPath: /run/agent-knowledge
       containers:
         - name: worker
-          image: example.invalid/agent-knowledge-worker:0.1.3
+          image: example.invalid/agent-knowledge-worker:0.1.4
           imagePullPolicy: IfNotPresent
           args:
             - --config
@@ -248,7 +248,7 @@ spec:
               mountPath: /opt/agent-knowledge-quartz
               readOnly: true
         - name: queue-ingress
-          image: example.invalid/agent-knowledge-queue-ingress:0.1.3
+          image: example.invalid/agent-knowledge-queue-ingress:0.1.4
           imagePullPolicy: IfNotPresent
           args:
             - --queue-root
@@ -281,7 +281,7 @@ spec:
             - name: runtime
               mountPath: /run/agent-knowledge
         - name: openssh-gateway
-          image: example.invalid/agent-knowledge-openssh-gateway:0.1.3
+          image: example.invalid/agent-knowledge-openssh-gateway:0.1.4
           imagePullPolicy: IfNotPresent
           ports:
             - name: ssh
