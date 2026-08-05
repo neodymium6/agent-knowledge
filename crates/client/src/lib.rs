@@ -28,6 +28,7 @@ use tar::{Builder, EntryType, Header};
 
 pub mod cli;
 mod mcp;
+mod mcp_create;
 
 const SSH_PROGRAM: &str = "ssh";
 const MAXIMUM_RESPONSE_BYTES: u64 = 64 * 1024;

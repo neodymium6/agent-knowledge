@@ -20,6 +20,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::mcp_create::CreateDocumentParameters;
 use crate::{ClientCommandError, SshClient};
 
 const DEFAULT_MAXIMUM_RESULTS: usize = 100;
@@ -212,6 +213,41 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
 #[tool_router]
 impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     #[tool(
+        name = "knowledge_create_document",
+        description = "Create and submit one Agent Knowledge Markdown document without a caller-visible request package. Reuse request_id, document_id, and created_at together to retry an uncertain response.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn create_document(
+        &self,
+        Parameters(parameters): Parameters<CreateDocumentParameters>,
+    ) -> Result<CallToolResult, String> {
+        let package = parameters.prepare()?;
+        let client = self.client.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            let temporary = package
+                .materialize()
+                .map_err(|_| StructuredSubmitError::Local)?;
+            client
+                .submit(temporary.path())
+                .map_err(StructuredSubmitError::Backend)
+        })
+        .await
+        .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
+        .map_err(|error| match error {
+            StructuredSubmitError::Local => {
+                "could not create a private temporary request package".to_owned()
+            }
+            StructuredSubmitError::Backend(error) => C::format_error(&error),
+        })?;
+        structured(response)
+    }
+
+    #[tool(
         name = "knowledge_list",
         description = "List committed Agent Knowledge documents in canonical path order.",
         annotations(read_only_hint = true, open_world_hint = true)
@@ -327,9 +363,14 @@ impl<C: KnowledgeBackend> ServerHandler for KnowledgeMcpServer<C> {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Read committed knowledge with list, recent, search, and get. Submit only a complete local request package; the SSH destination and credentials are configured on this machine.",
+                "Read committed knowledge with list, recent, search, and get. Use create_document for ordinary Markdown creation. Use submit_package only for advanced operations that already have a complete local request package. The SSH destination and credentials are configured on this machine.",
             )
     }
+}
+
+enum StructuredSubmitError<E> {
+    Local,
+    Backend(E),
 }
 
 async fn run_blocking<T, E>(
@@ -466,14 +507,17 @@ impl std::error::Error for McpServerError {
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
     use super::{
         DocumentParameters, KnowledgeBackend, KnowledgeMcpServer, Parameters, ReadParameters,
         http_router,
     };
+    use crate::mcp_create::CreateDocumentParameters;
     use agent_knowledge_protocol::{
         GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest, StatusRequest,
-        StatusResponse, SubmitResponse,
+        StatusResponse, SubmitOutcome, SubmitResponse,
     };
     use rmcp::{
         ServiceExt,
@@ -497,6 +541,56 @@ mod tests {
 
         fn list(&self, _request: &ListRequest) -> Result<ListResponse, Self::Error> {
             Ok(ListResponse::new("fictional-commit".to_owned(), Vec::new()))
+        }
+
+        fn recent(&self, _request: &ListRequest) -> Result<ListResponse, Self::Error> {
+            unreachable!()
+        }
+
+        fn search(&self, _request: &SearchRequest) -> Result<ListResponse, Self::Error> {
+            unreachable!()
+        }
+
+        fn get(&self, _request: &GetRequest) -> Result<GetResponse, Self::Error> {
+            unreachable!()
+        }
+
+        fn status(&self, _request: &StatusRequest) -> Result<StatusResponse, Self::Error> {
+            unreachable!()
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestSubmitBackend {
+        submitted_path: Arc<Mutex<Option<PathBuf>>>,
+        fail: bool,
+    }
+
+    impl KnowledgeBackend for TestSubmitBackend {
+        type Error = &'static str;
+
+        fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error> {
+            let package = agent_knowledge_queue::validate_package(
+                package_root,
+                &agent_knowledge_queue::PackagePolicy::default(),
+            )
+            .map_err(|_| "fictional package validation failed")?;
+            let mut submitted_path = self
+                .submitted_path
+                .lock()
+                .map_err(|_| "fictional test lock failed")?;
+            *submitted_path = Some(package_root.to_owned());
+            if self.fail {
+                return Err("fictional submit failed");
+            }
+            Ok(SubmitResponse::new(SubmitOutcome::Accepted {
+                request_id: package.request().request_id,
+                digest: package.digest().as_revision(),
+            }))
+        }
+
+        fn list(&self, _request: &ListRequest) -> Result<ListResponse, Self::Error> {
+            unreachable!()
         }
 
         fn recent(&self, _request: &ListRequest) -> Result<ListResponse, Self::Error> {
@@ -561,6 +655,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "knowledge_create_document",
                 "knowledge_get",
                 "knowledge_list",
                 "knowledge_recent",
@@ -569,6 +664,85 @@ mod tests {
                 "knowledge_submit_package",
             ]
         );
+
+        let create = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "knowledge_create_document")
+            .unwrap_or_else(|| panic!("create tool must be advertised"));
+        assert_eq!(
+            create
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.destructive_hint),
+            Some(false)
+        );
+        let schema = serde_json::to_value(&create.input_schema)
+            .unwrap_or_else(|error| panic!("create schema must encode: {error}"));
+        assert!(schema["properties"].get("body").is_some());
+        assert!(schema["properties"].get("package_root").is_none());
+    }
+
+    #[tokio::test]
+    async fn removes_the_structured_package_after_submit_failure() {
+        let submitted_path = Arc::new(Mutex::new(None));
+        let backend = TestSubmitBackend {
+            submitted_path: submitted_path.clone(),
+            fail: true,
+        };
+        let parameters = create_parameters();
+
+        let result = KnowledgeMcpServer::new(backend)
+            .create_document(Parameters(parameters))
+            .await;
+        assert_eq!(result.err().as_deref(), Some("fictional submit failed"));
+        assert_submitted_package_removed(&submitted_path);
+    }
+
+    #[tokio::test]
+    async fn submits_a_structured_document_and_removes_its_package() {
+        let submitted_path = Arc::new(Mutex::new(None));
+        let backend = TestSubmitBackend {
+            submitted_path: submitted_path.clone(),
+            fail: false,
+        };
+
+        let result = KnowledgeMcpServer::new(backend)
+            .create_document(Parameters(create_parameters()))
+            .await
+            .unwrap_or_else(|error| panic!("create tool must succeed: {error}"));
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("request_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("01K00000000000000000000003")
+        );
+        assert_submitted_package_removed(&submitted_path);
+    }
+
+    fn create_parameters() -> CreateDocumentParameters {
+        serde_json::from_value::<CreateDocumentParameters>(serde_json::json!({
+            "title": "Record fictional result",
+            "body": "The fictional result is reproducible.",
+            "project": "fictional-solver",
+            "document_type": "experiment",
+            "request_id": "01K00000000000000000000003",
+            "document_id": "01K00000000000000000000004",
+            "created_at": "2026-08-05T10:00:00Z"
+        }))
+        .unwrap_or_else(|error| panic!("create parameters must decode: {error}"))
+    }
+
+    fn assert_submitted_package_removed(submitted_path: &Arc<Mutex<Option<PathBuf>>>) {
+        let path = submitted_path
+            .lock()
+            .unwrap_or_else(|error| panic!("submitted path lock must succeed: {error}"))
+            .clone()
+            .unwrap_or_else(|| panic!("backend must observe the package path"));
+        assert!(!path.exists());
     }
 
     #[test]
