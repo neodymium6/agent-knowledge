@@ -126,6 +126,7 @@ jobs:
           gateway-container-image agent-knowledge-gateway
           openssh-gateway-container-image agent-knowledge-openssh-gateway
           storage-bootstrap-container-image agent-knowledge-storage-bootstrap
+          client-mcp-container-image agent-knowledge-client-mcp
           IMAGES
 
       - name: Upload client archive
@@ -201,6 +202,7 @@ jobs:
             agent-knowledge-gateway
             agent-knowledge-openssh-gateway
             agent-knowledge-storage-bootstrap
+            agent-knowledge-client-mcp
           )
 
           for image in "${images[@]}"; do
@@ -304,6 +306,14 @@ jobs:
         with:
           subject-name: ghcr.io/neodymium6/agent-knowledge-storage-bootstrap
           subject-digest: ${{ steps.manifests.outputs.storage_bootstrap_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest MCP Client image
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ghcr.io/neodymium6/agent-knowledge-client-mcp
+          subject-digest: ${{ steps.manifests.outputs.client_mcp_digest }}
           push-to-registry: true
           create-storage-record: false
 

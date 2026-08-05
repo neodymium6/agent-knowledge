@@ -6,6 +6,8 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 - Add an optional loopback-only Streamable HTTP MCP transport for same-Pod
   sidecars while retaining the default STDIO transport.
+- Add a non-root MCP client sidecar image containing the static client and
+  OpenSSH, published for `linux/amd64` and `linux/arm64`.
 
 ## 0.1.5
 

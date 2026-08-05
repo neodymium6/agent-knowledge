@@ -266,6 +266,7 @@ jobs:
             agent-knowledge-gateway
             agent-knowledge-openssh-gateway
             agent-knowledge-storage-bootstrap
+            agent-knowledge-client-mcp
           )
 
           for image in "${images[@]}"; do
