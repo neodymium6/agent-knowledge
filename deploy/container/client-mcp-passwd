@@ -1,0 +1,1 @@
+agent-knowledge-client:x:10005:10005:Agent Knowledge MCP client:/var/lib/agent-knowledge-client:/sbin/nologin

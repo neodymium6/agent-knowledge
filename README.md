@@ -36,6 +36,9 @@ ghcr.io/neodymium6/agent-knowledge-openssh-gateway:0.1.5
 ghcr.io/neodymium6/agent-knowledge-storage-bootstrap:0.1.5
 ```
 
+The MCP sidecar image is published alongside releases as
+`ghcr.io/neodymium6/agent-knowledge-client-mcp:<release-version>`.
+
 Images contain no deployment configuration, SSH keys, Git credentials, or
 Quartz content. Quartz remains an external, immutable deployment input.
 
@@ -123,6 +126,27 @@ agent-knowledge-client mcp \
 
 Package submission paths are local to the MCP process, so sidecar submission
 requires an explicitly shared volume. Read tools do not.
+
+A minimal sidecar container is:
+
+```yaml
+- name: agent-knowledge-mcp
+  image: ghcr.io/neodymium6/agent-knowledge-client-mcp:<release-version>
+  args:
+    - --destination
+    - fictional-knowledge
+    - --listen
+    - 127.0.0.1:8090
+  volumeMounts:
+    - name: agent-knowledge-ssh
+      mountPath: /var/lib/agent-knowledge-client/.ssh
+      readOnly: true
+```
+
+Provision that volume with SSH configuration, a private key, and `known_hosts`
+readable by image UID/GID `10005:10005`, and mount it only in this sidecar. The
+agent container connects to `http://127.0.0.1:8090/mcp` and can check
+`/healthz`; do not create a Service or Ingress for this listener.
 
 Request packages contain `request.json` and a `payload/` tree. Their exact
 format and path rules are defined in [DESIGN.md](DESIGN.md#14-change-requests).

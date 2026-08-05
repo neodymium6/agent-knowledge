@@ -157,8 +157,10 @@ contain no credentials, host keys, client keys, deployment-specific Worker or
 Gateway configuration, or Quartz content.
 
 The flake also publishes reproducible, Docker-compatible Worker, Queue Ingress,
-one-shot Gateway, and OpenSSH Gateway adapter image archives for `amd64` and
-`arm64`. The first three entrypoints fix the executable and exact `worker run`,
+one-shot Gateway, OpenSSH Gateway adapter, and MCP client sidecar image archives
+for `amd64` and `arm64`. The MCP image runs the static client as a non-root
+identity and includes OpenSSH without any keys or configuration. The first
+three server entrypoints fix the executable and exact `worker run`,
 `queue-ingress listen`, or `gateway` role so deployment arguments cannot start
 another role with the mounted authority. The Worker
 image resolves its non-root account to `10003:10003`, includes queue GID

@@ -92,6 +92,25 @@
             platforms = linuxSystems;
           };
         };
+      clientMcpPackageFor =
+        system:
+        let
+          pkgs = pkgsFor.${system};
+          client = staticClientPackageFor system;
+        in
+        pkgs.runCommand "agent-knowledge-client-mcp-${projectVersion}"
+          {
+            nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
+            pname = "agent-knowledge-client-mcp";
+            version = projectVersion;
+            meta = client.meta;
+          }
+          ''
+            mkdir -p "$out/bin"
+            makeBinaryWrapper ${client}/bin/agent-knowledge-client \
+              "$out/bin/agent-knowledge-client" \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.openssh ]}
+          '';
       clientReleaseArchiveFor =
         system:
         let
@@ -290,6 +309,47 @@
           install -m444 ${./deploy/container/passwd} "$out/etc/passwd"
           install -m444 ${./deploy/container/group} "$out/etc/group"
         '';
+      clientMcpContainerRootFilesystemFor =
+        system:
+        let
+          pkgs = pkgsFor.${system};
+        in
+        pkgs.runCommand "agent-knowledge-client-mcp-container-root" { } ''
+          install -d "$out/etc" "$out/var/lib/agent-knowledge-client"
+          install -m444 ${./deploy/container/client-mcp-passwd} "$out/etc/passwd"
+          install -m444 ${./deploy/container/client-mcp-group} "$out/etc/group"
+        '';
+      clientMcpContainerImageFor =
+        system:
+        let
+          pkgs = pkgsFor.${system};
+          package = clientMcpPackageFor system;
+          rootFilesystem = clientMcpContainerRootFilesystemFor system;
+        in
+        pkgs.dockerTools.buildLayeredImage {
+          name = "agent-knowledge-client-mcp";
+          tag = projectVersion;
+          contents = [
+            package
+            rootFilesystem
+          ];
+          config = {
+            User = "agent-knowledge-client";
+            WorkingDir = "/var/lib/agent-knowledge-client";
+            Entrypoint = [
+              "${package}/bin/agent-knowledge-client"
+              "mcp"
+            ];
+            Env = [ "HOME=/var/lib/agent-knowledge-client" ];
+            StopSignal = "SIGTERM";
+            Labels = {
+              "org.opencontainers.image.title" = "Agent Knowledge MCP Client";
+              "org.opencontainers.image.version" = projectVersion;
+              "org.opencontainers.image.source" = "https://github.com/neodymium6/agent-knowledge";
+              "org.opencontainers.image.licenses" = projectLicense;
+            };
+          };
+        };
       workerContainerImageFor =
         system:
         let
@@ -570,6 +630,7 @@
       packages = forLinuxSystems (system: rec {
         agent-knowledge = packageFor system;
         agent-knowledge-client = staticClientPackageFor system;
+        client-mcp-container-image = clientMcpContainerImageFor system;
         client-release-archive = clientReleaseArchiveFor system;
         gateway-container-image = gatewayContainerImageFor system;
         kubernetes-e2e-client = unwrappedPackageFor system;
@@ -693,6 +754,36 @@
                   "extracted/${archiveRoot}/agent-knowledge-client" \
                   | grep -F 'INTERP'
                 touch "$out"
+              '';
+          client-mcp-container-image =
+            let
+              clientMcpContainerImage = clientMcpContainerImageFor system;
+              clientMcpPackage = clientMcpPackageFor system;
+            in
+            pkgs.runCommand "check-agent-knowledge-client-mcp-container-image"
+              {
+                nativeBuildInputs = [
+                  pkgs.gnutar
+                  pkgs.gzip
+                  pkgs.jq
+                ];
+              }
+              ''
+                ${pkgs.bash}/bin/bash ${./deploy/container/check-image.sh} \
+                      ${clientMcpContainerImage} \
+                      ${containerArchitecture.${system}} \
+                      ${clientMcpPackage}/bin/agent-knowledge-client \
+                      ${projectVersion} \
+                      ${./deploy/container/client-mcp-passwd} \
+                      ${./deploy/container/client-mcp-group} \
+                      agent-knowledge-client-mcp \
+                      agent-knowledge-client \
+                      mcp \
+                      - \
+                      /var/lib/agent-knowledge-client \
+                      "Agent Knowledge MCP Client" \
+                      -
+                    touch "$out"
               '';
           package-metadata =
             assert package.pname == "agent-knowledge";
