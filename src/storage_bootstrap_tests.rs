@@ -845,7 +845,7 @@ fn marked_storage_rejects_a_corrupt_repository_binding() {
         .unwrap_or_else(|error| panic!("fresh bootstrap must succeed: {error}"));
     fs::write(
         root.path()
-            .join("storage/work/.agent-knowledge-repository-binding-v2"),
+            .join("storage/work/.agent-knowledge-repository-binding-v3"),
         b"corrupt",
     )
     .unwrap_or_else(|error| panic!("binding must be replaceable in the fixture: {error}"));
@@ -860,6 +860,65 @@ fn marked_storage_rejects_a_corrupt_repository_binding() {
         ))
     ));
     assert!(!request.runtime_directory.exists());
+}
+
+#[test]
+fn marked_storage_accepts_legacy_repository_bindings_after_a_device_id_change() {
+    const CURRENT_PREFIX: &[u8] = b"agent-knowledge-repository-binding-v3\0";
+    const LEGACY_PREFIX: &[u8] = b"agent-knowledge-repository-binding-v2\0";
+
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("fresh bootstrap must succeed: {error}"));
+    let storage = root.path().join("storage");
+    let paths = [
+        storage.join("repository"),
+        storage.join("content"),
+        storage.join("work"),
+        storage.join("work/transactions"),
+        storage.join("work/worktrees"),
+    ];
+    let current_repository = storage.join("repository/agent-knowledge/binding-v3");
+    let legacy_repository = storage.join("repository/agent-knowledge/binding-v2");
+    let current_work_root = storage.join("work/.agent-knowledge-repository-binding-v3");
+    let legacy_work_root = storage.join("work/.agent-knowledge-repository-binding-v2");
+    let mut binding = fs::read(&current_repository)
+        .unwrap_or_else(|error| panic!("current repository binding must be readable: {error}"));
+    assert_eq!(CURRENT_PREFIX.len(), LEGACY_PREFIX.len());
+    assert!(binding.starts_with(CURRENT_PREFIX));
+    binding[..LEGACY_PREFIX.len()].copy_from_slice(LEGACY_PREFIX);
+    let mut cursor = LEGACY_PREFIX.len();
+    for path in paths {
+        let canonical = fs::canonicalize(path)
+            .unwrap_or_else(|error| panic!("bound path must resolve: {error}"));
+        let encoded = canonical.as_os_str().as_encoded_bytes();
+        assert_eq!(&binding[cursor..cursor + encoded.len()], encoded);
+        cursor += encoded.len();
+        assert_eq!(binding[cursor], 0);
+        cursor += 1;
+        binding[cursor..cursor + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        cursor += 16;
+        assert_eq!(binding[cursor], 0);
+        cursor += 1;
+    }
+    assert_eq!(&binding[cursor..], b"refs/heads/main");
+    fs::rename(&current_repository, &legacy_repository)
+        .unwrap_or_else(|error| panic!("repository binding must become legacy: {error}"));
+    fs::write(&legacy_repository, &binding)
+        .unwrap_or_else(|error| panic!("legacy repository binding must be written: {error}"));
+    fs::rename(&current_work_root, &legacy_work_root)
+        .unwrap_or_else(|error| panic!("work-root binding must become legacy: {error}"));
+    fs::write(&legacy_work_root, binding)
+        .unwrap_or_else(|error| panic!("legacy work-root binding must be written: {error}"));
+    fs::remove_dir(&request.runtime_directory)
+        .unwrap_or_else(|error| panic!("runtime fixture must be removed: {error}"));
+
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("marked storage must accept legacy bindings: {error}"));
+
+    assert!(!current_repository.exists());
+    assert!(!current_work_root.exists());
 }
 
 #[test]

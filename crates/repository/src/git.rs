@@ -94,6 +94,12 @@ use crate::{ApplyError, ContentPolicy};
 const MAXIMUM_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const MAXIMUM_JOURNAL_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_BINDING_BYTES: usize = 64 * 1024;
+const REPOSITORY_BINDING_FILE_NAME: &str = "binding-v3";
+const LEGACY_REPOSITORY_BINDING_FILE_NAME: &str = "binding-v2";
+const WORK_ROOT_BINDING_FILE_NAME: &str = ".agent-knowledge-repository-binding-v3";
+const LEGACY_WORK_ROOT_BINDING_FILE_NAME: &str = ".agent-knowledge-repository-binding-v2";
+const REPOSITORY_BINDING_PREFIX: &[u8] = b"agent-knowledge-repository-binding-v3\0";
+const LEGACY_REPOSITORY_BINDING_PREFIX: &[u8] = b"agent-knowledge-repository-binding-v2\0";
 const MAXIMUM_TIMED_GIT_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy)]
@@ -245,10 +251,17 @@ pub struct GitRepository {
     configured_worktree_root: PathBuf,
     worktree_root: PathBuf,
     worktree_root_handle: Arc<File>,
-    binding_file: PathBuf,
-    work_root_binding_file: PathBuf,
+    binding_files: RepositoryBindingFiles,
     official_ref: String,
     identity: GitIdentity,
+}
+
+#[derive(Clone, Debug)]
+struct RepositoryBindingFiles {
+    repository: PathBuf,
+    work_root: PathBuf,
+    legacy_repository: PathBuf,
+    legacy_work_root: PathBuf,
 }
 
 #[derive(Clone, Copy)]
@@ -569,64 +582,33 @@ impl GitRepository {
             ),
         ];
         let expected_binding = repository_binding(&binding_directories, &official_ref)?;
-        let binding_file = repository_state.join("binding-v2");
-        let work_root_binding_file = work_root.join(".agent-knowledge-repository-binding-v2");
-        let prior_bindings = if matches!(binding_mode, BindingMode::RebindRestored) {
+        let binding_files = RepositoryBindingFiles {
+            repository: repository_state.join(REPOSITORY_BINDING_FILE_NAME),
+            work_root: work_root.join(WORK_ROOT_BINDING_FILE_NAME),
+            legacy_repository: repository_state.join(LEGACY_REPOSITORY_BINDING_FILE_NAME),
+            legacy_work_root: work_root.join(LEGACY_WORK_ROOT_BINDING_FILE_NAME),
+        };
+        if matches!(binding_mode, BindingMode::RebindRestored) {
             ensure_canonical_worktree_clean(&canonical_worktree)?;
             let official_commit = resolve_in_worktree(&canonical_worktree, &official_ref)?;
             let checked_out_commit = resolve_in_worktree(&canonical_worktree, "HEAD")?;
             if checked_out_commit != official_commit {
                 return Err(GitTransactionError::CanonicalWorktreeMismatch);
             }
-            let prior_repository_binding = read_binding(&binding_file)?;
-            let prior_work_root_binding = read_binding(&work_root_binding_file)?;
-            validate_restored_repository_binding(
-                &prior_repository_binding,
-                binding_directories.map(|(path, _handle)| path),
+            rebind_repository_bindings(
+                &binding_files,
+                &expected_binding,
+                &binding_directories,
                 &official_ref,
             )?;
-            validate_restored_repository_binding(
-                &prior_work_root_binding,
-                binding_directories.map(|(path, _handle)| path),
-                &official_ref,
-            )?;
-            if prior_repository_binding != prior_work_root_binding
-                && prior_repository_binding != expected_binding
-                && prior_work_root_binding != expected_binding
-            {
-                return Err(GitTransactionError::RepositoryBindingMismatch);
-            }
-            Some((prior_repository_binding, prior_work_root_binding))
         } else {
-            None
-        };
-        match binding_mode {
-            BindingMode::Initialize => ensure_binding(&binding_file, &expected_binding)?,
-            BindingMode::Existing => validate_binding(&binding_file, &expected_binding)?,
-            BindingMode::RebindRestored => {
-                if prior_bindings
-                    .as_ref()
-                    .is_none_or(|(repository, _work_root)| repository != &expected_binding)
-                {
-                    replace_existing_binding(&binding_file, &expected_binding)?;
-                }
-            }
-        }
-        match binding_mode {
-            BindingMode::Initialize => {
-                ensure_binding(&work_root_binding_file, &expected_binding)?;
-            }
-            BindingMode::Existing => {
-                validate_binding(&work_root_binding_file, &expected_binding)?;
-            }
-            BindingMode::RebindRestored => {
-                if prior_bindings
-                    .as_ref()
-                    .is_none_or(|(_repository, work_root)| work_root != &expected_binding)
-                {
-                    replace_existing_binding(&work_root_binding_file, &expected_binding)?;
-                }
-            }
+            validate_or_initialize_repository_bindings(
+                &binding_files,
+                &expected_binding,
+                &binding_directories,
+                &official_ref,
+                matches!(binding_mode, BindingMode::Initialize),
+            )?;
         }
         drop(writer);
         sync_directory(&repository_state).map_err(GitTransactionError::Io)?;
@@ -648,8 +630,7 @@ impl GitRepository {
             configured_worktree_root,
             worktree_root,
             worktree_root_handle,
-            binding_file,
-            work_root_binding_file,
+            binding_files,
             official_ref,
             identity,
         })
@@ -1394,8 +1375,13 @@ impl GitRepository {
             ),
         ];
         let expected_binding = repository_binding(&binding_directories, &self.official_ref)?;
-        validate_binding(&self.binding_file, &expected_binding)?;
-        validate_binding(&self.work_root_binding_file, &expected_binding)
+        validate_or_initialize_repository_bindings(
+            &self.binding_files,
+            &expected_binding,
+            &binding_directories,
+            &self.official_ref,
+            false,
+        )
     }
 
     fn validate_committed_journal(
@@ -2404,17 +2390,228 @@ fn read_binding(path: &Path) -> Result<Vec<u8>, GitTransactionError> {
     Ok(actual)
 }
 
+fn binding_exists(path: &Path) -> Result<bool, GitTransactionError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(GitTransactionError::Io(error)),
+    }
+}
+
+fn validate_or_initialize_repository_bindings(
+    files: &RepositoryBindingFiles,
+    expected: &[u8],
+    directories: &[(&Path, &File)],
+    official_ref: &str,
+    initialize: bool,
+) -> Result<(), GitTransactionError> {
+    let repository_current = binding_exists(&files.repository)?;
+    let work_root_current = binding_exists(&files.work_root)?;
+    if repository_current {
+        validate_binding(&files.repository, expected)?;
+    }
+    if work_root_current {
+        validate_binding(&files.work_root, expected)?;
+    }
+    if repository_current && work_root_current {
+        if initialize {
+            remove_legacy_repository_bindings(&files.legacy_repository, &files.legacy_work_root)?;
+        }
+        return Ok(());
+    }
+
+    let repository_legacy = binding_exists(&files.legacy_repository)?;
+    let work_root_legacy = binding_exists(&files.legacy_work_root)?;
+    if repository_legacy || work_root_legacy {
+        if !repository_legacy || !work_root_legacy {
+            return Err(GitTransactionError::RepositoryBindingMismatch);
+        }
+        let repository = read_binding(&files.legacy_repository)?;
+        let work_root = read_binding(&files.legacy_work_root)?;
+        if repository != work_root {
+            return Err(GitTransactionError::RepositoryBindingMismatch);
+        }
+        validate_legacy_repository_binding(&repository, directories, official_ref)?;
+        if initialize {
+            if !repository_current {
+                replace_binding(&files.repository, &files.legacy_repository, expected)?;
+            }
+            if !work_root_current {
+                replace_binding(&files.work_root, &files.legacy_work_root, expected)?;
+            }
+            validate_binding(&files.repository, expected)?;
+            validate_binding(&files.work_root, expected)?;
+            remove_legacy_repository_bindings(&files.legacy_repository, &files.legacy_work_root)?;
+        }
+        return Ok(());
+    }
+
+    if !initialize {
+        return Err(GitTransactionError::RepositoryBindingMismatch);
+    }
+    if !repository_current {
+        ensure_binding(&files.repository, expected)?;
+    }
+    if !work_root_current {
+        ensure_binding(&files.work_root, expected)?;
+    }
+    Ok(())
+}
+
+fn remove_legacy_repository_bindings(
+    legacy_binding_file: &Path,
+    legacy_work_root_binding_file: &Path,
+) -> Result<(), GitTransactionError> {
+    for path in [legacy_binding_file, legacy_work_root_binding_file] {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                let parent = path
+                    .parent()
+                    .ok_or(GitTransactionError::RepositoryBindingMismatch)?;
+                sync_directory(parent).map_err(GitTransactionError::Io)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(GitTransactionError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rebind_repository_bindings(
+    files: &RepositoryBindingFiles,
+    expected: &[u8],
+    directories: &[(&Path, &File)],
+    official_ref: &str,
+) -> Result<(), GitTransactionError> {
+    let repository_is_current = binding_exists(&files.repository)?;
+    let work_root_is_current = binding_exists(&files.work_root)?;
+    let repository_metadata_path = if repository_is_current {
+        &files.repository
+    } else {
+        &files.legacy_repository
+    };
+    let work_root_metadata_path = if work_root_is_current {
+        &files.work_root
+    } else {
+        &files.legacy_work_root
+    };
+    let repository = read_binding(repository_metadata_path)?;
+    let work_root = read_binding(work_root_metadata_path)?;
+    validate_restored_repository_binding(
+        &repository,
+        if repository_is_current {
+            REPOSITORY_BINDING_PREFIX
+        } else {
+            LEGACY_REPOSITORY_BINDING_PREFIX
+        },
+        directories.iter().map(|(path, _handle)| *path),
+        official_ref,
+    )?;
+    validate_restored_repository_binding(
+        &work_root,
+        if work_root_is_current {
+            REPOSITORY_BINDING_PREFIX
+        } else {
+            LEGACY_REPOSITORY_BINDING_PREFIX
+        },
+        directories.iter().map(|(path, _handle)| *path),
+        official_ref,
+    )?;
+
+    let repository_is_expected = repository_is_current && repository == expected;
+    let work_root_is_expected = work_root_is_current && work_root == expected;
+    let same_prior_binding =
+        repository_is_current == work_root_is_current && repository == work_root;
+    if !repository_is_expected && !work_root_is_expected && !same_prior_binding {
+        let legacy_repository = read_binding(&files.legacy_repository)?;
+        let legacy_work_root = read_binding(&files.legacy_work_root)?;
+        if legacy_repository != legacy_work_root {
+            return Err(GitTransactionError::RepositoryBindingMismatch);
+        }
+        validate_restored_repository_binding(
+            &legacy_repository,
+            LEGACY_REPOSITORY_BINDING_PREFIX,
+            directories.iter().map(|(path, _handle)| *path),
+            official_ref,
+        )?;
+    }
+
+    if !repository_is_expected {
+        replace_binding(&files.repository, repository_metadata_path, expected)?;
+    }
+    if !work_root_is_expected {
+        replace_binding(&files.work_root, work_root_metadata_path, expected)?;
+    }
+    validate_binding(&files.repository, expected)?;
+    validate_binding(&files.work_root, expected)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rebind_repository_bindings(
+    _files: &RepositoryBindingFiles,
+    _expected: &[u8],
+    _directories: &[(&Path, &File)],
+    _official_ref: &str,
+) -> Result<(), GitTransactionError> {
+    Err(GitTransactionError::RepositoryBindingMismatch)
+}
+
+fn validate_legacy_repository_binding(
+    actual: &[u8],
+    directories: &[(&Path, &File)],
+    official_ref: &str,
+) -> Result<(), GitTransactionError> {
+    let mut remaining = actual
+        .strip_prefix(LEGACY_REPOSITORY_BINDING_PREFIX)
+        .ok_or(GitTransactionError::RepositoryBindingMismatch)?;
+    for (path, handle) in directories {
+        remaining = remaining
+            .strip_prefix(path.as_os_str().as_encoded_bytes())
+            .ok_or(GitTransactionError::RepositoryBindingMismatch)?;
+        if remaining.first() != Some(&0) {
+            return Err(GitTransactionError::RepositoryBindingMismatch);
+        }
+        remaining = &remaining[1..];
+        #[cfg(unix)]
+        {
+            const IDENTITY_BYTES: usize = 16;
+            if remaining.len() < IDENTITY_BYTES + 1 || remaining[IDENTITY_BYTES] != 0 {
+                return Err(GitTransactionError::RepositoryBindingMismatch);
+            }
+            let inode = handle.metadata().map_err(GitTransactionError::Io)?.ino();
+            if remaining[8..16] != inode.to_le_bytes() {
+                return Err(GitTransactionError::RepositoryBindingMismatch);
+            }
+            remaining = &remaining[IDENTITY_BYTES + 1..];
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = handle;
+            if remaining.first() != Some(&0) {
+                return Err(GitTransactionError::RepositoryBindingMismatch);
+            }
+            remaining = &remaining[1..];
+        }
+    }
+    if remaining == official_ref.as_bytes() {
+        Ok(())
+    } else {
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn validate_restored_repository_binding<'a>(
     actual: &[u8],
+    prefix: &[u8],
     configured_paths: impl IntoIterator<Item = &'a Path>,
     official_ref: &str,
 ) -> Result<(), GitTransactionError> {
-    const PREFIX: &[u8] = b"agent-knowledge-repository-binding-v2\0";
     const FILESYSTEM_IDENTITY_BYTES: usize = 16;
 
     let mut remaining = actual
-        .strip_prefix(PREFIX)
+        .strip_prefix(prefix)
         .ok_or(GitTransactionError::RepositoryBindingMismatch)?;
     for path in configured_paths {
         remaining = remaining
@@ -2436,13 +2633,17 @@ fn validate_restored_repository_binding<'a>(
 }
 
 #[cfg(target_os = "linux")]
-fn replace_existing_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionError> {
+fn replace_binding(
+    path: &Path,
+    metadata_path: &Path,
+    expected: &[u8],
+) -> Result<(), GitTransactionError> {
     use nix::unistd::{Gid, Uid, fchown};
 
     if expected.len() > MAXIMUM_BINDING_BYTES {
         return Err(GitTransactionError::RepositoryBindingMismatch);
     }
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
+    let metadata = fs::symlink_metadata(metadata_path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             GitTransactionError::RepositoryBindingMismatch
         } else {
@@ -2485,15 +2686,46 @@ fn replace_existing_binding(path: &Path, expected: &[u8]) -> Result<(), GitTrans
 }
 
 #[cfg(not(target_os = "linux"))]
-fn replace_existing_binding(path: &Path, expected: &[u8]) -> Result<(), GitTransactionError> {
-    validate_binding(path, expected)
+fn replace_binding(
+    path: &Path,
+    metadata_path: &Path,
+    expected: &[u8],
+) -> Result<(), GitTransactionError> {
+    let metadata = fs::symlink_metadata(metadata_path).map_err(GitTransactionError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(GitTransactionError::RepositoryBindingMismatch);
+    }
+    let parent = path
+        .parent()
+        .ok_or(GitTransactionError::RepositoryBindingMismatch)?;
+    let file_name = path
+        .file_name()
+        .ok_or(GitTransactionError::RepositoryBindingMismatch)?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", Ulid::generate()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(expected)?;
+        file.set_permissions(metadata.permissions())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result.map_err(GitTransactionError::Io)
 }
 
 fn repository_binding(
     directories: &[(&Path, &File)],
     official_ref: &str,
 ) -> Result<Vec<u8>, GitTransactionError> {
-    let mut binding = b"agent-knowledge-repository-binding-v2\0".to_vec();
+    let mut binding = REPOSITORY_BINDING_PREFIX.to_vec();
     for (configured_path, handle) in directories {
         append_directory_binding(&mut binding, configured_path, handle)?;
     }
@@ -2508,9 +2740,17 @@ fn append_directory_binding(
 ) -> Result<(), GitTransactionError> {
     binding.extend_from_slice(configured_path.as_os_str().as_encoded_bytes());
     binding.push(0);
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        use std::os::unix::fs::MetadataExt;
+        let filesystem_id = nix::sys::statvfs::fstatvfs(handle)
+            .map_err(|error| GitTransactionError::Io(io::Error::from_raw_os_error(error as i32)))?
+            .filesystem_id();
+        let metadata = handle.metadata().map_err(GitTransactionError::Io)?;
+        binding.extend_from_slice(&(filesystem_id as u64).to_le_bytes());
+        binding.extend_from_slice(&metadata.ino().to_le_bytes());
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
         let metadata = handle.metadata().map_err(GitTransactionError::Io)?;
         binding.extend_from_slice(&metadata.dev().to_le_bytes());
         binding.extend_from_slice(&metadata.ino().to_le_bytes());

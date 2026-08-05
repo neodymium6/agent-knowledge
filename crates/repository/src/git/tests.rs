@@ -1355,6 +1355,245 @@ fn rejects_a_work_root_bound_to_another_repository() {
 }
 
 #[cfg(target_os = "linux")]
+fn install_legacy_repository_bindings(fixture: &GitFixture, device: u64) -> Vec<u8> {
+    use std::os::unix::fs::MetadataExt;
+
+    let current_binding = fs::read(
+        fixture
+            .repository
+            .join("agent-knowledge")
+            .join(super::REPOSITORY_BINDING_FILE_NAME),
+    )
+    .unwrap_or_else(|error| panic!("current repository binding must be readable: {error}"));
+    let paths = [
+        fixture.repository.clone(),
+        fixture.canonical.clone(),
+        fixture.work.clone(),
+        fixture.work.join("transactions"),
+        fixture.work.join("worktrees"),
+    ];
+    let mut binding = super::LEGACY_REPOSITORY_BINDING_PREFIX.to_vec();
+    for path in paths {
+        let path = fs::canonicalize(path)
+            .unwrap_or_else(|error| panic!("legacy binding path must resolve: {error}"));
+        let metadata = fs::metadata(&path)
+            .unwrap_or_else(|error| panic!("legacy binding path must be readable: {error}"));
+        binding.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        binding.push(0);
+        binding.extend_from_slice(&device.to_le_bytes());
+        binding.extend_from_slice(&metadata.ino().to_le_bytes());
+        binding.push(0);
+    }
+    binding.extend_from_slice(b"refs/heads/main");
+
+    fs::write(
+        fixture
+            .repository
+            .join("agent-knowledge")
+            .join(super::LEGACY_REPOSITORY_BINDING_FILE_NAME),
+        &binding,
+    )
+    .unwrap_or_else(|error| panic!("legacy repository binding must be written: {error}"));
+    fs::write(
+        fixture.work.join(super::LEGACY_WORK_ROOT_BINDING_FILE_NAME),
+        binding,
+    )
+    .unwrap_or_else(|error| panic!("legacy work-root binding must be written: {error}"));
+    fs::remove_file(
+        fixture
+            .repository
+            .join("agent-knowledge")
+            .join(super::REPOSITORY_BINDING_FILE_NAME),
+    )
+    .unwrap_or_else(|error| panic!("current repository binding must be removed: {error}"));
+    fs::remove_file(fixture.work.join(super::WORK_ROOT_BINDING_FILE_NAME))
+        .unwrap_or_else(|error| panic!("current work-root binding must be removed: {error}"));
+    current_binding
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_repository_binding_migrates_when_only_device_id_changes() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    drop(fixture.open());
+    let _current_binding = install_legacy_repository_bindings(&fixture, u64::MAX);
+    let identity = || {
+        GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+            .unwrap_or_else(|error| panic!("identity must be valid: {error}"))
+    };
+
+    drop(
+        GitRepository::open_existing(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity(),
+        )
+        .unwrap_or_else(|error| panic!("legacy binding must pass read-only validation: {error}")),
+    );
+    assert!(
+        !fixture
+            .repository
+            .join("agent-knowledge")
+            .join(super::REPOSITORY_BINDING_FILE_NAME)
+            .exists()
+    );
+
+    drop(
+        GitRepository::open(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity(),
+        )
+        .unwrap_or_else(|error| panic!("legacy binding must migrate: {error}")),
+    );
+    let repository_binding = fs::read(
+        fixture
+            .repository
+            .join("agent-knowledge")
+            .join(super::REPOSITORY_BINDING_FILE_NAME),
+    )
+    .unwrap_or_else(|error| panic!("current repository binding must be readable: {error}"));
+    let work_root_binding = fs::read(fixture.work.join(super::WORK_ROOT_BINDING_FILE_NAME))
+        .unwrap_or_else(|error| panic!("current work-root binding must be readable: {error}"));
+    assert_eq!(repository_binding, work_root_binding);
+    assert!(repository_binding.starts_with(super::REPOSITORY_BINDING_PREFIX));
+    assert!(
+        !fixture
+            .repository
+            .join("agent-knowledge")
+            .join(super::LEGACY_REPOSITORY_BINDING_FILE_NAME)
+            .exists()
+    );
+    assert!(
+        !fixture
+            .work
+            .join(super::LEGACY_WORK_ROOT_BINDING_FILE_NAME)
+            .exists()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_repository_binding_still_rejects_an_inode_change() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    drop(fixture.open());
+    let _current_binding = install_legacy_repository_bindings(&fixture, u64::MAX);
+    let binding_path = fixture
+        .repository
+        .join("agent-knowledge")
+        .join(super::LEGACY_REPOSITORY_BINDING_FILE_NAME);
+    let mut binding = fs::read(&binding_path)
+        .unwrap_or_else(|error| panic!("legacy binding must be readable: {error}"));
+    let inode_offset = super::LEGACY_REPOSITORY_BINDING_PREFIX.len()
+        + fs::canonicalize(&fixture.repository)
+            .unwrap_or_else(|error| panic!("repository path must resolve: {error}"))
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+        + 1
+        + 8;
+    binding[inode_offset] ^= 0xff;
+    fs::write(binding_path, &binding)
+        .unwrap_or_else(|error| panic!("legacy repository binding must be writable: {error}"));
+    fs::write(
+        fixture.work.join(super::LEGACY_WORK_ROOT_BINDING_FILE_NAME),
+        binding,
+    )
+    .unwrap_or_else(|error| panic!("legacy work-root binding must be writable: {error}"));
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+
+    assert!(matches!(
+        GitRepository::open_existing(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity,
+        ),
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repository_binding_migration_resumes_after_one_binding_is_created() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    drop(fixture.open());
+    let current_binding = install_legacy_repository_bindings(&fixture, u64::MAX);
+    fs::write(
+        fixture
+            .repository
+            .join("agent-knowledge")
+            .join(super::REPOSITORY_BINDING_FILE_NAME),
+        current_binding,
+    )
+    .unwrap_or_else(|error| panic!("current repository binding must be restored: {error}"));
+
+    drop(fixture.open());
+
+    let repository_binding = fs::read(
+        fixture
+            .repository
+            .join("agent-knowledge")
+            .join(super::REPOSITORY_BINDING_FILE_NAME),
+    )
+    .unwrap_or_else(|error| panic!("current repository binding must be readable: {error}"));
+    let work_root_binding = fs::read(fixture.work.join(super::WORK_ROOT_BINDING_FILE_NAME))
+        .unwrap_or_else(|error| panic!("current work-root binding must be readable: {error}"));
+    assert_eq!(repository_binding, work_root_binding);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn current_repository_binding_rejects_a_different_filesystem_identity() {
+    let root = TestDirectory::new();
+    let fixture = GitFixture::initialize(root.path());
+    drop(fixture.open());
+    let repository_binding_path = fixture
+        .repository
+        .join("agent-knowledge")
+        .join(super::REPOSITORY_BINDING_FILE_NAME);
+    let work_root_binding_path = fixture.work.join(super::WORK_ROOT_BINDING_FILE_NAME);
+    let mut binding = fs::read(&repository_binding_path)
+        .unwrap_or_else(|error| panic!("repository binding must be readable: {error}"));
+    let filesystem_id_offset = super::REPOSITORY_BINDING_PREFIX.len()
+        + fs::canonicalize(&fixture.repository)
+            .unwrap_or_else(|error| panic!("repository path must resolve: {error}"))
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+        + 1;
+    for byte in &mut binding[filesystem_id_offset..filesystem_id_offset + 8] {
+        *byte ^= 0xff;
+    }
+    fs::write(&repository_binding_path, &binding)
+        .unwrap_or_else(|error| panic!("repository binding must be writable: {error}"));
+    fs::write(work_root_binding_path, binding)
+        .unwrap_or_else(|error| panic!("work-root binding must be writable: {error}"));
+    let identity = GitIdentity::new("Agent Knowledge Worker", "agent-knowledge@example.invalid")
+        .unwrap_or_else(|error| panic!("identity must be valid: {error}"));
+
+    assert!(matches!(
+        GitRepository::open_existing(
+            &fixture.repository,
+            &fixture.canonical,
+            &fixture.work,
+            "main",
+            identity,
+        ),
+        Err(GitTransactionError::RepositoryBindingMismatch)
+    ));
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn rebinds_an_offline_repository_restored_at_its_configured_paths() {
     let root = TestDirectory::new();
@@ -1409,7 +1648,10 @@ fn refuses_to_rebind_a_repository_with_disagreeing_prior_bindings() {
     let fixture = GitFixture::initialize(root.path());
     drop(fixture.open());
     fs::write(
-        fixture.repository.join("agent-knowledge/binding-v2"),
+        fixture
+            .repository
+            .join("agent-knowledge")
+            .join(super::REPOSITORY_BINDING_FILE_NAME),
         b"invalid",
     )
     .unwrap_or_else(|error| panic!("malformed repository binding must be written: {error}"));
@@ -1457,9 +1699,8 @@ fn resumes_rebinding_after_only_one_repository_binding_was_replaced() {
     let root = TestDirectory::new();
     let fixture = GitFixture::initialize(root.path());
     drop(fixture.open());
-    let old_work_root_binding =
-        fs::read(fixture.work.join(".agent-knowledge-repository-binding-v2"))
-            .unwrap_or_else(|error| panic!("old work-root binding must be readable: {error}"));
+    let old_work_root_binding = fs::read(fixture.work.join(super::WORK_ROOT_BINDING_FILE_NAME))
+        .unwrap_or_else(|error| panic!("old work-root binding must be readable: {error}"));
 
     let backup = root.path().join("cold-backup-for-retry");
     fs::create_dir(&backup).unwrap_or_else(|error| panic!("backup root must be created: {error}"));
@@ -1488,7 +1729,7 @@ fn resumes_rebinding_after_only_one_repository_binding_was_replaced() {
         .unwrap_or_else(|error| panic!("first restore binding must succeed: {error}")),
     );
     fs::write(
-        fixture.work.join(".agent-knowledge-repository-binding-v2"),
+        fixture.work.join(super::WORK_ROOT_BINDING_FILE_NAME),
         old_work_root_binding,
     )
     .unwrap_or_else(|error| panic!("interrupted binding state must be created: {error}"));
