@@ -1,5 +1,8 @@
 use std::fmt;
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use agent_knowledge_core::{DocumentId, ProjectId, RequestId, SessionId};
 use agent_knowledge_protocol::{
@@ -15,11 +18,15 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use crate::{CancellationFlag, ClientCommandError, SshClient};
 
 const DEFAULT_MAXIMUM_RESULTS: usize = 100;
 const MAXIMUM_RESULTS: usize = 10_000;
+const MAXIMUM_CONCURRENT_OPERATIONS: usize = 4;
 
 trait KnowledgeBackend: Clone + Send + Sync + 'static {
     type Error: fmt::Display + Send + 'static;
@@ -202,13 +209,17 @@ fn status_request(request_id: String) -> Result<StatusRequest, String> {
 #[derive(Clone, Debug)]
 struct KnowledgeMcpServer<C: KnowledgeBackend> {
     client: C,
+    concurrency: Arc<Semaphore>,
+    shutdown: CancellationToken,
     tool_router: ToolRouter<Self>,
 }
 
 impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
-    fn new(client: C) -> Self {
+    fn new(client: C, shutdown: CancellationToken) -> Self {
         Self {
             client,
+            concurrency: Arc::new(Semaphore::new(MAXIMUM_CONCURRENT_OPERATIONS)),
+            shutdown,
             tool_router: Self::tool_router(),
         }
     }
@@ -229,7 +240,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
         let request = parameters.into_request()?;
         let client = self.client.clone();
         structured(
-            run_blocking(context, move |cancellation| {
+            self.run_blocking(context, move |cancellation| {
                 client.with_cancellation(cancellation).list(&request)
             })
             .await?,
@@ -249,7 +260,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
         let request = parameters.into_request()?;
         let client = self.client.clone();
         structured(
-            run_blocking(context, move |cancellation| {
+            self.run_blocking(context, move |cancellation| {
                 client.with_cancellation(cancellation).recent(&request)
             })
             .await?,
@@ -269,7 +280,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
         let request = parameters.into_request()?;
         let client = self.client.clone();
         structured(
-            run_blocking(context, move |cancellation| {
+            self.run_blocking(context, move |cancellation| {
                 client.with_cancellation(cancellation).search(&request)
             })
             .await?,
@@ -289,7 +300,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
         let request = get_request(parameters.document_id)?;
         let client = self.client.clone();
         structured(
-            run_blocking(context, move |cancellation| {
+            self.run_blocking(context, move |cancellation| {
                 client.with_cancellation(cancellation).get(&request)
             })
             .await?,
@@ -309,7 +320,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
         let request = status_request(parameters.request_id)?;
         let client = self.client.clone();
         structured(
-            run_blocking(context, move |cancellation| {
+            self.run_blocking(context, move |cancellation| {
                 client.with_cancellation(cancellation).status(&request)
             })
             .await?,
@@ -337,13 +348,61 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
         let package_root = parameters.package_root;
         let client = self.client.clone();
         structured(
-            run_blocking(context, move |cancellation| {
+            self.run_blocking(context, move |cancellation| {
                 client
                     .with_cancellation(cancellation)
                     .submit(Path::new(&package_root))
             })
             .await?,
         )
+    }
+}
+
+impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
+    async fn run_blocking<T, E>(
+        &self,
+        context: RequestContext<RoleServer>,
+        operation: impl FnOnce(CancellationFlag) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, String>
+    where
+        T: Send + 'static,
+        E: fmt::Display + Send + 'static,
+    {
+        let request_cancellation = context.ct;
+        let shutdown = self.shutdown.clone();
+        let concurrency = self.concurrency.clone();
+        let permit = tokio::select! {
+            permit = concurrency.acquire_owned() => permit
+                .map_err(|_| "MCP operation admission closed unexpectedly".to_owned())?,
+            () = request_cancellation.cancelled() => {
+                return Err("Agent Knowledge operation was cancelled".to_owned());
+            }
+            () = shutdown.cancelled() => {
+                return Err("Agent Knowledge operation was cancelled".to_owned());
+            }
+        };
+
+        if request_cancellation.is_cancelled() || shutdown.is_cancelled() {
+            return Err("Agent Knowledge operation was cancelled".to_owned());
+        }
+
+        let cancellation = CancellationFlag::default();
+        let worker_cancellation = cancellation.clone();
+        let mut task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation(worker_cancellation)
+        });
+        tokio::select! {
+            result = &mut task => result
+                .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
+                .map_err(|error| error.to_string()),
+            () = request_cancellation.cancelled() => {
+                cancel_operation(cancellation, task).await
+            }
+            () = shutdown.cancelled() => {
+                cancel_operation(cancellation, task).await
+            }
+        }
     }
 }
 
@@ -361,29 +420,19 @@ impl<C: KnowledgeBackend> ServerHandler for KnowledgeMcpServer<C> {
     }
 }
 
-async fn run_blocking<T, E>(
-    context: RequestContext<RoleServer>,
-    operation: impl FnOnce(CancellationFlag) -> Result<T, E> + Send + 'static,
+async fn cancel_operation<T, E>(
+    cancellation: CancellationFlag,
+    task: tokio::task::JoinHandle<Result<T, E>>,
 ) -> Result<T, String>
 where
     T: Send + 'static,
     E: fmt::Display + Send + 'static,
 {
-    let cancellation = CancellationFlag::default();
-    let worker_cancellation = cancellation.clone();
-    let mut task = tokio::task::spawn_blocking(move || operation(worker_cancellation));
-    tokio::select! {
-        result = &mut task => result
-            .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
-            .map_err(|error| error.to_string()),
-        () = context.ct.cancelled() => {
-            cancellation.cancel();
-            task.await
-                .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
-                .map_err(|error| error.to_string())?;
-            Err("Agent Knowledge operation was cancelled".to_owned())
-        }
-    }
+    cancellation.cancel();
+    task.await
+        .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
+        .map_err(|error| error.to_string())?;
+    Err("Agent Knowledge operation was cancelled".to_owned())
 }
 
 fn structured(value: impl Serialize) -> Result<CallToolResult, String> {
@@ -398,13 +447,53 @@ pub(crate) fn run(client: SshClient) -> Result<(), McpServerError> {
         .build()
         .map_err(McpServerError::Runtime)?
         .block_on(async move {
-            let service = KnowledgeMcpServer::new(client)
-                .serve(rmcp::transport::stdio())
+            let shutdown = CancellationToken::new();
+            let input = CancelOnEof::new(tokio::io::stdin(), shutdown.clone());
+            let service = KnowledgeMcpServer::new(client, shutdown.clone())
+                .serve((input, tokio::io::stdout()))
                 .await
                 .map_err(|error| McpServerError::Initialize(Box::new(error)))?;
-            service.waiting().await.map_err(McpServerError::Service)?;
+            let result = service.waiting().await.map_err(McpServerError::Service);
+            shutdown.cancel();
+            result?;
             Ok(())
         })
+}
+
+struct CancelOnEof<R> {
+    reader: R,
+    shutdown: CancellationToken,
+}
+
+impl<R> CancelOnEof<R> {
+    fn new(reader: R, shutdown: CancellationToken) -> Self {
+        Self { reader, shutdown }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for CancelOnEof<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled = buffer.filled().len();
+        let remaining = buffer.remaining();
+        let result = Pin::new(&mut self.reader).poll_read(context, buffer);
+        if remaining > 0
+            && matches!(&result, Poll::Ready(Ok(())))
+            && buffer.filled().len() == filled
+        {
+            self.shutdown.cancel();
+        }
+        result
+    }
+}
+
+impl<R> Drop for CancelOnEof<R> {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 #[derive(Debug)]
@@ -439,8 +528,8 @@ mod tests {
     use std::convert::Infallible;
 
     use super::{
-        CancellationFlag, KnowledgeBackend, KnowledgeMcpServer, ReadParameters, get_request,
-        structured,
+        CancellationFlag, CancellationToken, KnowledgeBackend, KnowledgeMcpServer, ReadParameters,
+        get_request, structured,
     };
     use agent_knowledge_protocol::{
         GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest, StatusRequest,
@@ -484,7 +573,7 @@ mod tests {
 
     #[test]
     fn advertises_the_expected_tool_set() {
-        let server = KnowledgeMcpServer::new(FakeBackend);
+        let server = KnowledgeMcpServer::new(FakeBackend, CancellationToken::new());
         let tools = server.tool_router.list_all();
         let submit = tools
             .iter()

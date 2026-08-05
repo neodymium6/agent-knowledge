@@ -39,6 +39,7 @@ const COMMON_USAGE: &str = "usage:\n\
     agent-knowledge client export --destination <ssh-destination> --document-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge client status --destination <ssh-destination> --request-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge client search --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
+    agent-knowledge client mcp --destination <ssh-destination> [--timeout-seconds <seconds>]\n\
     agent-knowledge gateway --config <path> --client-id <id>\n\
     agent-knowledge queue-ingress serve --queue-root <path> --socket-path <path>\n\
     agent-knowledge queue-ingress listen --queue-root <path> --socket-path <path> [--maximum-connections <count>] [--connection-timeout-seconds <seconds>]\n\
