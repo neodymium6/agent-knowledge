@@ -1181,14 +1181,22 @@ acceptance into a detached queue. Every returned claim retains a shared lease
 on the pinned `processing/` descriptor for as long as it exposes a
 `/proc/self/fd/<fd>` package path.
 
-The queue stores an immutable root binding containing its configured canonical
-path and the filesystem device/inode identities of the root, fixed lock files,
-and fixed child directories. A byte-for-byte copy is not accepted as a second
-live queue even when it preserves `queue-id`. On first initialization, fixed
-directory entries and both lock entries are synchronized before this binding is
-created. A cold restore onto a different filesystem identity requires the
-root-only `admin rebind-restored-storage` procedure. The procedure requires the
-same configured absolute paths, bootstrap marker, service identities, and
+On Linux, the queue stores an immutable root binding containing its configured
+canonical path, filesystem ID, and the stable inode identities of the root,
+fixed lock files, and fixed child directories. Live device and mount identities
+are checked separately so the same persistent filesystem can recover after a
+remount. A file-level copy onto another filesystem is not accepted as a second
+live queue even when it preserves `queue-id`.
+An exact block-level clone can preserve every internal identity and therefore
+cannot be distinguished without a deployment-provided external identity; the
+single-writer model requires exclusive volume attachment and prohibits running
+the source and such a clone concurrently. On first initialization, fixed
+directory entries and both lock entries are synchronized before this binding
+is created. The previous binding schema is migrated only after its canonical
+path and inode identities have been validated. A cold restore onto a different
+filesystem identity requires the root-only `admin rebind-restored-storage`
+procedure. It requires the same configured absolute paths, bootstrap marker,
+service identities, and
 repository configuration, takes every storage writer lock, and validates the
 queue, Git repository, canonical worktree, release store, and permission model
 after atomically replacing their filesystem bindings. The source storage must

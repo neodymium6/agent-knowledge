@@ -37,7 +37,9 @@ const DIGEST_FILE_NAME: &str = "digest";
 const ACCEPTANCE_FILE_NAME: &str = "acceptance.json";
 const NEXT_SEQUENCE_FILE_NAME: &str = "next-sequence";
 const QUEUE_IDENTITY_FILE_NAME: &str = "queue-id";
-const QUEUE_ROOT_BINDING_FILE_NAME: &str = "queue-root-binding-v1";
+const QUEUE_ROOT_BINDING_FILE_NAME: &str = "queue-root-binding-v2";
+const LEGACY_QUEUE_ROOT_BINDING_FILE_NAME: &str = "queue-root-binding-v1";
+const QUEUE_ROOT_BINDING_PREFIX: &[u8] = b"agent-knowledge-queue-root-v2\0";
 const QUARANTINE_MARKER_FILE_NAME: &str = ".quarantined-at";
 const WORKER_TEMP_DIRECTORY_NAME: &str = "worker-tmp";
 const LOCK_DIRECTORY_NAME: &str = ".locks";
@@ -239,11 +241,26 @@ pub fn rebind_restored_queue(queue_root: impl Into<PathBuf>) -> Result<(), Queue
     let _identity = read_queue_identity(&queue_root.join(QUEUE_IDENTITY_FILE_NAME))?;
     let _next_sequence = read_next_sequence(&queue_root.join(NEXT_SEQUENCE_FILE_NAME))?;
     let binding_path = queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME);
-    validate_restored_queue_binding(
-        &binding_path,
-        &configured_queue_root,
-        1 + directories.all().count() + 2,
-    )?;
+    let legacy_binding_path = queue_root.join(LEGACY_QUEUE_ROOT_BINDING_FILE_NAME);
+    let binding_metadata_path = match fs::symlink_metadata(&binding_path) {
+        Ok(_) => {
+            validate_restored_queue_binding(
+                &binding_path,
+                &configured_queue_root,
+                1 + directories.all().count() + 2,
+            )?;
+            &binding_path
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            validate_restored_legacy_queue_binding(
+                &legacy_binding_path,
+                &configured_queue_root,
+                1 + directories.all().count() + 2,
+            )?;
+            &legacy_binding_path
+        }
+        Err(error) => return Err(QueueError::Io(error)),
+    };
     let binding = queue_root_binding(
         &configured_queue_root,
         &root_handle,
@@ -251,7 +268,7 @@ pub fn rebind_restored_queue(queue_root: impl Into<PathBuf>) -> Result<(), Queue
         &queue_lock,
         &worker_lock,
     )?;
-    replace_queue_binding(&binding_path, &binding, &queue_root)?;
+    replace_queue_binding(&binding_path, binding_metadata_path, &binding, &queue_root)?;
     validate_queue_root_binding(
         &binding_path,
         &configured_queue_root,
@@ -269,20 +286,50 @@ fn validate_restored_queue_binding(
     configured_root: &Path,
     bound_objects: usize,
 ) -> Result<(), QueueError> {
-    const FILESYSTEM_IDENTITY_BYTES: usize = 16;
+    const ENCODED_IDENTITY_BYTES: usize = 9;
+
+    let actual = read_identity_file(path, 16 * 1024)?;
+    let mut prefix = QUEUE_ROOT_BINDING_PREFIX.to_vec();
+    prefix.extend_from_slice(configured_root.as_os_str().as_encoded_bytes());
+    let encoded_identities = bound_objects
+        .checked_add(1)
+        .ok_or(QueueError::InvalidQueueIdentity)?;
+    let expected_length = prefix
+        .len()
+        .checked_add(encoded_identities.saturating_mul(ENCODED_IDENTITY_BYTES))
+        .ok_or(QueueError::InvalidQueueIdentity)?;
+    if actual.len() != expected_length || !actual.starts_with(&prefix) {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    if actual[prefix.len()..]
+        .chunks_exact(ENCODED_IDENTITY_BYTES)
+        .all(|identity| identity[0] == 0)
+    {
+        Ok(())
+    } else {
+        Err(QueueError::InvalidQueueIdentity)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_restored_legacy_queue_binding(
+    path: &Path,
+    configured_root: &Path,
+    bound_objects: usize,
+) -> Result<(), QueueError> {
+    const ENCODED_IDENTITY_BYTES: usize = 17;
 
     let actual = read_identity_file(path, 16 * 1024)?;
     let prefix = configured_root.as_os_str().as_encoded_bytes();
-    let encoded_identity_bytes = 1 + FILESYSTEM_IDENTITY_BYTES;
     let expected_length = prefix
         .len()
-        .checked_add(bound_objects.saturating_mul(encoded_identity_bytes))
+        .checked_add(bound_objects.saturating_mul(ENCODED_IDENTITY_BYTES))
         .ok_or(QueueError::InvalidQueueIdentity)?;
     if actual.len() != expected_length || !actual.starts_with(prefix) {
         return Err(QueueError::InvalidQueueIdentity);
     }
     if actual[prefix.len()..]
-        .chunks_exact(encoded_identity_bytes)
+        .chunks_exact(ENCODED_IDENTITY_BYTES)
         .all(|identity| identity[0] == 0)
     {
         Ok(())
@@ -1320,8 +1367,8 @@ fn validate_current_queue(binding: QueueBinding<'_>) -> Result<Revision, QueueEr
     }
     validate_pinned_lock(binding.lock_file, binding.queue_lock_handle)?;
     validate_pinned_lock(binding.worker_lock_file, binding.worker_lock_handle)?;
-    validate_queue_root_binding(
-        &binding.queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME),
+    validate_existing_queue_root_binding(
+        binding.queue_root,
         binding.configured_queue_root,
         binding.root_handle,
         binding.directories,
@@ -1401,12 +1448,17 @@ fn queue_restore_lock_error(error: TryLockError) -> QueueError {
 }
 
 #[cfg(target_os = "linux")]
-fn replace_queue_binding(path: &Path, binding: &[u8], root: &Path) -> Result<(), QueueError> {
+fn replace_queue_binding(
+    path: &Path,
+    metadata_path: &Path,
+    binding: &[u8],
+    root: &Path,
+) -> Result<(), QueueError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use nix::unistd::{Gid, Uid, fchown};
 
-    let old_metadata = fs::symlink_metadata(path).map_err(QueueError::Io)?;
+    let old_metadata = fs::symlink_metadata(metadata_path).map_err(QueueError::Io)?;
     if !old_metadata.file_type().is_file() {
         return Err(QueueError::InvalidQueueIdentity);
     }
@@ -1431,6 +1483,41 @@ fn replace_queue_binding(path: &Path, binding: &[u8], root: &Path) -> Result<(),
             old_metadata.permissions().mode(),
         ))
         .map_err(QueueError::Io)?;
+        file.sync_all().map_err(QueueError::Io)?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(QueueError::Io)?;
+        sync_directory(root)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn replace_queue_binding(
+    path: &Path,
+    metadata_path: &Path,
+    binding: &[u8],
+    root: &Path,
+) -> Result<(), QueueError> {
+    let old_metadata = fs::symlink_metadata(metadata_path).map_err(QueueError::Io)?;
+    if !old_metadata.file_type().is_file() {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    let temporary = root.join(format!(
+        ".{QUEUE_ROOT_BINDING_FILE_NAME}.{}.tmp",
+        Ulid::generate()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(QueueError::Io)?;
+        file.write_all(binding).map_err(QueueError::Io)?;
+        file.set_permissions(old_metadata.permissions())
+            .map_err(QueueError::Io)?;
         file.sync_all().map_err(QueueError::Io)?;
         drop(file);
         fs::rename(&temporary, path).map_err(QueueError::Io)?;
@@ -1520,17 +1607,42 @@ fn ensure_queue_root_binding(
             worker_lock_handle,
         ),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if !accepted_states_are_empty(queue_root)? {
-                return Err(QueueError::InvalidQueueIdentity);
+            let legacy = queue_root.join(LEGACY_QUEUE_ROOT_BINDING_FILE_NAME);
+            match fs::symlink_metadata(&legacy) {
+                Ok(_) => {
+                    validate_legacy_queue_root_binding(
+                        &legacy,
+                        configured_root,
+                        root_handle,
+                        directories,
+                        queue_lock_handle,
+                        worker_lock_handle,
+                    )?;
+                    replace_queue_binding(path, &legacy, &expected, queue_root)?;
+                    validate_queue_root_binding(
+                        path,
+                        configured_root,
+                        root_handle,
+                        directories,
+                        queue_lock_handle,
+                        worker_lock_handle,
+                    )
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if !accepted_states_are_empty(queue_root)? {
+                        return Err(QueueError::InvalidQueueIdentity);
+                    }
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(path)
+                        .map_err(QueueError::Io)?;
+                    file.write_all(&expected).map_err(QueueError::Io)?;
+                    file.sync_all().map_err(QueueError::Io)?;
+                    sync_directory(queue_root)
+                }
+                Err(error) => Err(QueueError::Io(error)),
             }
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map_err(QueueError::Io)?;
-            file.write_all(&expected).map_err(QueueError::Io)?;
-            file.sync_all().map_err(QueueError::Io)?;
-            sync_directory(queue_root)
         }
         Err(error) => Err(QueueError::Io(error)),
     }
@@ -1543,21 +1655,92 @@ fn queue_root_binding(
     queue_lock_handle: &File,
     worker_lock_handle: &File,
 ) -> Result<Vec<u8>, QueueError> {
-    let mut expected = configured_root.as_os_str().as_encoded_bytes().to_vec();
+    let mut expected = QUEUE_ROOT_BINDING_PREFIX.to_vec();
+    expected.extend_from_slice(configured_root.as_os_str().as_encoded_bytes());
+    #[cfg(target_os = "linux")]
+    {
+        let filesystem_id = nix::sys::statvfs::fstatvfs(root_handle)
+            .map_err(|error| QueueError::Io(io::Error::from_raw_os_error(error as i32)))?
+            .filesystem_id();
+        expected.push(0);
+        expected.extend_from_slice(&(filesystem_id as u64).to_le_bytes());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let handles = std::iter::once(root_handle)
-            .chain(directories.all().map(|directory| directory.handle.as_ref()))
-            .chain([queue_lock_handle, worker_lock_handle]);
-        for handle in handles {
+        for handle in queue_binding_handles(
+            root_handle,
+            directories,
+            queue_lock_handle,
+            worker_lock_handle,
+        ) {
             let metadata = handle.metadata().map_err(QueueError::Io)?;
             expected.push(0);
-            expected.extend_from_slice(&metadata.dev().to_le_bytes());
             expected.extend_from_slice(&metadata.ino().to_le_bytes());
         }
     }
     Ok(expected)
+}
+
+fn validate_legacy_queue_root_binding(
+    path: &Path,
+    configured_root: &Path,
+    root_handle: &File,
+    directories: &QueueDirectories,
+    queue_lock_handle: &File,
+    worker_lock_handle: &File,
+) -> Result<(), QueueError> {
+    let actual = read_identity_file(path, 16 * 1024)?;
+    let prefix = configured_root.as_os_str().as_encoded_bytes();
+    if !actual.starts_with(prefix) {
+        return Err(QueueError::InvalidQueueIdentity);
+    }
+    let remainder = &actual[prefix.len()..];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let handles: Vec<&File> = queue_binding_handles(
+            root_handle,
+            directories,
+            queue_lock_handle,
+            worker_lock_handle,
+        )
+        .collect();
+        if remainder.len() != handles.len() * 17 {
+            return Err(QueueError::InvalidQueueIdentity);
+        }
+        for (encoded, handle) in remainder.chunks_exact(17).zip(handles) {
+            let inode = handle.metadata().map_err(QueueError::Io)?.ino();
+            if encoded[0] != 0 || encoded[9..] != inode.to_le_bytes() {
+                return Err(QueueError::InvalidQueueIdentity);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            root_handle,
+            directories,
+            queue_lock_handle,
+            worker_lock_handle,
+        );
+        if !remainder.is_empty() {
+            return Err(QueueError::InvalidQueueIdentity);
+        }
+    }
+    Ok(())
+}
+
+fn queue_binding_handles<'a>(
+    root_handle: &'a File,
+    directories: &'a QueueDirectories,
+    queue_lock_handle: &'a File,
+    worker_lock_handle: &'a File,
+) -> impl Iterator<Item = &'a File> {
+    std::iter::once(root_handle)
+        .chain(directories.all().map(|directory| directory.handle.as_ref()))
+        .chain([queue_lock_handle, worker_lock_handle])
 }
 
 fn validate_queue_root_binding(
@@ -1580,6 +1763,38 @@ fn validate_queue_root_binding(
         Ok(())
     } else {
         Err(QueueError::InvalidQueueIdentity)
+    }
+}
+
+fn validate_existing_queue_root_binding(
+    queue_root: &Path,
+    configured_root: &Path,
+    root_handle: &File,
+    directories: &QueueDirectories,
+    queue_lock_handle: &File,
+    worker_lock_handle: &File,
+) -> Result<(), QueueError> {
+    let current = queue_root.join(QUEUE_ROOT_BINDING_FILE_NAME);
+    match fs::symlink_metadata(&current) {
+        Ok(_) => validate_queue_root_binding(
+            &current,
+            configured_root,
+            root_handle,
+            directories,
+            queue_lock_handle,
+            worker_lock_handle,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            validate_legacy_queue_root_binding(
+                &queue_root.join(LEGACY_QUEUE_ROOT_BINDING_FILE_NAME),
+                configured_root,
+                root_handle,
+                directories,
+                queue_lock_handle,
+                worker_lock_handle,
+            )
+        }
+        Err(error) => Err(QueueError::Io(error)),
     }
 }
 
