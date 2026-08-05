@@ -1,4 +1,5 @@
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::Path;
 
 use agent_knowledge_core::{DocumentId, ProjectId, RequestId, SessionId};
@@ -6,11 +7,15 @@ use agent_knowledge_protocol::{
     GetRequest, GetResponse, ListRequest, ListResponse, ReadFilterRequest, SearchRequest,
     StatusRequest, StatusResponse, SubmitResponse,
 };
+use axum::{Router, http::StatusCode, routing::get};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -347,12 +352,16 @@ fn structured(value: impl Serialize) -> Result<CallToolResult, String> {
         .map_err(|_| "could not encode the Agent Knowledge response".to_owned())
 }
 
-pub(crate) fn run(client: SshClient) -> Result<(), McpServerError> {
+pub(crate) fn run(client: SshClient, listen: Option<SocketAddr>) -> Result<(), McpServerError> {
     tokio::runtime::Builder::new_current_thread()
+        .enable_io()
         .enable_time()
         .build()
         .map_err(McpServerError::Runtime)?
         .block_on(async move {
+            if let Some(address) = listen {
+                return run_http(client, address).await;
+            }
             let service = KnowledgeMcpServer::new(client)
                 .serve(rmcp::transport::stdio())
                 .await
@@ -362,9 +371,65 @@ pub(crate) fn run(client: SshClient) -> Result<(), McpServerError> {
         })
 }
 
+async fn run_http(client: SshClient, address: SocketAddr) -> Result<(), McpServerError> {
+    let config = StreamableHttpServerConfig::default()
+        .with_json_response(true)
+        .with_allowed_hosts([address.to_string(), format!("localhost:{}", address.port())]);
+    let cancellation = config.cancellation_token.clone();
+    let router = http_router(client, config);
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|source| McpServerError::Bind { address, source })?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown().await;
+            cancellation.cancel();
+        })
+        .await
+        .map_err(McpServerError::Serve)
+}
+
+fn http_router<C: KnowledgeBackend>(client: C, config: StreamableHttpServerConfig) -> Router {
+    let service: StreamableHttpService<KnowledgeMcpServer<C>, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(KnowledgeMcpServer::new(client.clone())),
+            Default::default(),
+            config,
+        );
+    Router::new()
+        .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
+        .nest_service("/mcp", service)
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown() {
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 #[derive(Debug)]
 pub enum McpServerError {
     Runtime(std::io::Error),
+    Bind {
+        address: SocketAddr,
+        source: std::io::Error,
+    },
+    Serve(std::io::Error),
     Initialize(Box<rmcp::service::ServerInitializeError>),
     Service(tokio::task::JoinError),
 }
@@ -373,6 +438,13 @@ impl fmt::Display for McpServerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Runtime(error) => write!(formatter, "could not start the MCP runtime: {error}"),
+            Self::Bind { address, source } => {
+                write!(
+                    formatter,
+                    "could not bind MCP listener at {address}: {source}"
+                )
+            }
+            Self::Serve(error) => write!(formatter, "MCP HTTP server failed: {error}"),
             Self::Initialize(error) => write!(formatter, "could not initialize MCP: {error}"),
             Self::Service(error) => write!(formatter, "MCP service failed: {error}"),
         }
@@ -383,6 +455,8 @@ impl std::error::Error for McpServerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Runtime(error) => Some(error),
+            Self::Bind { source, .. } => Some(source),
+            Self::Serve(error) => Some(error),
             Self::Initialize(error) => Some(error),
             Self::Service(error) => Some(error),
         }
@@ -395,10 +469,20 @@ mod tests {
 
     use super::{
         DocumentParameters, KnowledgeBackend, KnowledgeMcpServer, Parameters, ReadParameters,
+        http_router,
     };
     use agent_knowledge_protocol::{
         GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest, StatusRequest,
         StatusResponse, SubmitResponse,
+    };
+    use rmcp::{
+        ServiceExt,
+        model::{CallToolRequestParams, ClientInfo},
+        transport::{
+            StreamableHttpClientTransport,
+            streamable_http_client::StreamableHttpClientTransportConfig,
+            streamable_http_server::StreamableHttpServerConfig,
+        },
     };
 
     #[derive(Clone, Debug)]
@@ -528,5 +612,58 @@ mod tests {
             result.err().as_deref(),
             Some("document_id must be a canonical ULID")
         );
+    }
+
+    #[tokio::test]
+    async fn serves_a_read_tool_over_streamable_http() {
+        let config = StreamableHttpServerConfig::default()
+            .with_json_response(true)
+            .with_sse_keep_alive(None);
+        let cancellation = config.cancellation_token.clone();
+        let router = http_router(FakeBackend, config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| panic!("test listener must bind: {error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("test listener address must be available: {error}"));
+        let shutdown = cancellation.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+        });
+
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
+        );
+        let client = ClientInfo::default()
+            .serve(transport)
+            .await
+            .unwrap_or_else(|error| panic!("HTTP MCP client must initialize: {error}"));
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("knowledge_list").with_arguments(serde_json::Map::new()),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("HTTP MCP read tool must succeed: {error}"));
+
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("commit"))
+                .and_then(serde_json::Value::as_str),
+            Some("fictional-commit")
+        );
+        client
+            .cancel()
+            .await
+            .unwrap_or_else(|error| panic!("HTTP MCP client must stop: {error}"));
+        cancellation.cancel();
+        server
+            .await
+            .unwrap_or_else(|error| panic!("HTTP MCP server task must stop: {error}"))
+            .unwrap_or_else(|error| panic!("HTTP MCP server must stop cleanly: {error}"));
     }
 }
