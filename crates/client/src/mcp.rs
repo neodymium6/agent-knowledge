@@ -20,7 +20,9 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::mcp_archive::ArchiveDocumentParameters;
 use crate::mcp_create::CreateDocumentParameters;
+use crate::mcp_package::PreparedPackage;
 use crate::{ClientCommandError, SshClient};
 
 const DEFAULT_MAXIMUM_RESULTS: usize = 100;
@@ -213,6 +215,28 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
 #[tool_router]
 impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     #[tool(
+        name = "knowledge_archive_document",
+        description = "Archive one active mutable Agent Knowledge document without a caller-visible request package. Reuse document_id, expected_revision, request_id, and created_at together to retry an uncertain response.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn archive_document(
+        &self,
+        Parameters(parameters): Parameters<ArchiveDocumentParameters>,
+    ) -> Result<CallToolResult, String> {
+        let intent = parameters.parse()?;
+        let get_request = intent.get_request();
+        let client = self.client.clone();
+        let document = run_blocking(move || client.get(&get_request), C::format_error).await?;
+        let package = intent.prepare(&document.document.summary)?;
+        structured(submit_prepared(self.client.clone(), package).await?)
+    }
+
+    #[tool(
         name = "knowledge_create_document",
         description = "Create and submit one Agent Knowledge Markdown document without a caller-visible request package. Reuse request_id, document_id, and created_at together to retry an uncertain response.",
         annotations(
@@ -227,24 +251,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
         Parameters(parameters): Parameters<CreateDocumentParameters>,
     ) -> Result<CallToolResult, String> {
         let package = parameters.prepare()?;
-        let client = self.client.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            let temporary = package
-                .materialize()
-                .map_err(|_| StructuredSubmitError::Local)?;
-            client
-                .submit(temporary.path())
-                .map_err(StructuredSubmitError::Backend)
-        })
-        .await
-        .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
-        .map_err(|error| match error {
-            StructuredSubmitError::Local => {
-                "could not create a private temporary request package".to_owned()
-            }
-            StructuredSubmitError::Backend(error) => C::format_error(&error),
-        })?;
-        structured(response)
+        structured(submit_prepared(self.client.clone(), package).await?)
     }
 
     #[tool(
@@ -363,7 +370,7 @@ impl<C: KnowledgeBackend> ServerHandler for KnowledgeMcpServer<C> {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Read committed knowledge with list, recent, search, and get. Use create_document for ordinary Markdown creation. Use submit_package only for advanced operations that already have a complete local request package. The SSH destination and credentials are configured on this machine.",
+                "Read committed knowledge with list, recent, search, and get. Use create_document for ordinary Markdown creation and archive_document to archive an active mutable document. Use submit_package only for advanced operations that already have a complete local request package. The SSH destination and credentials are configured on this machine.",
             )
     }
 }
@@ -371,6 +378,28 @@ impl<C: KnowledgeBackend> ServerHandler for KnowledgeMcpServer<C> {
 enum StructuredSubmitError<E> {
     Local,
     Backend(E),
+}
+
+async fn submit_prepared<C: KnowledgeBackend>(
+    client: C,
+    package: PreparedPackage,
+) -> Result<SubmitResponse, String> {
+    tokio::task::spawn_blocking(move || {
+        let temporary = package
+            .materialize()
+            .map_err(|_| StructuredSubmitError::Local)?;
+        client
+            .submit(temporary.path())
+            .map_err(StructuredSubmitError::Backend)
+    })
+    .await
+    .map_err(|_| "local Agent Knowledge operation stopped unexpectedly".to_owned())?
+    .map_err(|error| match error {
+        StructuredSubmitError::Local => {
+            "could not create a private temporary request package".to_owned()
+        }
+        StructuredSubmitError::Backend(error) => C::format_error(&error),
+    })
 }
 
 async fn run_blocking<T, E>(
@@ -514,7 +543,9 @@ mod tests {
         DocumentParameters, KnowledgeBackend, KnowledgeMcpServer, Parameters, ReadParameters,
         http_router,
     };
+    use crate::mcp_archive::ArchiveDocumentParameters;
     use crate::mcp_create::CreateDocumentParameters;
+    use agent_knowledge_core::{ChangeRequest, Operation};
     use agent_knowledge_protocol::{
         GetRequest, GetResponse, ListRequest, ListResponse, SearchRequest, StatusRequest,
         StatusResponse, SubmitOutcome, SubmitResponse,
@@ -610,6 +641,61 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct ArchiveBackend {
+        document: Option<GetResponse>,
+        submitted_path: Arc<Mutex<Option<PathBuf>>>,
+        submitted_request: Arc<Mutex<Option<ChangeRequest>>>,
+        fail_submit: bool,
+    }
+
+    impl KnowledgeBackend for ArchiveBackend {
+        type Error = &'static str;
+
+        fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error> {
+            let package = agent_knowledge_queue::validate_package(
+                package_root,
+                &agent_knowledge_queue::PackagePolicy::default(),
+            )
+            .map_err(|_| "fictional package validation failed")?;
+            *self
+                .submitted_path
+                .lock()
+                .map_err(|_| "fictional path lock failed")? = Some(package_root.to_owned());
+            *self
+                .submitted_request
+                .lock()
+                .map_err(|_| "fictional request lock failed")? = Some(package.request().clone());
+            if self.fail_submit {
+                return Err("fictional archive submit failed");
+            }
+            Ok(SubmitResponse::new(SubmitOutcome::Accepted {
+                request_id: package.request().request_id,
+                digest: package.digest().as_revision(),
+            }))
+        }
+
+        fn list(&self, _request: &ListRequest) -> Result<ListResponse, Self::Error> {
+            unreachable!()
+        }
+
+        fn recent(&self, _request: &ListRequest) -> Result<ListResponse, Self::Error> {
+            unreachable!()
+        }
+
+        fn search(&self, _request: &SearchRequest) -> Result<ListResponse, Self::Error> {
+            unreachable!()
+        }
+
+        fn get(&self, _request: &GetRequest) -> Result<GetResponse, Self::Error> {
+            self.document.clone().ok_or("fictional document not found")
+        }
+
+        fn status(&self, _request: &StatusRequest) -> Result<StatusResponse, Self::Error> {
+            unreachable!()
+        }
+    }
+
     #[test]
     fn advertises_the_expected_tool_set() {
         let server = KnowledgeMcpServer::new(FakeBackend);
@@ -655,6 +741,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "knowledge_archive_document",
                 "knowledge_create_document",
                 "knowledge_get",
                 "knowledge_list",
@@ -681,6 +768,46 @@ mod tests {
         let schema = serde_json::to_value(&create.input_schema)
             .unwrap_or_else(|error| panic!("create schema must encode: {error}"));
         assert!(schema["properties"].get("body").is_some());
+        assert!(schema["properties"].get("package_root").is_none());
+
+        let archive = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "knowledge_archive_document")
+            .unwrap_or_else(|| panic!("archive tool must be advertised"));
+        assert_eq!(
+            archive
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint),
+            Some(false)
+        );
+        assert_eq!(
+            archive
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.destructive_hint),
+            Some(true)
+        );
+        assert_eq!(
+            archive
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.idempotent_hint),
+            Some(false)
+        );
+        assert_eq!(
+            archive
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.open_world_hint),
+            Some(true)
+        );
+        let schema = serde_json::to_value(&archive.input_schema)
+            .unwrap_or_else(|error| panic!("archive schema must encode: {error}"));
+        assert!(schema["properties"].get("document_id").is_some());
+        assert!(schema["properties"].get("expected_revision").is_some());
         assert!(schema["properties"].get("package_root").is_none());
     }
 
@@ -723,6 +850,87 @@ mod tests {
         assert_submitted_package_removed(&submitted_path);
     }
 
+    #[tokio::test]
+    async fn archives_a_document_and_removes_its_package() {
+        let submitted_path = Arc::new(Mutex::new(None));
+        let submitted_request = Arc::new(Mutex::new(None));
+        let backend = ArchiveBackend {
+            document: Some(archive_response()),
+            submitted_path: submitted_path.clone(),
+            submitted_request: submitted_request.clone(),
+            fail_submit: false,
+        };
+
+        let result = KnowledgeMcpServer::new(backend)
+            .archive_document(Parameters(archive_parameters()))
+            .await
+            .unwrap_or_else(|error| panic!("archive tool must succeed: {error}"));
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("request_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("01K00000000000000000000005")
+        );
+        let request = submitted_request
+            .lock()
+            .unwrap_or_else(|error| panic!("submitted request lock must succeed: {error}"))
+            .clone()
+            .unwrap_or_else(|| panic!("backend must observe the request"));
+        assert_eq!(request.title, "Archive document 01K00000000000000000000004");
+        assert!(matches!(
+            request.operations.as_slice(),
+            [Operation::ArchiveDocument { .. }]
+        ));
+        assert_submitted_package_removed(&submitted_path);
+    }
+
+    #[tokio::test]
+    async fn removes_the_archive_package_after_submit_failure() {
+        let submitted_path = Arc::new(Mutex::new(None));
+        let backend = ArchiveBackend {
+            document: Some(archive_response()),
+            submitted_path: submitted_path.clone(),
+            submitted_request: Arc::new(Mutex::new(None)),
+            fail_submit: true,
+        };
+
+        let result = KnowledgeMcpServer::new(backend)
+            .archive_document(Parameters(archive_parameters()))
+            .await;
+        assert_eq!(
+            result.err().as_deref(),
+            Some("fictional archive submit failed")
+        );
+        assert_submitted_package_removed(&submitted_path);
+    }
+
+    #[tokio::test]
+    async fn returns_missing_document_without_submitting_archive() {
+        let submitted_path = Arc::new(Mutex::new(None));
+        let backend = ArchiveBackend {
+            document: None,
+            submitted_path: submitted_path.clone(),
+            submitted_request: Arc::new(Mutex::new(None)),
+            fail_submit: false,
+        };
+
+        let result = KnowledgeMcpServer::new(backend)
+            .archive_document(Parameters(archive_parameters()))
+            .await;
+        assert_eq!(
+            result.err().as_deref(),
+            Some("fictional document not found")
+        );
+        assert!(
+            submitted_path
+                .lock()
+                .unwrap_or_else(|error| panic!("submitted path lock must succeed: {error}"))
+                .is_none()
+        );
+    }
+
     fn create_parameters() -> CreateDocumentParameters {
         serde_json::from_value::<CreateDocumentParameters>(serde_json::json!({
             "title": "Record fictional result",
@@ -734,6 +942,46 @@ mod tests {
             "created_at": "2026-08-05T10:00:00Z"
         }))
         .unwrap_or_else(|error| panic!("create parameters must decode: {error}"))
+    }
+
+    fn archive_parameters() -> ArchiveDocumentParameters {
+        serde_json::from_value::<ArchiveDocumentParameters>(archive_parameter_value())
+            .unwrap_or_else(|error| panic!("archive parameters must decode: {error}"))
+    }
+
+    fn archive_parameter_value() -> serde_json::Value {
+        serde_json::json!({
+            "document_id": "01K00000000000000000000004",
+            "expected_revision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "request_id": "01K00000000000000000000005",
+            "created_at": "2026-08-06T10:00:00Z"
+        })
+    }
+
+    fn archive_response() -> GetResponse {
+        serde_json::from_value(serde_json::json!({
+            "protocol_version": 1,
+            "commit": "fictional-commit",
+            "document": {
+                "summary": {
+                    "path": "projects/fictional-solver/experiments/2026/08/fictional-result.md",
+                    "document_type": "experiment",
+                    "project": "fictional-solver",
+                    "archived": false,
+                    "revision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "metadata": {
+                        "schema_version": 1,
+                        "document_id": "01K00000000000000000000004",
+                        "title": "Fictional result",
+                        "created": "2026-08-05T10:00:00Z",
+                        "request_id": "01K00000000000000000000006",
+                        "status": "active"
+                    }
+                },
+                "markdown": "---\nschema_version: 1\n---\n\nFictional result."
+            }
+        }))
+        .unwrap_or_else(|error| panic!("get response must decode: {error}"))
     }
 
     fn assert_submitted_package_removed(submitted_path: &Arc<Mutex<Option<PathBuf>>>) {
@@ -830,6 +1078,71 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("fictional-commit")
         );
+        client
+            .cancel()
+            .await
+            .unwrap_or_else(|error| panic!("HTTP MCP client must stop: {error}"));
+        cancellation.cancel();
+        server
+            .await
+            .unwrap_or_else(|error| panic!("HTTP MCP server task must stop: {error}"))
+            .unwrap_or_else(|error| panic!("HTTP MCP server must stop cleanly: {error}"));
+    }
+
+    #[tokio::test]
+    async fn serves_the_archive_tool_over_streamable_http() {
+        let submitted_path = Arc::new(Mutex::new(None));
+        let backend = ArchiveBackend {
+            document: Some(archive_response()),
+            submitted_path: submitted_path.clone(),
+            submitted_request: Arc::new(Mutex::new(None)),
+            fail_submit: false,
+        };
+        let config = StreamableHttpServerConfig::default()
+            .with_json_response(true)
+            .with_sse_keep_alive(None);
+        let cancellation = config.cancellation_token.clone();
+        let router = http_router(backend, config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| panic!("test listener must bind: {error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("test listener address must be available: {error}"));
+        let shutdown = cancellation.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+        });
+
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
+        );
+        let client = ClientInfo::default()
+            .serve(transport)
+            .await
+            .unwrap_or_else(|error| panic!("HTTP MCP client must initialize: {error}"));
+        let arguments = archive_parameter_value()
+            .as_object()
+            .cloned()
+            .unwrap_or_else(|| panic!("archive parameters must encode as an object"));
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("knowledge_archive_document").with_arguments(arguments),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("HTTP MCP archive tool must succeed: {error}"));
+
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("request_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("01K00000000000000000000005")
+        );
+        assert_submitted_package_removed(&submitted_path);
         client
             .cancel()
             .await

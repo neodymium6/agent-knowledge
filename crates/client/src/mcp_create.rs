@@ -1,10 +1,3 @@
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-use std::path::Path;
-
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
 use agent_knowledge_core::{
     CURRENT_DOCUMENT_SCHEMA_VERSION, CURRENT_PROTOCOL_VERSION, ChangeRequest, DocumentId,
     DocumentMetadata, DocumentStatus, DocumentType, Operation, PayloadPath, ProjectId, RequestId,
@@ -13,8 +6,9 @@ use agent_knowledge_core::{
 use agent_knowledge_queue::PackagePolicy;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tempfile::TempDir;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+use crate::mcp_package::{PayloadFile, PreparedPackage};
 
 const DOCUMENT_PAYLOAD_PATH: &str = "document.md";
 
@@ -77,13 +71,8 @@ pub(super) struct CreateDocumentParameters {
     created_at: Option<String>,
 }
 
-pub(super) struct PreparedCreatePackage {
-    request_json: Vec<u8>,
-    markdown: Vec<u8>,
-}
-
 impl CreateDocumentParameters {
-    pub(super) fn prepare(self) -> Result<PreparedCreatePackage, String> {
+    pub(super) fn prepare(self) -> Result<PreparedPackage, String> {
         let policy = PackagePolicy::default();
         let limits = policy.limits();
         let request_id = self
@@ -145,7 +134,7 @@ impl CreateDocumentParameters {
             created_at,
             operations: vec![Operation::CreateDocument {
                 document_id,
-                content,
+                content: content.clone(),
             }],
         };
         request
@@ -170,8 +159,6 @@ impl CreateDocumentParameters {
             .validate(document_type, limits.document)
             .map_err(|error| error.to_string())?;
 
-        let request_json = serde_json::to_vec_pretty(&request)
-            .map_err(|_| "could not encode the change request".to_owned())?;
         let yaml = serde_saphyr::to_string(&metadata)
             .map_err(|_| "could not encode document front matter".to_owned())?;
         let front_matter_bytes = yaml
@@ -198,78 +185,8 @@ impl CreateDocumentParameters {
         markdown.extend_from_slice(b"---\n\n");
         markdown.extend_from_slice(self.body.as_bytes());
 
-        enforce_package_size(
-            &request_json,
-            &markdown,
-            limits.maximum_file_bytes,
-            limits.maximum_total_bytes,
-        )?;
-        Ok(PreparedCreatePackage {
-            request_json,
-            markdown,
-        })
+        PreparedPackage::new(request, vec![PayloadFile::new(content, markdown)?])
     }
-}
-
-fn enforce_package_size(
-    request_json: &[u8],
-    markdown: &[u8],
-    maximum_file_bytes: u64,
-    maximum_total_bytes: u64,
-) -> Result<(), String> {
-    let request_bytes =
-        u64::try_from(request_json.len()).map_err(|_| "change request is too large".to_owned())?;
-    let markdown_bytes =
-        u64::try_from(markdown.len()).map_err(|_| "document is too large".to_owned())?;
-    if request_bytes > maximum_file_bytes {
-        return Err(format!("change request exceeds {maximum_file_bytes} bytes"));
-    }
-    if markdown_bytes > maximum_file_bytes {
-        return Err(format!("document exceeds {maximum_file_bytes} bytes"));
-    }
-    if request_bytes
-        .checked_add(markdown_bytes)
-        .is_none_or(|total| total > maximum_total_bytes)
-    {
-        return Err(format!(
-            "request package exceeds {maximum_total_bytes} bytes"
-        ));
-    }
-    Ok(())
-}
-
-impl PreparedCreatePackage {
-    pub(super) fn materialize(&self) -> io::Result<TempDir> {
-        let root = tempfile::Builder::new()
-            .prefix("agent-knowledge-mcp-")
-            .tempdir()?;
-        let payload = root.path().join("payload");
-        fs::create_dir(&payload)?;
-        set_private_directory(root.path())?;
-        set_private_directory(&payload)?;
-        write_private_file(&root.path().join("request.json"), &self.request_json)?;
-        write_private_file(&payload.join(DOCUMENT_PAYLOAD_PATH), &self.markdown)?;
-        Ok(root)
-    }
-}
-
-#[cfg(unix)]
-fn set_private_directory(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn set_private_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path)?;
-    file.write_all(contents)
 }
 
 #[cfg(test)]
@@ -282,7 +199,7 @@ mod tests {
     use agent_knowledge_core::{DocumentType, decode_document_metadata, markdown_body};
     use agent_knowledge_queue::{PackagePolicy, validate_package};
 
-    use super::{CreateDocumentParameters, enforce_package_size};
+    use super::CreateDocumentParameters;
 
     const REQUEST_ID: &str = "01K00000000000000000000000";
     const DOCUMENT_ID: &str = "01K00000000000000000000001";
@@ -312,8 +229,7 @@ mod tests {
         let second = parameters()
             .prepare()
             .unwrap_or_else(|error| panic!("package must prepare again: {error}"));
-        assert_eq!(first.request_json, second.request_json);
-        assert_eq!(first.markdown, second.markdown);
+        assert_eq!(first, second);
 
         let temporary = first
             .materialize()
@@ -370,22 +286,6 @@ mod tests {
         assert_eq!(
             parameters.prepare().err().as_deref(),
             Some("log request requires `node` metadata")
-        );
-    }
-
-    #[test]
-    fn rejects_payloads_that_exceed_package_limits() {
-        assert_eq!(
-            enforce_package_size(b"{}", b"12345", 4, 16)
-                .err()
-                .as_deref(),
-            Some("document exceeds 4 bytes")
-        );
-        assert_eq!(
-            enforce_package_size(b"1234", b"5678", 4, 7)
-                .err()
-                .as_deref(),
-            Some("request package exceeds 7 bytes")
         );
     }
 }
