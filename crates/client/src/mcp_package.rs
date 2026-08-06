@@ -49,10 +49,7 @@ impl PreparedPackage {
                 limits.maximum_file_count
             ));
         }
-        let entry_count = file_count
-            .checked_add(1)
-            .ok_or_else(|| "request package contains too many entries".to_owned())?;
-        if entry_count > limits.maximum_entry_count {
+        if file_count > limits.maximum_entry_count {
             return Err(format!(
                 "request package exceeds {} entries",
                 limits.maximum_entry_count
