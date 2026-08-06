@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[test]
-fn initializes_the_stdio_mcp_server() {
+fn initializes_and_lists_tools_from_the_stdio_mcp_server() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-knowledge-client"))
         .args(["mcp", "--destination", "fictional-knowledge"])
         .stdin(Stdio::piped())
@@ -27,6 +27,11 @@ fn initializes_the_stdio_mcp_server() {
         r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
     )
     .unwrap_or_else(|error| panic!("initialized notification must be written: {error}"));
+    writeln!(
+        input,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+    )
+    .unwrap_or_else(|error| panic!("tools/list request must be written: {error}"));
     drop(input);
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -60,12 +65,32 @@ fn initializes_the_stdio_mcp_server() {
         .unwrap_or_else(|error| panic!("MCP diagnostics must be readable: {error}"));
 
     assert!(status.success(), "MCP client failed: {diagnostic}");
-    let response: serde_json::Value = serde_json::from_str(output.trim())
-        .unwrap_or_else(|error| panic!("MCP response must be JSON: {error}; response: {output}"));
-    assert_eq!(response["id"], 1);
+    let responses = output
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                panic!("MCP response must be JSON: {error}; response: {line}")
+            })
+        })
+        .collect::<Vec<_>>();
+    let response = responses
+        .iter()
+        .find(|response| response["id"] == 1)
+        .unwrap_or_else(|| panic!("initialize response must be present: {output}"));
     assert_eq!(
         response["result"]["serverInfo"]["name"],
         "agent-knowledge-client"
     );
     assert!(response["result"]["capabilities"]["tools"].is_object());
+    let tools = responses
+        .iter()
+        .find(|response| response["id"] == 2)
+        .and_then(|response| response["result"]["tools"].as_array())
+        .unwrap_or_else(|| panic!("tools/list response must be present: {output}"));
+    assert!(tools.iter().any(|tool| {
+        tool["name"] == "knowledge_archive_document"
+            && tool["inputSchema"]["properties"]
+                .get("package_root")
+                .is_none()
+    }));
 }
