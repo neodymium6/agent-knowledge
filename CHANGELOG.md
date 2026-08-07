@@ -4,6 +4,8 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.8
+
 - Add structured MCP document archival over STDIO or Streamable HTTP without a
   shared filesystem.
 
