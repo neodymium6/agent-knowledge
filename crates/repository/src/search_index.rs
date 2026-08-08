@@ -14,7 +14,8 @@ use tantivy::schema::{
 use tantivy::{DocSet, Index, IndexReader, SegmentReader, TERMINATED};
 
 use crate::{
-    CommittedReadError, CommittedSnapshot, DocumentRecord, ReadFilter, SearchMetadataFields,
+    CommittedReadError, CommittedSnapshot, DetachedSnapshot, DocumentRecord, ReadFilter,
+    SearchMetadataFields,
 };
 
 // Tantivy 0.26 requires at least 15 MB per indexing thread. Keep the initial
@@ -39,6 +40,31 @@ pub struct TantivySearchIndex {
     reader: IndexReader,
     fields: SearchFields,
     _directory_anchor: Option<Arc<File>>,
+}
+
+trait IndexedSnapshot {
+    fn commit(&self) -> &str;
+    fn document(&self, document_id: DocumentId) -> Option<&DocumentRecord>;
+}
+
+impl IndexedSnapshot for CommittedSnapshot {
+    fn commit(&self) -> &str {
+        self.commit()
+    }
+
+    fn document(&self, document_id: DocumentId) -> Option<&DocumentRecord> {
+        self.document(document_id)
+    }
+}
+
+impl IndexedSnapshot for DetachedSnapshot {
+    fn commit(&self) -> &str {
+        self.commit()
+    }
+
+    fn document(&self, document_id: DocumentId) -> Option<&DocumentRecord> {
+        self.document(document_id)
+    }
 }
 
 /// Bounds enforced by the synchronous Tantivy search primitive.
@@ -182,6 +208,34 @@ impl TantivySearchIndex {
     pub fn search_with_metadata<'a>(
         &self,
         snapshot: &'a CommittedSnapshot,
+        query: &str,
+        filter: &ReadFilter,
+        metadata_fields: SearchMetadataFields,
+        policy: TantivySearchPolicy,
+    ) -> Result<Vec<&'a DocumentRecord>, TantivySearchError> {
+        self.search_snapshot_with_metadata(snapshot, query, filter, metadata_fields, policy)
+    }
+
+    /// Searches against owned committed metadata after its publication lock
+    /// has been released.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::search`].
+    pub fn search_detached<'a>(
+        &self,
+        snapshot: &'a DetachedSnapshot,
+        query: &str,
+        filter: &ReadFilter,
+        metadata_fields: SearchMetadataFields,
+        policy: TantivySearchPolicy,
+    ) -> Result<Vec<&'a DocumentRecord>, TantivySearchError> {
+        self.search_snapshot_with_metadata(snapshot, query, filter, metadata_fields, policy)
+    }
+
+    fn search_snapshot_with_metadata<'a>(
+        &self,
+        snapshot: &'a impl IndexedSnapshot,
         query: &str,
         filter: &ReadFilter,
         metadata_fields: SearchMetadataFields,

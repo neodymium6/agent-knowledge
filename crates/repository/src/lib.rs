@@ -19,7 +19,7 @@ pub use index::{
 };
 pub use read::{
     CommittedBundle, CommittedBundleEntry, CommittedDocument, CommittedReadError,
-    CommittedSnapshot, CommittedStore, LinearSearch, ReadFilter, SearchBackend,
+    CommittedSnapshot, CommittedStore, DetachedSnapshot, LinearSearch, ReadFilter, SearchBackend,
     SearchMetadataFields, SearchPolicy,
 };
 pub use replication::{

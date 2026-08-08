@@ -1003,6 +1003,23 @@ fn shared_snapshot_lock_blocks_publication_until_drop() {
     }
 }
 
+#[test]
+fn detached_snapshot_releases_the_publication_lock() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let commit = snapshot.commit().to_owned();
+    let detached = snapshot.into_detached();
+    let writer = File::open(&fixture.content)
+        .unwrap_or_else(|error| panic!("publication lock fixture must open: {error}"));
+    writer
+        .try_lock()
+        .unwrap_or_else(|error| panic!("detached metadata must not retain the lock: {error}"));
+    assert_eq!(detached.commit(), commit);
+}
+
 #[cfg(unix)]
 #[test]
 fn bundle_export_rejects_an_attachment_replaced_by_a_hard_link() {

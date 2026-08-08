@@ -183,9 +183,7 @@ impl ReadGateway {
         read::search(
             &self.settings,
             &self.committed,
-            self.search_indexes
-                .as_ref()
-                .map(PathAttestation::stable_path),
+            self.search_indexes.clone(),
             request,
         )
         .map(|prepared| prepared.response)
@@ -221,9 +219,7 @@ impl ReadGateway {
         read::search_until(
             &self.settings,
             &self.committed,
-            self.search_indexes
-                .as_ref()
-                .map(PathAttestation::stable_path),
+            self.search_indexes.clone(),
             request,
             deadline,
         )
@@ -258,6 +254,8 @@ pub enum GatewayError {
     OperationDeadlineExceeded,
     /// Configured derived search state was absent, stale, or unreadable.
     SearchIndexUnavailable,
+    /// The isolated indexed-search execution could not start or stopped.
+    SearchExecution(std::io::Error),
     /// No durable state exists for the requested change request.
     RequestNotFound {
         /// Requested immutable change-request identifier.
@@ -278,6 +276,7 @@ impl GatewayError {
             Self::OperationDeadlineExceeded | Self::SearchIndexUnavailable => {
                 ErrorCode::TemporaryFailure
             }
+            Self::SearchExecution(_) => ErrorCode::InternalError,
             Self::RequestNotFound { .. } => ErrorCode::RequestNotFound,
         }
     }
@@ -302,6 +301,9 @@ impl fmt::Display for GatewayError {
             Self::SearchIndexUnavailable => {
                 formatter.write_str("configured search index is temporarily unavailable")
             }
+            Self::SearchExecution(error) => {
+                write!(formatter, "Gateway search execution failed: {error}")
+            }
             Self::RequestNotFound { request_id } => {
                 write!(
                     formatter,
@@ -320,6 +322,7 @@ impl std::error::Error for GatewayError {
             Self::ReadRequest(error) => Some(error),
             Self::CommittedRead(error) => Some(error.as_ref()),
             Self::Attestation(error) => Some(error),
+            Self::SearchExecution(error) => Some(error),
             Self::OverlappingStorage
             | Self::OperationDeadlineExceeded
             | Self::SearchIndexUnavailable
