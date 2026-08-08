@@ -5,6 +5,7 @@ mod git;
 mod index;
 mod read;
 mod replication;
+mod search_index;
 
 pub use apply::ApplyError;
 pub use git::{
@@ -26,3 +27,4 @@ pub use replication::{
     RemoteReplicationStatus, RemoteReplicator, read_remote_replication_status,
     read_remote_replication_status_until,
 };
+pub use search_index::{TantivySearchError, TantivySearchIndex, TantivySearchPolicy};
