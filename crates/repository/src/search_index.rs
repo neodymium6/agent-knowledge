@@ -5,13 +5,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agent_knowledge_core::{DocumentId, markdown_body};
-use tantivy::collector::{Collector, SegmentCollector, TopDocs};
+use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, QueryParserError, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, NumericOptions, STORED, STRING, Schema, TEXT, TantivyDocument, Term,
     TextOptions, Value,
 };
-use tantivy::{DocSet, Index, IndexReader, SegmentReader, TERMINATED};
+use tantivy::{
+    DocAddress, DocId, DocSet, Index, IndexReader, Score, SegmentOrdinal, SegmentReader, TERMINATED,
+};
 
 use crate::{
     CommittedReadError, CommittedSnapshot, DetachedSnapshot, DocumentRecord, ReadFilter,
@@ -292,7 +294,7 @@ impl TantivySearchIndex {
             .search(
                 &filtered,
                 &DeadlineCollector {
-                    inner: TopDocs::with_limit(result_limit).order_by_score(),
+                    inner: AllScoresCollector,
                     deadline: policy.deadline,
                 },
             )
@@ -319,7 +321,58 @@ impl TantivySearchIndex {
                 .total_cmp(left_score)
                 .then_with(|| left.relative_path().cmp(right.relative_path()))
         });
-        Ok(records.into_iter().map(|(_, record)| record).collect())
+        Ok(records
+            .into_iter()
+            .take(result_limit)
+            .map(|(_, record)| record)
+            .collect())
+    }
+}
+
+struct AllScoresCollector;
+
+struct AllScoresSegmentCollector {
+    segment_ord: SegmentOrdinal,
+    hits: Vec<(Score, DocAddress)>,
+}
+
+impl Collector for AllScoresCollector {
+    type Fruit = Vec<(Score, DocAddress)>;
+    type Child = AllScoresSegmentCollector;
+
+    fn for_segment(
+        &self,
+        segment_ord: SegmentOrdinal,
+        _segment: &SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        Ok(AllScoresSegmentCollector {
+            segment_ord,
+            hits: Vec::new(),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        true
+    }
+
+    fn merge_fruits(
+        &self,
+        segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
+    ) -> tantivy::Result<Self::Fruit> {
+        Ok(segment_fruits.into_iter().flatten().collect())
+    }
+}
+
+impl SegmentCollector for AllScoresSegmentCollector {
+    type Fruit = Vec<(Score, DocAddress)>;
+
+    fn collect(&mut self, document: DocId, score: Score) {
+        self.hits
+            .push((score, DocAddress::new(self.segment_ord, document)));
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        self.hits
     }
 }
 

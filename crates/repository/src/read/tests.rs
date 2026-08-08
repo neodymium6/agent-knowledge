@@ -319,6 +319,17 @@ fn tantivy_searches_terms_phrases_metadata_and_exact_filters() {
     assert_eq!(ranked.len(), 2);
     assert_eq!(ranked[0].metadata().document_id.to_string(), LOG_ID);
 
+    let equal_scores = index
+        .search(
+            &snapshot,
+            "*",
+            &ReadFilter::default(),
+            TantivySearchPolicy::new(64, 1),
+        )
+        .unwrap_or_else(|error| panic!("equal-score limited search must succeed: {error}"));
+    assert_eq!(equal_scores.len(), 1);
+    assert_eq!(equal_scores[0].metadata().document_id.to_string(), LOG_ID);
+
     let metadata = index
         .search(
             &snapshot,
