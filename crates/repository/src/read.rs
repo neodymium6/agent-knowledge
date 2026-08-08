@@ -714,7 +714,7 @@ impl ReadFilter {
     }
 }
 
-/// Allowlisted optional metadata searched by the initial linear backend.
+/// Allowlisted optional metadata searched by full-text backends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchMetadataFields {
     node: bool,
