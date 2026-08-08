@@ -17,7 +17,7 @@ flake for `x86_64-linux` and `aarch64-linux`:
 
 ```sh
 nix profile install \
-  github:neodymium6/agent-knowledge/v0.1.8#agent-knowledge
+  github:neodymium6/agent-knowledge/v0.2.0#agent-knowledge
 agent-knowledge --version
 ```
 
@@ -29,12 +29,12 @@ archive for `x86_64-unknown-linux-musl` or
 Server containers are published to GHCR for `linux/amd64` and `linux/arm64`:
 
 ```text
-ghcr.io/neodymium6/agent-knowledge-worker:0.1.8
-ghcr.io/neodymium6/agent-knowledge-queue-ingress:0.1.8
-ghcr.io/neodymium6/agent-knowledge-gateway:0.1.8
-ghcr.io/neodymium6/agent-knowledge-openssh-gateway:0.1.8
-ghcr.io/neodymium6/agent-knowledge-storage-bootstrap:0.1.8
-ghcr.io/neodymium6/agent-knowledge-client-mcp:0.1.8
+ghcr.io/neodymium6/agent-knowledge-worker:0.2.0
+ghcr.io/neodymium6/agent-knowledge-queue-ingress:0.2.0
+ghcr.io/neodymium6/agent-knowledge-gateway:0.2.0
+ghcr.io/neodymium6/agent-knowledge-openssh-gateway:0.2.0
+ghcr.io/neodymium6/agent-knowledge-storage-bootstrap:0.2.0
+ghcr.io/neodymium6/agent-knowledge-client-mcp:0.2.0
 ```
 
 Images contain no deployment configuration, SSH keys, Git credentials, or
@@ -140,7 +140,7 @@ A minimal sidecar container is:
 
 ```yaml
 - name: agent-knowledge-mcp
-  image: ghcr.io/neodymium6/agent-knowledge-client-mcp:0.1.8
+  image: ghcr.io/neodymium6/agent-knowledge-client-mcp:0.2.0
   args:
     - --destination
     - fictional-knowledge
