@@ -2,6 +2,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use agent_knowledge_core::read_bounded_regular_file;
 use serde::{Deserialize, Serialize};
 use tantivy::Index;
@@ -13,6 +16,8 @@ const FORMAT_VERSION: u16 = 1;
 const INDEX_DIRECTORY: &str = "tantivy";
 const MANIFEST_FILE: &str = ".agent-knowledge-search-index.json";
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024;
+#[cfg(unix)]
+const INDEX_FILE_MODE: u32 = 0o640;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -38,7 +43,8 @@ impl TantivySearchIndex {
     /// The parent directory must already exist and `directory` itself must not.
     /// A format manifest is written only after Tantivy has committed and synced
     /// the complete index. A failed build may leave an incomplete directory for
-    /// its staging owner to discard or inspect.
+    /// its staging owner to discard or inspect. On Unix, generated regular files
+    /// are made group-readable before the staging directory can be promoted.
     ///
     /// # Errors
     ///
@@ -69,6 +75,8 @@ impl TantivySearchIndex {
             metadata_fields: metadata_fields.into(),
         };
         write_manifest(directory, &manifest)?;
+        normalize_index_file_permissions(directory)?;
+        sync_parent(directory)?;
         Ok(built)
     }
 
@@ -200,6 +208,31 @@ fn sync_directory(path: &Path) -> Result<(), TantivySearchError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(TantivySearchError::io)
+}
+
+#[cfg(unix)]
+fn normalize_index_file_permissions(path: &Path) -> Result<(), TantivySearchError> {
+    let metadata = fs::symlink_metadata(path).map_err(TantivySearchError::io)?;
+    if metadata.file_type().is_dir() {
+        for entry in fs::read_dir(path).map_err(TantivySearchError::io)? {
+            let entry = entry.map_err(TantivySearchError::io)?;
+            normalize_index_file_permissions(&entry.path())?;
+        }
+        sync_directory(path)
+    } else if metadata.file_type().is_file() {
+        fs::set_permissions(path, fs::Permissions::from_mode(INDEX_FILE_MODE))
+            .map_err(TantivySearchError::io)?;
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(TantivySearchError::io)
+    } else {
+        Err(TantivySearchError::InvalidDiskManifest)
+    }
+}
+
+#[cfg(not(unix))]
+fn normalize_index_file_permissions(_path: &Path) -> Result<(), TantivySearchError> {
+    Ok(())
 }
 
 fn valid_commit(commit: &str) -> bool {

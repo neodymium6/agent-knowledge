@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use agent_knowledge_core::{DocumentId, ProjectId};
 use agent_knowledge_queue::PackagePolicy;
 
@@ -24,6 +27,24 @@ const LOG_REQUEST_ID: &str = "01K00000000000000000000004";
 const RUNBOOK_REQUEST_ID: &str = "01K00000000000000000000005";
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+fn assert_published_index_file_permissions(path: &Path) {
+    let metadata = fs::symlink_metadata(path)
+        .unwrap_or_else(|error| panic!("index metadata must be readable: {error}"));
+    if metadata.file_type().is_dir() {
+        for entry in fs::read_dir(path)
+            .unwrap_or_else(|error| panic!("index directory must be readable: {error}"))
+        {
+            let entry =
+                entry.unwrap_or_else(|error| panic!("index entry must be readable: {error}"));
+            assert_published_index_file_permissions(&entry.path());
+        }
+    } else {
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o640);
+    }
+}
 
 struct TestDirectory(PathBuf);
 
@@ -410,6 +431,8 @@ fn tantivy_reopens_a_committed_disk_index_with_its_search_policy() {
     )
     .unwrap_or_else(|error| panic!("disk index must build: {error}"));
     assert_eq!(built.commit(), snapshot.commit());
+    #[cfg(unix)]
+    assert_published_index_file_permissions(&directory);
     drop(built);
 
     let reopened = TantivySearchIndex::open_directory(&directory)
