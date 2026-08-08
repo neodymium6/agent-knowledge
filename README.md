@@ -95,6 +95,10 @@ agent-knowledge-client export \
   >bundle.tar
 ```
 
+Search uses the Worker-published Tantivy index when it matches the committed
+revision, returning BM25-ranked results. If that derived index is unavailable,
+the Gateway preserves availability with the bounded Markdown scan backend.
+
 SSH host aliases, identities, host-key policy, and proxies belong in the
 client's OpenSSH configuration. The client disables interactive prompts, TTYs,
 and forwarding and enforces bounded request, response, and transfer sizes.
