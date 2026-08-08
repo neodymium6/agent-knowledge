@@ -304,6 +304,7 @@ storage:
   queue_socket: $test_root/run/queue-ingress.sock
   git_directory: $test_root/storage/repository
   content_root: $test_root/storage/content
+  search_index_root: $test_root/storage/search-indexes
 repository:
   official_branch: main
 reads:
@@ -479,6 +480,15 @@ list_response=$(
       --client-id fictional-node-a
 )
 grep -Fq '01K00000000000000000000001' <<<"$list_response"
+
+search_response=$(
+  printf '%s\n' '{"protocol_version":1,"query":"\"Fictional Gateway body\"","maximum_results":10}' |
+    setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
+      env SSH_ORIGINAL_COMMAND='akp-v1 search' \
+      "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
+      --client-id fictional-node-a
+)
+grep -Fq '01K00000000000000000000001' <<<"$search_response"
 
 gateway_account=fictional-ak-gateway
 gateway_group=fictional-ak-gateway
