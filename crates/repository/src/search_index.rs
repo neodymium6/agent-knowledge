@@ -1,17 +1,16 @@
 use std::fmt;
-use std::time::Instant;
 
 use agent_knowledge_core::{DocumentId, markdown_body};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, QueryParserError, TermQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, STORED, STRING, Schema, TEXT, TantivyDocument, Term, Value,
+    Field, IndexRecordOption, NumericOptions, STORED, STRING, Schema, TEXT, TantivyDocument, Term,
+    TextOptions, Value,
 };
 use tantivy::{Index, IndexReader};
 
 use crate::{
     CommittedReadError, CommittedSnapshot, DocumentRecord, ReadFilter, SearchMetadataFields,
-    SearchPolicy,
 };
 
 // Tantivy 0.26 requires at least 15 MB per indexing thread. Keep the initial
@@ -26,9 +25,33 @@ const INDEX_WRITER_MEMORY_BYTES: usize = 15_000_000;
 /// indexes. Markdown remains the canonical data source.
 pub struct TantivySearchIndex {
     commit: String,
+    document_count: usize,
     index: Index,
+    query_schema: Schema,
     reader: IndexReader,
     fields: SearchFields,
+}
+
+/// Bounds that the synchronous Tantivy search primitive can enforce itself.
+///
+/// Request deadlines belong at the caller boundary, where the blocking search
+/// can be isolated or cancelled. Linear-scan byte and document limits do not
+/// apply to an already-built index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TantivySearchPolicy {
+    maximum_query_characters: usize,
+    maximum_results: usize,
+}
+
+impl TantivySearchPolicy {
+    /// Creates bounds for one Tantivy query.
+    #[must_use]
+    pub const fn new(maximum_query_characters: usize, maximum_results: usize) -> Self {
+        Self {
+            maximum_query_characters,
+            maximum_results,
+        }
+    }
 }
 
 impl TantivySearchIndex {
@@ -46,13 +69,14 @@ impl TantivySearchIndex {
         snapshot: &CommittedSnapshot,
         metadata_fields: SearchMetadataFields,
     ) -> Result<Self, TantivySearchError> {
-        let (schema, fields) = SearchFields::schema(metadata_fields);
+        let (schema, query_schema, fields) = SearchFields::schemas(metadata_fields);
         let index = Index::create_in_ram(schema);
         let mut writer = index
             .writer_with_num_threads(1, INDEX_WRITER_MEMORY_BYTES)
             .map_err(TantivySearchError::engine)?;
         let mut records = snapshot.documents().collect::<Vec<_>>();
         records.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
+        let document_count = records.len();
         for record in records {
             let markdown = snapshot
                 .read_markdown(record)
@@ -73,7 +97,9 @@ impl TantivySearchIndex {
         let reader = index.reader().map_err(TantivySearchError::engine)?;
         Ok(Self {
             commit: snapshot.commit().to_owned(),
+            document_count,
             index,
+            query_schema,
             reader,
             fields,
         })
@@ -95,15 +121,14 @@ impl TantivySearchIndex {
     /// # Errors
     ///
     /// Returns an error for a mismatched snapshot, invalid bounds or query
-    /// syntax, deadline expiry, corrupt stored identities, or Tantivy failure.
+    /// syntax, corrupt stored identities, or Tantivy failure.
     pub fn search<'a>(
         &self,
         snapshot: &'a CommittedSnapshot,
         query: &str,
         filter: &ReadFilter,
-        policy: SearchPolicy,
+        policy: TantivySearchPolicy,
     ) -> Result<Vec<&'a DocumentRecord>, TantivySearchError> {
-        check_deadline(policy.deadline)?;
         if snapshot.commit() != self.commit {
             return Err(TantivySearchError::SnapshotCommitMismatch {
                 index: self.commit.clone(),
@@ -125,7 +150,11 @@ impl TantivySearchIndex {
             });
         }
 
-        let mut parser = QueryParser::for_index(&self.index, self.fields.searchable.clone());
+        let mut parser = QueryParser::new(
+            self.query_schema.clone(),
+            self.fields.searchable.clone(),
+            self.index.tokenizers().clone(),
+        );
         parser.set_conjunction_by_default();
         parser.set_field_boost(self.fields.title, 4.0);
         parser.set_field_boost(self.fields.tags, 3.0);
@@ -134,20 +163,21 @@ impl TantivySearchIndex {
             .parse_query(query)
             .map_err(TantivySearchError::Query)?;
         let filtered = self.fields.filtered_query(parsed, filter);
-        check_deadline(policy.deadline)?;
+        let result_limit = policy.maximum_results.min(self.document_count);
+        if result_limit == 0 {
+            return Ok(Vec::new());
+        }
 
         let searcher = self.reader.searcher();
         let hits = searcher
             .search(
                 &filtered,
-                &TopDocs::with_limit(policy.maximum_results).order_by_score(),
+                &TopDocs::with_limit(result_limit).order_by_score(),
             )
             .map_err(TantivySearchError::engine)?;
-        check_deadline(policy.deadline)?;
 
         let mut records = Vec::with_capacity(hits.len());
         for (score, address) in hits {
-            check_deadline(policy.deadline)?;
             let stored = searcher
                 .doc::<TantivyDocument>(address)
                 .map_err(TantivySearchError::engine)?;
@@ -176,6 +206,7 @@ impl fmt::Debug for TantivySearchIndex {
         formatter
             .debug_struct("TantivySearchIndex")
             .field("commit", &self.commit)
+            .field("document_count", &self.document_count)
             .finish_non_exhaustive()
     }
 }
@@ -199,22 +230,65 @@ struct SearchFields {
 }
 
 impl SearchFields {
-    fn schema(metadata_fields: SearchMetadataFields) -> (Schema, Self) {
+    fn schemas(metadata_fields: SearchMetadataFields) -> (Schema, Schema, Self) {
         let mut schema = Schema::builder();
+        let mut query_schema = Schema::builder();
         let document_id = schema.add_text_field("document_id", STRING | STORED);
+        query_schema.add_text_field("document_id", TextOptions::default());
         let title = schema.add_text_field("title", TEXT);
+        query_schema.add_text_field("title", TEXT);
         let body = schema.add_text_field("body", TEXT);
+        query_schema.add_text_field("body", TEXT);
         let path = schema.add_text_field("path", TEXT);
+        query_schema.add_text_field("path", TEXT);
         let tags = schema.add_text_field("tags", TEXT);
+        query_schema.add_text_field("tags", TEXT);
         let exact_tags = schema.add_text_field("exact_tags", STRING);
+        query_schema.add_text_field("exact_tags", TextOptions::default());
         let node = schema.add_text_field("node", TEXT);
+        query_schema.add_text_field(
+            "node",
+            if metadata_fields.node() {
+                TEXT
+            } else {
+                TextOptions::default()
+            },
+        );
         let agent = schema.add_text_field("agent", TEXT);
+        query_schema.add_text_field(
+            "agent",
+            if metadata_fields.agent() {
+                TEXT
+            } else {
+                TextOptions::default()
+            },
+        );
         let session = schema.add_text_field("session", TEXT);
+        query_schema.add_text_field(
+            "session",
+            if metadata_fields.session() {
+                TEXT
+            } else {
+                TextOptions::default()
+            },
+        );
         let exact_session = schema.add_text_field("exact_session", STRING);
+        query_schema.add_text_field("exact_session", TextOptions::default());
         let request_id = schema.add_text_field("request_id", TEXT);
+        query_schema.add_text_field(
+            "request_id",
+            if metadata_fields.request_id() {
+                TEXT
+            } else {
+                TextOptions::default()
+            },
+        );
         let project = schema.add_text_field("project", STRING);
+        query_schema.add_text_field("project", TextOptions::default());
         let archived = schema.add_bool_field("archived", tantivy::schema::INDEXED);
+        query_schema.add_bool_field("archived", NumericOptions::default());
         let schema = schema.build();
+        let query_schema = query_schema.build();
         let mut searchable = vec![title, body, path, tags];
         if metadata_fields.node() {
             searchable.push(node);
@@ -230,6 +304,7 @@ impl SearchFields {
         }
         (
             schema,
+            query_schema,
             Self {
                 document_id,
                 title,
@@ -326,14 +401,6 @@ impl SearchFields {
     }
 }
 
-fn check_deadline(deadline: Option<Instant>) -> Result<(), TantivySearchError> {
-    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        Err(TantivySearchError::OperationDeadlineExceeded)
-    } else {
-        Ok(())
-    }
-}
-
 /// Failure while building or querying a Tantivy-derived search index.
 #[derive(Debug)]
 pub enum TantivySearchError {
@@ -354,8 +421,6 @@ pub enum TantivySearchError {
     },
     /// The requested result limit was zero.
     InvalidResultLimit,
-    /// The absolute operation deadline expired.
-    OperationDeadlineExceeded,
     /// The index and supplied snapshot represent different commits.
     SnapshotCommitMismatch {
         /// Commit represented by the index.
@@ -396,7 +461,6 @@ impl fmt::Display for TantivySearchError {
                 "search query has {actual} characters; maximum is {maximum}"
             ),
             Self::InvalidResultLimit => formatter.write_str("maximum results must be positive"),
-            Self::OperationDeadlineExceeded => formatter.write_str("search deadline expired"),
             Self::SnapshotCommitMismatch { index, snapshot } => write!(
                 formatter,
                 "search index commit `{index}` does not match snapshot commit `{snapshot}`"

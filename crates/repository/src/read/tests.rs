@@ -12,7 +12,7 @@ use super::{
     CommittedReadError, CommittedStore, LinearSearch, ReadFilter, SearchBackend,
     SearchMetadataFields, SearchPolicy,
 };
-use crate::{ContentPolicy, TantivySearchError, TantivySearchIndex};
+use crate::{ContentPolicy, TantivySearchError, TantivySearchIndex, TantivySearchPolicy};
 
 const LOG_ID: &str = "01K00000000000000000000001";
 const RUNBOOK_ID: &str = "01K00000000000000000000002";
@@ -267,7 +267,7 @@ fn tantivy_searches_terms_phrases_metadata_and_exact_filters() {
             &snapshot,
             "fictional OOM",
             &ReadFilter::default(),
-            SearchPolicy::new(64, 10),
+            TantivySearchPolicy::new(64, 10),
         )
         .unwrap_or_else(|error| panic!("conjunctive search must succeed: {error}"));
     assert_eq!(terms.len(), 1);
@@ -278,7 +278,7 @@ fn tantivy_searches_terms_phrases_metadata_and_exact_filters() {
             &snapshot,
             "\"restart procedure\"",
             &ReadFilter::default(),
-            SearchPolicy::new(64, 10),
+            TantivySearchPolicy::new(64, 10),
         )
         .unwrap_or_else(|error| panic!("phrase search must succeed: {error}"));
     assert_eq!(phrase.len(), 1);
@@ -289,7 +289,7 @@ fn tantivy_searches_terms_phrases_metadata_and_exact_filters() {
             &snapshot,
             "GPU",
             &ReadFilter::default(),
-            SearchPolicy::new(64, 10),
+            TantivySearchPolicy::new(64, 10),
         )
         .unwrap_or_else(|error| panic!("ranked search must succeed: {error}"));
     assert_eq!(ranked.len(), 2);
@@ -300,7 +300,7 @@ fn tantivy_searches_terms_phrases_metadata_and_exact_filters() {
             &snapshot,
             "fictional-node-a",
             &ReadFilter::default(),
-            SearchPolicy::new(64, 10),
+            TantivySearchPolicy::new(64, 10),
         )
         .unwrap_or_else(|error| panic!("metadata search must succeed: {error}"));
     assert_eq!(metadata.len(), 1);
@@ -312,7 +312,7 @@ fn tantivy_searches_terms_phrases_metadata_and_exact_filters() {
             &snapshot,
             "fictional",
             &operations_only,
-            SearchPolicy::new(64, 10),
+            TantivySearchPolicy::new(64, 10),
         )
         .unwrap_or_else(|error| panic!("filtered search must succeed: {error}"));
     assert_eq!(filtered.len(), 1);
@@ -337,7 +337,7 @@ fn tantivy_honors_metadata_selection_and_query_bounds() {
             &snapshot,
             "fictional-node-a",
             &ReadFilter::default(),
-            SearchPolicy::new(64, 10),
+            TantivySearchPolicy::new(64, 10),
         )
         .unwrap_or_else(|error| panic!("restricted search must succeed: {error}"));
     assert!(metadata.is_empty());
@@ -346,7 +346,7 @@ fn tantivy_honors_metadata_selection_and_query_bounds() {
             &snapshot,
             " ",
             &ReadFilter::default(),
-            SearchPolicy::new(64, 10),
+            TantivySearchPolicy::new(64, 10),
         ),
         Err(TantivySearchError::EmptyQuery)
     ));
@@ -355,7 +355,7 @@ fn tantivy_honors_metadata_selection_and_query_bounds() {
             &snapshot,
             "oversized",
             &ReadFilter::default(),
-            SearchPolicy::new(3, 10),
+            TantivySearchPolicy::new(3, 10),
         ),
         Err(TantivySearchError::QueryTooLong {
             maximum: 3,
@@ -367,22 +367,29 @@ fn tantivy_honors_metadata_selection_and_query_bounds() {
             &snapshot,
             "fictional",
             &ReadFilter::default(),
-            SearchPolicy::new(64, 0),
+            TantivySearchPolicy::new(64, 0),
         ),
         Err(TantivySearchError::InvalidResultLimit)
     ));
     assert!(matches!(
         index.search(
             &snapshot,
+            &format!("exact_session:{SESSION_ID}"),
+            &ReadFilter::default(),
+            TantivySearchPolicy::new(64, 10),
+        ),
+        Err(TantivySearchError::Query(_))
+    ));
+
+    let unbounded = index
+        .search(
+            &snapshot,
             "fictional",
             &ReadFilter::default(),
-            SearchPolicy {
-                deadline: Some(std::time::Instant::now()),
-                ..SearchPolicy::new(64, 10)
-            },
-        ),
-        Err(TantivySearchError::OperationDeadlineExceeded)
-    ));
+            TantivySearchPolicy::new(64, usize::MAX),
+        )
+        .unwrap_or_else(|error| panic!("result limit must be clamped: {error}"));
+    assert_eq!(unbounded.len(), 2);
 }
 
 #[test]
