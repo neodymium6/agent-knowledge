@@ -11,6 +11,8 @@ use agent_knowledge_worker::{
 use time::OffsetDateTime;
 
 #[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, OsStr};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
@@ -320,6 +322,7 @@ pub(crate) fn validate_storage_tree(
         Path::new(""),
         &mut fingerprint,
         TreeValidation::strict(),
+        None,
     )?;
     let fingerprint = fingerprint.finish();
     verify_fingerprint(&root.file, &fingerprint)?;
@@ -327,7 +330,7 @@ pub(crate) fn validate_storage_tree(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn validate_symlinked_storage_tree(
+pub(crate) fn validate_search_index_tree(
     root: &Path,
     owner: Uid,
     group: Gid,
@@ -336,27 +339,32 @@ pub(crate) fn validate_symlinked_storage_tree(
 ) -> Result<(), StorageMigrationError> {
     let root = MigrationRoot::open(root)?;
     let mut budget = MigrationBudget::new();
-    preflight_release_directory(&root.file, 0, Path::new(""), &mut budget)?;
+    preflight_release_directory(&root.file, 0, Path::new(""), &mut budget, true)?;
     let permissions = TreePermissions {
         owner: Some(owner),
         group,
         directory_mode,
         file_mode,
     };
+    let validation = TreeValidation {
+        allow_symlinks: true,
+        allow_internal_hard_links: true,
+        ..TreeValidation::strict()
+    };
     let mut fingerprint = TreeFingerprintBuilder::new();
+    let mut hard_links = HardLinkInventory::default();
     validate_directory_permissions(
         &root.file,
         permissions,
         0,
         Path::new(""),
         &mut fingerprint,
-        TreeValidation {
-            allow_symlinks: true,
-            ..TreeValidation::strict()
-        },
+        validation,
+        Some(&mut hard_links),
     )?;
+    hard_links.finish()?;
     let fingerprint = fingerprint.finish();
-    verify_release_fingerprint(&root.file, &fingerprint)?;
+    verify_search_index_fingerprint(&root.file, &fingerprint)?;
     root.revalidate()
 }
 
@@ -388,6 +396,7 @@ pub(crate) fn validate_repository_tree(
             allow_read_only_files: true,
             ..TreeValidation::strict()
         },
+        None,
     )?;
     let fingerprint = fingerprint.finish();
     verify_fingerprint(&root.file, &fingerprint)?;
@@ -404,7 +413,7 @@ pub(crate) fn validate_release_tree(
 ) -> Result<(), StorageMigrationError> {
     let root = MigrationRoot::open(root)?;
     let mut budget = MigrationBudget::new();
-    preflight_release_directory(&root.file, 0, Path::new(""), &mut budget)?;
+    preflight_release_directory(&root.file, 0, Path::new(""), &mut budget, false)?;
     let permissions = TreePermissions {
         owner: Some(owner),
         group,
@@ -424,6 +433,7 @@ pub(crate) fn validate_release_tree(
             allow_symlinks: true,
             ..TreeValidation::strict()
         },
+        None,
     )?;
     let fingerprint = fingerprint.finish();
     verify_release_fingerprint(&root.file, &fingerprint)?;
@@ -457,6 +467,7 @@ pub(crate) fn validate_queue_tree(
             alternate_file: Some((worker_owner, Mode::from_bits_truncate(0o640))),
             ..TreeValidation::strict()
         },
+        None,
     )?;
     let fingerprint = fingerprint.finish();
     verify_fingerprint(&root.file, &fingerprint)?;
@@ -796,6 +807,7 @@ fn preflight_release_directory(
     depth: usize,
     relative: &Path,
     budget: &mut MigrationBudget,
+    allow_internal_hard_links: bool,
 ) -> Result<(), StorageMigrationError> {
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
@@ -820,9 +832,16 @@ fn preflight_release_directory(
             if object_identity(&child)? != identity {
                 return Err(StorageMigrationError::TreeChanged(path));
             }
-            preflight_release_directory(&child, depth + 1, &path, budget)?;
+            preflight_release_directory(
+                &child,
+                depth + 1,
+                &path,
+                budget,
+                allow_internal_hard_links,
+            )?;
         } else if matches!(identity.file_type, nix::libc::S_IFREG | nix::libc::S_IFLNK)
-            && identity.links == 1
+            && (identity.links == 1
+                || (allow_internal_hard_links && identity.file_type == nix::libc::S_IFREG))
         {
             if identity.file_type == nix::libc::S_IFREG {
                 let child = open_child_regular(directory, &name)?;
@@ -853,6 +872,7 @@ struct TreePermissions {
 struct TreeValidation {
     allow_read_only_files: bool,
     allow_symlinks: bool,
+    allow_internal_hard_links: bool,
     alternate_file_mode: Option<Mode>,
     alternate_file: Option<(Uid, Mode)>,
 }
@@ -863,6 +883,7 @@ impl TreeValidation {
         Self {
             allow_read_only_files: false,
             allow_symlinks: false,
+            allow_internal_hard_links: false,
             alternate_file_mode: None,
             alternate_file: None,
         }
@@ -931,6 +952,7 @@ fn validate_directory_permissions(
     relative: &Path,
     fingerprint: &mut TreeFingerprintBuilder,
     validation: TreeValidation,
+    mut hard_links: Option<&mut HardLinkInventory>,
 ) -> Result<(), StorageMigrationError> {
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
@@ -952,8 +974,11 @@ fn validate_directory_permissions(
                 &path,
                 fingerprint,
                 validation,
+                hard_links.as_deref_mut(),
             )?;
-        } else if identity.file_type == nix::libc::S_IFREG && identity.links == 1 {
+        } else if identity.file_type == nix::libc::S_IFREG
+            && (identity.links == 1 || validation.allow_internal_hard_links)
+        {
             let child = open_child_regular(directory, name)?;
             if object_identity(&child)? != identity {
                 return Err(StorageMigrationError::TreeChanged(path));
@@ -967,6 +992,9 @@ fn validate_directory_permissions(
                 &path,
                 validation,
             )?;
+            if let Some(hard_links) = hard_links.as_deref_mut() {
+                hard_links.record(&path, identity)?;
+            }
             fingerprint.record(&path, identity)?;
         } else if validation.allow_symlinks
             && identity.file_type == nix::libc::S_IFLNK
@@ -1203,7 +1231,7 @@ fn verify_fingerprint(
     expected: &TreeFingerprint,
 ) -> Result<(), StorageMigrationError> {
     let mut observed = TreeFingerprintBuilder::new();
-    fingerprint_directory(root, 0, Path::new(""), &mut observed, false)?;
+    fingerprint_directory(root, 0, Path::new(""), &mut observed, false, false, None)?;
     if &observed.finish() == expected {
         Ok(())
     } else {
@@ -1217,7 +1245,31 @@ fn verify_release_fingerprint(
     expected: &TreeFingerprint,
 ) -> Result<(), StorageMigrationError> {
     let mut observed = TreeFingerprintBuilder::new();
-    fingerprint_directory(root, 0, Path::new(""), &mut observed, true)?;
+    fingerprint_directory(root, 0, Path::new(""), &mut observed, true, false, None)?;
+    if &observed.finish() == expected {
+        Ok(())
+    } else {
+        Err(StorageMigrationError::TreeChanged(PathBuf::new()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_search_index_fingerprint(
+    root: &File,
+    expected: &TreeFingerprint,
+) -> Result<(), StorageMigrationError> {
+    let mut observed = TreeFingerprintBuilder::new();
+    let mut hard_links = HardLinkInventory::default();
+    fingerprint_directory(
+        root,
+        0,
+        Path::new(""),
+        &mut observed,
+        true,
+        true,
+        Some(&mut hard_links),
+    )?;
+    hard_links.finish()?;
     if &observed.finish() == expected {
         Ok(())
     } else {
@@ -1232,6 +1284,8 @@ fn fingerprint_directory(
     relative: &Path,
     fingerprint: &mut TreeFingerprintBuilder,
     allow_symlinks: bool,
+    allow_internal_hard_links: bool,
+    mut hard_links: Option<&mut HardLinkInventory>,
 ) -> Result<(), StorageMigrationError> {
     if depth > MAXIMUM_MIGRATION_DEPTH {
         return Err(StorageMigrationError::UnsafeEntry(relative.to_path_buf()));
@@ -1246,11 +1300,25 @@ fn fingerprint_directory(
             if object_identity(&child)? != identity {
                 return Err(StorageMigrationError::TreeChanged(path));
             }
-            fingerprint_directory(&child, depth + 1, &path, fingerprint, allow_symlinks)?;
+            fingerprint_directory(
+                &child,
+                depth + 1,
+                &path,
+                fingerprint,
+                allow_symlinks,
+                allow_internal_hard_links,
+                hard_links.as_deref_mut(),
+            )?;
         } else if (identity.file_type == nix::libc::S_IFREG
             || (allow_symlinks && identity.file_type == nix::libc::S_IFLNK))
-            && identity.links == 1
+            && (identity.links == 1
+                || (allow_internal_hard_links && identity.file_type == nix::libc::S_IFREG))
         {
+            if identity.file_type == nix::libc::S_IFREG
+                && let Some(hard_links) = hard_links.as_deref_mut()
+            {
+                hard_links.record(&path, identity)?;
+            }
             fingerprint.record(&path, identity)?;
         } else {
             return Err(StorageMigrationError::UnsafeEntry(path));
@@ -1365,6 +1433,60 @@ struct ObjectIdentity {
     inode: u64,
     file_type: u32,
     links: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct HardLinkInventory {
+    files: BTreeMap<(u64, u64, u64), HardLinkRecord>,
+}
+
+#[cfg(target_os = "linux")]
+struct HardLinkRecord {
+    expected_links: u64,
+    observed_links: u64,
+    first_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl HardLinkInventory {
+    fn record(
+        &mut self,
+        path: &Path,
+        identity: ObjectIdentity,
+    ) -> Result<(), StorageMigrationError> {
+        let key = (identity.mount, identity.device, identity.inode);
+        let record = self.files.entry(key).or_insert_with(|| HardLinkRecord {
+            expected_links: identity.links,
+            observed_links: 0,
+            first_path: path.to_path_buf(),
+        });
+        if record.expected_links != identity.links {
+            return Err(StorageMigrationError::TreeChanged(path.to_path_buf()));
+        }
+        record.observed_links = record
+            .observed_links
+            .checked_add(1)
+            .ok_or_else(|| StorageMigrationError::UnsafeEntry(path.to_path_buf()))?;
+        if record.observed_links > record.expected_links {
+            return Err(StorageMigrationError::UnsafeEntry(path.to_path_buf()));
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), StorageMigrationError> {
+        if let Some(record) = self
+            .files
+            .values()
+            .find(|record| record.observed_links != record.expected_links)
+        {
+            Err(StorageMigrationError::UnsafeEntry(
+                record.first_path.clone(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1583,16 +1705,19 @@ impl std::error::Error for AdminRetentionError {
 #[cfg(all(test, target_os = "linux"))]
 mod migration_tests {
     use std::fs;
+    use std::os::unix::fs::symlink;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use agent_knowledge_queue::{FileQueue, PackagePolicy};
+    use nix::sys::stat::Mode;
     use nix::unistd::{Gid, Uid};
 
     use super::{
         MAXIMUM_MIGRATION_ENTRIES, MAXIMUM_MIGRATION_PATH_BYTES, MigrationBudget,
-        StorageMigrationError, migrate_v1_storage_with_ids, worker_owned_queue_file,
+        StorageMigrationError, migrate_v1_storage_with_ids, validate_search_index_tree,
+        worker_owned_queue_file,
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1665,6 +1790,72 @@ mod migration_tests {
         assert!(matches!(
             path_budget.record(Path::new("x")),
             Err(StorageMigrationError::MigrationLimitExceeded(_))
+        ));
+    }
+
+    fn create_search_index_fixture(root: &Path) -> PathBuf {
+        let search = root.join("search-indexes");
+        let tantivy = search.join("by-id/fictional-generation/tantivy");
+        fs::create_dir_all(&tantivy)
+            .unwrap_or_else(|error| panic!("search index directories must be created: {error}"));
+        fs::create_dir(search.join(".staging"))
+            .unwrap_or_else(|error| panic!("search staging directory must be created: {error}"));
+        for directory in [
+            &search,
+            &search.join("by-id"),
+            &search.join("by-id/fictional-generation"),
+            &tantivy,
+            &search.join(".staging"),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o2750))
+                .unwrap_or_else(|error| panic!("search index directory mode must be set: {error}"));
+        }
+        let managed = tantivy.join(".managed.json");
+        fs::write(&managed, b"[]\n")
+            .unwrap_or_else(|error| panic!("managed file must be written: {error}"));
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o640))
+            .unwrap_or_else(|error| panic!("managed file mode must be set: {error}"));
+        symlink("by-id/fictional-generation", search.join("current"))
+            .unwrap_or_else(|error| panic!("current search index must be selected: {error}"));
+        search
+    }
+
+    #[test]
+    fn search_index_validation_accepts_hard_links_contained_in_the_tree() {
+        let fixture = TestDirectory::create();
+        let search = create_search_index_fixture(fixture.path());
+        let managed = search.join("by-id/fictional-generation/tantivy/.managed.json");
+        let linked = search.join("by-id/fictional-generation/tantivy/.managed-copy.json");
+        fs::hard_link(&managed, &linked)
+            .unwrap_or_else(|error| panic!("internal hard link must be created: {error}"));
+
+        validate_search_index_tree(
+            &search,
+            Uid::effective(),
+            Gid::current(),
+            Mode::from_bits_truncate(0o2750),
+            Mode::from_bits_truncate(0o640),
+        )
+        .unwrap_or_else(|error| panic!("internal search index links must be accepted: {error}"));
+    }
+
+    #[test]
+    fn search_index_validation_rejects_hard_links_leaving_the_tree() {
+        let fixture = TestDirectory::create();
+        let search = create_search_index_fixture(fixture.path());
+        let managed = search.join("by-id/fictional-generation/tantivy/.managed.json");
+        fs::hard_link(&managed, fixture.path().join("external-managed.json"))
+            .unwrap_or_else(|error| panic!("external hard link fixture must be created: {error}"));
+
+        assert!(matches!(
+            validate_search_index_tree(
+                &search,
+                Uid::effective(),
+                Gid::current(),
+                Mode::from_bits_truncate(0o2750),
+                Mode::from_bits_truncate(0o640),
+            ),
+            Err(StorageMigrationError::UnsafeEntry(_))
         ));
     }
 

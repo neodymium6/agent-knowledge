@@ -25,8 +25,8 @@ use ulid::Ulid;
 use crate::admin::{
     StorageMigrationError, normalize_storage_directory, normalize_storage_tree, resolve_group,
     resolve_user, validate_bootstrap_source_tree, validate_queue_tree, validate_release_tree,
-    validate_repository_tree, validate_same_storage_mount, validate_storage_directory_no_posix_acl,
-    validate_storage_file_mount, validate_storage_tree, validate_symlinked_storage_tree,
+    validate_repository_tree, validate_same_storage_mount, validate_search_index_tree,
+    validate_storage_directory_no_posix_acl, validate_storage_file_mount, validate_storage_tree,
 };
 
 const MARKER_NAME: &str = ".agent-knowledge-bootstrap-v1.json";
@@ -1107,7 +1107,7 @@ fn validate_durable_permissions(
     .map_err(|error| StorageBootstrapError::Permissions(settings.release_root().into(), error))?;
     if let Some(root) = settings.search_index_root() {
         require_directory_metadata(root, ids.worker_owner, ids.gateway_group, 0o2750)?;
-        validate_symlinked_storage_tree(
+        validate_search_index_tree(
             root,
             ids.worker_owner,
             ids.gateway_group,
