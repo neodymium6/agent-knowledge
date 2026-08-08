@@ -133,6 +133,10 @@ pub(crate) fn validate_worker(settings: &WorkerSettings) -> Result<(), RuntimeId
         content: DirectoryIdentity::inspect(settings.content_root())?,
         work: DirectoryIdentity::inspect(settings.work_root())?,
         releases: DirectoryIdentity::inspect(settings.release_root())?,
+        search_indexes: settings
+            .search_index_root()
+            .map(DirectoryIdentity::inspect)
+            .transpose()?,
     };
     validate_worker_identity(&ProcessIdentity::current()?, &boundaries)
 }
@@ -273,6 +277,7 @@ struct WorkerBoundaries {
     content: DirectoryIdentity,
     work: DirectoryIdentity,
     releases: DirectoryIdentity,
+    search_indexes: Option<DirectoryIdentity>,
 }
 
 fn validate_worker_identity(
@@ -288,12 +293,19 @@ fn validate_worker_identity(
         &boundaries.releases,
         WORKER_PRIVATE_DIRECTORY_MODE,
     )?;
-    require_matching_owner(
-        WORKER_ROLE,
-        &boundaries.repository,
-        &[&boundaries.content, &boundaries.work, &boundaries.releases],
-    )?;
-    require_matching_group(WORKER_ROLE, &boundaries.repository, &[&boundaries.content])?;
+    if let Some(search_indexes) = boundaries.search_indexes.as_ref() {
+        require_boundary_mode(WORKER_ROLE, search_indexes, READER_DIRECTORY_MODE)?;
+    }
+    let mut worker_owned = vec![&boundaries.content, &boundaries.work, &boundaries.releases];
+    if let Some(search_indexes) = boundaries.search_indexes.as_ref() {
+        worker_owned.push(search_indexes);
+    }
+    require_matching_owner(WORKER_ROLE, &boundaries.repository, &worker_owned)?;
+    let mut gateway_readable = vec![&boundaries.content];
+    if let Some(search_indexes) = boundaries.search_indexes.as_ref() {
+        gateway_readable.push(search_indexes);
+    }
+    require_matching_group(WORKER_ROLE, &boundaries.repository, &gateway_readable)?;
     require_matching_group(WORKER_ROLE, &boundaries.work, &[&boundaries.releases])?;
     require_distinct(
         WORKER_ROLE,
@@ -893,6 +905,12 @@ mod tests {
                 62_003,
                 0o750,
             ),
+            search_indexes: Some(DirectoryIdentity::fictional(
+                "/srv/fictional/search-indexes",
+                61_003,
+                62_001,
+                0o2750,
+            )),
         }
     }
 
@@ -902,6 +920,19 @@ mod tests {
             validate_worker_identity(
                 &process(61_003, 62_003, &[62_002, 62_003]),
                 &worker_boundaries(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn accepts_worker_identity_when_search_indexes_are_disabled() {
+        let mut boundaries = worker_boundaries();
+        boundaries.search_indexes = None;
+        assert!(
+            validate_worker_identity(
+                &process(61_003, 62_003, &[62_002, 62_003]),
+                &boundaries,
             )
             .is_ok()
         );
@@ -923,6 +954,11 @@ mod tests {
         let mut boundaries = worker_boundaries();
         boundaries.repository.gid = boundaries.queue.gid;
         boundaries.content.gid = boundaries.queue.gid;
+        boundaries
+            .search_indexes
+            .as_mut()
+            .unwrap_or_else(|| panic!("search index fixture must exist"))
+            .gid = boundaries.queue.gid;
         assert!(matches!(
             validate_worker_identity(&process(61_003, 62_003, &[62_002, 62_003]), &boundaries,),
             Err(RuntimeIdentityError::CollapsedBoundary { .. })

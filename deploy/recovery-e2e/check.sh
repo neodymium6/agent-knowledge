@@ -156,6 +156,7 @@ storage:
   content_root: $storage_root/content
   work_root: $storage_root/work
   release_root: $storage_root/releases
+  search_index_root: $storage_root/search-indexes
 repository:
   official_branch: main
   author_name: Fictional Recovery Worker

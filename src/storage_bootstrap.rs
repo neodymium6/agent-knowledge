@@ -13,7 +13,7 @@ use agent_knowledge_queue::{
 };
 use agent_knowledge_release::{ReleasePolicy, ReleaseReader, ReleaseStore};
 use agent_knowledge_repository::{
-    CommittedStore, GitRepository, GitTransactionError, trusted_git_program,
+    CommittedStore, GitRepository, GitTransactionError, SearchIndexStore, trusted_git_program,
     validate_git_compatibility,
 };
 use agent_knowledge_worker::{WorkerConfigError, WorkerSettings};
@@ -26,7 +26,7 @@ use crate::admin::{
     StorageMigrationError, normalize_storage_directory, normalize_storage_tree, resolve_group,
     resolve_user, validate_bootstrap_source_tree, validate_queue_tree, validate_release_tree,
     validate_repository_tree, validate_same_storage_mount, validate_storage_directory_no_posix_acl,
-    validate_storage_file_mount, validate_storage_tree,
+    validate_storage_file_mount, validate_storage_tree, validate_symlinked_storage_tree,
 };
 
 const MARKER_NAME: &str = ".agent-knowledge-bootstrap-v1.json";
@@ -288,6 +288,7 @@ fn rebind_restored_storage_with_ids(
     if marker != BootstrapMarker::new(&settings, identities) {
         return Err(StorageBootstrapError::MarkerMismatch);
     }
+    provision_search_index_storage(&settings, identities)?;
     validate_same_storage_mount(&storage_root, &storage_paths(&settings))
         .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
     validate_durable_permissions(&settings, identities)?;
@@ -388,6 +389,7 @@ fn bootstrap_storage_with_ids_and_git_check(
         if marker != expected_marker {
             return Err(StorageBootstrapError::MarkerMismatch);
         }
+        provision_search_index_storage(&settings, identities)?;
         validate_same_storage_mount(&storage_root, &storage_paths(&settings))
             .map_err(|error| StorageBootstrapError::Permissions(storage_root.clone(), error))?;
         validate_durable_initialized(&settings, identities)?;
@@ -450,6 +452,11 @@ fn bootstrap_storage_with_ids_and_git_check(
     ReleaseStore::open(settings.release_root(), ReleasePolicy::default()).map_err(|error| {
         StorageBootstrapError::Component("release initialization", error.to_string())
     })?;
+    if let Some(root) = settings.search_index_root() {
+        SearchIndexStore::open(root).map_err(|error| {
+            StorageBootstrapError::Component("search index initialization", error.to_string())
+        })?;
+    }
     revalidate_storage_lock(&storage_root, &storage_lock)?;
 
     normalize_storage_tree(
@@ -479,6 +486,16 @@ fn bootstrap_storage_with_ids_and_git_check(
             Mode::from_bits_truncate(0o640),
         )
         .map_err(|error| StorageBootstrapError::Permissions(path.into(), error))?;
+    }
+    if let Some(root) = settings.search_index_root() {
+        normalize_storage_tree(
+            root,
+            identities.worker_owner,
+            identities.gateway_group,
+            Mode::from_bits_truncate(0o2750),
+            Mode::from_bits_truncate(0o640),
+        )
+        .map_err(|error| StorageBootstrapError::Permissions(root.into(), error))?;
     }
     revalidate_storage_lock(&storage_root, &storage_lock)?;
     validate_initialized(&settings, &request.runtime_directory, identities)?;
@@ -664,14 +681,64 @@ fn valid_empty_lost_and_found(path: &Path, owner: Uid) -> Result<bool, StorageBo
         .is_none())
 }
 
-fn storage_paths(settings: &WorkerSettings) -> [&Path; 5] {
-    [
+fn provision_search_index_storage(
+    settings: &WorkerSettings,
+    ids: StorageIdentities,
+) -> Result<(), StorageBootstrapError> {
+    let Some(root) = settings.search_index_root() else {
+        return Ok(());
+    };
+    let needs_initialization = match fs::symlink_metadata(root) {
+        Ok(metadata)
+            if metadata.file_type().is_dir()
+                && metadata.uid() == ids.administrative_owner.as_raw()
+                && metadata.permissions().mode() & 0o7777 == 0o700 =>
+        {
+            require_absent_or_empty(root)?;
+            true
+        }
+        Ok(metadata) if metadata.file_type().is_dir() => false,
+        Ok(_) => return Err(StorageBootstrapError::UnsafePath(root.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => return Err(StorageBootstrapError::Io(error)),
+    };
+    if !needs_initialization {
+        return Ok(());
+    }
+
+    ensure_directory(root)?;
+    normalize_storage_directory(
+        root,
+        ids.administrative_owner,
+        ids.administrative_group,
+        Mode::from_bits_truncate(0o700),
+    )
+    .map_err(|error| StorageBootstrapError::Permissions(root.into(), error))?;
+    SearchIndexStore::open(root).map_err(|error| {
+        StorageBootstrapError::Component("search index initialization", error.to_string())
+    })?;
+    normalize_storage_tree(
+        root,
+        ids.worker_owner,
+        ids.gateway_group,
+        Mode::from_bits_truncate(0o2750),
+        Mode::from_bits_truncate(0o640),
+    )
+    .map_err(|error| StorageBootstrapError::Permissions(root.into(), error))
+}
+
+fn storage_paths(settings: &WorkerSettings) -> Vec<&Path> {
+    let mut paths = vec![
         settings.queue_root(),
         settings.repository_root(),
         settings.content_root(),
         settings.work_root(),
         settings.release_root(),
-    ]
+    ];
+    if let Some(root) = settings.search_index_root() {
+        paths.push(root);
+    }
+    paths
 }
 
 fn common_storage_root(settings: &WorkerSettings) -> Result<PathBuf, StorageBootstrapError> {
@@ -946,6 +1013,11 @@ fn validate_durable_initialized(
     ReleaseReader::open(settings.release_root(), ReleasePolicy::default()).map_err(|error| {
         StorageBootstrapError::Component("release validation", error.to_string())
     })?;
+    if let Some(root) = settings.search_index_root() {
+        SearchIndexStore::open(root).map_err(|error| {
+            StorageBootstrapError::Component("search index validation", error.to_string())
+        })?;
+    }
     Ok(())
 }
 
@@ -1033,6 +1105,17 @@ fn validate_durable_permissions(
         Mode::from_bits_truncate(0o640),
     )
     .map_err(|error| StorageBootstrapError::Permissions(settings.release_root().into(), error))?;
+    if let Some(root) = settings.search_index_root() {
+        require_directory_metadata(root, ids.worker_owner, ids.gateway_group, 0o2750)?;
+        validate_symlinked_storage_tree(
+            root,
+            ids.worker_owner,
+            ids.gateway_group,
+            Mode::from_bits_truncate(0o2750),
+            Mode::from_bits_truncate(0o640),
+        )
+        .map_err(|error| StorageBootstrapError::Permissions(root.into(), error))?;
+    }
     Ok(())
 }
 

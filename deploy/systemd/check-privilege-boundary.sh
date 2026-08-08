@@ -243,6 +243,7 @@ storage:
   content_root: $test_root/storage/content
   work_root: $test_root/storage/work
   release_root: $test_root/storage/releases
+  search_index_root: $test_root/storage/search-indexes
 repository:
   official_branch: main
   author_name: Fictional Knowledge Worker

@@ -327,6 +327,40 @@ pub(crate) fn validate_storage_tree(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn validate_symlinked_storage_tree(
+    root: &Path,
+    owner: Uid,
+    group: Gid,
+    directory_mode: Mode,
+    file_mode: Mode,
+) -> Result<(), StorageMigrationError> {
+    let root = MigrationRoot::open(root)?;
+    let mut budget = MigrationBudget::new();
+    preflight_release_directory(&root.file, 0, Path::new(""), &mut budget)?;
+    let permissions = TreePermissions {
+        owner: Some(owner),
+        group,
+        directory_mode,
+        file_mode,
+    };
+    let mut fingerprint = TreeFingerprintBuilder::new();
+    validate_directory_permissions(
+        &root.file,
+        permissions,
+        0,
+        Path::new(""),
+        &mut fingerprint,
+        TreeValidation {
+            allow_symlinks: true,
+            ..TreeValidation::strict()
+        },
+    )?;
+    let fingerprint = fingerprint.finish();
+    verify_release_fingerprint(&root.file, &fingerprint)?;
+    root.revalidate()
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn validate_repository_tree(
     root: &Path,
     owner: Uid,

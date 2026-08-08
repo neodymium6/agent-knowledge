@@ -125,7 +125,7 @@ fn fixture(root: &Path) -> (StorageBootstrap, StorageIdentities) {
     fs::write(
         &config,
         format!(
-            "schema_version: 1\nstorage:\n  queue_root: {0}/queue\n  repository_root: {0}/repository\n  content_root: {0}/content\n  work_root: {0}/work\n  release_root: {0}/releases\nrepository:\n  official_branch: main\n  author_name: Fictional Knowledge Worker\n  author_email: worker@example.invalid\nquartz:\n  program: /opt/fictional-quartz/bin/build-site\n  integration_root: /opt/fictional-quartz\n  timeout_seconds: 300\nbatch:\n  debounce_seconds: 30\n  maximum_age_seconds: 300\n  maximum_scan_entries: 1024\n  maximum_requests: 100\n  maximum_recovery_requests: 10000\n",
+            "schema_version: 1\nstorage:\n  queue_root: {0}/queue\n  repository_root: {0}/repository\n  content_root: {0}/content\n  work_root: {0}/work\n  release_root: {0}/releases\n  search_index_root: {0}/search-indexes\nrepository:\n  official_branch: main\n  author_name: Fictional Knowledge Worker\n  author_email: worker@example.invalid\nquartz:\n  program: /opt/fictional-quartz/bin/build-site\n  integration_root: /opt/fictional-quartz\n  timeout_seconds: 300\nbatch:\n  debounce_seconds: 30\n  maximum_age_seconds: 300\n  maximum_scan_entries: 1024\n  maximum_requests: 100\n  maximum_recovery_requests: 10000\n",
             storage.display()
         ),
     )
@@ -386,6 +386,16 @@ fn initializes_fresh_storage_and_is_idempotent() {
     assert!(storage.join("content/.git").is_file());
     assert!(storage.join("repository/refs/heads/main").is_file());
     assert!(storage.join("releases/by-id").is_dir());
+    assert!(storage.join("search-indexes/by-id").is_dir());
+    assert!(storage.join("search-indexes/.staging").is_dir());
+    assert_eq!(
+        fs::symlink_metadata(storage.join("search-indexes"))
+            .unwrap_or_else(|error| panic!("search index metadata must exist: {error}"))
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o2750
+    );
     let marker = fs::symlink_metadata(storage.join(MARKER_NAME))
         .unwrap_or_else(|error| panic!("bootstrap marker metadata must exist: {error}"));
     assert_eq!(marker.uid(), identities.administrative_owner.as_raw());
@@ -404,6 +414,37 @@ fn initializes_fresh_storage_and_is_idempotent() {
         .unwrap_or_else(|error| panic!("ephemeral runtime must be recreated: {error}"));
     assert_eq!(after_restart, b"{\"status\":\"already_initialized\"}\n");
     assert!(request.runtime_directory.is_dir());
+}
+
+#[test]
+fn marked_storage_adds_an_enabled_search_index_store() {
+    let root = TestDirectory::new();
+    let (request, identities) = fixture(root.path());
+    let current_config = fs::read_to_string(&request.config)
+        .unwrap_or_else(|error| panic!("Worker config must be readable: {error}"));
+    let legacy_config = current_config.replace(
+        &format!(
+            "  search_index_root: {}/storage/search-indexes\n",
+            root.path().display()
+        ),
+        "",
+    );
+    fs::write(&request.config, legacy_config)
+        .unwrap_or_else(|error| panic!("legacy Worker config must be written: {error}"));
+    bootstrap_storage_with_ids(&request, identities, Vec::new())
+        .unwrap_or_else(|error| panic!("storage without search must initialize: {error}"));
+    let search_indexes = root.path().join("storage/search-indexes");
+    assert!(!search_indexes.exists());
+
+    fs::write(&request.config, current_config)
+        .unwrap_or_else(|error| panic!("search-enabled Worker config must be written: {error}"));
+    let mut output = Vec::new();
+    bootstrap_storage_with_ids(&request, identities, &mut output)
+        .unwrap_or_else(|error| panic!("search index storage must be added: {error}"));
+
+    assert_eq!(output, b"{\"status\":\"already_initialized\"}\n");
+    assert!(search_indexes.join("by-id").is_dir());
+    assert!(search_indexes.join(".staging").is_dir());
 }
 
 #[test]
