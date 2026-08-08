@@ -294,6 +294,11 @@ impl SearchIndexStore {
     fn quarantine_active(&self) -> Result<(), SearchIndexStoreError> {
         let _mutation = self.lock_mutation()?;
         self.validate_live_storage()?;
+        match self.active_index() {
+            Ok(_) => return Ok(()),
+            Err(error) if recoverable_active_error(&error) => {}
+            Err(error) => return Err(error),
+        }
         let current = self.root.stable.join(CURRENT_ENTRY);
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
