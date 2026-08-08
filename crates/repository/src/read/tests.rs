@@ -12,7 +12,10 @@ use super::{
     CommittedReadError, CommittedStore, LinearSearch, ReadFilter, SearchBackend,
     SearchMetadataFields, SearchPolicy,
 };
-use crate::{ContentPolicy, TantivySearchError, TantivySearchIndex, TantivySearchPolicy};
+use crate::{
+    ContentPolicy, SearchIndexStore, SearchIndexStoreError, TantivySearchError, TantivySearchIndex,
+    TantivySearchPolicy,
+};
 
 const LOG_ID: &str = "01K00000000000000000000001";
 const RUNBOOK_ID: &str = "01K00000000000000000000002";
@@ -605,6 +608,104 @@ fn tantivy_disk_open_pins_a_switched_current_symlink() {
             .unwrap_or_else(|error| panic!("switched current symlink must be read: {error}")),
         second_directory
     );
+}
+
+#[test]
+fn search_index_store_prepares_activates_reopens_and_reuses_a_generation() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let root = fixture._root.path().join("search-indexes");
+    let store = SearchIndexStore::open(&root)
+        .unwrap_or_else(|error| panic!("search index store must open: {error}"));
+
+    let prepared = store
+        .prepare(&snapshot, SearchMetadataFields::default())
+        .unwrap_or_else(|error| panic!("search generation must prepare: {error}"));
+    assert_eq!(prepared.commit(), snapshot.commit());
+    assert!(
+        store
+            .active_index()
+            .unwrap_or_else(|error| panic!("empty current selection must validate: {error}"))
+            .is_none()
+    );
+    let active = store
+        .activate(&prepared)
+        .unwrap_or_else(|error| panic!("search generation must activate: {error}"));
+    assert_eq!(active.generation_id(), prepared.generation_id());
+    assert_eq!(active.commit(), snapshot.commit());
+
+    let reopened = SearchIndexStore::open(&root)
+        .unwrap_or_else(|error| panic!("search index store must reopen: {error}"));
+    assert_eq!(
+        reopened
+            .active_index()
+            .unwrap_or_else(|error| panic!("active search index must validate: {error}"))
+            .unwrap_or_else(|| panic!("active search index must exist")),
+        active
+    );
+    let selected = TantivySearchIndex::open_directory(root.join("current"))
+        .unwrap_or_else(|error| panic!("selected search index must open: {error}"));
+    let hits = selected
+        .search(
+            &snapshot,
+            "Needle",
+            &ReadFilter::default(),
+            TantivySearchPolicy::new(64, 10),
+        )
+        .unwrap_or_else(|error| panic!("selected search index must query: {error}"));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].metadata().document_id.to_string(), LOG_ID);
+
+    let generations_before = fs::read_dir(root.join("by-id"))
+        .unwrap_or_else(|error| panic!("generations must be readable: {error}"))
+        .count();
+    let reused = reopened
+        .prepare(&snapshot, SearchMetadataFields::default())
+        .unwrap_or_else(|error| panic!("active generation must be reused: {error}"));
+    assert_eq!(reused, prepared);
+    assert_eq!(
+        fs::read_dir(root.join("by-id"))
+            .unwrap_or_else(|error| panic!("generations must remain readable: {error}"))
+            .count(),
+        generations_before
+    );
+}
+
+#[test]
+fn search_index_store_rejects_writer_contention_and_invalid_current() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let root = fixture._root.path().join("search-indexes");
+    let store = SearchIndexStore::open(&root)
+        .unwrap_or_else(|error| panic!("search index store must open: {error}"));
+    let lock =
+        File::open(&root).unwrap_or_else(|error| panic!("search index root must open: {error}"));
+    lock.try_lock()
+        .unwrap_or_else(|error| panic!("search index writer fixture must lock: {error}"));
+    assert!(matches!(
+        store.prepare(&snapshot, SearchMetadataFields::default()),
+        Err(SearchIndexStoreError::Busy)
+    ));
+    lock.unlock()
+        .unwrap_or_else(|error| panic!("search index writer fixture must unlock: {error}"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        symlink("/fictional/outside", root.join("current"))
+            .unwrap_or_else(|error| panic!("invalid current fixture must be created: {error}"));
+        assert!(matches!(
+            SearchIndexStore::open(&root),
+            Err(SearchIndexStoreError::InvalidCurrentEntry)
+        ));
+    }
 }
 
 #[test]
