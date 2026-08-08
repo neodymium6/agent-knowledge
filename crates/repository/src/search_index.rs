@@ -101,7 +101,11 @@ impl TantivySearchIndex {
                 .add_document(fields.document(record, body, metadata_fields))
                 .map_err(TantivySearchError::engine)?;
         }
-        writer.commit().map_err(TantivySearchError::engine)?;
+        let mut commit = writer
+            .prepare_commit()
+            .map_err(TantivySearchError::engine)?;
+        commit.set_payload(snapshot.commit());
+        commit.commit().map_err(TantivySearchError::engine)?;
         writer
             .wait_merging_threads()
             .map_err(TantivySearchError::engine)?;
@@ -434,6 +438,8 @@ pub enum TantivySearchError {
     InvalidDiskManifest,
     /// The persistent Tantivy schema did not match this software release.
     DiskSchemaMismatch,
+    /// The manifest commit did not match Tantivy's own commit payload.
+    DiskCommitMismatch,
     /// The persistent manifest and Tantivy index reported different sizes.
     DiskDocumentCountMismatch {
         /// Document count recorded after the index build.
@@ -497,6 +503,9 @@ impl fmt::Display for TantivySearchError {
             }
             Self::DiskSchemaMismatch => {
                 formatter.write_str("persistent search index schema is incompatible")
+            }
+            Self::DiskCommitMismatch => {
+                formatter.write_str("persistent search index commit binding is inconsistent")
             }
             Self::DiskDocumentCountMismatch { manifest, index } => write!(
                 formatter,

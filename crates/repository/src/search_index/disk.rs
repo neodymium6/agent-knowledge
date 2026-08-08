@@ -59,6 +59,7 @@ impl TantivySearchIndex {
         let index =
             Index::create_in_dir(&index_directory, schema).map_err(TantivySearchError::engine)?;
         let built = Self::build(snapshot, metadata_fields, index, query_schema, fields)?;
+        sync_directory(&index_directory)?;
         let document_count = u64::try_from(built.document_count)
             .map_err(|_| TantivySearchError::InvalidDiskManifest)?;
         let manifest = DiskManifest {
@@ -78,12 +79,29 @@ impl TantivySearchIndex {
     /// Returns an error when the manifest or Tantivy files are missing,
     /// malformed, incompatible, or disagree about the indexed document count.
     pub fn open_directory(directory: impl AsRef<Path>) -> Result<Self, TantivySearchError> {
-        let directory = directory.as_ref();
-        let manifest = read_manifest(directory)?;
+        Self::open_directory_with(directory.as_ref(), || {})
+    }
+
+    fn open_directory_with(
+        directory: &Path,
+        after_resolve: impl FnOnce(),
+    ) -> Result<Self, TantivySearchError> {
+        let directory = fs::canonicalize(directory).map_err(TantivySearchError::io)?;
+        after_resolve();
+        let manifest = read_manifest(&directory)?;
         let metadata_fields = SearchMetadataFields::from(manifest.metadata_fields);
         let (expected_schema, query_schema, fields) = SearchFields::schemas(metadata_fields);
         let index = Index::open_in_dir(directory.join(INDEX_DIRECTORY))
             .map_err(TantivySearchError::engine)?;
+        if index
+            .load_metas()
+            .map_err(TantivySearchError::engine)?
+            .payload
+            .as_deref()
+            != Some(manifest.commit.as_str())
+        {
+            return Err(TantivySearchError::DiskCommitMismatch);
+        }
         if index.schema() != expected_schema {
             return Err(TantivySearchError::DiskSchemaMismatch);
         }
@@ -105,6 +123,14 @@ impl TantivySearchIndex {
             reader,
             fields,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_directory_after_resolve(
+        directory: impl AsRef<Path>,
+        after_resolve: impl FnOnce(),
+    ) -> Result<Self, TantivySearchError> {
+        Self::open_directory_with(directory.as_ref(), after_resolve)
     }
 }
 
@@ -166,6 +192,12 @@ fn sync_parent(path: &Path) -> Result<(), TantivySearchError> {
         .parent()
         .ok_or(TantivySearchError::InvalidDiskManifest)?;
     File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(TantivySearchError::io)
+}
+
+fn sync_directory(path: &Path) -> Result<(), TantivySearchError> {
+    File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(TantivySearchError::io)
 }
