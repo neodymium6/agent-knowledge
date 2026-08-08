@@ -393,6 +393,133 @@ fn tantivy_honors_metadata_selection_and_query_bounds() {
 }
 
 #[test]
+fn tantivy_reopens_a_committed_disk_index_with_its_search_policy() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let directory = fixture._root.path().join("search-index");
+    let built = TantivySearchIndex::build_in_directory(
+        &snapshot,
+        SearchMetadataFields::new(false, false, false, false),
+        &directory,
+    )
+    .unwrap_or_else(|error| panic!("disk index must build: {error}"));
+    assert_eq!(built.commit(), snapshot.commit());
+    drop(built);
+
+    let reopened = TantivySearchIndex::open_directory(&directory)
+        .unwrap_or_else(|error| panic!("disk index must reopen: {error}"));
+    assert_eq!(reopened.commit(), snapshot.commit());
+    assert!(
+        reopened
+            .search(
+                &snapshot,
+                "fictional-node-a",
+                &ReadFilter::default(),
+                TantivySearchPolicy::new(64, 10),
+            )
+            .unwrap_or_else(|error| panic!("restricted search must succeed: {error}"))
+            .is_empty()
+    );
+    assert!(matches!(
+        reopened.search(
+            &snapshot,
+            &format!("exact_session:{SESSION_ID}"),
+            &ReadFilter::default(),
+            TantivySearchPolicy::new(64, 10),
+        ),
+        Err(TantivySearchError::Query(_))
+    ));
+    let session = SESSION_ID
+        .parse()
+        .unwrap_or_else(|error| panic!("session fixture must parse: {error}"));
+    let filtered = reopened
+        .search(
+            &snapshot,
+            "fictional",
+            &ReadFilter::new(None, None, Some(session), false),
+            TantivySearchPolicy::new(64, 10),
+        )
+        .unwrap_or_else(|error| panic!("exact session filter must succeed: {error}"));
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].metadata().document_id.to_string(), LOG_ID);
+}
+
+#[test]
+fn tantivy_disk_index_rejects_overwrite_and_manifest_mismatch() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let existing = fixture._root.path().join("existing-index");
+    fs::create_dir(&existing)
+        .unwrap_or_else(|error| panic!("existing index directory must be created: {error}"));
+    assert!(matches!(
+        TantivySearchIndex::build_in_directory(
+            &snapshot,
+            SearchMetadataFields::default(),
+            &existing,
+        ),
+        Err(TantivySearchError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+    ));
+
+    let directory = fixture._root.path().join("search-index");
+    let built = TantivySearchIndex::build_in_directory(
+        &snapshot,
+        SearchMetadataFields::default(),
+        &directory,
+    )
+    .unwrap_or_else(|error| panic!("disk index must build: {error}"));
+    drop(built);
+    let manifest_path = directory.join(".agent-knowledge-search-index.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .unwrap_or_else(|error| panic!("disk manifest must be read: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("disk manifest must decode: {error}"));
+    manifest["document_count"] = serde_json::json!(100);
+    fs::write(
+        manifest_path,
+        serde_json::to_vec(&manifest)
+            .unwrap_or_else(|error| panic!("changed disk manifest must encode: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("changed disk manifest must be written: {error}"));
+    assert!(matches!(
+        TantivySearchIndex::open_directory(&directory),
+        Err(TantivySearchError::DiskDocumentCountMismatch {
+            manifest: 100,
+            index: 2
+        })
+    ));
+    manifest["document_count"] = serde_json::json!(2);
+    manifest["metadata_fields"]["node"] = serde_json::json!(false);
+    fs::write(
+        directory.join(".agent-knowledge-search-index.json"),
+        serde_json::to_vec(&manifest)
+            .unwrap_or_else(|error| panic!("changed disk schema manifest must encode: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("changed disk schema manifest must be written: {error}"));
+    assert!(matches!(
+        TantivySearchIndex::open_directory(&directory),
+        Err(TantivySearchError::DiskSchemaMismatch)
+    ));
+    manifest["format_version"] = serde_json::json!(2);
+    fs::write(
+        directory.join(".agent-knowledge-search-index.json"),
+        serde_json::to_vec(&manifest)
+            .unwrap_or_else(|error| panic!("unsupported disk manifest must encode: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("unsupported disk manifest must be written: {error}"));
+    assert!(matches!(
+        TantivySearchIndex::open_directory(&directory),
+        Err(TantivySearchError::InvalidDiskManifest)
+    ));
+}
+
+#[test]
 fn rejects_writer_contention_dirty_content_and_invalid_bounds() {
     let fixture = Fixture::create();
     let store = fixture.store();

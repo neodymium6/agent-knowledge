@@ -18,11 +18,12 @@ use crate::{
 // justify a configurable larger budget.
 const INDEX_WRITER_MEMORY_BYTES: usize = 15_000_000;
 
-/// An in-memory Tantivy index built from one exact committed snapshot.
+mod disk;
+
+/// A Tantivy index built from one exact committed snapshot.
 ///
-/// This is the repository-layer primitive used to validate schema and query
-/// semantics before a later storage layer publishes persistent derived
-/// indexes. Markdown remains the canonical data source.
+/// The index may live in memory or in a completed derived directory. Markdown
+/// remains the canonical data source.
 pub struct TantivySearchIndex {
     commit: String,
     document_count: usize,
@@ -71,6 +72,16 @@ impl TantivySearchIndex {
     ) -> Result<Self, TantivySearchError> {
         let (schema, query_schema, fields) = SearchFields::schemas(metadata_fields);
         let index = Index::create_in_ram(schema);
+        Self::build(snapshot, metadata_fields, index, query_schema, fields)
+    }
+
+    fn build(
+        snapshot: &CommittedSnapshot,
+        metadata_fields: SearchMetadataFields,
+        index: Index,
+        query_schema: Schema,
+        fields: SearchFields,
+    ) -> Result<Self, TantivySearchError> {
         let mut writer = index
             .writer_with_num_threads(1, INDEX_WRITER_MEMORY_BYTES)
             .map_err(TantivySearchError::engine)?;
@@ -245,7 +256,7 @@ impl SearchFields {
         query_schema.add_text_field("tags", TEXT);
         let exact_tags = schema.add_text_field("exact_tags", STRING);
         query_schema.add_text_field("exact_tags", TextOptions::default());
-        let node = schema.add_text_field("node", TEXT);
+        let node = schema.add_text_field("node", optional_text(metadata_fields.node()));
         query_schema.add_text_field(
             "node",
             if metadata_fields.node() {
@@ -254,7 +265,7 @@ impl SearchFields {
                 TextOptions::default()
             },
         );
-        let agent = schema.add_text_field("agent", TEXT);
+        let agent = schema.add_text_field("agent", optional_text(metadata_fields.agent()));
         query_schema.add_text_field(
             "agent",
             if metadata_fields.agent() {
@@ -263,7 +274,7 @@ impl SearchFields {
                 TextOptions::default()
             },
         );
-        let session = schema.add_text_field("session", TEXT);
+        let session = schema.add_text_field("session", optional_text(metadata_fields.session()));
         query_schema.add_text_field(
             "session",
             if metadata_fields.session() {
@@ -274,7 +285,8 @@ impl SearchFields {
         );
         let exact_session = schema.add_text_field("exact_session", STRING);
         query_schema.add_text_field("exact_session", TextOptions::default());
-        let request_id = schema.add_text_field("request_id", TEXT);
+        let request_id =
+            schema.add_text_field("request_id", optional_text(metadata_fields.request_id()));
         query_schema.add_text_field(
             "request_id",
             if metadata_fields.request_id() {
@@ -401,6 +413,14 @@ impl SearchFields {
     }
 }
 
+fn optional_text(enabled: bool) -> TextOptions {
+    if enabled {
+        TEXT
+    } else {
+        TextOptions::default()
+    }
+}
+
 /// Failure while building or querying a Tantivy-derived search index.
 #[derive(Debug)]
 pub enum TantivySearchError {
@@ -408,6 +428,19 @@ pub enum TantivySearchError {
     Committed(Box<CommittedReadError>),
     /// Tantivy failed to build, commit, read, or query its index.
     Engine(Box<tantivy::TantivyError>),
+    /// Filesystem I/O for a persistent index failed.
+    Io(std::io::Error),
+    /// The persistent index manifest was absent, malformed, or unsupported.
+    InvalidDiskManifest,
+    /// The persistent Tantivy schema did not match this software release.
+    DiskSchemaMismatch,
+    /// The persistent manifest and Tantivy index reported different sizes.
+    DiskDocumentCountMismatch {
+        /// Document count recorded after the index build.
+        manifest: u64,
+        /// Live documents observed after reopening Tantivy.
+        index: u64,
+    },
     /// The user-facing Tantivy query syntax was invalid.
     Query(QueryParserError),
     /// The query was empty after trimming.
@@ -447,6 +480,10 @@ impl TantivySearchError {
     fn engine(error: tantivy::TantivyError) -> Self {
         Self::Engine(Box::new(error))
     }
+
+    fn io(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
 impl fmt::Display for TantivySearchError {
@@ -454,6 +491,17 @@ impl fmt::Display for TantivySearchError {
         match self {
             Self::Committed(error) => write!(formatter, "committed search input failed: {error}"),
             Self::Engine(error) => write!(formatter, "Tantivy search index failed: {error}"),
+            Self::Io(error) => write!(formatter, "persistent search index I/O failed: {error}"),
+            Self::InvalidDiskManifest => {
+                formatter.write_str("persistent search index manifest is invalid")
+            }
+            Self::DiskSchemaMismatch => {
+                formatter.write_str("persistent search index schema is incompatible")
+            }
+            Self::DiskDocumentCountMismatch { manifest, index } => write!(
+                formatter,
+                "persistent search index has {index} documents; manifest records {manifest}"
+            ),
             Self::Query(error) => write!(formatter, "search query is invalid: {error}"),
             Self::EmptyQuery => formatter.write_str("search query must not be empty"),
             Self::QueryTooLong { maximum, actual } => write!(
@@ -484,6 +532,7 @@ impl std::error::Error for TantivySearchError {
         match self {
             Self::Committed(error) => Some(error),
             Self::Engine(error) => Some(error),
+            Self::Io(error) => Some(error),
             Self::Query(error) => Some(error),
             _ => None,
         }
