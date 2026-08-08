@@ -52,6 +52,7 @@ Gateway ── Unix socket ── Queue Ingress ── durable queue
                                       Repository Worker
                                       ├─ Git history/remote
                                       ├─ canonical content
+                                      ├─ search indexes
                                       └─ Quartz releases
 ```
 

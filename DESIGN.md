@@ -286,9 +286,10 @@ service container starts. It consumes the validated Worker configuration,
 requires the five durable roots to be siblings, creates the durable queue,
 bare repository and official branch, canonical content worktree, transaction
 root, and release store, then applies the fixed service ownership boundary. A
-root-owned, GID-`0`, mode-`0444` completion marker is published after validation and a
-filesystem durability barrier succeed. The marker and all five roots must share
-one mount. Matching marked storage is accepted idempotently only after bounded
+configured derived search-index store is created as a sibling on the same
+mount. After validation and a filesystem durability barrier, bootstrap publishes
+a root-owned, GID-`0`, mode-`0444` completion marker. The marker and all five
+roots must share one mount. Matching marked storage is accepted idempotently only after bounded
 read-only validation; nonempty unmarked storage or a marker that disagrees with
 configuration or identities is rejected instead of repaired. The runtime socket
 directory and its path are not covered by durable completion: it is recreated
