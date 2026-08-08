@@ -99,6 +99,7 @@ impl StatusGateway {
 #[derive(Debug)]
 pub struct ReadGateway {
     committed: CommittedStore,
+    search_indexes: Option<PathAttestation>,
     settings: GatewaySettings,
 }
 
@@ -109,12 +110,18 @@ impl ReadGateway {
         settings: &GatewaySettings,
         deadline: Option<std::time::Instant>,
     ) -> Result<Self, GatewayError> {
-        let resolved = [
+        let mut resolved = vec![
             PathAttestation::resolve_destination(settings.git_directory())
                 .map_err(GatewayError::Attestation)?,
             PathAttestation::resolve_destination(settings.content_root())
                 .map_err(GatewayError::Attestation)?,
         ];
+        if let Some(search_index_root) = settings.search_index_root() {
+            resolved.push(
+                PathAttestation::resolve_destination(search_index_root)
+                    .map_err(GatewayError::Attestation)?,
+            );
+        }
         validate_disjoint_storage(&resolved)?;
         let committed = CommittedStore::open_until(
             resolved[0].stable_path(),
@@ -135,8 +142,10 @@ impl ReadGateway {
             ));
         }
         ensure_deadline(deadline)?;
+        let search_indexes = (resolved.len() == 3).then(|| resolved.remove(2));
         Ok(Self {
             committed,
+            search_indexes,
             settings: settings.clone(),
         })
     }
@@ -171,7 +180,15 @@ impl ReadGateway {
 
     /// Searches committed Markdown and configured metadata fields.
     pub fn search(&self, request: &SearchRequest) -> Result<ListResponse, GatewayError> {
-        read::search(&self.settings, &self.committed, request).map(|prepared| prepared.response)
+        read::search(
+            &self.settings,
+            &self.committed,
+            self.search_indexes
+                .as_ref()
+                .map(PathAttestation::stable_path),
+            request,
+        )
+        .map(|prepared| prepared.response)
     }
 
     /// Encodes one list response exactly once under the supplied deadline.
@@ -201,8 +218,16 @@ impl ReadGateway {
         request: &SearchRequest,
         deadline: std::time::Instant,
     ) -> Result<Vec<u8>, GatewayError> {
-        read::search_until(&self.settings, &self.committed, request, deadline)
-            .map(|prepared| prepared.encoded)
+        read::search_until(
+            &self.settings,
+            &self.committed,
+            self.search_indexes
+                .as_ref()
+                .map(PathAttestation::stable_path),
+            request,
+            deadline,
+        )
+        .map(|prepared| prepared.encoded)
     }
 }
 

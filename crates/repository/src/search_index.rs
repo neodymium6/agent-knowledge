@@ -147,6 +147,32 @@ impl TantivySearchIndex {
         filter: &ReadFilter,
         policy: TantivySearchPolicy,
     ) -> Result<Vec<&'a DocumentRecord>, TantivySearchError> {
+        self.search_with_metadata(
+            snapshot,
+            query,
+            filter,
+            self.fields.indexed_metadata,
+            policy,
+        )
+    }
+
+    /// Searches the index while restricting optional full-text metadata to an
+    /// additional caller allowlist.
+    ///
+    /// Fields omitted while building the index remain unavailable even when
+    /// requested here. Exact filters are unaffected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::search`].
+    pub fn search_with_metadata<'a>(
+        &self,
+        snapshot: &'a CommittedSnapshot,
+        query: &str,
+        filter: &ReadFilter,
+        metadata_fields: SearchMetadataFields,
+        policy: TantivySearchPolicy,
+    ) -> Result<Vec<&'a DocumentRecord>, TantivySearchError> {
         if snapshot.commit() != self.commit {
             return Err(TantivySearchError::SnapshotCommitMismatch {
                 index: self.commit.clone(),
@@ -170,7 +196,7 @@ impl TantivySearchIndex {
 
         let mut parser = QueryParser::new(
             self.query_schema.clone(),
-            self.fields.searchable.clone(),
+            self.fields.searchable(metadata_fields),
             self.index.tokenizers().clone(),
         );
         parser.set_conjunction_by_default();
@@ -244,7 +270,7 @@ struct SearchFields {
     request_id: Field,
     project: Field,
     archived: Field,
-    searchable: Vec<Field>,
+    indexed_metadata: SearchMetadataFields,
 }
 
 impl SearchFields {
@@ -308,19 +334,6 @@ impl SearchFields {
         query_schema.add_bool_field("archived", NumericOptions::default());
         let schema = schema.build();
         let query_schema = query_schema.build();
-        let mut searchable = vec![title, body, path, tags];
-        if metadata_fields.node() {
-            searchable.push(node);
-        }
-        if metadata_fields.agent() {
-            searchable.push(agent);
-        }
-        if metadata_fields.session() {
-            searchable.push(session);
-        }
-        if metadata_fields.request_id() {
-            searchable.push(request_id);
-        }
         (
             schema,
             query_schema,
@@ -338,9 +351,26 @@ impl SearchFields {
                 request_id,
                 project,
                 archived,
-                searchable,
+                indexed_metadata: metadata_fields,
             },
         )
+    }
+
+    fn searchable(&self, requested: SearchMetadataFields) -> Vec<Field> {
+        let mut searchable = vec![self.title, self.body, self.path, self.tags];
+        if self.indexed_metadata.node() && requested.node() {
+            searchable.push(self.node);
+        }
+        if self.indexed_metadata.agent() && requested.agent() {
+            searchable.push(self.agent);
+        }
+        if self.indexed_metadata.session() && requested.session() {
+            searchable.push(self.session);
+        }
+        if self.indexed_metadata.request_id() && requested.request_id() {
+            searchable.push(self.request_id);
+        }
+        searchable
     }
 
     fn document(

@@ -365,6 +365,20 @@ fn tantivy_honors_metadata_selection_and_query_bounds() {
         )
         .unwrap_or_else(|error| panic!("restricted search must succeed: {error}"));
     assert!(metadata.is_empty());
+
+    let complete_index =
+        TantivySearchIndex::build_in_memory(&snapshot, SearchMetadataFields::default())
+            .unwrap_or_else(|error| panic!("complete Tantivy index must build: {error}"));
+    let restricted = complete_index
+        .search_with_metadata(
+            &snapshot,
+            "fictional-node-a",
+            &ReadFilter::default(),
+            SearchMetadataFields::new(false, false, false, false),
+            TantivySearchPolicy::new(64, 10),
+        )
+        .unwrap_or_else(|error| panic!("caller-restricted search must succeed: {error}"));
+    assert!(restricted.is_empty());
     assert!(matches!(
         index.search(
             &snapshot,
@@ -681,6 +695,10 @@ fn search_index_store_prepares_activates_reopens_and_reuses_a_generation() {
         .unwrap_or_else(|error| panic!("selected search index must query: {error}"));
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].metadata().document_id.to_string(), LOG_ID);
+    let read_only = SearchIndexStore::open_active_read_only(&root)
+        .unwrap_or_else(|error| panic!("active search index must open read-only: {error}"))
+        .unwrap_or_else(|| panic!("active read-only search index must exist"));
+    assert_eq!(read_only.commit(), snapshot.commit());
 
     let generations_before = fs::read_dir(root.join("by-id"))
         .unwrap_or_else(|error| panic!("generations must be readable: {error}"))
@@ -695,6 +713,32 @@ fn search_index_store_prepares_activates_reopens_and_reuses_a_generation() {
             .count(),
         generations_before
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_search_index_selection_rejects_an_external_by_id_directory() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::create();
+    let root = fixture._root.path().join("reader-search-indexes");
+    let outside = fixture._root.path().join("outside-by-id");
+    fs::create_dir(&root)
+        .unwrap_or_else(|error| panic!("reader search root must be created: {error}"));
+    fs::create_dir(&outside)
+        .unwrap_or_else(|error| panic!("outside by-id fixture must be created: {error}"));
+    symlink(&outside, root.join("by-id"))
+        .unwrap_or_else(|error| panic!("external by-id link must be created: {error}"));
+    symlink(
+        "by-id/00000000000000000000000000-0123456789abcdef",
+        root.join("current"),
+    )
+    .unwrap_or_else(|error| panic!("current selector must be created: {error}"));
+
+    assert!(matches!(
+        SearchIndexStore::open_active_read_only(&root),
+        Err(SearchIndexStoreError::InvalidCurrentEntry)
+    ));
 }
 
 #[test]

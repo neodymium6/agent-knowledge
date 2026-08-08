@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io::{self, Write};
+use std::path::Path;
 use std::time::Instant;
 
 use agent_knowledge_core::{DocumentLimits, ErrorCode};
@@ -10,7 +11,8 @@ use agent_knowledge_protocol::{
 use agent_knowledge_queue::PackagePolicy;
 use agent_knowledge_repository::{
     CommittedBundleEntry, CommittedReadError, CommittedStore, ContentPolicy, DocumentRecord,
-    LinearSearch, ReadFilter, SearchBackend, SearchMetadataFields, SearchPolicy,
+    LinearSearch, ReadFilter, SearchBackend, SearchIndexStore, SearchMetadataFields, SearchPolicy,
+    TantivySearchError, TantivySearchPolicy,
 };
 use tar::{Builder, EntryType, Header};
 
@@ -136,14 +138,22 @@ fn write_export_archive(entries: &[CommittedBundleEntry], output: impl Write) ->
 pub(super) fn search(
     settings: &GatewaySettings,
     store: &CommittedStore,
+    search_index_root: Option<&Path>,
     request: &SearchRequest,
 ) -> Result<PreparedResponse<ListResponse>, GatewayError> {
-    search_until(settings, store, request, read_deadline(settings)?)
+    search_until(
+        settings,
+        store,
+        search_index_root,
+        request,
+        read_deadline(settings)?,
+    )
 }
 
 pub(super) fn search_until(
     settings: &GatewaySettings,
     store: &CommittedStore,
+    search_index_root: Option<&Path>,
     request: &SearchRequest,
     deadline: Instant,
 ) -> Result<PreparedResponse<ListResponse>, GatewayError> {
@@ -152,23 +162,31 @@ pub(super) fn search_until(
     validate_result_limit(settings, request.maximum_results)?;
     let snapshot = snapshot(settings, store, deadline)?;
     let fields = settings.search_metadata_fields();
-    let search = LinearSearch::new(SearchMetadataFields::new(
-        fields[0], fields[1], fields[2], fields[3],
-    ));
-    let records = search
-        .search(
-            &snapshot,
-            &request.query,
-            &repository_filter(&request.filter),
-            SearchPolicy {
-                maximum_query_characters: settings.maximum_search_query_characters(),
-                maximum_results: request.maximum_results,
-                maximum_scanned_documents: settings.maximum_search_documents(),
-                maximum_scanned_markdown_bytes: settings.maximum_search_markdown_bytes(),
-                deadline: Some(deadline),
-            },
-        )
-        .map_err(committed)?;
+    let metadata_fields = SearchMetadataFields::new(fields[0], fields[1], fields[2], fields[3]);
+    let filter = repository_filter(&request.filter);
+    let linear_policy = SearchPolicy {
+        maximum_query_characters: settings.maximum_search_query_characters(),
+        maximum_results: request.maximum_results,
+        maximum_scanned_documents: settings.maximum_search_documents(),
+        maximum_scanned_markdown_bytes: settings.maximum_search_markdown_bytes(),
+        deadline: Some(deadline),
+    };
+    let records = match indexed_search(
+        search_index_root,
+        &snapshot,
+        &request.query,
+        &filter,
+        metadata_fields,
+        TantivySearchPolicy::new(
+            settings.maximum_search_query_characters(),
+            request.maximum_results,
+        ),
+    )? {
+        Some(records) => records,
+        None => LinearSearch::new(metadata_fields)
+            .search(&snapshot, &request.query, &filter, linear_policy)
+            .map_err(committed)?,
+    };
     let documents = records
         .into_iter()
         .map(document_summary)
@@ -176,6 +194,40 @@ pub(super) fn search_until(
     let response = ListResponse::new(snapshot.commit().to_owned(), documents);
     drop(snapshot);
     prepare_response(settings, response, deadline)
+}
+
+fn indexed_search<'a>(
+    root: Option<&Path>,
+    snapshot: &'a agent_knowledge_repository::CommittedSnapshot,
+    query: &str,
+    filter: &ReadFilter,
+    metadata_fields: SearchMetadataFields,
+    policy: TantivySearchPolicy,
+) -> Result<Option<Vec<&'a DocumentRecord>>, GatewayError> {
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let index = match SearchIndexStore::open_active_read_only(root) {
+        Ok(Some(index)) if index.commit() == snapshot.commit() => index,
+        Ok(_) | Err(_) => return Ok(None),
+    };
+    match index.search_with_metadata(snapshot, query, filter, metadata_fields, policy) {
+        Ok(records) => Ok(Some(records)),
+        Err(TantivySearchError::EmptyQuery) => Err(committed(CommittedReadError::EmptyQuery)),
+        Err(TantivySearchError::QueryTooLong { maximum, actual }) => {
+            Err(committed(CommittedReadError::QueryTooLong {
+                maximum,
+                actual,
+            }))
+        }
+        Err(TantivySearchError::InvalidResultLimit) => {
+            Err(committed(CommittedReadError::InvalidResultLimit))
+        }
+        Err(TantivySearchError::Query(_)) => Err(GatewayError::ReadRequest(
+            ReadRequestError::InvalidSearchQuery,
+        )),
+        Err(_) => Ok(None),
+    }
 }
 
 fn snapshot(
@@ -483,6 +535,8 @@ pub enum ReadRequestError {
         /// Requested results.
         actual: usize,
     },
+    /// The configured indexed-search backend rejected the query syntax.
+    InvalidSearchQuery,
     /// Validated committed content unexpectedly had a non-UTF-8 path.
     InvalidCommittedPath,
     /// The absolute operation deadline could not be represented.
@@ -505,6 +559,7 @@ impl ReadRequestError {
             Self::UnsupportedProtocolVersion { .. } => ErrorCode::InvalidProtocol,
             Self::TagTooLong { .. } | Self::InvalidResultLimit { .. } => ErrorCode::LimitExceeded,
             Self::InvalidTag => ErrorCode::InvalidRequest,
+            Self::InvalidSearchQuery => ErrorCode::InvalidRequest,
             Self::InvalidCommittedPath => ErrorCode::ContentValidationFailed,
             Self::InvalidDeadline => ErrorCode::InternalError,
             Self::ResponseTooLarge { .. } => ErrorCode::LimitExceeded,
@@ -531,6 +586,7 @@ impl fmt::Display for ReadRequestError {
                 formatter,
                 "maximum results is {actual}; configured maximum is {maximum}"
             ),
+            Self::InvalidSearchQuery => formatter.write_str("search query syntax is invalid"),
             Self::InvalidCommittedPath => {
                 formatter.write_str("committed document path is not UTF-8")
             }

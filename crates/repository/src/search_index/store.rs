@@ -84,6 +84,61 @@ struct PinnedStoreDirectory {
 }
 
 impl SearchIndexStore {
+    /// Opens the immutable index selected by `current` without creating or
+    /// modifying search-index storage.
+    ///
+    /// The selector must be the exact relative `by-id/<generation>` shape, so
+    /// a malformed link cannot redirect a reader outside the configured root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the existing store layout or selected generation
+    /// is missing, malformed, incompatible, or inconsistent.
+    pub fn open_active_read_only(
+        root: impl AsRef<Path>,
+    ) -> Result<Option<TantivySearchIndex>, SearchIndexStoreError> {
+        let root = fs::canonicalize(root).map_err(SearchIndexStoreError::Io)?;
+        let current = root.join(CURRENT_ENTRY);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SearchIndexStoreError::Io(error)),
+        };
+        if !metadata.file_type().is_symlink() {
+            return Err(SearchIndexStoreError::InvalidCurrentEntry);
+        }
+        let target = fs::read_link(&current).map_err(SearchIndexStoreError::Io)?;
+        let generation_id = generation_from_target(&target)?;
+        let by_id_path = root.join(BY_ID_DIRECTORY);
+        if !fs::symlink_metadata(&by_id_path)
+            .map_err(SearchIndexStoreError::Io)?
+            .file_type()
+            .is_dir()
+        {
+            return Err(SearchIndexStoreError::InvalidCurrentEntry);
+        }
+        let by_id = fs::canonicalize(&by_id_path).map_err(SearchIndexStoreError::Io)?;
+        if by_id != by_id_path {
+            return Err(SearchIndexStoreError::InvalidCurrentEntry);
+        }
+        let generation_path = by_id.join(generation_id);
+        if !fs::symlink_metadata(&generation_path)
+            .map_err(SearchIndexStoreError::Io)?
+            .file_type()
+            .is_dir()
+        {
+            return Err(SearchIndexStoreError::InvalidCurrentEntry);
+        }
+        let generation = fs::canonicalize(&generation_path).map_err(SearchIndexStoreError::Io)?;
+        if generation != generation_path || generation.parent() != Some(by_id.as_path()) {
+            return Err(SearchIndexStoreError::InvalidCurrentEntry);
+        }
+        let index = TantivySearchIndex::open_directory(generation)
+            .map_err(SearchIndexStoreError::search)?;
+        validate_generation_id(generation_id, index.commit())?;
+        Ok(Some(index))
+    }
+
     /// Creates or opens the fixed derived-index storage layout.
     ///
     /// Existing immutable generations are validated only when selected. An
