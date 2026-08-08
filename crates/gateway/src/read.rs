@@ -164,13 +164,6 @@ pub(super) fn search_until(
     let fields = settings.search_metadata_fields();
     let metadata_fields = SearchMetadataFields::new(fields[0], fields[1], fields[2], fields[3]);
     let filter = repository_filter(&request.filter);
-    let linear_policy = SearchPolicy {
-        maximum_query_characters: settings.maximum_search_query_characters(),
-        maximum_results: request.maximum_results,
-        maximum_scanned_documents: settings.maximum_search_documents(),
-        maximum_scanned_markdown_bytes: settings.maximum_search_markdown_bytes(),
-        deadline: Some(deadline),
-    };
     let records = match indexed_search(
         search_index_root,
         &snapshot,
@@ -183,9 +176,18 @@ pub(super) fn search_until(
         ),
     )? {
         Some(records) => records,
-        None => LinearSearch::new(metadata_fields)
-            .search(&snapshot, &request.query, &filter, linear_policy)
-            .map_err(committed)?,
+        None => {
+            let policy = SearchPolicy {
+                maximum_query_characters: settings.maximum_search_query_characters(),
+                maximum_results: request.maximum_results,
+                maximum_scanned_documents: settings.maximum_search_documents(),
+                maximum_scanned_markdown_bytes: settings.maximum_search_markdown_bytes(),
+                deadline: Some(deadline),
+            };
+            LinearSearch::new(metadata_fields)
+                .search(&snapshot, &request.query, &filter, policy)
+                .map_err(committed)?
+        }
     };
     let documents = records
         .into_iter()
@@ -207,10 +209,12 @@ fn indexed_search<'a>(
     let Some(root) = root else {
         return Ok(None);
     };
-    let index = match SearchIndexStore::open_active_read_only(root) {
-        Ok(Some(index)) if index.commit() == snapshot.commit() => index,
-        Ok(_) | Err(_) => return Ok(None),
-    };
+    let index = SearchIndexStore::open_active_read_only(root)
+        .map_err(|_| GatewayError::SearchIndexUnavailable)?
+        .ok_or(GatewayError::SearchIndexUnavailable)?;
+    if index.commit() != snapshot.commit() {
+        return Err(GatewayError::SearchIndexUnavailable);
+    }
     match index.search_with_metadata(snapshot, query, filter, metadata_fields, policy) {
         Ok(records) => Ok(Some(records)),
         Err(TantivySearchError::EmptyQuery) => Err(committed(CommittedReadError::EmptyQuery)),
@@ -226,7 +230,7 @@ fn indexed_search<'a>(
         Err(TantivySearchError::Query(_)) => Err(GatewayError::ReadRequest(
             ReadRequestError::InvalidSearchQuery,
         )),
-        Err(_) => Ok(None),
+        Err(_) => Err(GatewayError::SearchIndexUnavailable),
     }
 }
 

@@ -256,6 +256,8 @@ pub enum GatewayError {
     OverlappingStorage,
     /// A bounded Gateway operation exceeded its absolute deadline.
     OperationDeadlineExceeded,
+    /// Configured derived search state was absent, stale, or unreadable.
+    SearchIndexUnavailable,
     /// No durable state exists for the requested change request.
     RequestNotFound {
         /// Requested immutable change-request identifier.
@@ -273,7 +275,9 @@ impl GatewayError {
             Self::ReadRequest(error) => error.error_code(),
             Self::CommittedRead(error) => read::committed_error_code(error),
             Self::Attestation(_) | Self::OverlappingStorage => ErrorCode::InternalError,
-            Self::OperationDeadlineExceeded => ErrorCode::TemporaryFailure,
+            Self::OperationDeadlineExceeded | Self::SearchIndexUnavailable => {
+                ErrorCode::TemporaryFailure
+            }
             Self::RequestNotFound { .. } => ErrorCode::RequestNotFound,
         }
     }
@@ -295,6 +299,9 @@ impl fmt::Display for GatewayError {
             Self::OperationDeadlineExceeded => {
                 formatter.write_str("Gateway operation deadline expired")
             }
+            Self::SearchIndexUnavailable => {
+                formatter.write_str("configured search index is temporarily unavailable")
+            }
             Self::RequestNotFound { request_id } => {
                 write!(
                     formatter,
@@ -315,6 +322,7 @@ impl std::error::Error for GatewayError {
             Self::Attestation(error) => Some(error),
             Self::OverlappingStorage
             | Self::OperationDeadlineExceeded
+            | Self::SearchIndexUnavailable
             | Self::RequestNotFound { .. } => None,
         }
     }

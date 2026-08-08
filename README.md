@@ -96,8 +96,9 @@ agent-knowledge-client export \
 ```
 
 Search uses the Worker-published Tantivy index when it matches the committed
-revision, returning BM25-ranked results. If that derived index is unavailable,
-the Gateway preserves availability with the bounded Markdown scan backend.
+revision, returning BM25-ranked results. A configured index that is absent,
+stale, or unreadable is a retryable failure. Deployments that omit
+`search_index_root` retain the bounded Markdown scan backend.
 
 SSH host aliases, identities, host-key policy, and proxies belong in the
 client's OpenSSH configuration. The client disables interactive prompts, TTYs,

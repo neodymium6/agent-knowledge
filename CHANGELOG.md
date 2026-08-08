@@ -4,8 +4,9 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
-- Serve exact-commit BM25 search from Worker-published Tantivy indexes, with a
-  bounded committed-Markdown fallback when derived indexes are unavailable.
+- Serve exact-commit BM25 search from Worker-published Tantivy indexes. Missing,
+  stale, or unreadable configured indexes fail retryably; deployments without
+  indexed search retain the bounded committed-Markdown backend.
 
 ## 0.1.8
 

@@ -81,7 +81,7 @@ fn gateway(root: &TestDirectory) -> SubmitGateway {
 
 fn read_gateway(root: &TestDirectory) -> ReadGateway {
     initialize_committed_content(root);
-    let settings = settings(root);
+    let settings = settings_without_search_index(root);
     ReadGateway::open_until(&settings, None)
         .unwrap_or_else(|error| panic!("read Gateway must open: {error}"))
 }
@@ -96,6 +96,17 @@ fn settings(root: &TestDirectory) -> GatewaySettings {
     );
     GatewaySettings::decode(&yaml)
         .unwrap_or_else(|error| panic!("Gateway settings must decode: {error}"))
+}
+
+fn settings_without_search_index(root: &TestDirectory) -> GatewaySettings {
+    let yaml = format!(
+        "schema_version: 4\nidentity:\n  gateway_uid: 61001\nstorage:\n  queue_socket: {}\n  git_directory: {}\n  content_root: {}\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
+        root.path().join("queue").display(),
+        root.path().join("repository").display(),
+        root.path().join("content").display(),
+    );
+    GatewaySettings::decode(&yaml)
+        .unwrap_or_else(|error| panic!("Gateway settings without indexing must decode: {error}"))
 }
 
 fn publish_search_index(root: &TestDirectory) {
@@ -275,6 +286,22 @@ fn serves_phrase_search_from_the_matching_published_index() {
         search.documents[0].metadata.document_id.to_string(),
         "01K00000000000000000000001"
     );
+}
+
+#[test]
+fn reports_configured_search_index_unavailability_without_changing_query_semantics() {
+    let root = TestDirectory::create();
+    initialize_committed_content(&root);
+    let gateway = ReadGateway::open_until(&settings(&root), None)
+        .unwrap_or_else(|error| panic!("indexed read Gateway must open: {error}"));
+    assert!(matches!(
+        gateway.search(&SearchRequest::new(
+            "\"fictional service\"".into(),
+            ReadFilterRequest::default(),
+            10,
+        )),
+        Err(GatewayError::SearchIndexUnavailable)
+    ));
 }
 
 #[test]
