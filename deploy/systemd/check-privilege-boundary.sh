@@ -482,7 +482,7 @@ list_response=$(
 grep -Fq '01K00000000000000000000001' <<<"$list_response"
 
 search_response=$(
-  printf '%s\n' '{"protocol_version":1,"query":"\"Fictional Gateway body\"","maximum_results":10}' |
+  printf '%s\n' '{"protocol_version":1,"query":"\"Fictional privilege-boundary body\"","maximum_results":10}' |
     setpriv --reuid="$gateway_uid" --regid="$gateway_gid" --groups="$ingress_gid" \
       env SSH_ORIGINAL_COMMAND='akp-v1 search' \
       "$test_root/agent-knowledge" gateway --config "$test_root/gateway.yaml" \
