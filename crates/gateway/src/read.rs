@@ -173,7 +173,8 @@ pub(super) fn search_until(
         TantivySearchPolicy::new(
             settings.maximum_search_query_characters(),
             request.maximum_results,
-        ),
+        )
+        .with_deadline(deadline),
     )? {
         Some(records) => records,
         None => {
@@ -227,6 +228,7 @@ fn indexed_search<'a>(
         Err(TantivySearchError::InvalidResultLimit) => {
             Err(committed(CommittedReadError::InvalidResultLimit))
         }
+        Err(TantivySearchError::DeadlineExceeded) => Err(GatewayError::OperationDeadlineExceeded),
         Err(TantivySearchError::Query(_)) => Err(GatewayError::ReadRequest(
             ReadRequestError::InvalidSearchQuery,
         )),

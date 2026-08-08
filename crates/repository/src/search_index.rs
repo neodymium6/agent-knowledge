@@ -1,13 +1,17 @@
 use std::fmt;
+use std::fs::File;
+use std::io;
+use std::sync::Arc;
+use std::time::Instant;
 
 use agent_knowledge_core::{DocumentId, markdown_body};
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Collector, SegmentCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, QueryParserError, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, NumericOptions, STORED, STRING, Schema, TEXT, TantivyDocument, Term,
     TextOptions, Value,
 };
-use tantivy::{Index, IndexReader};
+use tantivy::{DocSet, Index, IndexReader, SegmentReader, TERMINATED};
 
 use crate::{
     CommittedReadError, CommittedSnapshot, DocumentRecord, ReadFilter, SearchMetadataFields,
@@ -34,17 +38,18 @@ pub struct TantivySearchIndex {
     query_schema: Schema,
     reader: IndexReader,
     fields: SearchFields,
+    _directory_anchor: Option<Arc<File>>,
 }
 
-/// Bounds that the synchronous Tantivy search primitive can enforce itself.
+/// Bounds enforced by the synchronous Tantivy search primitive.
 ///
-/// Request deadlines belong at the caller boundary, where the blocking search
-/// can be isolated or cancelled. Linear-scan byte and document limits do not
-/// apply to an already-built index.
+/// Linear-scan byte and document limits do not apply to an already-built
+/// index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TantivySearchPolicy {
     maximum_query_characters: usize,
     maximum_results: usize,
+    deadline: Option<Instant>,
 }
 
 impl TantivySearchPolicy {
@@ -54,7 +59,15 @@ impl TantivySearchPolicy {
         Self {
             maximum_query_characters,
             maximum_results,
+            deadline: None,
         }
+    }
+
+    /// Adds an absolute query deadline checked while collecting matches.
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 }
 
@@ -120,6 +133,7 @@ impl TantivySearchIndex {
             query_schema,
             reader,
             fields,
+            _directory_anchor: None,
         })
     }
 
@@ -182,6 +196,7 @@ impl TantivySearchIndex {
         if policy.maximum_results == 0 {
             return Err(TantivySearchError::InvalidResultLimit);
         }
+        check_deadline(policy.deadline)?;
         let query = query.trim();
         if query.is_empty() {
             return Err(TantivySearchError::EmptyQuery);
@@ -222,9 +237,12 @@ impl TantivySearchIndex {
         let hits = searcher
             .search(
                 &filtered,
-                &TopDocs::with_limit(result_limit).order_by_score(),
+                &DeadlineCollector {
+                    inner: TopDocs::with_limit(result_limit).order_by_score(),
+                    deadline: policy.deadline,
+                },
             )
-            .map_err(TantivySearchError::engine)?;
+            .map_err(TantivySearchError::from_search)?;
 
         let mut records = Vec::with_capacity(hits.len());
         for (score, address) in hits {
@@ -248,6 +266,84 @@ impl TantivySearchIndex {
                 .then_with(|| left.relative_path().cmp(right.relative_path()))
         });
         Ok(records.into_iter().map(|(_, record)| record).collect())
+    }
+}
+
+struct DeadlineCollector<C> {
+    inner: C,
+    deadline: Option<Instant>,
+}
+
+impl<C> Collector for DeadlineCollector<C>
+where
+    C: Collector,
+{
+    type Fruit = C::Fruit;
+    type Child = C::Child;
+
+    fn check_schema(&self, schema: &Schema) -> tantivy::Result<()> {
+        self.inner.check_schema(schema)
+    }
+
+    fn for_segment(
+        &self,
+        segment_local_id: u32,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        self.inner.for_segment(segment_local_id, segment)
+    }
+
+    fn requires_scoring(&self) -> bool {
+        self.inner.requires_scoring()
+    }
+
+    fn merge_fruits(
+        &self,
+        segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
+    ) -> tantivy::Result<Self::Fruit> {
+        check_collector_deadline(self.deadline)?;
+        self.inner.merge_fruits(segment_fruits)
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn tantivy::query::Weight,
+        segment_ord: u32,
+        reader: &SegmentReader,
+    ) -> tantivy::Result<<Self::Child as SegmentCollector>::Fruit> {
+        check_collector_deadline(self.deadline)?;
+        let mut collector = self.inner.for_segment(segment_ord, reader)?;
+        let mut scorer = weight.scorer(reader, 1.0)?;
+        while scorer.doc() != TERMINATED {
+            check_collector_deadline(self.deadline)?;
+            let document = scorer.doc();
+            if reader
+                .alive_bitset()
+                .is_none_or(|alive| alive.is_alive(document))
+            {
+                let score = scorer.score();
+                collector.collect(document, score);
+            }
+            scorer.advance();
+        }
+        check_collector_deadline(self.deadline)?;
+        Ok(collector.harvest())
+    }
+}
+
+fn check_collector_deadline(deadline: Option<Instant>) -> tantivy::Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(io::Error::new(io::ErrorKind::TimedOut, "search deadline expired").into())
+    } else {
+        Ok(())
+    }
+}
+
+fn check_deadline(deadline: Option<Instant>) -> Result<(), TantivySearchError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(TantivySearchError::DeadlineExceeded)
+    } else {
+        Ok(())
     }
 }
 
@@ -508,6 +604,8 @@ pub enum TantivySearchError {
     },
     /// The requested result limit was zero.
     InvalidResultLimit,
+    /// The absolute query deadline expired.
+    DeadlineExceeded,
     /// The index and supplied snapshot represent different commits.
     SnapshotCommitMismatch {
         /// Commit represented by the index.
@@ -533,6 +631,15 @@ impl TantivySearchError {
 
     fn engine(error: tantivy::TantivyError) -> Self {
         Self::Engine(Box::new(error))
+    }
+
+    fn from_search(error: tantivy::TantivyError) -> Self {
+        if matches!(&error, tantivy::TantivyError::IoError(source) if source.kind() == io::ErrorKind::TimedOut)
+        {
+            Self::DeadlineExceeded
+        } else {
+            Self::engine(error)
+        }
     }
 
     fn io(error: std::io::Error) -> Self {
@@ -566,6 +673,7 @@ impl fmt::Display for TantivySearchError {
                 "search query has {actual} characters; maximum is {maximum}"
             ),
             Self::InvalidResultLimit => formatter.write_str("maximum results must be positive"),
+            Self::DeadlineExceeded => formatter.write_str("search deadline expired"),
             Self::SnapshotCommitMismatch { index, snapshot } => write!(
                 formatter,
                 "search index commit `{index}` does not match snapshot commit `{snapshot}`"

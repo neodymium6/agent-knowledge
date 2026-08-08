@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -87,14 +88,19 @@ impl TantivySearchIndex {
     /// Returns an error when the manifest or Tantivy files are missing,
     /// malformed, incompatible, or disagree about the indexed document count.
     pub fn open_directory(directory: impl AsRef<Path>) -> Result<Self, TantivySearchError> {
-        Self::open_directory_with(directory.as_ref(), || {})
+        Self::open_directory_with(directory.as_ref(), || {}, None)
     }
 
     fn open_directory_with(
         directory: &Path,
         after_resolve: impl FnOnce(),
+        directory_anchor: Option<Arc<std::fs::File>>,
     ) -> Result<Self, TantivySearchError> {
-        let directory = fs::canonicalize(directory).map_err(TantivySearchError::io)?;
+        let directory = if directory_anchor.is_some() {
+            directory.to_owned()
+        } else {
+            fs::canonicalize(directory).map_err(TantivySearchError::io)?
+        };
         after_resolve();
         let manifest = read_manifest(&directory)?;
         let metadata_fields = SearchMetadataFields::from(manifest.metadata_fields);
@@ -130,7 +136,15 @@ impl TantivySearchIndex {
             query_schema,
             reader,
             fields,
+            _directory_anchor: directory_anchor,
         })
+    }
+
+    pub(super) fn open_pinned_directory(
+        directory: &Path,
+        directory_anchor: Arc<std::fs::File>,
+    ) -> Result<Self, TantivySearchError> {
+        Self::open_directory_with(directory, || {}, Some(directory_anchor))
     }
 
     #[cfg(test)]
@@ -138,7 +152,7 @@ impl TantivySearchIndex {
         directory: impl AsRef<Path>,
         after_resolve: impl FnOnce(),
     ) -> Result<Self, TantivySearchError> {
-        Self::open_directory_with(directory.as_ref(), after_resolve)
+        Self::open_directory_with(directory.as_ref(), after_resolve, None)
     }
 }
 

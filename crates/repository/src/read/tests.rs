@@ -422,6 +422,15 @@ fn tantivy_honors_metadata_selection_and_query_bounds() {
     assert!(matches!(
         index.search(
             &snapshot,
+            "fictional",
+            &ReadFilter::default(),
+            TantivySearchPolicy::new(64, 10).with_deadline(std::time::Instant::now()),
+        ),
+        Err(TantivySearchError::DeadlineExceeded)
+    ));
+    assert!(matches!(
+        index.search(
+            &snapshot,
             &format!("exact_session:{SESSION_ID}"),
             &ReadFilter::default(),
             TantivySearchPolicy::new(64, 10),
@@ -748,6 +757,36 @@ fn read_only_search_index_selection_rejects_an_external_by_id_directory() {
     assert!(matches!(
         SearchIndexStore::open_active_read_only(&root),
         Err(SearchIndexStoreError::InvalidCurrentEntry)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_only_search_index_detects_root_replacement_after_pinning() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let root = fixture._root.path().join("reader-search-indexes");
+    let moved = fixture._root.path().join("moved-reader-search-indexes");
+    let store = SearchIndexStore::open(&root)
+        .unwrap_or_else(|error| panic!("search index store must open: {error}"));
+    let prepared = store
+        .prepare(&snapshot, SearchMetadataFields::default())
+        .unwrap_or_else(|error| panic!("search index must prepare: {error}"));
+    store
+        .activate(&prepared)
+        .unwrap_or_else(|error| panic!("search index must activate: {error}"));
+
+    let selected = SearchIndexStore::open_active_read_only_after_root_pin(&root, || {
+        fs::rename(&root, &moved).unwrap_or_else(|error| panic!("search root must move: {error}"));
+        fs::create_dir(&root)
+            .unwrap_or_else(|error| panic!("replacement search root must be created: {error}"));
+    });
+    assert!(matches!(
+        selected,
+        Err(SearchIndexStoreError::Attestation(_))
     ));
 }
 

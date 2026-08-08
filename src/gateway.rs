@@ -137,10 +137,9 @@ where
             let deadline = read_deadline(&settings);
             let gateway =
                 ReadGateway::open_until(&settings, Some(deadline)).map_err(gateway_error)?;
-            let encoded = run_isolated_search_until(
-                move || gateway.search_encoded_until(&request, deadline),
-                deadline,
-            )?;
+            let encoded = gateway
+                .search_encoded_until(&request, deadline)
+                .map_err(gateway_error)?;
             write_encoded_response_until(output, encoded, deadline)
         }
         GatewayCommand::Status => {
@@ -177,35 +176,6 @@ where
 
 fn read_deadline(settings: &GatewaySettings) -> Instant {
     Instant::now() + settings.read_operation_timeout()
-}
-
-// Tantivy search is synchronous and cannot be interrupted by its caller. The
-// forced-command process serves exactly one request, so a detached search is
-// terminated by the process exit that follows a deadline response.
-fn run_isolated_search_until<F>(
-    operation: F,
-    deadline: Instant,
-) -> Result<Vec<u8>, GatewayCommandError>
-where
-    F: FnOnce() -> Result<Vec<u8>, GatewayError> + Send + 'static,
-{
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("gateway-index-search".into())
-        .spawn(move || {
-            let _ = sender.send(operation());
-        })
-        .map_err(GatewayCommandError::SearchExecution)?;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match receiver.recv_timeout(remaining) {
-        Ok(result) => result.map_err(gateway_error),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err(gateway_error(GatewayError::OperationDeadlineExceeded))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(
-            GatewayCommandError::SearchExecution(io::Error::other("search execution stopped")),
-        ),
-    }
 }
 
 fn decode_control_request<T: DeserializeOwned>(
@@ -401,7 +371,6 @@ pub enum GatewayCommandError {
     Ingress(IngressClientError),
     InputSetup(io::Error),
     OutputSetup(io::Error),
-    SearchExecution(io::Error),
     ControlInput(io::Error),
     ControlRequestTooLarge,
     ControlJson(serde_json::Error),
@@ -437,7 +406,6 @@ impl GatewayCommandError {
             | Self::Identity(_)
             | Self::InputSetup(_)
             | Self::OutputSetup(_)
-            | Self::SearchExecution(_)
             | Self::ControlInput(_)
             | Self::Json(_)
             | Self::Io(_) => ErrorCode::InternalError,
@@ -481,9 +449,6 @@ impl fmt::Display for GatewayCommandError {
             Self::Ingress(error) => error.fmt(formatter),
             Self::InputSetup(error) => write!(formatter, "Gateway input setup failed: {error}"),
             Self::OutputSetup(error) => write!(formatter, "Gateway output setup failed: {error}"),
-            Self::SearchExecution(error) => {
-                write!(formatter, "Gateway search execution failed: {error}")
-            }
             Self::ControlInput(error) => write!(formatter, "Gateway control input failed: {error}"),
             Self::ControlRequestTooLarge => write!(
                 formatter,
@@ -507,7 +472,6 @@ impl std::error::Error for GatewayCommandError {
             Self::Ingress(error) => Some(error),
             Self::InputSetup(error) => Some(error),
             Self::OutputSetup(error) => Some(error),
-            Self::SearchExecution(error) => Some(error),
             Self::ControlInput(error) => Some(error),
             Self::ControlJson(error) => Some(error),
             Self::Json(error) => Some(error),
@@ -535,7 +499,7 @@ mod tests {
 
     use super::GatewayCommandError;
     #[cfg(target_os = "linux")]
-    use super::{DeadlineReader, run_isolated_search_until, write_encoded_response_until};
+    use super::{DeadlineReader, write_encoded_response_until};
 
     #[test]
     fn command_selection_failures_emit_only_a_versioned_protocol_error() {
@@ -646,23 +610,5 @@ mod tests {
             .read_to_end(&mut delivered)
             .unwrap_or_else(|error| panic!("closed response stream must drain: {error}"));
         assert!(delivered.len() < response_length);
-    }
-
-    #[test]
-    fn indexed_search_returns_when_the_operation_deadline_expires() {
-        let started = Instant::now();
-        let result = run_isolated_search_until(
-            || {
-                std::thread::sleep(Duration::from_millis(200));
-                Ok(Vec::new())
-            },
-            started + Duration::from_millis(20),
-        );
-        assert!(matches!(
-            result,
-            Err(GatewayCommandError::Gateway(error))
-                if matches!(*error, agent_knowledge_gateway::GatewayError::OperationDeadlineExceeded)
-        ));
-        assert!(started.elapsed() < Duration::from_millis(150));
     }
 }

@@ -97,8 +97,17 @@ impl SearchIndexStore {
     pub fn open_active_read_only(
         root: impl AsRef<Path>,
     ) -> Result<Option<TantivySearchIndex>, SearchIndexStoreError> {
-        let root = fs::canonicalize(root).map_err(SearchIndexStoreError::Io)?;
-        let current = root.join(CURRENT_ENTRY);
+        Self::open_active_read_only_with(root.as_ref(), || {})
+    }
+
+    fn open_active_read_only_with(
+        root: &Path,
+        after_root_pin: impl FnOnce(),
+    ) -> Result<Option<TantivySearchIndex>, SearchIndexStoreError> {
+        let root = pin_directory(root)?;
+        after_root_pin();
+        validate_pinned_directory(&root)?;
+        let current = root.stable.join(CURRENT_ENTRY);
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -109,34 +118,26 @@ impl SearchIndexStore {
         }
         let target = fs::read_link(&current).map_err(SearchIndexStoreError::Io)?;
         let generation_id = generation_from_target(&target)?;
-        let by_id_path = root.join(BY_ID_DIRECTORY);
-        if !fs::symlink_metadata(&by_id_path)
-            .map_err(SearchIndexStoreError::Io)?
-            .file_type()
-            .is_dir()
-        {
-            return Err(SearchIndexStoreError::InvalidCurrentEntry);
-        }
-        let by_id = fs::canonicalize(&by_id_path).map_err(SearchIndexStoreError::Io)?;
-        if by_id != by_id_path {
-            return Err(SearchIndexStoreError::InvalidCurrentEntry);
-        }
-        let generation_path = by_id.join(generation_id);
-        if !fs::symlink_metadata(&generation_path)
-            .map_err(SearchIndexStoreError::Io)?
-            .file_type()
-            .is_dir()
-        {
-            return Err(SearchIndexStoreError::InvalidCurrentEntry);
-        }
-        let generation = fs::canonicalize(&generation_path).map_err(SearchIndexStoreError::Io)?;
-        if generation != generation_path || generation.parent() != Some(by_id.as_path()) {
-            return Err(SearchIndexStoreError::InvalidCurrentEntry);
-        }
-        let index = TantivySearchIndex::open_directory(generation)
-            .map_err(SearchIndexStoreError::search)?;
+        let by_id = pin_active_directory(&root.stable.join(BY_ID_DIRECTORY))?;
+        let generation = pin_active_directory(&by_id.stable.join(generation_id))?;
+        let index = TantivySearchIndex::open_pinned_directory(
+            &generation.stable,
+            Arc::clone(&generation.handle),
+        )
+        .map_err(SearchIndexStoreError::search)?;
+        validate_pinned_directory(&root)?;
+        validate_pinned_directory(&by_id)?;
+        validate_pinned_directory(&generation)?;
         validate_generation_id(generation_id, index.commit())?;
         Ok(Some(index))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_active_read_only_after_root_pin(
+        root: impl AsRef<Path>,
+        after_root_pin: impl FnOnce(),
+    ) -> Result<Option<TantivySearchIndex>, SearchIndexStoreError> {
+        Self::open_active_read_only_with(root.as_ref(), after_root_pin)
     }
 
     /// Creates or opens the fixed derived-index storage layout.
@@ -520,6 +521,10 @@ fn pin_directory(path: &Path) -> Result<PinnedStoreDirectory, SearchIndexStoreEr
     };
     validate_pinned_directory(&directory)?;
     Ok(directory)
+}
+
+fn pin_active_directory(path: &Path) -> Result<PinnedStoreDirectory, SearchIndexStoreError> {
+    pin_directory(path).map_err(|_| SearchIndexStoreError::InvalidCurrentEntry)
 }
 
 fn validate_pinned_directory(
