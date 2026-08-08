@@ -5,15 +5,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agent_knowledge_core::{DocumentId, markdown_body};
-use tantivy::collector::{Collector, SegmentCollector};
+use tantivy::collector::sort_key::{SortBySimilarityScore, SortByString};
+use tantivy::collector::{Collector, SegmentCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, QueryParserError, TermQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, NumericOptions, STORED, STRING, Schema, TEXT, TantivyDocument, Term,
-    TextOptions, Value,
+    FAST, Field, IndexRecordOption, NumericOptions, STORED, STRING, Schema, TEXT, TantivyDocument,
+    Term, TextOptions, Value,
 };
-use tantivy::{
-    DocAddress, DocId, DocSet, Index, IndexReader, Score, SegmentOrdinal, SegmentReader, TERMINATED,
-};
+use tantivy::{DocSet, Index, IndexReader, Order, SegmentReader, TERMINATED};
 
 use crate::{
     CommittedReadError, CommittedSnapshot, DetachedSnapshot, DocumentRecord, ReadFilter,
@@ -24,6 +23,7 @@ use crate::{
 // primitive single-threaded and at that minimum until deployment measurements
 // justify a configurable larger budget.
 const INDEX_WRITER_MEMORY_BYTES: usize = 15_000_000;
+const SORT_PATH_FIELD: &str = "sort_path";
 
 mod disk;
 mod store;
@@ -294,14 +294,18 @@ impl TantivySearchIndex {
             .search(
                 &filtered,
                 &DeadlineCollector {
-                    inner: AllScoresCollector,
+                    inner: TopDocs::with_limit(result_limit).order_by((
+                        (SortBySimilarityScore, Order::Desc),
+                        (SortByString::for_field(SORT_PATH_FIELD), Order::Asc),
+                    )),
                     deadline: policy.deadline,
                 },
             )
             .map_err(TantivySearchError::from_search)?;
 
         let mut records = Vec::with_capacity(hits.len());
-        for (score, address) in hits {
+        for ((_score, _path), address) in hits {
+            check_deadline(policy.deadline)?;
             let stored = searcher
                 .doc::<TantivyDocument>(address)
                 .map_err(TantivySearchError::engine)?;
@@ -314,65 +318,10 @@ impl TantivySearchIndex {
             let record = snapshot
                 .document(document_id)
                 .ok_or(TantivySearchError::UnknownDocumentId { document_id })?;
-            records.push((score, record));
+            records.push(record);
         }
-        records.sort_by(|(left_score, left), (right_score, right)| {
-            right_score
-                .total_cmp(left_score)
-                .then_with(|| left.relative_path().cmp(right.relative_path()))
-        });
-        Ok(records
-            .into_iter()
-            .take(result_limit)
-            .map(|(_, record)| record)
-            .collect())
-    }
-}
-
-struct AllScoresCollector;
-
-struct AllScoresSegmentCollector {
-    segment_ord: SegmentOrdinal,
-    hits: Vec<(Score, DocAddress)>,
-}
-
-impl Collector for AllScoresCollector {
-    type Fruit = Vec<(Score, DocAddress)>;
-    type Child = AllScoresSegmentCollector;
-
-    fn for_segment(
-        &self,
-        segment_ord: SegmentOrdinal,
-        _segment: &SegmentReader,
-    ) -> tantivy::Result<Self::Child> {
-        Ok(AllScoresSegmentCollector {
-            segment_ord,
-            hits: Vec::new(),
-        })
-    }
-
-    fn requires_scoring(&self) -> bool {
-        true
-    }
-
-    fn merge_fruits(
-        &self,
-        segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
-    ) -> tantivy::Result<Self::Fruit> {
-        Ok(segment_fruits.into_iter().flatten().collect())
-    }
-}
-
-impl SegmentCollector for AllScoresSegmentCollector {
-    type Fruit = Vec<(Score, DocAddress)>;
-
-    fn collect(&mut self, document: DocId, score: Score) {
-        self.hits
-            .push((score, DocAddress::new(self.segment_ord, document)));
-    }
-
-    fn harvest(self) -> Self::Fruit {
-        self.hits
+        check_deadline(policy.deadline)?;
+        Ok(records)
     }
 }
 
@@ -470,6 +419,7 @@ struct SearchFields {
     title: Field,
     body: Field,
     path: Field,
+    sort_path: Field,
     tags: Field,
     exact_tags: Field,
     node: Field,
@@ -494,6 +444,8 @@ impl SearchFields {
         query_schema.add_text_field("body", TEXT);
         let path = schema.add_text_field("path", TEXT);
         query_schema.add_text_field("path", TEXT);
+        let sort_path = schema.add_text_field(SORT_PATH_FIELD, FAST);
+        query_schema.add_text_field(SORT_PATH_FIELD, TextOptions::default());
         let tags = schema.add_text_field("tags", TEXT);
         query_schema.add_text_field("tags", TEXT);
         let exact_tags = schema.add_text_field("exact_tags", STRING);
@@ -551,6 +503,7 @@ impl SearchFields {
                 title,
                 body,
                 path,
+                sort_path,
                 tags,
                 exact_tags,
                 node,
@@ -603,6 +556,7 @@ impl SearchFields {
         document.add_text(self.title, &metadata.title);
         document.add_text(self.body, body);
         document.add_text(self.path, record.relative_path().to_string_lossy());
+        document.add_text(self.sort_path, record.relative_path().to_string_lossy());
         for tag in &metadata.tags {
             document.add_text(self.tags, tag);
             document.add_text(self.exact_tags, tag);

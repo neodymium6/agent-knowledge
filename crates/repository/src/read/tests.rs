@@ -588,7 +588,7 @@ fn tantivy_disk_index_rejects_overwrite_and_manifest_mismatch() {
         TantivySearchIndex::open_directory(&directory),
         Err(TantivySearchError::DiskSchemaMismatch)
     ));
-    manifest["format_version"] = serde_json::json!(2);
+    manifest["format_version"] = serde_json::json!(3);
     fs::write(
         directory.join(".agent-knowledge-search-index.json"),
         serde_json::to_vec(&manifest)

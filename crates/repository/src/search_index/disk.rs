@@ -13,7 +13,7 @@ use tantivy::Index;
 use super::{SearchFields, TantivySearchError, TantivySearchIndex};
 use crate::{CommittedSnapshot, SearchMetadataFields};
 
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 const INDEX_DIRECTORY: &str = "tantivy";
 const MANIFEST_FILE: &str = ".agent-knowledge-search-index.json";
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024;
