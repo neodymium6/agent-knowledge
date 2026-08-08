@@ -930,11 +930,8 @@ mod tests {
         let mut boundaries = worker_boundaries();
         boundaries.search_indexes = None;
         assert!(
-            validate_worker_identity(
-                &process(61_003, 62_003, &[62_002, 62_003]),
-                &boundaries,
-            )
-            .is_ok()
+            validate_worker_identity(&process(61_003, 62_003, &[62_002, 62_003]), &boundaries,)
+                .is_ok()
         );
     }
 

@@ -1014,7 +1014,7 @@ fn validate_durable_initialized(
         StorageBootstrapError::Component("release validation", error.to_string())
     })?;
     if let Some(root) = settings.search_index_root() {
-        SearchIndexStore::open(root).map_err(|error| {
+        SearchIndexStore::open_recovering(root).map_err(|error| {
             StorageBootstrapError::Component("search index validation", error.to_string())
         })?;
     }

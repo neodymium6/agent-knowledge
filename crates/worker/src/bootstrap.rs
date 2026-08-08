@@ -73,7 +73,7 @@ impl WorkerBootstrap {
         let search_indexes = topology
             .search_index_root
             .as_ref()
-            .map(|root| SearchIndexStore::open(root.stable_path()))
+            .map(|root| SearchIndexStore::open_recovering(root.stable_path()))
             .transpose()
             .map_err(|error| WorkerOpenError::SearchIndex(Box::new(error)))?;
         let committed = search_indexes

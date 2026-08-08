@@ -95,7 +95,37 @@ impl SearchIndexStore {
     /// Returns an error when storage cannot be created and pinned, fixed
     /// directories overlap mount boundaries, or `current` is malformed.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SearchIndexStoreError> {
-        let root = root.as_ref();
+        let store = Self::open_layout(root.as_ref())?;
+        store.active_index()?;
+        Ok(store)
+    }
+
+    /// Opens the store and quarantines a corrupt active derived generation.
+    ///
+    /// Storage identity, fixed-directory, and mount-boundary failures remain
+    /// fatal. Only the active selection and its selected immutable generation
+    /// are quarantined, allowing a caller to rebuild them from canonical
+    /// content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage is unsafe, another writer owns it, the
+    /// active failure is not recoverable derived-data corruption, or durable
+    /// quarantine fails.
+    pub fn open_recovering(root: impl AsRef<Path>) -> Result<Self, SearchIndexStoreError> {
+        let store = Self::open_layout(root.as_ref())?;
+        match store.active_index() {
+            Ok(_) => Ok(store),
+            Err(error) if recoverable_active_error(&error) => {
+                store.quarantine_active()?;
+                store.active_index()?;
+                Ok(store)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_layout(root: &Path) -> Result<Self, SearchIndexStoreError> {
         ensure_or_create_directory(root)?;
         let configured_root = fs::canonicalize(root).map_err(SearchIndexStoreError::Io)?;
         let root = pin_directory(&configured_root)?;
@@ -113,7 +143,6 @@ impl SearchIndexStore {
             mutation_available: Arc::new(AtomicBool::new(true)),
         };
         store.validate_live_storage()?;
-        store.active_index()?;
         Ok(store)
     }
 
@@ -262,6 +291,51 @@ impl SearchIndexStore {
         validate_common_filesystem(&self.root, &self.by_id, &self.staging)
     }
 
+    fn quarantine_active(&self) -> Result<(), SearchIndexStoreError> {
+        let _mutation = self.lock_mutation()?;
+        self.validate_live_storage()?;
+        let current = self.root.stable.join(CURRENT_ENTRY);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(SearchIndexStoreError::Io(error)),
+        };
+        let selected_generation = if metadata.file_type().is_symlink() {
+            fs::read_link(&current)
+                .ok()
+                .and_then(|target| generation_from_target(&target).ok().map(str::to_owned))
+        } else {
+            None
+        };
+        let quarantine_id = Ulid::generate();
+        let quarantined_current = self
+            .staging
+            .stable
+            .join(format!("invalid-current-{quarantine_id}"));
+        fs::rename(&current, &quarantined_current).map_err(SearchIndexStoreError::Io)?;
+        sync_directory(&self.root.stable)?;
+        sync_directory(&self.staging.stable)?;
+
+        if let Some(generation) = selected_generation {
+            let selected = self.by_id.stable.join(&generation);
+            match fs::symlink_metadata(&selected) {
+                Ok(_) => {
+                    let quarantined_generation = self
+                        .staging
+                        .stable
+                        .join(format!("invalid-generation-{generation}-{quarantine_id}"));
+                    fs::rename(&selected, &quarantined_generation)
+                        .map_err(SearchIndexStoreError::Io)?;
+                    sync_directory(&self.by_id.stable)?;
+                    sync_directory(&self.staging.stable)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(SearchIndexStoreError::Io(error)),
+            }
+        }
+        self.validate_live_storage()
+    }
+
     fn lock_mutation(&self) -> Result<MutationLease<'_>, SearchIndexStoreError> {
         if self
             .mutation_available
@@ -280,7 +354,7 @@ impl SearchIndexStore {
         match root_lock.try_lock() {
             Ok(()) => Ok(MutationLease {
                 available: &self.mutation_available,
-                _root_lock: root_lock,
+                root_lock,
             }),
             Err(TryLockError::WouldBlock) => {
                 self.mutation_available.store(true, Ordering::Release);
@@ -296,17 +370,28 @@ impl SearchIndexStore {
 
 struct MutationLease<'a> {
     available: &'a AtomicBool,
-    _root_lock: File,
+    root_lock: File,
 }
 
 impl Drop for MutationLease<'_> {
     fn drop(&mut self) {
+        let _ = self.root_lock.unlock();
         self.available.store(true, Ordering::Release);
     }
 }
 
 fn generation_id(commit: &str) -> String {
     format!("{commit}-{}", Ulid::generate())
+}
+
+fn recoverable_active_error(error: &SearchIndexStoreError) -> bool {
+    matches!(
+        error,
+        SearchIndexStoreError::Search(_)
+            | SearchIndexStoreError::InvalidGeneration
+            | SearchIndexStoreError::GenerationCommitMismatch
+            | SearchIndexStoreError::InvalidCurrentEntry
+    )
 }
 
 fn validate_generation_id(generation_id: &str, commit: &str) -> Result<(), SearchIndexStoreError> {

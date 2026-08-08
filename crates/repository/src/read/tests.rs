@@ -705,7 +705,65 @@ fn search_index_store_rejects_writer_contention_and_invalid_current() {
             SearchIndexStore::open(&root),
             Err(SearchIndexStoreError::InvalidCurrentEntry)
         ));
+        let recovered = SearchIndexStore::open_recovering(&root)
+            .unwrap_or_else(|error| panic!("invalid derived selection must recover: {error}"));
+        assert!(
+            recovered
+                .active_index()
+                .unwrap_or_else(|error| panic!("recovered selection must validate: {error}"))
+                .is_none()
+        );
     }
+}
+
+#[test]
+fn search_index_store_quarantines_a_corrupt_selected_generation() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let root = fixture._root.path().join("search-indexes");
+    let store = SearchIndexStore::open(&root)
+        .unwrap_or_else(|error| panic!("search index store must open: {error}"));
+    let prepared = store
+        .prepare(&snapshot, SearchMetadataFields::default())
+        .unwrap_or_else(|error| panic!("search generation must prepare: {error}"));
+    store
+        .activate(&prepared)
+        .unwrap_or_else(|error| panic!("search generation must activate: {error}"));
+    fs::write(
+        root.join("by-id")
+            .join(prepared.generation_id())
+            .join(".agent-knowledge-search-index.json"),
+        b"{invalid",
+    )
+    .unwrap_or_else(|error| panic!("search manifest must be corrupted: {error}"));
+
+    assert!(matches!(
+        SearchIndexStore::open(&root),
+        Err(SearchIndexStoreError::Search(_))
+    ));
+    let recovered = SearchIndexStore::open_recovering(&root)
+        .unwrap_or_else(|error| panic!("corrupt derived generation must recover: {error}"));
+    assert!(
+        recovered
+            .active_index()
+            .unwrap_or_else(|error| panic!("recovered selection must validate: {error}"))
+            .is_none()
+    );
+    assert!(!root.join("by-id").join(prepared.generation_id()).exists());
+    let replacement = recovered
+        .prepare(&snapshot, SearchMetadataFields::default())
+        .unwrap_or_else(|error| panic!("replacement generation must prepare: {error}"));
+    assert_ne!(replacement.generation_id(), prepared.generation_id());
+    assert_eq!(
+        recovered
+            .activate(&replacement)
+            .unwrap_or_else(|error| panic!("replacement generation must activate: {error}"))
+            .commit(),
+        snapshot.commit()
+    );
 }
 
 #[test]
