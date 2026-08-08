@@ -10,6 +10,8 @@ use std::os::unix::fs::PermissionsExt;
 
 use agent_knowledge_core::{DocumentId, ProjectId};
 use agent_knowledge_queue::PackagePolicy;
+#[cfg(unix)]
+use tantivy::directory::META_LOCK;
 
 use super::{
     CommittedReadError, CommittedStore, LinearSearch, ReadFilter, SearchBackend,
@@ -42,7 +44,12 @@ fn assert_published_index_file_permissions(path: &Path) {
         }
     } else {
         assert!(metadata.file_type().is_file());
-        assert_eq!(metadata.permissions().mode() & 0o7777, 0o640);
+        let expected = if path.file_name() == META_LOCK.filepath.file_name() {
+            0o660
+        } else {
+            0o640
+        };
+        assert_eq!(metadata.permissions().mode() & 0o7777, expected);
     }
 }
 

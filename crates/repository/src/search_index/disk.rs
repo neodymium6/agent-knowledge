@@ -9,6 +9,8 @@ use std::os::unix::fs::PermissionsExt;
 use agent_knowledge_core::read_bounded_regular_file;
 use serde::{Deserialize, Serialize};
 use tantivy::Index;
+#[cfg(unix)]
+use tantivy::directory::META_LOCK;
 
 use super::{SearchFields, TantivySearchError, TantivySearchIndex};
 use crate::{CommittedSnapshot, SearchMetadataFields};
@@ -19,6 +21,8 @@ const MANIFEST_FILE: &str = ".agent-knowledge-search-index.json";
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024;
 #[cfg(unix)]
 const INDEX_FILE_MODE: u32 = 0o640;
+#[cfg(unix)]
+const INDEX_LOCK_FILE_MODE: u32 = 0o660;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -234,7 +238,14 @@ fn normalize_index_file_permissions(path: &Path) -> Result<(), TantivySearchErro
         }
         sync_directory(path)
     } else if metadata.file_type().is_file() {
-        fs::set_permissions(path, fs::Permissions::from_mode(INDEX_FILE_MODE))
+        // Tantivy write-opens its metadata lock even for an IndexReader. Keep
+        // only that coordination file writable by the read-only Gateway group.
+        let mode = if path.file_name() == META_LOCK.filepath.file_name() {
+            INDEX_LOCK_FILE_MODE
+        } else {
+            INDEX_FILE_MODE
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .map_err(TantivySearchError::io)?;
         File::open(path)
             .and_then(|file| file.sync_all())
