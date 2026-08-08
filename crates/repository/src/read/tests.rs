@@ -380,6 +380,16 @@ fn tantivy_honors_metadata_selection_and_query_bounds() {
         .unwrap_or_else(|error| panic!("caller-restricted search must succeed: {error}"));
     assert!(restricted.is_empty());
     assert!(matches!(
+        complete_index.search_with_metadata(
+            &snapshot,
+            "node:fictional-node-a",
+            &ReadFilter::default(),
+            SearchMetadataFields::new(false, false, false, false),
+            TantivySearchPolicy::new(64, 10),
+        ),
+        Err(TantivySearchError::Query(_))
+    ));
+    assert!(matches!(
         index.search(
             &snapshot,
             " ",

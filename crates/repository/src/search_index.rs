@@ -194,9 +194,15 @@ impl TantivySearchIndex {
             });
         }
 
+        let allowed_metadata = self.fields.allowed_metadata(metadata_fields);
+        let query_schema = if allowed_metadata == self.fields.indexed_metadata {
+            self.query_schema.clone()
+        } else {
+            SearchFields::schemas(allowed_metadata).1
+        };
         let mut parser = QueryParser::new(
-            self.query_schema.clone(),
-            self.fields.searchable(metadata_fields),
+            query_schema,
+            self.fields.searchable(allowed_metadata),
             self.index.tokenizers().clone(),
         );
         parser.set_conjunction_by_default();
@@ -371,6 +377,15 @@ impl SearchFields {
             searchable.push(self.request_id);
         }
         searchable
+    }
+
+    fn allowed_metadata(&self, requested: SearchMetadataFields) -> SearchMetadataFields {
+        SearchMetadataFields::new(
+            self.indexed_metadata.node() && requested.node(),
+            self.indexed_metadata.agent() && requested.agent(),
+            self.indexed_metadata.session() && requested.session(),
+            self.indexed_metadata.request_id() && requested.request_id(),
+        )
     }
 
     fn document(
