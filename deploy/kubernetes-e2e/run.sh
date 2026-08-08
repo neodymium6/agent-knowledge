@@ -274,7 +274,7 @@ jq -e --arg request_id "$REQUEST_ID" \
 wait_for_completed_request
 
 run_client client search --destination agent-knowledge-e2e \
-  --query 'persistence needle' --project fictional-solver \
+  --query '"persistence needle"' --project fictional-solver \
   --maximum-results 10 --timeout-seconds 10 \
   >"$temporary_directory/search-before.json"
 jq -e --arg document_id "$DOCUMENT_ID" \
@@ -314,7 +314,7 @@ jq -e --arg commit "$commit_before" --arg document_id "$DOCUMENT_ID" \
   '.commit == $commit and .document.summary.metadata.document_id == $document_id' \
   "$temporary_directory/get-after.json" >/dev/null
 run_client client search --destination agent-knowledge-e2e \
-  --query 'persistence needle' --project fictional-solver \
+  --query '"persistence needle"' --project fictional-solver \
   --maximum-results 10 --timeout-seconds 10 \
   >"$temporary_directory/search-after.json"
 jq -e --arg commit "$commit_before" --arg document_id "$DOCUMENT_ID" \

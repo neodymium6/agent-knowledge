@@ -51,6 +51,7 @@ let
       queue_socket: /run/agent-knowledge/queue-ingress.sock
       git_directory: /var/lib/agent-knowledge/repository
       content_root: /var/lib/agent-knowledge/content
+      search_index_root: /var/lib/agent-knowledge/search-indexes
     repository:
       official_branch: main
     reads:
@@ -403,7 +404,7 @@ pkgs.testers.runNixOSTest {
     assert "Fictional systemd benchmark body one." in first_document["document"]["markdown"]
     search = json.loads(
         run_client(
-            "search --destination fictional-systemd --query 'body one' "
+            "search --destination fictional-systemd --query '\"body one\"' "
             "--maximum-results 10 --timeout-seconds 120"
         )
     )

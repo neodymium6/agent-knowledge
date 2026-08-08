@@ -84,6 +84,62 @@ struct PinnedStoreDirectory {
 }
 
 impl SearchIndexStore {
+    /// Opens the immutable index selected by `current` without creating or
+    /// modifying search-index storage.
+    ///
+    /// The selector must be the exact relative `by-id/<generation>` shape, so
+    /// a malformed link cannot redirect a reader outside the configured root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the existing store layout or selected generation
+    /// is missing, malformed, incompatible, or inconsistent.
+    pub fn open_active_read_only(
+        root: impl AsRef<Path>,
+    ) -> Result<Option<TantivySearchIndex>, SearchIndexStoreError> {
+        Self::open_active_read_only_with(root.as_ref(), || {})
+    }
+
+    fn open_active_read_only_with(
+        root: &Path,
+        after_root_pin: impl FnOnce(),
+    ) -> Result<Option<TantivySearchIndex>, SearchIndexStoreError> {
+        let root = pin_directory(root)?;
+        after_root_pin();
+        validate_pinned_directory(&root)?;
+        let current = root.stable.join(CURRENT_ENTRY);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SearchIndexStoreError::Io(error)),
+        };
+        if !metadata.file_type().is_symlink() {
+            return Err(SearchIndexStoreError::InvalidCurrentEntry);
+        }
+        let target = fs::read_link(&current).map_err(SearchIndexStoreError::Io)?;
+        let generation_id = generation_from_target(&target)?;
+        let by_id = pin_active_directory(&root.stable.join(BY_ID_DIRECTORY))?;
+        let generation = pin_active_directory(&by_id.stable.join(generation_id))?;
+        let index = TantivySearchIndex::open_pinned_directory(
+            &generation.stable,
+            Arc::clone(&generation.handle),
+        )
+        .map_err(SearchIndexStoreError::search)?;
+        validate_pinned_directory(&root)?;
+        validate_pinned_directory(&by_id)?;
+        validate_pinned_directory(&generation)?;
+        validate_generation_id(generation_id, index.commit())?;
+        Ok(Some(index))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_active_read_only_after_root_pin(
+        root: impl AsRef<Path>,
+        after_root_pin: impl FnOnce(),
+    ) -> Result<Option<TantivySearchIndex>, SearchIndexStoreError> {
+        Self::open_active_read_only_with(root.as_ref(), after_root_pin)
+    }
+
     /// Creates or opens the fixed derived-index storage layout.
     ///
     /// Existing immutable generations are validated only when selected. An
@@ -465,6 +521,10 @@ fn pin_directory(path: &Path) -> Result<PinnedStoreDirectory, SearchIndexStoreEr
     };
     validate_pinned_directory(&directory)?;
     Ok(directory)
+}
+
+fn pin_active_directory(path: &Path) -> Result<PinnedStoreDirectory, SearchIndexStoreError> {
+    pin_directory(path).map_err(|_| SearchIndexStoreError::InvalidCurrentEntry)
 }
 
 fn validate_pinned_directory(

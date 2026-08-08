@@ -275,11 +275,31 @@ pub struct CommittedSnapshot {
     _content_lock: File,
 }
 
+/// Owned committed metadata detached from the canonical-worktree read lock.
+///
+/// This view cannot read Markdown or attachments. It is suitable for resolving
+/// hits from an immutable derived index after the publication lock is released.
+#[derive(Debug)]
+pub struct DetachedSnapshot {
+    commit: String,
+    index: ContentIndex,
+}
+
 impl CommittedSnapshot {
     /// Returns the exact official commit pinned by this snapshot.
     #[must_use]
     pub fn commit(&self) -> &str {
         &self.commit
+    }
+
+    /// Releases the canonical-worktree read lock while retaining owned
+    /// document metadata for derived-index hit resolution.
+    #[must_use]
+    pub fn into_detached(self) -> DetachedSnapshot {
+        DetachedSnapshot {
+            commit: self.commit,
+            index: self.index,
+        }
     }
 
     pub(crate) fn documents(&self) -> impl Iterator<Item = &DocumentRecord> {
@@ -547,6 +567,18 @@ impl CommittedSnapshot {
             return Err(CommittedReadError::ContentChanged { document_id });
         }
         Ok(output.stdout)
+    }
+}
+
+impl DetachedSnapshot {
+    /// Returns the exact official commit represented by this metadata view.
+    #[must_use]
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub(crate) fn document(&self, document_id: DocumentId) -> Option<&DocumentRecord> {
+        self.index.get(document_id)
     }
 }
 

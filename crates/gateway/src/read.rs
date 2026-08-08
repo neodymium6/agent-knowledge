@@ -2,15 +2,16 @@ use std::fmt;
 use std::io::{self, Write};
 use std::time::Instant;
 
-use agent_knowledge_core::{DocumentLimits, ErrorCode};
+use agent_knowledge_core::{DocumentLimits, ErrorCode, PathAttestation};
 use agent_knowledge_protocol::{
     CURRENT_GATEWAY_PROTOCOL_VERSION, DocumentContent, DocumentSummary, ExportRequest, GetRequest,
     GetResponse, ListRequest, ListResponse, ReadFilterRequest, SearchRequest,
 };
 use agent_knowledge_queue::PackagePolicy;
 use agent_knowledge_repository::{
-    CommittedBundleEntry, CommittedReadError, CommittedStore, ContentPolicy, DocumentRecord,
-    LinearSearch, ReadFilter, SearchBackend, SearchMetadataFields, SearchPolicy,
+    CommittedBundleEntry, CommittedReadError, CommittedStore, ContentPolicy, DetachedSnapshot,
+    DocumentRecord, LinearSearch, ReadFilter, SearchBackend, SearchIndexStore,
+    SearchMetadataFields, SearchPolicy, TantivySearchError, TantivySearchPolicy,
 };
 use tar::{Builder, EntryType, Header};
 
@@ -136,14 +137,22 @@ fn write_export_archive(entries: &[CommittedBundleEntry], output: impl Write) ->
 pub(super) fn search(
     settings: &GatewaySettings,
     store: &CommittedStore,
+    search_indexes: Option<PathAttestation>,
     request: &SearchRequest,
 ) -> Result<PreparedResponse<ListResponse>, GatewayError> {
-    search_until(settings, store, request, read_deadline(settings)?)
+    search_until(
+        settings,
+        store,
+        search_indexes,
+        request,
+        read_deadline(settings)?,
+    )
 }
 
 pub(super) fn search_until(
     settings: &GatewaySettings,
     store: &CommittedStore,
+    search_indexes: Option<PathAttestation>,
     request: &SearchRequest,
     deadline: Instant,
 ) -> Result<PreparedResponse<ListResponse>, GatewayError> {
@@ -152,30 +161,116 @@ pub(super) fn search_until(
     validate_result_limit(settings, request.maximum_results)?;
     let snapshot = snapshot(settings, store, deadline)?;
     let fields = settings.search_metadata_fields();
-    let search = LinearSearch::new(SearchMetadataFields::new(
-        fields[0], fields[1], fields[2], fields[3],
-    ));
-    let records = search
-        .search(
-            &snapshot,
-            &request.query,
-            &repository_filter(&request.filter),
-            SearchPolicy {
-                maximum_query_characters: settings.maximum_search_query_characters(),
-                maximum_results: request.maximum_results,
-                maximum_scanned_documents: settings.maximum_search_documents(),
-                maximum_scanned_markdown_bytes: settings.maximum_search_markdown_bytes(),
-                deadline: Some(deadline),
-            },
-        )
-        .map_err(committed)?;
-    let documents = records
-        .into_iter()
-        .map(document_summary)
-        .collect::<Result<Vec<_>, _>>()?;
-    let response = ListResponse::new(snapshot.commit().to_owned(), documents);
-    drop(snapshot);
+    let metadata_fields = SearchMetadataFields::new(fields[0], fields[1], fields[2], fields[3]);
+    let filter = repository_filter(&request.filter);
+    let commit = snapshot.commit().to_owned();
+    let documents = if let Some(search_indexes) = search_indexes {
+        let snapshot = snapshot.into_detached();
+        indexed_search(
+            search_indexes,
+            snapshot,
+            request.query.clone(),
+            filter,
+            metadata_fields,
+            TantivySearchPolicy::new(
+                settings.maximum_search_query_characters(),
+                request.maximum_results,
+            )
+            .with_deadline(deadline),
+            deadline,
+        )?
+    } else {
+        let policy = SearchPolicy {
+            maximum_query_characters: settings.maximum_search_query_characters(),
+            maximum_results: request.maximum_results,
+            maximum_scanned_documents: settings.maximum_search_documents(),
+            maximum_scanned_markdown_bytes: settings.maximum_search_markdown_bytes(),
+            deadline: Some(deadline),
+        };
+        let records = LinearSearch::new(metadata_fields)
+            .search(&snapshot, &request.query, &filter, policy)
+            .map_err(committed)?;
+        let documents = records
+            .into_iter()
+            .map(document_summary)
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(snapshot);
+        documents
+    };
+    let response = ListResponse::new(commit, documents);
     prepare_response(settings, response, deadline)
+}
+
+fn indexed_search(
+    root: PathAttestation,
+    snapshot: DetachedSnapshot,
+    query: String,
+    filter: ReadFilter,
+    metadata_fields: SearchMetadataFields,
+    policy: TantivySearchPolicy,
+    deadline: Instant,
+) -> Result<Vec<DocumentSummary>, GatewayError> {
+    run_until(
+        move || {
+            let index = SearchIndexStore::open_active_read_only(root.stable_path())
+                .map_err(|_| GatewayError::SearchIndexUnavailable)?
+                .ok_or(GatewayError::SearchIndexUnavailable)?;
+            if index.commit() != snapshot.commit() {
+                return Err(GatewayError::SearchIndexUnavailable);
+            }
+            match index.search_detached(&snapshot, &query, &filter, metadata_fields, policy) {
+                Ok(records) => records
+                    .into_iter()
+                    .map(document_summary)
+                    .collect::<Result<Vec<_>, _>>(),
+                Err(TantivySearchError::EmptyQuery) => {
+                    Err(committed(CommittedReadError::EmptyQuery))
+                }
+                Err(TantivySearchError::QueryTooLong { maximum, actual }) => {
+                    Err(committed(CommittedReadError::QueryTooLong {
+                        maximum,
+                        actual,
+                    }))
+                }
+                Err(TantivySearchError::InvalidResultLimit) => {
+                    Err(committed(CommittedReadError::InvalidResultLimit))
+                }
+                Err(TantivySearchError::DeadlineExceeded) => {
+                    Err(GatewayError::OperationDeadlineExceeded)
+                }
+                Err(TantivySearchError::Query(_)) => Err(GatewayError::ReadRequest(
+                    ReadRequestError::InvalidSearchQuery,
+                )),
+                Err(_) => Err(GatewayError::SearchIndexUnavailable),
+            }
+        },
+        deadline,
+    )
+}
+
+fn run_until<T>(
+    operation: impl FnOnce() -> Result<T, GatewayError> + Send + 'static,
+    deadline: Instant,
+) -> Result<T, GatewayError>
+where
+    T: Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("gateway-index-search".into())
+        .spawn(move || {
+            let _ = sender.send(operation());
+        })
+        .map_err(GatewayError::SearchExecution)?;
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(GatewayError::OperationDeadlineExceeded)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(GatewayError::SearchExecution(
+            io::Error::other("search execution stopped"),
+        )),
+    }
 }
 
 fn snapshot(
@@ -483,6 +578,8 @@ pub enum ReadRequestError {
         /// Requested results.
         actual: usize,
     },
+    /// The configured indexed-search backend rejected the query syntax.
+    InvalidSearchQuery,
     /// Validated committed content unexpectedly had a non-UTF-8 path.
     InvalidCommittedPath,
     /// The absolute operation deadline could not be represented.
@@ -505,6 +602,7 @@ impl ReadRequestError {
             Self::UnsupportedProtocolVersion { .. } => ErrorCode::InvalidProtocol,
             Self::TagTooLong { .. } | Self::InvalidResultLimit { .. } => ErrorCode::LimitExceeded,
             Self::InvalidTag => ErrorCode::InvalidRequest,
+            Self::InvalidSearchQuery => ErrorCode::InvalidRequest,
             Self::InvalidCommittedPath => ErrorCode::ContentValidationFailed,
             Self::InvalidDeadline => ErrorCode::InternalError,
             Self::ResponseTooLarge { .. } => ErrorCode::LimitExceeded,
@@ -531,6 +629,7 @@ impl fmt::Display for ReadRequestError {
                 formatter,
                 "maximum results is {actual}; configured maximum is {maximum}"
             ),
+            Self::InvalidSearchQuery => formatter.write_str("search query syntax is invalid"),
             Self::InvalidCommittedPath => {
                 formatter.write_str("committed document path is not UTF-8")
             }
@@ -555,7 +654,9 @@ mod tests {
     use agent_knowledge_protocol::ListResponse;
     use agent_knowledge_repository::{CommittedReadError, ContentIndexError};
 
-    use super::{ReadRequestError, ResponseBuffer, committed_error_code, prepare_response};
+    use super::{
+        ReadRequestError, ResponseBuffer, committed_error_code, prepare_response, run_until,
+    };
     use crate::{GatewayError, GatewaySettings};
 
     #[test]
@@ -601,5 +702,22 @@ mod tests {
             ContentIndexError::FileChangedDuringScan(PathBuf::from("fictional.md")),
         ));
         assert_eq!(committed_error_code(&error), ErrorCode::TemporaryFailure);
+    }
+
+    #[test]
+    fn indexed_boundary_returns_at_the_absolute_deadline() {
+        let started = std::time::Instant::now();
+        let result = run_until(
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(())
+            },
+            started + std::time::Duration::from_millis(20),
+        );
+        assert!(matches!(
+            result,
+            Err(GatewayError::OperationDeadlineExceeded)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
     }
 }

@@ -430,7 +430,8 @@ The Gateway:
 - validates the wire format and operation;
 - forwards authenticated submissions over the local queue-ingress socket;
 - serves committed documents and attachments;
-- searches committed Markdown and permitted metadata; and
+- searches committed Markdown and permitted metadata through an exact-commit
+  derived index or a bounded scan fallback; and
 - reports request status.
 
 The Gateway does not open the queue file system, write `content/`, mutate Git
@@ -598,6 +599,9 @@ knowledge/
 ├── releases/
 │   ├── by-id/
 │   └── current -> by-id/<release-id>/
+├── search-indexes/
+│   ├── by-id/               # immutable exact-commit Tantivy generations
+│   └── current -> by-id/<generation-id>/
 └── work/                    # repository lock, journals, worktrees, and builds
 ```
 
@@ -1673,14 +1677,27 @@ budget includes the JSON Lines framing newline.
 
 ## 24. Search
 
-The initial search implementation scans committed Markdown and permitted
-front-matter fields. It searches:
+The Worker publishes an immutable Tantivy index for each committed snapshot and
+atomically selects it through `search-indexes/current`. The Gateway opens the
+selection read-only and uses it only when its manifest and Tantivy commit
+payload match the exact committed snapshot pinned for the request. Matching
+documents are ranked with BM25, with canonical path as the deterministic
+equal-score tie-breaker.
+
+If indexing is disabled, the Gateway uses the bounded linear scan backend.
+When indexing is configured, a missing, stale, or invalid selection is a
+retryable failure so query syntax does not silently change. The Gateway never
+repairs or changes derived storage; the Worker validates and rebuilds it. Both
+backends search:
 
 - titles;
 - Markdown bodies;
 - paths;
 - tags; and
 - configured metadata fields.
+
+The initial Tantivy integration uses its standard tokenizer and does not add a
+Japanese-specific tokenizer.
 
 It does not search:
 
@@ -1690,9 +1707,8 @@ It does not search:
 - binary attachment contents; or
 - PDF or standalone HTML bodies.
 
-Search is exposed behind an internal Rust trait so that a dedicated text or
-vector index can be added later. An index is always derived data and must be
-associated with an exact commit ID.
+The index is derived data and may be rebuilt from committed Markdown. Semantic
+or vector search remains outside the initial implementation.
 
 ## 25. Failure classification
 

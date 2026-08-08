@@ -10,6 +10,8 @@ use std::os::unix::fs::PermissionsExt;
 
 use agent_knowledge_core::{DocumentId, ProjectId};
 use agent_knowledge_queue::PackagePolicy;
+#[cfg(unix)]
+use tantivy::directory::META_LOCK;
 
 use super::{
     CommittedReadError, CommittedStore, LinearSearch, ReadFilter, SearchBackend,
@@ -42,7 +44,12 @@ fn assert_published_index_file_permissions(path: &Path) {
         }
     } else {
         assert!(metadata.file_type().is_file());
-        assert_eq!(metadata.permissions().mode() & 0o7777, 0o640);
+        let expected = if path.file_name() == META_LOCK.filepath.file_name() {
+            0o660
+        } else {
+            0o640
+        };
+        assert_eq!(metadata.permissions().mode() & 0o7777, expected);
     }
 }
 
@@ -319,6 +326,17 @@ fn tantivy_searches_terms_phrases_metadata_and_exact_filters() {
     assert_eq!(ranked.len(), 2);
     assert_eq!(ranked[0].metadata().document_id.to_string(), LOG_ID);
 
+    let equal_scores = index
+        .search(
+            &snapshot,
+            "*",
+            &ReadFilter::default(),
+            TantivySearchPolicy::new(64, 1),
+        )
+        .unwrap_or_else(|error| panic!("equal-score limited search must succeed: {error}"));
+    assert_eq!(equal_scores.len(), 1);
+    assert_eq!(equal_scores[0].metadata().document_id.to_string(), LOG_ID);
+
     let metadata = index
         .search(
             &snapshot,
@@ -365,6 +383,30 @@ fn tantivy_honors_metadata_selection_and_query_bounds() {
         )
         .unwrap_or_else(|error| panic!("restricted search must succeed: {error}"));
     assert!(metadata.is_empty());
+
+    let complete_index =
+        TantivySearchIndex::build_in_memory(&snapshot, SearchMetadataFields::default())
+            .unwrap_or_else(|error| panic!("complete Tantivy index must build: {error}"));
+    let restricted = complete_index
+        .search_with_metadata(
+            &snapshot,
+            "fictional-node-a",
+            &ReadFilter::default(),
+            SearchMetadataFields::new(false, false, false, false),
+            TantivySearchPolicy::new(64, 10),
+        )
+        .unwrap_or_else(|error| panic!("caller-restricted search must succeed: {error}"));
+    assert!(restricted.is_empty());
+    assert!(matches!(
+        complete_index.search_with_metadata(
+            &snapshot,
+            "node:fictional-node-a",
+            &ReadFilter::default(),
+            SearchMetadataFields::new(false, false, false, false),
+            TantivySearchPolicy::new(64, 10),
+        ),
+        Err(TantivySearchError::Query(_))
+    ));
     assert!(matches!(
         index.search(
             &snapshot,
@@ -394,6 +436,15 @@ fn tantivy_honors_metadata_selection_and_query_bounds() {
             TantivySearchPolicy::new(64, 0),
         ),
         Err(TantivySearchError::InvalidResultLimit)
+    ));
+    assert!(matches!(
+        index.search(
+            &snapshot,
+            "fictional",
+            &ReadFilter::default(),
+            TantivySearchPolicy::new(64, 10).with_deadline(std::time::Instant::now()),
+        ),
+        Err(TantivySearchError::DeadlineExceeded)
     ));
     assert!(matches!(
         index.search(
@@ -544,7 +595,7 @@ fn tantivy_disk_index_rejects_overwrite_and_manifest_mismatch() {
         TantivySearchIndex::open_directory(&directory),
         Err(TantivySearchError::DiskSchemaMismatch)
     ));
-    manifest["format_version"] = serde_json::json!(2);
+    manifest["format_version"] = serde_json::json!(3);
     fs::write(
         directory.join(".agent-knowledge-search-index.json"),
         serde_json::to_vec(&manifest)
@@ -681,6 +732,10 @@ fn search_index_store_prepares_activates_reopens_and_reuses_a_generation() {
         .unwrap_or_else(|error| panic!("selected search index must query: {error}"));
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].metadata().document_id.to_string(), LOG_ID);
+    let read_only = SearchIndexStore::open_active_read_only(&root)
+        .unwrap_or_else(|error| panic!("active search index must open read-only: {error}"))
+        .unwrap_or_else(|| panic!("active read-only search index must exist"));
+    assert_eq!(read_only.commit(), snapshot.commit());
 
     let generations_before = fs::read_dir(root.join("by-id"))
         .unwrap_or_else(|error| panic!("generations must be readable: {error}"))
@@ -695,6 +750,62 @@ fn search_index_store_prepares_activates_reopens_and_reuses_a_generation() {
             .count(),
         generations_before
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_search_index_selection_rejects_an_external_by_id_directory() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::create();
+    let root = fixture._root.path().join("reader-search-indexes");
+    let outside = fixture._root.path().join("outside-by-id");
+    fs::create_dir(&root)
+        .unwrap_or_else(|error| panic!("reader search root must be created: {error}"));
+    fs::create_dir(&outside)
+        .unwrap_or_else(|error| panic!("outside by-id fixture must be created: {error}"));
+    symlink(&outside, root.join("by-id"))
+        .unwrap_or_else(|error| panic!("external by-id link must be created: {error}"));
+    symlink(
+        "by-id/00000000000000000000000000-0123456789abcdef",
+        root.join("current"),
+    )
+    .unwrap_or_else(|error| panic!("current selector must be created: {error}"));
+
+    assert!(matches!(
+        SearchIndexStore::open_active_read_only(&root),
+        Err(SearchIndexStoreError::InvalidCurrentEntry)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_only_search_index_detects_root_replacement_after_pinning() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let root = fixture._root.path().join("reader-search-indexes");
+    let moved = fixture._root.path().join("moved-reader-search-indexes");
+    let store = SearchIndexStore::open(&root)
+        .unwrap_or_else(|error| panic!("search index store must open: {error}"));
+    let prepared = store
+        .prepare(&snapshot, SearchMetadataFields::default())
+        .unwrap_or_else(|error| panic!("search index must prepare: {error}"));
+    store
+        .activate(&prepared)
+        .unwrap_or_else(|error| panic!("search index must activate: {error}"));
+
+    let selected = SearchIndexStore::open_active_read_only_after_root_pin(&root, || {
+        fs::rename(&root, &moved).unwrap_or_else(|error| panic!("search root must move: {error}"));
+        fs::create_dir(&root)
+            .unwrap_or_else(|error| panic!("replacement search root must be created: {error}"));
+    });
+    assert!(matches!(
+        selected,
+        Err(SearchIndexStoreError::Attestation(_))
+    ));
 }
 
 #[test]
@@ -908,6 +1019,23 @@ fn shared_snapshot_lock_blocks_publication_until_drop() {
             Err(error) => panic!("writer lock must succeed after snapshot drop: {error}"),
         }
     }
+}
+
+#[test]
+fn detached_snapshot_releases_the_publication_lock() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let commit = snapshot.commit().to_owned();
+    let detached = snapshot.into_detached();
+    let writer = File::open(&fixture.content)
+        .unwrap_or_else(|error| panic!("publication lock fixture must open: {error}"));
+    writer
+        .try_lock()
+        .unwrap_or_else(|error| panic!("detached metadata must not retain the lock: {error}"));
+    assert_eq!(detached.commit(), commit);
 }
 
 #[cfg(unix)]

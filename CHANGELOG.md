@@ -4,6 +4,10 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Serve exact-commit BM25 search from Worker-published Tantivy indexes. Missing,
+  stale, or unreadable configured indexes fail retryably; deployments without
+  indexed search retain the bounded committed-Markdown backend.
+
 ## 0.1.8
 
 - Add structured MCP document archival over STDIO or Streamable HTTP without a

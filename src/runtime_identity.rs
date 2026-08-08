@@ -262,6 +262,10 @@ pub(crate) fn validate_gateway(settings: &GatewaySettings) -> Result<(), Runtime
     let boundaries = GatewayBoundaries {
         repository: DirectoryIdentity::inspect(settings.git_directory())?,
         content: DirectoryIdentity::inspect(settings.content_root())?,
+        search_indexes: settings
+            .search_index_root()
+            .map(DirectoryIdentity::inspect)
+            .transpose()?,
         runtime: DirectoryIdentity::inspect(socket_parent)?,
     };
     validate_gateway_identity(
@@ -356,6 +360,7 @@ fn validate_queue_ingress_identity(
 struct GatewayBoundaries {
     repository: DirectoryIdentity,
     content: DirectoryIdentity,
+    search_indexes: Option<DirectoryIdentity>,
     runtime: DirectoryIdentity,
 }
 
@@ -366,9 +371,16 @@ fn validate_gateway_identity(
 ) -> Result<(), RuntimeIdentityError> {
     require_boundary_mode(GATEWAY_ROLE, &boundaries.repository, READER_DIRECTORY_MODE)?;
     require_boundary_mode(GATEWAY_ROLE, &boundaries.content, READER_DIRECTORY_MODE)?;
+    if let Some(search_indexes) = boundaries.search_indexes.as_ref() {
+        require_boundary_mode(GATEWAY_ROLE, search_indexes, READER_DIRECTORY_MODE)?;
+    }
     require_boundary_mode(GATEWAY_ROLE, &boundaries.runtime, RUNTIME_DIRECTORY_MODE)?;
-    require_matching_owner(GATEWAY_ROLE, &boundaries.repository, &[&boundaries.content])?;
-    require_matching_group(GATEWAY_ROLE, &boundaries.repository, &[&boundaries.content])?;
+    let mut worker_owned = vec![&boundaries.content];
+    if let Some(search_indexes) = boundaries.search_indexes.as_ref() {
+        worker_owned.push(search_indexes);
+    }
+    require_matching_owner(GATEWAY_ROLE, &boundaries.repository, &worker_owned)?;
+    require_matching_group(GATEWAY_ROLE, &boundaries.repository, &worker_owned)?;
     require_distinct(
         GATEWAY_ROLE,
         "Repository Worker and Queue Ingress owners",
@@ -1035,6 +1047,12 @@ mod tests {
                 0o2750,
             ),
             content: DirectoryIdentity::fictional("/srv/fictional/content", 61_003, 62_001, 0o2750),
+            search_indexes: Some(DirectoryIdentity::fictional(
+                "/srv/fictional/search-indexes",
+                61_003,
+                62_001,
+                0o2750,
+            )),
             runtime: DirectoryIdentity::fictional("/run/fictional", 61_002, 62_004, 0o2750),
         }
     }
@@ -1046,6 +1064,20 @@ mod tests {
                 &process(61_001, 62_001, &[62_001, 62_004]),
                 61_001,
                 &gateway_boundaries(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn accepts_gateway_identity_when_search_indexes_are_disabled() {
+        let mut boundaries = gateway_boundaries();
+        boundaries.search_indexes = None;
+        assert!(
+            validate_gateway_identity(
+                &process(61_001, 62_001, &[62_001, 62_004]),
+                61_001,
+                &boundaries,
             )
             .is_ok()
         );

@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -8,16 +9,20 @@ use std::os::unix::fs::PermissionsExt;
 use agent_knowledge_core::read_bounded_regular_file;
 use serde::{Deserialize, Serialize};
 use tantivy::Index;
+#[cfg(unix)]
+use tantivy::directory::META_LOCK;
 
 use super::{SearchFields, TantivySearchError, TantivySearchIndex};
 use crate::{CommittedSnapshot, SearchMetadataFields};
 
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 const INDEX_DIRECTORY: &str = "tantivy";
 const MANIFEST_FILE: &str = ".agent-knowledge-search-index.json";
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024;
 #[cfg(unix)]
 const INDEX_FILE_MODE: u32 = 0o640;
+#[cfg(unix)]
+const INDEX_LOCK_FILE_MODE: u32 = 0o660;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -87,14 +92,19 @@ impl TantivySearchIndex {
     /// Returns an error when the manifest or Tantivy files are missing,
     /// malformed, incompatible, or disagree about the indexed document count.
     pub fn open_directory(directory: impl AsRef<Path>) -> Result<Self, TantivySearchError> {
-        Self::open_directory_with(directory.as_ref(), || {})
+        Self::open_directory_with(directory.as_ref(), || {}, None)
     }
 
     fn open_directory_with(
         directory: &Path,
         after_resolve: impl FnOnce(),
+        directory_anchor: Option<Arc<std::fs::File>>,
     ) -> Result<Self, TantivySearchError> {
-        let directory = fs::canonicalize(directory).map_err(TantivySearchError::io)?;
+        let directory = if directory_anchor.is_some() {
+            directory.to_owned()
+        } else {
+            fs::canonicalize(directory).map_err(TantivySearchError::io)?
+        };
         after_resolve();
         let manifest = read_manifest(&directory)?;
         let metadata_fields = SearchMetadataFields::from(manifest.metadata_fields);
@@ -130,7 +140,15 @@ impl TantivySearchIndex {
             query_schema,
             reader,
             fields,
+            _directory_anchor: directory_anchor,
         })
+    }
+
+    pub(super) fn open_pinned_directory(
+        directory: &Path,
+        directory_anchor: Arc<std::fs::File>,
+    ) -> Result<Self, TantivySearchError> {
+        Self::open_directory_with(directory, || {}, Some(directory_anchor))
     }
 
     #[cfg(test)]
@@ -138,7 +156,7 @@ impl TantivySearchIndex {
         directory: impl AsRef<Path>,
         after_resolve: impl FnOnce(),
     ) -> Result<Self, TantivySearchError> {
-        Self::open_directory_with(directory.as_ref(), after_resolve)
+        Self::open_directory_with(directory.as_ref(), after_resolve, None)
     }
 }
 
@@ -220,7 +238,14 @@ fn normalize_index_file_permissions(path: &Path) -> Result<(), TantivySearchErro
         }
         sync_directory(path)
     } else if metadata.file_type().is_file() {
-        fs::set_permissions(path, fs::Permissions::from_mode(INDEX_FILE_MODE))
+        // Tantivy write-opens its metadata lock even for an IndexReader. Keep
+        // only that coordination file writable by the read-only Gateway group.
+        let mode = if path.file_name() == META_LOCK.filepath.file_name() {
+            INDEX_LOCK_FILE_MODE
+        } else {
+            INDEX_FILE_MODE
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .map_err(TantivySearchError::io)?;
         File::open(path)
             .and_then(|file| file.sync_all())

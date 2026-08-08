@@ -28,6 +28,7 @@ pub struct GatewaySettings {
     queue_socket: PathBuf,
     git_directory: PathBuf,
     content_root: PathBuf,
+    search_index_root: Option<PathBuf>,
     official_branch: String,
     maximum_read_results: usize,
     maximum_search_query_characters: usize,
@@ -123,6 +124,12 @@ impl GatewaySettings {
         &self.content_root
     }
 
+    /// Returns the optional Worker-published derived search-index store.
+    #[must_use]
+    pub fn search_index_root(&self) -> Option<&Path> {
+        self.search_index_root.as_deref()
+    }
+
     /// Returns the official branch name without the `refs/heads/` prefix.
     #[must_use]
     pub fn official_branch(&self) -> &str {
@@ -204,6 +211,11 @@ impl TryFrom<WireGatewayConfig> for GatewaySettings {
         let queue_socket = validate_storage_path(wire.storage.queue_socket, "queue_socket")?;
         let git_directory = validate_storage_path(wire.storage.git_directory, "git_directory")?;
         let content_root = validate_storage_path(wire.storage.content_root, "content_root")?;
+        let search_index_root = wire
+            .storage
+            .search_index_root
+            .map(|path| validate_storage_path(path, "search_index_root"))
+            .transpose()?;
         if !valid_official_branch(&wire.repository.official_branch) {
             return Err(GatewayConfigError::InvalidOfficialBranch);
         }
@@ -255,6 +267,7 @@ impl TryFrom<WireGatewayConfig> for GatewaySettings {
             queue_socket,
             git_directory,
             content_root,
+            search_index_root,
             official_branch: wire.repository.official_branch,
             maximum_read_results: wire.reads.maximum_results,
             maximum_search_query_characters: wire.reads.maximum_query_characters,
@@ -346,6 +359,8 @@ struct WireStorage {
     queue_socket: PathBuf,
     git_directory: PathBuf,
     content_root: PathBuf,
+    #[serde(default)]
+    search_index_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -522,6 +537,26 @@ mod tests {
         assert_eq!(settings.read_operation_timeout(), Duration::from_secs(30));
         assert_eq!(settings.maximum_response_bytes(), 268_435_456);
         assert_eq!(settings.search_metadata_fields(), [true; 4]);
+        assert!(settings.search_index_root().is_none());
+
+        let indexed = GatewaySettings::decode(&VALID_CONFIG.replace(
+            "  content_root: /srv/fictional-knowledge/content\n",
+            "  content_root: /srv/fictional-knowledge/content\n  search_index_root: /srv/fictional-knowledge/search-indexes\n",
+        ))
+        .unwrap_or_else(|error| panic!("indexed Gateway fixture must decode: {error}"));
+        assert_eq!(
+            indexed.search_index_root(),
+            Some(std::path::Path::new(
+                "/srv/fictional-knowledge/search-indexes"
+            ))
+        );
+        assert!(
+            GatewaySettings::decode(&VALID_CONFIG.replace(
+                "  content_root: /srv/fictional-knowledge/content\n",
+                "  content_root: /srv/fictional-knowledge/content\n  search_index_root: relative/indexes\n",
+            ))
+            .is_err()
+        );
 
         let version_three = VALID_CONFIG.replacen(
             "schema_version: 4\nidentity:\n  gateway_uid: 61001\n",

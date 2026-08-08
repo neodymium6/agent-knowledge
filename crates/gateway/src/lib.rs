@@ -99,6 +99,7 @@ impl StatusGateway {
 #[derive(Debug)]
 pub struct ReadGateway {
     committed: CommittedStore,
+    search_indexes: Option<PathAttestation>,
     settings: GatewaySettings,
 }
 
@@ -109,12 +110,18 @@ impl ReadGateway {
         settings: &GatewaySettings,
         deadline: Option<std::time::Instant>,
     ) -> Result<Self, GatewayError> {
-        let resolved = [
+        let mut resolved = vec![
             PathAttestation::resolve_destination(settings.git_directory())
                 .map_err(GatewayError::Attestation)?,
             PathAttestation::resolve_destination(settings.content_root())
                 .map_err(GatewayError::Attestation)?,
         ];
+        if let Some(search_index_root) = settings.search_index_root() {
+            resolved.push(
+                PathAttestation::resolve_destination(search_index_root)
+                    .map_err(GatewayError::Attestation)?,
+            );
+        }
         validate_disjoint_storage(&resolved)?;
         let committed = CommittedStore::open_until(
             resolved[0].stable_path(),
@@ -135,8 +142,10 @@ impl ReadGateway {
             ));
         }
         ensure_deadline(deadline)?;
+        let search_indexes = (resolved.len() == 3).then(|| resolved.remove(2));
         Ok(Self {
             committed,
+            search_indexes,
             settings: settings.clone(),
         })
     }
@@ -171,7 +180,13 @@ impl ReadGateway {
 
     /// Searches committed Markdown and configured metadata fields.
     pub fn search(&self, request: &SearchRequest) -> Result<ListResponse, GatewayError> {
-        read::search(&self.settings, &self.committed, request).map(|prepared| prepared.response)
+        read::search(
+            &self.settings,
+            &self.committed,
+            self.search_indexes.clone(),
+            request,
+        )
+        .map(|prepared| prepared.response)
     }
 
     /// Encodes one list response exactly once under the supplied deadline.
@@ -201,8 +216,14 @@ impl ReadGateway {
         request: &SearchRequest,
         deadline: std::time::Instant,
     ) -> Result<Vec<u8>, GatewayError> {
-        read::search_until(&self.settings, &self.committed, request, deadline)
-            .map(|prepared| prepared.encoded)
+        read::search_until(
+            &self.settings,
+            &self.committed,
+            self.search_indexes.clone(),
+            request,
+            deadline,
+        )
+        .map(|prepared| prepared.encoded)
     }
 }
 
@@ -231,6 +252,10 @@ pub enum GatewayError {
     OverlappingStorage,
     /// A bounded Gateway operation exceeded its absolute deadline.
     OperationDeadlineExceeded,
+    /// Configured derived search state was absent, stale, or unreadable.
+    SearchIndexUnavailable,
+    /// The isolated indexed-search execution could not start or stopped.
+    SearchExecution(std::io::Error),
     /// No durable state exists for the requested change request.
     RequestNotFound {
         /// Requested immutable change-request identifier.
@@ -248,7 +273,10 @@ impl GatewayError {
             Self::ReadRequest(error) => error.error_code(),
             Self::CommittedRead(error) => read::committed_error_code(error),
             Self::Attestation(_) | Self::OverlappingStorage => ErrorCode::InternalError,
-            Self::OperationDeadlineExceeded => ErrorCode::TemporaryFailure,
+            Self::OperationDeadlineExceeded | Self::SearchIndexUnavailable => {
+                ErrorCode::TemporaryFailure
+            }
+            Self::SearchExecution(_) => ErrorCode::InternalError,
             Self::RequestNotFound { .. } => ErrorCode::RequestNotFound,
         }
     }
@@ -270,6 +298,12 @@ impl fmt::Display for GatewayError {
             Self::OperationDeadlineExceeded => {
                 formatter.write_str("Gateway operation deadline expired")
             }
+            Self::SearchIndexUnavailable => {
+                formatter.write_str("configured search index is temporarily unavailable")
+            }
+            Self::SearchExecution(error) => {
+                write!(formatter, "Gateway search execution failed: {error}")
+            }
             Self::RequestNotFound { request_id } => {
                 write!(
                     formatter,
@@ -288,8 +322,10 @@ impl std::error::Error for GatewayError {
             Self::ReadRequest(error) => Some(error),
             Self::CommittedRead(error) => Some(error.as_ref()),
             Self::Attestation(error) => Some(error),
+            Self::SearchExecution(error) => Some(error),
             Self::OverlappingStorage
             | Self::OperationDeadlineExceeded
+            | Self::SearchIndexUnavailable
             | Self::RequestNotFound { .. } => None,
         }
     }

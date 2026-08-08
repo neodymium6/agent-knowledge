@@ -10,6 +10,9 @@ use agent_knowledge_protocol::{
     SearchRequest, StatusRequest, SubmitOutcome,
 };
 use agent_knowledge_queue::{PackagePolicy, validate_accepted_package};
+use agent_knowledge_repository::{
+    CommittedStore, ContentPolicy, SearchIndexStore, SearchMetadataFields,
+};
 use tar::{Builder, EntryType, Header};
 
 use super::{
@@ -78,12 +81,24 @@ fn gateway(root: &TestDirectory) -> SubmitGateway {
 
 fn read_gateway(root: &TestDirectory) -> ReadGateway {
     initialize_committed_content(root);
-    let settings = settings(root);
+    let settings = settings_without_search_index(root);
     ReadGateway::open_until(&settings, None)
         .unwrap_or_else(|error| panic!("read Gateway must open: {error}"))
 }
 
 fn settings(root: &TestDirectory) -> GatewaySettings {
+    let yaml = format!(
+        "schema_version: 4\nidentity:\n  gateway_uid: 61001\nstorage:\n  queue_socket: {}\n  git_directory: {}\n  content_root: {}\n  search_index_root: {}\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
+        root.path().join("queue").display(),
+        root.path().join("repository").display(),
+        root.path().join("content").display(),
+        root.path().join("search-indexes").display(),
+    );
+    GatewaySettings::decode(&yaml)
+        .unwrap_or_else(|error| panic!("Gateway settings must decode: {error}"))
+}
+
+fn settings_without_search_index(root: &TestDirectory) -> GatewaySettings {
     let yaml = format!(
         "schema_version: 4\nidentity:\n  gateway_uid: 61001\nstorage:\n  queue_socket: {}\n  git_directory: {}\n  content_root: {}\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
         root.path().join("queue").display(),
@@ -91,7 +106,27 @@ fn settings(root: &TestDirectory) -> GatewaySettings {
         root.path().join("content").display(),
     );
     GatewaySettings::decode(&yaml)
-        .unwrap_or_else(|error| panic!("Gateway settings must decode: {error}"))
+        .unwrap_or_else(|error| panic!("Gateway settings without indexing must decode: {error}"))
+}
+
+fn publish_search_index(root: &TestDirectory) {
+    let committed = CommittedStore::open(
+        &root.path().join("repository"),
+        &root.path().join("content"),
+        "main",
+    )
+    .unwrap_or_else(|error| panic!("committed store must open: {error}"));
+    let snapshot = committed
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let indexes = SearchIndexStore::open(root.path().join("search-indexes"))
+        .unwrap_or_else(|error| panic!("search index store must open: {error}"));
+    let prepared = indexes
+        .prepare(&snapshot, SearchMetadataFields::default())
+        .unwrap_or_else(|error| panic!("search index must prepare: {error}"));
+    indexes
+        .activate(&prepared)
+        .unwrap_or_else(|error| panic!("search index must activate: {error}"));
 }
 
 fn client_id() -> ClientId {
@@ -230,6 +265,43 @@ fn serves_list_recent_get_and_search_from_one_committed_revision() {
         .unwrap_or_else(|error| panic!("committed search must succeed: {error}"));
     assert_eq!(search.documents.len(), 1);
     assert_eq!(search.commit, list.commit);
+}
+
+#[test]
+fn serves_phrase_search_from_the_matching_published_index() {
+    let root = TestDirectory::create();
+    initialize_committed_content(&root);
+    publish_search_index(&root);
+    let gateway = ReadGateway::open_until(&settings(&root), None)
+        .unwrap_or_else(|error| panic!("indexed read Gateway must open: {error}"));
+    let search = gateway
+        .search(&SearchRequest::new(
+            "\"fictional service\"".into(),
+            ReadFilterRequest::default(),
+            10,
+        ))
+        .unwrap_or_else(|error| panic!("indexed phrase search must succeed: {error}"));
+    assert_eq!(search.documents.len(), 1);
+    assert_eq!(
+        search.documents[0].metadata.document_id.to_string(),
+        "01K00000000000000000000001"
+    );
+}
+
+#[test]
+fn reports_configured_search_index_unavailability_without_changing_query_semantics() {
+    let root = TestDirectory::create();
+    initialize_committed_content(&root);
+    let gateway = ReadGateway::open_until(&settings(&root), None)
+        .unwrap_or_else(|error| panic!("indexed read Gateway must open: {error}"));
+    assert!(matches!(
+        gateway.search(&SearchRequest::new(
+            "\"fictional service\"".into(),
+            ReadFilterRequest::default(),
+            10,
+        )),
+        Err(GatewayError::SearchIndexUnavailable)
+    ));
 }
 
 #[test]
