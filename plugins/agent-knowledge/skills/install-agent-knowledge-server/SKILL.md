@@ -34,6 +34,8 @@ examples. Ask before changing a live target.
    Require operator review for a nonempty, unmarked storage root.
 4. Preserve the five sibling durable roots together: `queue`, `repository`,
    `content`, `work`, and `releases`.
+   Keep a configured derived `search-indexes` root as a sibling on the same
+   mount; it may be rebuilt instead of backed up.
 
 ## Install on systemd Linux
 
