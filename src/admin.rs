@@ -49,6 +49,8 @@ const MAXIMUM_MIGRATION_ENTRIES: u64 = 1_000_000;
 const MAXIMUM_MIGRATION_PATH_BYTES: u64 = 512 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const POSIX_ACL_XATTRS: [&str; 2] = ["system.posix_acl_access", "system.posix_acl_default"];
+#[cfg(target_os = "linux")]
+const TANTIVY_META_LOCK_FILE: &str = ".tantivy-meta.lock";
 
 pub(crate) fn status<W>(
     config: &Path,
@@ -349,6 +351,7 @@ pub(crate) fn validate_search_index_tree(
     let validation = TreeValidation {
         allow_symlinks: true,
         allow_internal_hard_links: true,
+        allow_tantivy_reader_lock: true,
         ..TreeValidation::strict()
     };
     let mut fingerprint = TreeFingerprintBuilder::new();
@@ -873,6 +876,7 @@ struct TreeValidation {
     allow_read_only_files: bool,
     allow_symlinks: bool,
     allow_internal_hard_links: bool,
+    allow_tantivy_reader_lock: bool,
     alternate_file_mode: Option<Mode>,
     alternate_file: Option<(Uid, Mode)>,
 }
@@ -884,6 +888,7 @@ impl TreeValidation {
             allow_read_only_files: false,
             allow_symlinks: false,
             allow_internal_hard_links: false,
+            allow_tantivy_reader_lock: false,
             alternate_file_mode: None,
             alternate_file: None,
         }
@@ -1079,6 +1084,15 @@ fn require_file_metadata(
     ) || validation
         .alternate_file_mode
         .is_some_and(|mode| metadata_matches(&metadata, owner, group, mode, false))
+        || (validation.allow_tantivy_reader_lock
+            && tantivy_reader_lock_file(path)
+            && metadata_matches(
+                &metadata,
+                owner,
+                group,
+                Mode::from_bits_truncate(0o660),
+                false,
+            ))
         || (worker_owned_queue_file(path)
             && validation.alternate_file.is_some_and(|(owner, mode)| {
                 metadata_matches(&metadata, Some(owner), group, mode, false)
@@ -1088,6 +1102,19 @@ fn require_file_metadata(
     } else {
         Err(StorageMigrationError::UnsafeEntry(path.to_path_buf()))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn tantivy_reader_lock_file(path: &Path) -> bool {
+    let mut components = path.iter();
+    let Some(area) = components.next() else {
+        return false;
+    };
+    matches!(area.to_str(), Some("by-id" | ".staging"))
+        && components.next().is_some()
+        && components.next() == Some(OsStr::new("tantivy"))
+        && components.next() == Some(OsStr::new(TANTIVY_META_LOCK_FILE))
+        && components.next().is_none()
 }
 
 #[cfg(target_os = "linux")]
@@ -1716,8 +1743,8 @@ mod migration_tests {
 
     use super::{
         MAXIMUM_MIGRATION_ENTRIES, MAXIMUM_MIGRATION_PATH_BYTES, MigrationBudget,
-        StorageMigrationError, migrate_v1_storage_with_ids, validate_search_index_tree,
-        worker_owned_queue_file,
+        StorageMigrationError, TANTIVY_META_LOCK_FILE, migrate_v1_storage_with_ids,
+        validate_search_index_tree, worker_owned_queue_file,
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1815,6 +1842,11 @@ mod migration_tests {
             .unwrap_or_else(|error| panic!("managed file must be written: {error}"));
         fs::set_permissions(&managed, fs::Permissions::from_mode(0o640))
             .unwrap_or_else(|error| panic!("managed file mode must be set: {error}"));
+        let meta_lock = tantivy.join(TANTIVY_META_LOCK_FILE);
+        fs::write(&meta_lock, b"")
+            .unwrap_or_else(|error| panic!("metadata lock file must be written: {error}"));
+        fs::set_permissions(&meta_lock, fs::Permissions::from_mode(0o660))
+            .unwrap_or_else(|error| panic!("metadata lock mode must be set: {error}"));
         symlink("by-id/fictional-generation", search.join("current"))
             .unwrap_or_else(|error| panic!("current search index must be selected: {error}"));
         search
@@ -1846,6 +1878,28 @@ mod migration_tests {
         let managed = search.join("by-id/fictional-generation/tantivy/.managed.json");
         fs::hard_link(&managed, fixture.path().join("external-managed.json"))
             .unwrap_or_else(|error| panic!("external hard link fixture must be created: {error}"));
+
+        assert!(matches!(
+            validate_search_index_tree(
+                &search,
+                Uid::effective(),
+                Gid::current(),
+                Mode::from_bits_truncate(0o2750),
+                Mode::from_bits_truncate(0o640),
+            ),
+            Err(StorageMigrationError::UnsafeEntry(_))
+        ));
+    }
+
+    #[test]
+    fn search_index_validation_rejects_writable_lock_names_outside_tantivy() {
+        let fixture = TestDirectory::create();
+        let search = create_search_index_fixture(fixture.path());
+        let misplaced = search.join("by-id/fictional-generation/.tantivy-meta.lock");
+        fs::write(&misplaced, b"")
+            .unwrap_or_else(|error| panic!("misplaced lock fixture must be written: {error}"));
+        fs::set_permissions(&misplaced, fs::Permissions::from_mode(0o660))
+            .unwrap_or_else(|error| panic!("misplaced lock mode must be set: {error}"));
 
         assert!(matches!(
             validate_search_index_tree(
