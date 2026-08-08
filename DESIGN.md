@@ -1684,10 +1684,11 @@ payload match the exact committed snapshot pinned for the request. Matching
 documents are ranked with BM25, with canonical path as the deterministic
 equal-score tie-breaker.
 
-If indexing is disabled, the selection is missing, its commit is stale, or the
-derived data cannot be validated, the Gateway uses the bounded linear scan
-backend for that request. The Gateway never repairs or changes derived storage;
-the Worker validates and rebuilds it. Both backends search:
+If indexing is disabled, the Gateway uses the bounded linear scan backend.
+When indexing is configured, a missing, stale, or invalid selection is a
+retryable failure so query syntax does not silently change. The Gateway never
+repairs or changes derived storage; the Worker validates and rebuilds it. Both
+backends search:
 
 - titles;
 - Markdown bodies;
