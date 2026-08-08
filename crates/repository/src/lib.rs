@@ -27,4 +27,7 @@ pub use replication::{
     RemoteReplicationStatus, RemoteReplicator, read_remote_replication_status,
     read_remote_replication_status_until,
 };
-pub use search_index::{TantivySearchError, TantivySearchIndex, TantivySearchPolicy};
+pub use search_index::{
+    ActiveSearchIndex, PreparedSearchIndex, SearchIndexStore, SearchIndexStoreError,
+    TantivySearchError, TantivySearchIndex, TantivySearchPolicy,
+};

@@ -19,6 +19,9 @@ use crate::{
 const INDEX_WRITER_MEMORY_BYTES: usize = 15_000_000;
 
 mod disk;
+mod store;
+
+pub use store::{ActiveSearchIndex, PreparedSearchIndex, SearchIndexStore, SearchIndexStoreError};
 
 /// A Tantivy index built from one exact committed snapshot.
 ///

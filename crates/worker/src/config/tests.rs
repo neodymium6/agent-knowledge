@@ -45,6 +45,7 @@ storage:
   content_root: {content}
   work_root: {work}
   release_root: {releases}
+  search_index_root: {search_indexes}
 repository:
   official_branch: main
   author_name: Fictional Knowledge Worker
@@ -65,6 +66,7 @@ batch:
         content = root.join("content").display(),
         work = root.join("work").display(),
         releases = root.join("releases").display(),
+        search_indexes = root.join("search-indexes").display(),
         integration = root.join("quartz-integration").display(),
         script = root.join("quartz-integration/quartz.sh").display(),
     )
@@ -86,6 +88,23 @@ fn decodes_strict_versioned_operational_settings() {
         10_000
     );
     assert_eq!(settings.release_retention().maximum_removals().get(), 10);
+    assert_eq!(
+        settings.search_index_root(),
+        Some(Path::new("/srv/fictional-knowledge/search-indexes"))
+    );
+}
+
+#[test]
+fn search_index_publication_is_optional() {
+    let yaml = valid_yaml(Path::new("/srv/fictional-knowledge")).replace(
+        "  search_index_root: /srv/fictional-knowledge/search-indexes\n",
+        "",
+    );
+    let settings = WorkerSettings::decode(&yaml).unwrap_or_else(|error| {
+        panic!("configuration without search indexes must decode: {error}")
+    });
+
+    assert!(settings.search_index_root().is_none());
 }
 
 #[test]

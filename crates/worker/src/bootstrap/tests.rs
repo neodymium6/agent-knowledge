@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration as StandardDuration, Instant};
 
+use agent_knowledge_repository::SearchIndexStore;
 use time::{Duration, OffsetDateTime};
 
 #[cfg(unix)]
@@ -62,6 +63,65 @@ fn opens_components_and_completes_clean_startup_recovery() {
 
     assert_eq!(startup, StartupOutcome::Clean);
     assert_eq!(schedule.debounce(), Duration::seconds(30));
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_rebuilds_corrupt_derived_search_publications() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::create();
+    initialize_repository(root.path());
+    initialize_quartz(root.path());
+    let settings = WorkerSettings::decode(&valid_yaml(root.path()))
+        .unwrap_or_else(|error| panic!("fixture settings must decode: {error}"));
+    {
+        let bootstrap = WorkerBootstrap::open(settings.clone())
+            .unwrap_or_else(|error| panic!("configured components must open: {error}"));
+        let (_runtime, _, _) = bootstrap
+            .start(created_at())
+            .unwrap_or_else(|error| panic!("configured Worker must start: {error}"));
+    }
+
+    let search_root = root.path().join("search-indexes");
+    let first = SearchIndexStore::open(&search_root)
+        .unwrap_or_else(|error| panic!("published search index must open: {error}"))
+        .active_index()
+        .unwrap_or_else(|error| panic!("published search index must validate: {error}"))
+        .unwrap_or_else(|| panic!("published search index must exist"));
+    fs::write(
+        search_root
+            .join("by-id")
+            .join(first.generation_id())
+            .join(".agent-knowledge-search-index.json"),
+        b"{invalid",
+    )
+    .unwrap_or_else(|error| panic!("selected search generation must be corrupted: {error}"));
+    {
+        let bootstrap = WorkerBootstrap::open(settings.clone())
+            .unwrap_or_else(|error| panic!("corrupt derived generation must recover: {error}"));
+        let (_runtime, _, _) = bootstrap
+            .start(created_at())
+            .unwrap_or_else(|error| panic!("search generation must rebuild: {error}"));
+    }
+
+    let current = search_root.join("current");
+    fs::remove_file(&current)
+        .unwrap_or_else(|error| panic!("current search selection must be removed: {error}"));
+    symlink("/fictional/outside", &current)
+        .unwrap_or_else(|error| panic!("invalid current selection must be created: {error}"));
+    let bootstrap = WorkerBootstrap::open(settings)
+        .unwrap_or_else(|error| panic!("invalid derived selection must recover: {error}"));
+    let (_runtime, _, _) = bootstrap
+        .start(created_at())
+        .unwrap_or_else(|error| panic!("invalid selection must rebuild: {error}"));
+    assert!(
+        SearchIndexStore::open(&search_root)
+            .unwrap_or_else(|error| panic!("rebuilt search index must open: {error}"))
+            .active_index()
+            .unwrap_or_else(|error| panic!("rebuilt search index must validate: {error}"))
+            .is_some()
+    );
 }
 
 #[test]
@@ -383,6 +443,7 @@ storage:
   content_root: {content}
   work_root: {work}
   release_root: {releases}
+  search_index_root: {search_indexes}
 repository:
   official_branch: main
   author_name: Fictional Knowledge Worker
@@ -403,6 +464,7 @@ batch:
         content = root.join("content").display(),
         work = root.join("work").display(),
         releases = root.join("releases").display(),
+        search_indexes = root.join("search-indexes").display(),
         integration = root.join("quartz-integration").display(),
         script = root.join("quartz-integration/quartz.sh").display(),
     )

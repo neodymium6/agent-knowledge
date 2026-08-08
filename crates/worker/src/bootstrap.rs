@@ -7,7 +7,8 @@ use agent_knowledge_release::{
     QuartzBuildError, QuartzBuilder, ReleaseError, ReleasePolicy, ReleaseStore,
 };
 use agent_knowledge_repository::{
-    ContentPolicy, GitRepository, GitTransactionError, RemoteReplicationError, RemoteReplicator,
+    CommittedReadError, CommittedStore, ContentPolicy, GitRepository, GitTransactionError,
+    RemoteReplicationError, RemoteReplicator, SearchIndexStore, SearchIndexStoreError,
 };
 use time::OffsetDateTime;
 
@@ -69,18 +70,44 @@ impl WorkerBootstrap {
         .map_err(|error| WorkerOpenError::Quartz(Box::new(error)))?;
         let releases = ReleaseStore::open(topology.release_root.stable_path(), release_policy)
             .map_err(|error| WorkerOpenError::Release(Box::new(error)))?;
+        let search_indexes = topology
+            .search_index_root
+            .as_ref()
+            .map(|root| SearchIndexStore::open_recovering(root.stable_path()))
+            .transpose()
+            .map_err(|error| WorkerOpenError::SearchIndex(Box::new(error)))?;
+        let committed = search_indexes
+            .as_ref()
+            .map(|_| {
+                CommittedStore::open(
+                    topology.repository_root.stable_path(),
+                    topology.content_root.stable_path(),
+                    settings.official_branch(),
+                )
+            })
+            .transpose()
+            .map_err(|error| WorkerOpenError::CommittedRead(Box::new(error)))?;
         let package_policy = PackagePolicy::default();
         let queue =
             FileQueue::initialize(topology.queue_root.stable_path(), package_policy.clone())
                 .map_err(|error| WorkerOpenError::Queue(Box::new(error)))?;
-        validate_opened_topology(&repository, &quartz, &releases, &queue)?;
-        let processor = BatchProcessor::new(
+        validate_opened_topology(
+            &repository,
+            &quartz,
+            &releases,
+            search_indexes.as_ref(),
+            &queue,
+        )?;
+        let mut processor = BatchProcessor::new(
             repository,
             quartz,
             releases,
             ContentPolicy::default(),
             package_policy,
         );
+        if let (Some(committed), Some(search_indexes)) = (committed, search_indexes) {
+            processor = processor.with_search_index(committed, search_indexes);
+        }
         Ok(Self {
             queue,
             processor,
@@ -138,6 +165,7 @@ pub(crate) struct ResolvedTopology {
     pub(crate) content_root: PathAttestation,
     pub(crate) work_root: PathAttestation,
     pub(crate) release_root: PathAttestation,
+    pub(crate) search_index_root: Option<PathAttestation>,
     pub(crate) quartz_program: PathAttestation,
     pub(crate) quartz_integration_root: PathAttestation,
 }
@@ -167,6 +195,10 @@ pub enum WorkerOpenError {
     Quartz(Box<QuartzBuildError>),
     /// The release store could not be opened.
     Release(Box<ReleaseError>),
+    /// The committed read boundary for search indexing could not be opened.
+    CommittedRead(Box<CommittedReadError>),
+    /// The persistent search index store could not be opened.
+    SearchIndex(Box<SearchIndexStoreError>),
     /// The durable queue could not be initialized.
     Queue(Box<QueueError>),
 }
@@ -187,6 +219,12 @@ impl fmt::Display for WorkerOpenError {
             }
             Self::Quartz(error) => write!(formatter, "could not open Quartz builder: {error}"),
             Self::Release(error) => write!(formatter, "could not open release store: {error}"),
+            Self::CommittedRead(error) => {
+                write!(formatter, "could not open committed search store: {error}")
+            }
+            Self::SearchIndex(error) => {
+                write!(formatter, "could not open search index store: {error}")
+            }
             Self::Queue(error) => write!(formatter, "could not open durable queue: {error}"),
         }
     }
@@ -201,6 +239,8 @@ impl std::error::Error for WorkerOpenError {
             Self::Replication(error) => Some(error),
             Self::Quartz(error) => Some(error),
             Self::Release(error) => Some(error),
+            Self::CommittedRead(error) => Some(error),
+            Self::SearchIndex(error) => Some(error),
             Self::Queue(error) => Some(error),
         }
     }
@@ -210,6 +250,7 @@ fn validate_opened_topology(
     repository: &GitRepository,
     quartz: &QuartzBuilder,
     releases: &ReleaseStore,
+    search_indexes: Option<&SearchIndexStore>,
     queue: &FileQueue,
 ) -> Result<(), WorkerOpenError> {
     let [repository_root, content_root, work_root] =
@@ -240,13 +281,24 @@ fn validate_opened_topology(
                 component: "Quartz command",
                 source,
             })?;
-    let storage = [
+    let mut storage = vec![
         ("storage.queue_root", queue_root),
         ("storage.repository_root", repository_root),
         ("storage.content_root", content_root),
         ("storage.work_root", work_root),
         ("storage.release_root", release_root),
     ];
+    if let Some(search_indexes) = search_indexes {
+        storage.push((
+            "storage.search_index_root",
+            search_indexes.storage_attestation().map_err(|source| {
+                WorkerOpenError::Attestation {
+                    component: "search index storage",
+                    source,
+                }
+            })?,
+        ));
+    }
     for (index, (field, attestation)) in storage.iter().enumerate() {
         for (other_field, other_attestation) in &storage[index + 1..] {
             reject_attested_overlap(field, attestation, other_field, other_attestation)?;
@@ -272,28 +324,26 @@ fn validate_opened_topology(
 pub(crate) fn validate_resolved_topology(
     settings: &WorkerSettings,
 ) -> Result<ResolvedTopology, WorkerOpenError> {
-    let storage = [
-        (
-            "storage.queue_root",
-            attest_destination("storage.queue_root", settings.queue_root())?,
-        ),
-        (
-            "storage.repository_root",
-            attest_destination("storage.repository_root", settings.repository_root())?,
-        ),
-        (
-            "storage.content_root",
-            attest_destination("storage.content_root", settings.content_root())?,
-        ),
-        (
-            "storage.work_root",
-            attest_destination("storage.work_root", settings.work_root())?,
-        ),
-        (
-            "storage.release_root",
-            attest_destination("storage.release_root", settings.release_root())?,
-        ),
+    let queue_root = attest_destination("storage.queue_root", settings.queue_root())?;
+    let repository_root =
+        attest_destination("storage.repository_root", settings.repository_root())?;
+    let content_root = attest_destination("storage.content_root", settings.content_root())?;
+    let work_root = attest_destination("storage.work_root", settings.work_root())?;
+    let release_root = attest_destination("storage.release_root", settings.release_root())?;
+    let search_index_root = settings
+        .search_index_root()
+        .map(|root| attest_destination("storage.search_index_root", root))
+        .transpose()?;
+    let mut storage = vec![
+        ("storage.queue_root", &queue_root),
+        ("storage.repository_root", &repository_root),
+        ("storage.content_root", &content_root),
+        ("storage.work_root", &work_root),
+        ("storage.release_root", &release_root),
     ];
+    if let Some(search_index_root) = search_index_root.as_ref() {
+        storage.push(("storage.search_index_root", search_index_root));
+    }
     for (index, (field, attestation)) in storage.iter().enumerate() {
         for (other_field, other_attestation) in &storage[index + 1..] {
             reject_attested_overlap(field, attestation, other_field, other_attestation)?;
@@ -323,13 +373,6 @@ pub(crate) fn validate_resolved_topology(
             )?;
         }
     }
-    let [
-        (_, queue_root),
-        (_, repository_root),
-        (_, content_root),
-        (_, work_root),
-        (_, release_root),
-    ] = storage;
     let [(_, quartz_program), (_, quartz_integration_root)] = trusted;
     Ok(ResolvedTopology {
         queue_root,
@@ -337,6 +380,7 @@ pub(crate) fn validate_resolved_topology(
         content_root,
         work_root,
         release_root,
+        search_index_root,
         quartz_program,
         quartz_integration_root,
     })

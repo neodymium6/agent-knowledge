@@ -140,6 +140,8 @@ install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
   "$test_root/storage/content"
 install -d -m 0750 -o "$worker_uid" -g "$worker_gid" \
   "$test_root/storage/work" "$test_root/storage/releases"
+install -d -m 2750 -o "$worker_uid" -g "$gateway_gid" \
+  "$test_root/storage/search-indexes"
 install -d -m 2750 -o "$queue_uid" -g "$ingress_gid" "$test_root/run"
 install -d -m 0755 "$test_root/package/payload/run"
 
@@ -243,6 +245,7 @@ storage:
   content_root: $test_root/storage/content
   work_root: $test_root/storage/work
   release_root: $test_root/storage/releases
+  search_index_root: $test_root/storage/search-indexes
 repository:
   official_branch: main
   author_name: Fictional Knowledge Worker
