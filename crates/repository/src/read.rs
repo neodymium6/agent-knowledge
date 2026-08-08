@@ -282,6 +282,14 @@ impl CommittedSnapshot {
         &self.commit
     }
 
+    pub(crate) fn documents(&self) -> impl Iterator<Item = &DocumentRecord> {
+        self.index.documents()
+    }
+
+    pub(crate) fn document(&self, document_id: DocumentId) -> Option<&DocumentRecord> {
+        self.index.get(document_id)
+    }
+
     /// Lists matching documents in canonical path order.
     ///
     /// # Errors
@@ -415,7 +423,10 @@ impl CommittedSnapshot {
         Ok(CommittedBundle { record, entries })
     }
 
-    fn read_markdown(&self, record: &DocumentRecord) -> Result<Vec<u8>, CommittedReadError> {
+    pub(crate) fn read_markdown(
+        &self,
+        record: &DocumentRecord,
+    ) -> Result<Vec<u8>, CommittedReadError> {
         check_operation_deadline(self.deadline)?;
         let mut file = self
             .root
@@ -668,6 +679,22 @@ impl ReadFilter {
         }
     }
 
+    pub(crate) const fn project(&self) -> Option<&ProjectId> {
+        self.project.as_ref()
+    }
+
+    pub(crate) fn tag(&self) -> Option<&str> {
+        self.tag.as_deref()
+    }
+
+    pub(crate) const fn session(&self) -> Option<SessionId> {
+        self.session
+    }
+
+    pub(crate) const fn include_archived(&self) -> bool {
+        self.include_archived
+    }
+
     fn matches(&self, document: &DocumentRecord) -> bool {
         (self.include_archived || !document.location().is_archived())
             && self
@@ -706,6 +733,22 @@ impl SearchMetadataFields {
             session,
             request_id,
         }
+    }
+
+    pub(crate) const fn node(self) -> bool {
+        self.node
+    }
+
+    pub(crate) const fn agent(self) -> bool {
+        self.agent
+    }
+
+    pub(crate) const fn session(self) -> bool {
+        self.session
+    }
+
+    pub(crate) const fn request_id(self) -> bool {
+        self.request_id
     }
 }
 

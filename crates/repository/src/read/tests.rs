@@ -12,7 +12,7 @@ use super::{
     CommittedReadError, CommittedStore, LinearSearch, ReadFilter, SearchBackend,
     SearchMetadataFields, SearchPolicy,
 };
-use crate::ContentPolicy;
+use crate::{ContentPolicy, TantivySearchError, TantivySearchIndex};
 
 const LOG_ID: &str = "01K00000000000000000000001";
 const RUNBOOK_ID: &str = "01K00000000000000000000002";
@@ -99,7 +99,7 @@ impl Fixture {
         fs::write(
             &runbook_path,
             format!(
-                "---\nschema_version: 1\ndocument_id: {RUNBOOK_ID}\ntitle: Fictional restart procedure\ncreated: 2026-07-31T04:00:00Z\nupdated: 2026-07-31T05:00:00Z\nrequest_id: {RUNBOOK_REQUEST_ID}\ntags:\n  - operations\nstatus: active\n---\nRestart the fictional service.\n"
+                "---\nschema_version: 1\ndocument_id: {RUNBOOK_ID}\ntitle: Fictional restart procedure\ncreated: 2026-07-31T04:00:00Z\nupdated: 2026-07-31T05:00:00Z\nrequest_id: {RUNBOOK_REQUEST_ID}\ntags:\n  - operations\nstatus: active\n---\nRestart the fictional GPU service.\n"
             ),
         )
         .unwrap_or_else(|error| panic!("runbook fixture must be written: {error}"));
@@ -249,6 +249,140 @@ fn filters_tags_and_disables_unselected_search_metadata() {
             .unwrap_or_else(|error| panic!("restricted metadata search must succeed: {error}"))
             .is_empty()
     );
+}
+
+#[test]
+fn tantivy_searches_terms_phrases_metadata_and_exact_filters() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let index = TantivySearchIndex::build_in_memory(&snapshot, SearchMetadataFields::default())
+        .unwrap_or_else(|error| panic!("Tantivy index must build: {error}"));
+    assert_eq!(index.commit(), snapshot.commit());
+
+    let terms = index
+        .search(
+            &snapshot,
+            "fictional OOM",
+            &ReadFilter::default(),
+            SearchPolicy::new(64, 10),
+        )
+        .unwrap_or_else(|error| panic!("conjunctive search must succeed: {error}"));
+    assert_eq!(terms.len(), 1);
+    assert_eq!(terms[0].metadata().document_id.to_string(), LOG_ID);
+
+    let phrase = index
+        .search(
+            &snapshot,
+            "\"restart procedure\"",
+            &ReadFilter::default(),
+            SearchPolicy::new(64, 10),
+        )
+        .unwrap_or_else(|error| panic!("phrase search must succeed: {error}"));
+    assert_eq!(phrase.len(), 1);
+    assert_eq!(phrase[0].metadata().document_id.to_string(), RUNBOOK_ID);
+
+    let ranked = index
+        .search(
+            &snapshot,
+            "GPU",
+            &ReadFilter::default(),
+            SearchPolicy::new(64, 10),
+        )
+        .unwrap_or_else(|error| panic!("ranked search must succeed: {error}"));
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(ranked[0].metadata().document_id.to_string(), LOG_ID);
+
+    let metadata = index
+        .search(
+            &snapshot,
+            "fictional-node-a",
+            &ReadFilter::default(),
+            SearchPolicy::new(64, 10),
+        )
+        .unwrap_or_else(|error| panic!("metadata search must succeed: {error}"));
+    assert_eq!(metadata.len(), 1);
+    assert_eq!(metadata[0].metadata().document_id.to_string(), LOG_ID);
+
+    let operations_only = ReadFilter::new(None, Some("operations".into()), None, false);
+    let filtered = index
+        .search(
+            &snapshot,
+            "fictional",
+            &operations_only,
+            SearchPolicy::new(64, 10),
+        )
+        .unwrap_or_else(|error| panic!("filtered search must succeed: {error}"));
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].metadata().document_id.to_string(), RUNBOOK_ID);
+}
+
+#[test]
+fn tantivy_honors_metadata_selection_and_query_bounds() {
+    let fixture = Fixture::create();
+    let snapshot = fixture
+        .store()
+        .snapshot(ContentPolicy::default(), &PackagePolicy::default())
+        .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
+    let index = TantivySearchIndex::build_in_memory(
+        &snapshot,
+        SearchMetadataFields::new(false, false, false, false),
+    )
+    .unwrap_or_else(|error| panic!("restricted Tantivy index must build: {error}"));
+
+    let metadata = index
+        .search(
+            &snapshot,
+            "fictional-node-a",
+            &ReadFilter::default(),
+            SearchPolicy::new(64, 10),
+        )
+        .unwrap_or_else(|error| panic!("restricted search must succeed: {error}"));
+    assert!(metadata.is_empty());
+    assert!(matches!(
+        index.search(
+            &snapshot,
+            " ",
+            &ReadFilter::default(),
+            SearchPolicy::new(64, 10),
+        ),
+        Err(TantivySearchError::EmptyQuery)
+    ));
+    assert!(matches!(
+        index.search(
+            &snapshot,
+            "oversized",
+            &ReadFilter::default(),
+            SearchPolicy::new(3, 10),
+        ),
+        Err(TantivySearchError::QueryTooLong {
+            maximum: 3,
+            actual: 9
+        })
+    ));
+    assert!(matches!(
+        index.search(
+            &snapshot,
+            "fictional",
+            &ReadFilter::default(),
+            SearchPolicy::new(64, 0),
+        ),
+        Err(TantivySearchError::InvalidResultLimit)
+    ));
+    assert!(matches!(
+        index.search(
+            &snapshot,
+            "fictional",
+            &ReadFilter::default(),
+            SearchPolicy {
+                deadline: Some(std::time::Instant::now()),
+                ..SearchPolicy::new(64, 10)
+            },
+        ),
+        Err(TantivySearchError::OperationDeadlineExceeded)
+    ));
 }
 
 #[test]
