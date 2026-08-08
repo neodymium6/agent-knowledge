@@ -331,6 +331,10 @@ spec:
             - name: knowledge
               mountPath: /var/lib/agent-knowledge
               readOnly: true
+            - name: knowledge
+              mountPath: /var/lib/agent-knowledge/search-indexes
+              readOnly: false
+              subPath: search-indexes
             - name: runtime
               mountPath: /run/agent-knowledge
             - name: sshd-runtime

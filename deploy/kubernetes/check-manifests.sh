@@ -114,11 +114,34 @@ jq -e '
     and (container("queue-ingress").securityContext.runAsGroup == 10002)
     and (container("queue-ingress").securityContext.runAsNonRoot == true)
     and ([init_containers[], containers[]]
-      | all(.[].volumeMounts[]?; (has("subPath") or has("subPathExpr")) | not))
+      | all(.[].volumeMounts[]?; has("subPathExpr") | not))
+    and ([init_containers[], containers[]]
+      | map({
+          container: .name,
+          mounts: [.volumeMounts[]? | select(has("subPath"))
+            | {name, mountPath, subPath}]
+        })
+      | map(select(.mounts | length > 0))
+      == [{
+        "container": "openssh-gateway",
+        "mounts": [{
+          "name": "knowledge",
+          "mountPath": "/var/lib/agent-knowledge/search-indexes",
+          "subPath": "search-indexes"
+        }]
+      }])
     and (mount(init_container("storage-bootstrap"); "knowledge").readOnly != true)
     and (mount(container("worker"); "knowledge").readOnly != true)
     and (mount(container("queue-ingress"); "knowledge").readOnly != true)
     and (mount(container("openssh-gateway"); "knowledge").readOnly == true)
+    and ([container("openssh-gateway").volumeMounts[]
+      | select(.name == "knowledge")] | length == 2)
+    and (container("openssh-gateway").volumeMounts
+      | any(.[];
+        .name == "knowledge"
+        and .mountPath == "/var/lib/agent-knowledge/search-indexes"
+        and .readOnly == false
+        and .subPath == "search-indexes"))
     and (mount(container("worker"); "quartz").readOnly == true)
     and (volume("runtime") | has("emptyDir"))
     and (volume("sshd-runtime") | has("emptyDir"))
