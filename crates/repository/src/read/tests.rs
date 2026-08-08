@@ -564,7 +564,15 @@ fn tantivy_disk_open_pins_a_switched_current_symlink() {
     run_git(Some(&fixture.content), ["add", "."]);
     run_git(
         Some(&fixture.content),
-        ["commit", "-m", "Change fictional knowledge"],
+        [
+            "-c",
+            "user.name=Fictional Writer",
+            "-c",
+            "user.email=writer@fictional.invalid",
+            "commit",
+            "-m",
+            "Change fictional knowledge",
+        ],
     );
     let second_snapshot = fixture
         .store()
