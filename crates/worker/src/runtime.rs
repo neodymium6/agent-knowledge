@@ -580,6 +580,14 @@ impl WorkerRuntime {
                 }
             }
         };
+        if should_stop() {
+            return Ok(InterruptibleStart::Stopped {
+                failed_requests: journal_failures,
+            });
+        }
+        processor
+            .ensure_current_search_index()
+            .map_err(|error| WorkerRunError::processor(error, journal_failures))?;
         let replication = replication
             .map(ReplicationBackground::start)
             .transpose()

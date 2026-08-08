@@ -16,8 +16,8 @@ use agent_knowledge_queue::{
 };
 use agent_knowledge_release::{QuartzBuilder, ReleasePolicy, ReleaseStore};
 use agent_knowledge_repository::{
-    BatchCommitOutcome, BatchPublication, ClaimedBatch, ContentPolicy, GitIdentity, GitRepository,
-    GitTransactionError, PublicationError,
+    BatchCommitOutcome, BatchPublication, ClaimedBatch, CommittedStore, ContentPolicy, GitIdentity,
+    GitRepository, GitTransactionError, PublicationError, SearchIndexStore,
 };
 use time::{Duration as TimeDuration, OffsetDateTime};
 
@@ -194,6 +194,15 @@ impl Fixture {
             ContentPolicy::default(),
             PackagePolicy::default(),
         )
+    }
+
+    fn processor_with_search_index(&self, repository: GitRepository) -> BatchProcessor {
+        let committed = CommittedStore::open(&self.repository_path, &self.content_path, "main")
+            .unwrap_or_else(|error| panic!("committed store must open: {error}"));
+        let indexes = SearchIndexStore::open(self.root.path().join("search-indexes"))
+            .unwrap_or_else(|error| panic!("search index store must open: {error}"));
+        self.processor(repository)
+            .with_search_index(committed, indexes)
     }
 }
 
@@ -387,12 +396,12 @@ fn enqueue_missing_update(queue: &FileQueue, worker: &mut WorkerSession) -> Clai
 }
 
 #[test]
-fn publishes_release_before_completing_the_queue_and_journal() {
+fn publishes_release_and_search_index_before_completing_the_queue_and_journal() {
     let fixture = Fixture::create();
     let repository = fixture.repository();
     let (queue, mut worker) = fixture.queue_and_worker();
     let claim = enqueue_and_claim(&queue, &mut worker);
-    let processor = fixture.processor(repository);
+    let processor = fixture.processor_with_search_index(repository);
 
     let outcome = processor
         .process(&mut worker, batch_id(), &[claim], 0, created_at())
@@ -406,6 +415,15 @@ fn publishes_release_before_completing_the_queue_and_journal() {
             .active_release()
             .unwrap_or_else(|error| panic!("active release must validate: {error}"))
             .unwrap_or_else(|| panic!("release must be active"))
+            .commit(),
+        commit
+    );
+    assert_eq!(
+        SearchIndexStore::open(fixture.root.path().join("search-indexes"))
+            .unwrap_or_else(|error| panic!("search index store must reopen: {error}"))
+            .active_index()
+            .unwrap_or_else(|error| panic!("active search index must validate: {error}"))
+            .unwrap_or_else(|| panic!("search index must be active"))
             .commit(),
         commit
     );
@@ -477,7 +495,7 @@ fn recovery_prepares_release_before_advancing_an_interrupted_commit() {
             .is_dir()
     );
 
-    let processor = fixture.processor(repository);
+    let processor = fixture.processor_with_search_index(repository);
     let outcome = processor
         .recover(&mut worker, batch_id(), created_at())
         .unwrap_or_else(|error| panic!("interrupted batch must recover: {error}"));
@@ -490,6 +508,15 @@ fn recovery_prepares_release_before_advancing_an_interrupted_commit() {
             .active_release()
             .unwrap_or_else(|error| panic!("active release must validate: {error}"))
             .unwrap_or_else(|| panic!("release must be active"))
+            .commit(),
+        commit
+    );
+    assert_eq!(
+        SearchIndexStore::open(fixture.root.path().join("search-indexes"))
+            .unwrap_or_else(|error| panic!("search index store must reopen: {error}"))
+            .active_index()
+            .unwrap_or_else(|error| panic!("recovered search index must validate: {error}"))
+            .unwrap_or_else(|| panic!("recovered search index must be active"))
             .commit(),
         commit
     );
@@ -614,15 +641,20 @@ fn all_failed_batch_reconciles_without_creating_a_release() {
 }
 
 #[test]
-fn runtime_starts_clean_and_reports_an_empty_snapshot() {
+fn runtime_starts_clean_and_backfills_the_search_index() {
     let fixture = Fixture::create();
     let repository = fixture.repository();
+    let committed = CommittedStore::open(&fixture.repository_path, &fixture.content_path, "main")
+        .unwrap_or_else(|error| panic!("committed store must open: {error}"));
+    let expected_commit = committed
+        .current_commit_until(None)
+        .unwrap_or_else(|error| panic!("current commit must be readable: {error}"));
     let queue = FileQueue::initialize(fixture.root.path().join("queue"), PackagePolicy::default())
         .unwrap_or_else(|error| panic!("queue must initialize: {error}"));
 
     let (mut runtime, startup) = WorkerRuntime::start(
         &queue,
-        fixture.processor(repository),
+        fixture.processor_with_search_index(repository),
         Default::default(),
         created_at(),
     )
@@ -634,6 +666,12 @@ fn runtime_starts_clean_and_reports_an_empty_snapshot() {
             .unwrap_or_else(|error| panic!("empty cycle must complete: {error}")),
         WorkerRunOutcome::Idle
     );
+    let active = SearchIndexStore::open(fixture.root.path().join("search-indexes"))
+        .unwrap_or_else(|error| panic!("search index store must reopen: {error}"))
+        .active_index()
+        .unwrap_or_else(|error| panic!("active search index must validate: {error}"))
+        .unwrap_or_else(|| panic!("startup must publish the search index"));
+    assert_eq!(active.commit(), expected_commit);
 }
 
 #[test]

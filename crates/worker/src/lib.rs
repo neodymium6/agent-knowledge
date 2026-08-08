@@ -10,12 +10,13 @@ use agent_knowledge_release::{
     ActiveRelease, BuiltDirectory, PreparedRelease, QuartzBuildError, QuartzBuilder, ReleaseError,
     ReleaseStore,
 };
+use agent_knowledge_repository::{
+    ActiveSearchIndex, BatchPublication, ClaimedBatch, CommittedReadError, CommittedStore,
+    ContentPolicy, GitRepository, GitTransactionError, PublicationError, RepositoryTransaction,
+    RequestFailure, SearchIndexStore, SearchIndexStoreError, SearchMetadataFields,
+};
 pub use agent_knowledge_repository::{
     BatchCommitOutcome, RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicationPolicy,
-};
-use agent_knowledge_repository::{
-    BatchPublication, ClaimedBatch, ContentPolicy, GitRepository, GitTransactionError,
-    PublicationError, RepositoryTransaction, RequestFailure,
 };
 use time::OffsetDateTime;
 
@@ -39,6 +40,13 @@ pub struct BatchProcessor {
     releases: ReleaseStore,
     content_policy: ContentPolicy,
     package_policy: PackagePolicy,
+    search: Option<SearchPublication>,
+}
+
+#[derive(Clone, Debug)]
+struct SearchPublication {
+    committed: CommittedStore,
+    indexes: SearchIndexStore,
 }
 
 impl BatchProcessor {
@@ -57,7 +65,19 @@ impl BatchProcessor {
             releases,
             content_policy,
             package_policy,
+            search: None,
         }
+    }
+
+    /// Enables committed-snapshot search index publication for this processor.
+    #[must_use]
+    pub fn with_search_index(
+        mut self,
+        committed: CommittedStore,
+        indexes: SearchIndexStore,
+    ) -> Self {
+        self.search = Some(SearchPublication { committed, indexes });
+        self
     }
 
     /// Discovers durable repository work that must be resumed at startup.
@@ -172,6 +192,7 @@ impl BatchProcessor {
         };
         let active = match &outcome {
             BatchCommitOutcome::Committed { commit, .. } => {
+                self.publish_search_index(commit)?;
                 let release = match prepared.take() {
                     Some(release) => release,
                     None => self
@@ -230,6 +251,7 @@ impl BatchProcessor {
         };
         let active = match &outcome {
             BatchCommitOutcome::Committed { commit, .. } => {
+                self.publish_search_index(commit)?;
                 Some(self.activate_recovered(batch_id, commit, prepared.take())?)
             }
             BatchCommitOutcome::NoChanges { .. } => None,
@@ -250,6 +272,62 @@ impl BatchProcessor {
         self.quartz
             .build(content, build)
             .map_err(BatchProcessorError::quartz)
+    }
+
+    pub(crate) fn ensure_current_search_index(
+        &self,
+    ) -> Result<Option<ActiveSearchIndex>, BatchProcessorError> {
+        let Some(search) = self.search.as_ref() else {
+            return Ok(None);
+        };
+        let snapshot = search
+            .committed
+            .snapshot(self.content_policy, &self.package_policy)
+            .map_err(BatchProcessorError::committed_read)?;
+        self.publish_search_snapshot(search, &snapshot).map(Some)
+    }
+
+    fn publish_search_index(
+        &self,
+        expected_commit: &str,
+    ) -> Result<Option<ActiveSearchIndex>, BatchProcessorError> {
+        let Some(search) = self.search.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(active) = search
+            .indexes
+            .active_index()
+            .map_err(BatchProcessorError::search_index)?
+            && active.commit() == expected_commit
+        {
+            return Ok(Some(active));
+        }
+        let snapshot = search
+            .committed
+            .snapshot(self.content_policy, &self.package_policy)
+            .map_err(BatchProcessorError::committed_read)?;
+        if snapshot.commit() != expected_commit {
+            return Err(BatchProcessorError::SearchSnapshotCommitMismatch {
+                expected: expected_commit.to_owned(),
+                actual: snapshot.commit().to_owned(),
+            });
+        }
+        self.publish_search_snapshot(search, &snapshot).map(Some)
+    }
+
+    fn publish_search_snapshot(
+        &self,
+        search: &SearchPublication,
+        snapshot: &agent_knowledge_repository::CommittedSnapshot,
+    ) -> Result<ActiveSearchIndex, BatchProcessorError> {
+        let prepared = search
+            .indexes
+            .prepare(snapshot, SearchMetadataFields::default())
+            .map_err(BatchProcessorError::search_index)?;
+        search
+            .indexes
+            .activate(&prepared)
+            .map_err(BatchProcessorError::search_index)
     }
 
     fn prepare_recovered(
@@ -358,12 +436,23 @@ pub enum BatchProcessorError {
     Quartz(Box<QuartzBuildError>),
     /// Immutable release preparation or activation failed.
     Release(Box<ReleaseError>),
+    /// The canonical committed snapshot could not be opened for indexing.
+    CommittedRead(Box<CommittedReadError>),
+    /// Persistent search index publication failed.
+    SearchIndex(Box<SearchIndexStoreError>),
     /// A terminal queue transition failed.
     Queue(Box<agent_knowledge_queue::WorkerQueueError>),
     /// The repository requested publication without a successful trial output.
     MissingBuildOutput,
     /// A committed batch had no recoverable prepared release.
     MissingPreparedRelease,
+    /// The canonical committed snapshot did not match the completed batch.
+    SearchSnapshotCommitMismatch {
+        /// Commit produced by the completed repository transaction.
+        expected: String,
+        /// Commit observed from the canonical read boundary.
+        actual: String,
+    },
 }
 
 impl BatchProcessorError {
@@ -379,6 +468,14 @@ impl BatchProcessorError {
         Self::Release(Box::new(error))
     }
 
+    fn committed_read(error: CommittedReadError) -> Self {
+        Self::CommittedRead(Box::new(error))
+    }
+
+    fn search_index(error: SearchIndexStoreError) -> Self {
+        Self::SearchIndex(Box::new(error))
+    }
+
     fn queue(error: agent_knowledge_queue::WorkerQueueError) -> Self {
         Self::Queue(Box::new(error))
     }
@@ -390,6 +487,12 @@ impl fmt::Display for BatchProcessorError {
             Self::Repository(error) => write!(formatter, "repository transaction failed: {error}"),
             Self::Quartz(error) => write!(formatter, "Quartz build failed: {error}"),
             Self::Release(error) => write!(formatter, "release publication failed: {error}"),
+            Self::CommittedRead(error) => {
+                write!(formatter, "committed search snapshot failed: {error}")
+            }
+            Self::SearchIndex(error) => {
+                write!(formatter, "search index publication failed: {error}")
+            }
             Self::Queue(error) => {
                 write!(formatter, "terminal queue reconciliation failed: {error}")
             }
@@ -399,6 +502,10 @@ impl fmt::Display for BatchProcessorError {
             Self::MissingPreparedRelease => {
                 formatter.write_str("committed batch has no recoverable prepared release")
             }
+            Self::SearchSnapshotCommitMismatch { expected, actual } => write!(
+                formatter,
+                "committed search snapshot `{actual}` does not match batch commit `{expected}`"
+            ),
         }
     }
 }
@@ -409,8 +516,12 @@ impl std::error::Error for BatchProcessorError {
             Self::Repository(error) => Some(error),
             Self::Quartz(error) => Some(error),
             Self::Release(error) => Some(error),
+            Self::CommittedRead(error) => Some(error),
+            Self::SearchIndex(error) => Some(error),
             Self::Queue(error) => Some(error),
-            Self::MissingBuildOutput | Self::MissingPreparedRelease => None,
+            Self::MissingBuildOutput
+            | Self::MissingPreparedRelease
+            | Self::SearchSnapshotCommitMismatch { .. } => None,
         }
     }
 }

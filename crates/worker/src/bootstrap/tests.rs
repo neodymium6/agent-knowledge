@@ -383,6 +383,7 @@ storage:
   content_root: {content}
   work_root: {work}
   release_root: {releases}
+  search_index_root: {search_indexes}
 repository:
   official_branch: main
   author_name: Fictional Knowledge Worker
@@ -403,6 +404,7 @@ batch:
         content = root.join("content").display(),
         work = root.join("work").display(),
         releases = root.join("releases").display(),
+        search_indexes = root.join("search-indexes").display(),
         integration = root.join("quartz-integration").display(),
         script = root.join("quartz-integration/quartz.sh").display(),
     )

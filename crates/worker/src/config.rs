@@ -25,6 +25,7 @@ pub struct WorkerSettings {
     content_root: PathBuf,
     work_root: PathBuf,
     release_root: PathBuf,
+    search_index_root: Option<PathBuf>,
     official_branch: String,
     identity: GitIdentity,
     replication: Option<RemoteReplicationPolicy>,
@@ -120,6 +121,12 @@ impl WorkerSettings {
         &self.release_root
     }
 
+    /// Returns the optional derived search index publication root.
+    #[must_use]
+    pub fn search_index_root(&self) -> Option<&Path> {
+        self.search_index_root.as_deref()
+    }
+
     /// Returns the official Git branch name.
     #[must_use]
     pub fn official_branch(&self) -> &str {
@@ -184,13 +191,16 @@ impl TryFrom<WireWorkerConfig> for WorkerSettings {
                 found: wire.schema_version,
             });
         }
-        let storage = [
+        let mut storage = vec![
             ("storage.queue_root", &wire.storage.queue_root),
             ("storage.repository_root", &wire.storage.repository_root),
             ("storage.content_root", &wire.storage.content_root),
             ("storage.work_root", &wire.storage.work_root),
             ("storage.release_root", &wire.storage.release_root),
         ];
+        if let Some(search_index_root) = wire.storage.search_index_root.as_ref() {
+            storage.push(("storage.search_index_root", search_index_root));
+        }
         validate_storage_paths(&storage)?;
         validate_absolute_path("quartz.program", &wire.quartz.program)?;
         validate_absolute_path("quartz.integration_root", &wire.quartz.integration_root)?;
@@ -297,6 +307,7 @@ impl TryFrom<WireWorkerConfig> for WorkerSettings {
             content_root: wire.storage.content_root,
             work_root: wire.storage.work_root,
             release_root: wire.storage.release_root,
+            search_index_root: wire.storage.search_index_root,
             official_branch: wire.repository.official_branch,
             identity,
             replication,
@@ -409,6 +420,7 @@ struct WireStorage {
     content_root: PathBuf,
     work_root: PathBuf,
     release_root: PathBuf,
+    search_index_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
