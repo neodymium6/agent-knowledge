@@ -945,13 +945,13 @@ login user differs from the configured Gateway account. The root-controlled
 OpenSSH configuration supplies both user values, the trusted owner UID, the
 registry root, and the Gateway configuration path.
 
-The authorized-key file and all of its parent directories are controlled by
-root and are not writable by the Gateway account. The OpenSSH `Match User`
-configuration requires public-key authentication and disables password and
-keyboard-interactive authentication, forwarding, PTYs, and user startup files.
-It disables `AuthorizedKeysCommand` and `TrustedUserCAKeys` for the Gateway
-account so every accepted key is constrained by the root-controlled
-`authorized_keys` entry and its forced command.
+The OpenSSH `Match User` configuration requires public-key authentication and
+disables password and keyboard-interactive authentication, forwarding, PTYs,
+user startup files, and `TrustedUserCAKeys`. Static-file mode uses only a
+root-controlled `authorized_keys` file and disables `AuthorizedKeysCommand`.
+Registry mode sets `AuthorizedKeysFile none` and configures only the
+root-controlled registry adapter as `AuthorizedKeysCommand`. The selected mode
+therefore constrains every accepted key to its forced Gateway command.
 
 The operating-system account must permit public-key login under the selected
 PAM and `UsePAM` policy without having a usable password. This matters because
