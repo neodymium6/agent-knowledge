@@ -2,6 +2,7 @@
 
 let
   gatewayUid = 41003;
+  accessUid = 41005;
   quartzFixture = pkgs.writeShellApplication {
     name = "build-site";
     runtimeInputs = [ pkgs.coreutils ];
@@ -162,6 +163,7 @@ pkgs.testers.runNixOSTest {
         pkgs.gnutar
         pkgs.jq
         pkgs.openssh
+        pkgs.util-linux
       ];
 
       environment.etc."agent-knowledge/worker.yaml" = {
@@ -179,6 +181,7 @@ pkgs.testers.runNixOSTest {
         agent-knowledge-queue.gid = 41002;
         agent-knowledge-gateway.gid = 41003;
         agent-knowledge-ingress.gid = 41004;
+        agent-knowledge-access.gid = accessUid;
       };
       users.users = {
         agent-knowledge = {
@@ -194,6 +197,13 @@ pkgs.testers.runNixOSTest {
           uid = 41002;
           group = "agent-knowledge-queue";
           home = "/var/lib/agent-knowledge";
+          createHome = false;
+        };
+        agent-knowledge-access = {
+          isSystemUser = true;
+          uid = accessUid;
+          group = "agent-knowledge-access";
+          home = "/var/empty";
           createHome = false;
         };
         fictional-ak-gateway = {
@@ -254,7 +264,7 @@ pkgs.testers.runNixOSTest {
       services.openssh = {
         enable = true;
         ports = [ 2222 ];
-        authorizedKeysFiles = lib.mkForce [ "/etc/agent-knowledge/authorized_keys" ];
+        authorizedKeysFiles = lib.mkForce [ "none" ];
         hostKeys = [
           {
             path = "/etc/ssh/ssh_host_ed25519_key";
@@ -268,6 +278,8 @@ pkgs.testers.runNixOSTest {
           PermitRootLogin = "no";
         };
         extraConfig = ''
+          AuthorizedKeysCommand ${package}/bin/agent-knowledge access authorized-keys --registry-root /var/lib/agent-knowledge-access --gateway-config /etc/agent-knowledge/gateway.yaml --trusted-owner-uid 0 --gateway-user fictional-ak-gateway --requested-user %u
+          AuthorizedKeysCommandUser agent-knowledge-access
           AllowUsers fictional-ak-gateway
           AllowGroups agent-knowledge-gateway
           PermitTTY no
@@ -322,6 +334,9 @@ pkgs.testers.runNixOSTest {
         "test \"$(id -G agent-knowledge-queue)\" = '41002'"
     )
     machine.succeed(
+        "test \"$(id -G agent-knowledge-access)\" = '41005'"
+    )
+    machine.succeed(
         "test \"$(id -G fictional-ak-gateway)\" = '41003 41004'"
     )
     machine.succeed(
@@ -349,12 +364,31 @@ pkgs.testers.runNixOSTest {
         "-C fictional-systemd-client -f /root/.ssh/id_ed25519"
     )
     machine.succeed(
-        "public_key=$(cat /root/.ssh/id_ed25519.pub); "
-        "printf '%s %s\\n' "
-        "'restrict,command=\"akg-v1 /etc/agent-knowledge/gateway.yaml "
-        "fictional-systemd-node\"' \"$public_key\" "
-        ">/etc/agent-knowledge/authorized_keys; "
-        "chmod 0644 /etc/agent-knowledge/authorized_keys"
+        client
+        + " admin clients add "
+        + "--registry-root /var/lib/agent-knowledge-access "
+        + "--client-id fictional-systemd-node "
+        + "--public-key-file /root/.ssh/id_ed25519.pub"
+    )
+    machine.succeed(
+        "test \"$(stat -c '%U:%G:%a' /var/lib/agent-knowledge-access)\" "
+        "= 'root:agent-knowledge-access:2750'; "
+        "runuser -u agent-knowledge-access -- "
+        + client
+        + " access authorized-keys "
+        + "--registry-root /var/lib/agent-knowledge-access "
+        + "--gateway-config /etc/agent-knowledge/gateway.yaml "
+        + "--trusted-owner-uid 0 "
+        + "--gateway-user fictional-ak-gateway "
+        + "--requested-user fictional-ak-gateway "
+        + "| grep -F 'fictional-systemd-node'"
+    )
+    machine.fail(
+        "runuser -u agent-knowledge-access -- "
+        + client
+        + " admin clients disable "
+        + "--registry-root /var/lib/agent-knowledge-access "
+        + "--client-id fictional-systemd-node"
     )
     machine.succeed(
         "host_key=$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub); "
@@ -469,6 +503,19 @@ pkgs.testers.runNixOSTest {
     machine.succeed(
         "test \"$(git --git-dir=/var/lib/agent-knowledge/repository "
         "rev-list --count main)\" = 3"
+    )
+    machine.succeed(
+        client
+        + " admin clients disable "
+        + "--registry-root /var/lib/agent-knowledge-access "
+        + "--client-id fictional-systemd-node"
+    )
+    machine.succeed(
+        "set +e; "
+        "output=$(ssh -F /root/.ssh/config fictional-systemd "
+        "'akp-v1 list' 2>&1); status=$?; set -e; "
+        "test \"$status\" -eq 255; "
+        "printf '%s\\n' \"$output\" | grep -F 'Permission denied (publickey)'"
     )
   '';
 }
