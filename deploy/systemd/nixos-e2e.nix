@@ -364,7 +364,8 @@ pkgs.testers.runNixOSTest {
         "-C fictional-systemd-client -f /root/.ssh/id_ed25519"
     )
     machine.succeed(
-        client
+        "umask 0077; "
+        + client
         + " admin clients add "
         + "--registry-root /var/lib/agent-knowledge-access "
         + "--client-id fictional-systemd-node "

@@ -752,6 +752,7 @@ fn ensure_directory(path: &Path) -> Result<(), AccessRegistryError> {
                 let mut builder = fs::DirBuilder::new();
                 builder.mode(0o750);
                 builder.create(path).map_err(AccessRegistryError::Io)?;
+                set_exact_directory_mode(&open_directory(path)?)?;
             }
             #[cfg(not(unix))]
             {
@@ -774,7 +775,8 @@ fn create_private_directory(path: &Path) -> Result<(), AccessRegistryError> {
         use std::os::unix::fs::DirBuilderExt;
         let mut builder = fs::DirBuilder::new();
         builder.mode(0o750);
-        builder.create(path).map_err(AccessRegistryError::Io)
+        builder.create(path).map_err(AccessRegistryError::Io)?;
+        set_exact_directory_mode(&open_directory(path)?)
     }
     #[cfg(not(unix))]
     {
@@ -793,8 +795,31 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), AccessRegistryError> 
             .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
     }
     let mut file = options.open(path).map_err(AccessRegistryError::Io)?;
+    #[cfg(unix)]
+    set_exact_mode(&file, 0o640)?;
     file.write_all(bytes).map_err(AccessRegistryError::Io)?;
     file.sync_all().map_err(AccessRegistryError::Io)
+}
+
+#[cfg(unix)]
+fn set_exact_mode(file: &File, mode: u32) -> Result<(), AccessRegistryError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(AccessRegistryError::Io)
+}
+
+#[cfg(unix)]
+fn set_exact_directory_mode(file: &File) -> Result<(), AccessRegistryError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let inherited_set_group_id = file
+        .metadata()
+        .map_err(AccessRegistryError::Io)?
+        .permissions()
+        .mode()
+        & 0o2000;
+    set_exact_mode(file, 0o750 | inherited_set_group_id)
 }
 
 #[cfg(unix)]
@@ -1159,6 +1184,47 @@ mod tests {
     fn open_registry(path: impl AsRef<Path>) -> Result<AccessRegistry, AccessRegistryError> {
         let path = path.as_ref();
         AccessRegistry::open(path, trusted_owner_uid(path)?)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creates_an_exact_group_readable_layout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDirectory::create();
+        let registry_root = root.path().join("registry");
+        fs::create_dir(&registry_root)
+            .unwrap_or_else(|error| panic!("registry root must be created: {error}"));
+        fs::set_permissions(&registry_root, fs::Permissions::from_mode(0o2750))
+            .unwrap_or_else(|error| panic!("registry root mode must be set: {error}"));
+        let registry = open_registry(&registry_root)
+            .unwrap_or_else(|error| panic!("registry must open: {error}"));
+        let outcome = registry
+            .add(client_id("fictional-node-a"), key(KEY_A), "local-admin")
+            .unwrap_or_else(|error| panic!("client must be added: {error}"));
+        let generation = registry_root
+            .join("by-id")
+            .join(outcome.snapshot().generation_id());
+
+        for directory in [
+            registry_root.clone(),
+            registry_root.join("by-id"),
+            registry_root.join(STAGING_DIRECTORY),
+            generation.clone(),
+        ] {
+            let mode = fs::metadata(&directory)
+                .unwrap_or_else(|error| panic!("directory mode must be readable: {error}"))
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o2750, "unexpected mode for {}", directory.display());
+        }
+        let file_mode = fs::metadata(generation.join("registry.json"))
+            .unwrap_or_else(|error| panic!("registry mode must be readable: {error}"))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o640);
     }
 
     #[test]
