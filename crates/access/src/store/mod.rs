@@ -179,16 +179,42 @@ impl AccessRegistry {
         root: impl AsRef<Path>,
         trusted_owner_uid: u32,
     ) -> Result<Self, AccessRegistryError> {
-        ensure_directory(root.as_ref())?;
-        let configured_root = fs::canonicalize(root.as_ref()).map_err(AccessRegistryError::Io)?;
+        Self::open_with_initialization(root.as_ref(), trusted_owner_uid, true)
+    }
+
+    /// Opens an existing access-registry layout without creating storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root or fixed entries do not exist, are
+    /// unsafe, are not owned by the trusted UID, or select an invalid
+    /// generation.
+    pub fn open_existing(
+        root: impl AsRef<Path>,
+        trusted_owner_uid: u32,
+    ) -> Result<Self, AccessRegistryError> {
+        Self::open_with_initialization(root.as_ref(), trusted_owner_uid, false)
+    }
+
+    fn open_with_initialization(
+        root: &Path,
+        trusted_owner_uid: u32,
+        initialize: bool,
+    ) -> Result<Self, AccessRegistryError> {
+        if initialize {
+            ensure_directory(root)?;
+        }
+        let configured_root = fs::canonicalize(root).map_err(AccessRegistryError::Io)?;
         let root_handle = Arc::new(open_directory(&configured_root)?);
         let stable_root = stable_directory_path(&root_handle, &configured_root)?;
         validate_pinned_directory(&configured_root, &root_handle)?;
         let root_metadata = root_handle.metadata().map_err(AccessRegistryError::Io)?;
         validate_registry_directory(&root_metadata, &root_metadata, trusted_owner_uid)?;
-        ensure_directory(&stable_root.join(BY_ID_DIRECTORY))?;
-        ensure_directory(&stable_root.join(STAGING_DIRECTORY))?;
-        sync_directory(&stable_root)?;
+        if initialize {
+            ensure_directory(&stable_root.join(BY_ID_DIRECTORY))?;
+            ensure_directory(&stable_root.join(STAGING_DIRECTORY))?;
+            sync_directory(&stable_root)?;
+        }
         let registry = Self {
             configured_root,
             stable_root,
@@ -1063,7 +1089,7 @@ mod tests {
 
     use agent_knowledge_protocol::ClientId;
 
-    use super::{AccessRegistry, AccessRegistryError, ClientStatus};
+    use super::{AccessRegistry, AccessRegistryError, ClientStatus, STAGING_DIRECTORY};
     use crate::{ImportedClient, NormalizedPublicKey};
 
     const KEY_A: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti fictional-a@example.invalid";
@@ -1349,5 +1375,22 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::NotFound
         ));
         assert!(!missing_parent.exists());
+    }
+
+    #[test]
+    fn opens_existing_storage_without_initializing_missing_entries() {
+        let root = TestDirectory::create();
+        let registry_root = root.path().join("registry");
+        let registry = open_registry(&registry_root)
+            .unwrap_or_else(|error| panic!("registry must initialize: {error}"));
+        let owner_uid = trusted_owner_uid(&registry_root)
+            .unwrap_or_else(|error| panic!("fixture owner must be readable: {error}"));
+        AccessRegistry::open_existing(&registry_root, owner_uid)
+            .unwrap_or_else(|error| panic!("existing registry must open: {error}"));
+
+        fs::remove_dir(registry.stable_root.join(STAGING_DIRECTORY))
+            .unwrap_or_else(|error| panic!("staging fixture must be removed: {error}"));
+        assert!(AccessRegistry::open_existing(&registry_root, owner_uid).is_err());
+        assert!(!registry_root.join(STAGING_DIRECTORY).exists());
     }
 }

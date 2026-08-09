@@ -1,3 +1,4 @@
+mod access_adapter;
 mod admin;
 mod cli;
 mod gateway;

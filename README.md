@@ -198,9 +198,15 @@ operations. `import-authorized-keys` migrates either restricted form described
 in `DESIGN.md` as one atomic generation. Registry storage must be owned by the
 administrative UID running the command, and its parent path must not be
 writable by untrusted users. Create that parent before the first command. The
-current OpenSSH deployment
-continues to use its static root-controlled file until the registry lookup
-adapter is configured; registry changes alone do not change accepted SSH keys.
+current OpenSSH deployment continues to use its static root-controlled file
+until the registry lookup adapter is configured; registry changes alone do not
+change accepted SSH keys.
+
+The read-only `access authorized-keys` command is intended for a
+root-controlled OpenSSH `AuthorizedKeysCommand`. It validates the configured
+registry owner, emits only active keys, and returns no keys unless the requested
+login user matches the configured Gateway user. Deployment integration remains
+opt-in.
 
 ## Linux systemd deployment
 

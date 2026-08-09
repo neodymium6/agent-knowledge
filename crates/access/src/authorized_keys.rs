@@ -1,11 +1,12 @@
 use std::ffi::OsStr;
 use std::fmt;
+use std::io::{self, Write};
 use std::path::Path;
 use std::str::FromStr;
 
 use agent_knowledge_protocol::{ClientId, ClientIdError};
 
-use crate::{KeyValidationError, NormalizedPublicKey};
+use crate::{ClientStatus, KeyValidationError, NormalizedPublicKey, RegistrySnapshot};
 
 const MAXIMUM_AUTHORIZED_KEYS_BYTES: usize = 4 * 1024 * 1024;
 const FORCED_COMMAND_PREFIX: &str = "restrict,command=\"";
@@ -20,6 +21,69 @@ pub struct ImportedClient {
     pub client_id: ClientId,
     /// Validated public key.
     pub public_key: NormalizedPublicKey,
+}
+
+/// Writes active registry clients in the restricted OpenSSH key format.
+///
+/// # Errors
+///
+/// Returns an error when the Gateway configuration path cannot be represented
+/// safely in a forced command or when output fails.
+pub fn write_authorized_keys(
+    snapshot: Option<&RegistrySnapshot>,
+    gateway_config: &Path,
+    mut output: impl Write,
+) -> Result<(), AuthorizedKeysRenderError> {
+    let gateway_config = gateway_config
+        .to_str()
+        .filter(|value| is_safe_direct_path(value))
+        .ok_or(AuthorizedKeysRenderError::InvalidGatewayConfig)?;
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    for client in snapshot
+        .clients()
+        .iter()
+        .filter(|client| client.status() == ClientStatus::Active)
+    {
+        writeln!(
+            output,
+            "restrict,command=\"{FORCED_COMMAND_VERSION} {gateway_config} {}\" {}",
+            client.client_id(),
+            client.public_key()
+        )
+        .map_err(AuthorizedKeysRenderError::Io)?;
+    }
+    Ok(())
+}
+
+/// Failure to render active registry clients for OpenSSH.
+#[derive(Debug)]
+pub enum AuthorizedKeysRenderError {
+    /// The Gateway configuration path is not an absolute command-safe path.
+    InvalidGatewayConfig,
+    /// The output stream failed.
+    Io(io::Error),
+}
+
+impl fmt::Display for AuthorizedKeysRenderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidGatewayConfig => {
+                formatter.write_str("Gateway configuration path is not command-safe")
+            }
+            Self::Io(error) => write!(formatter, "authorized_keys output failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AuthorizedKeysRenderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::InvalidGatewayConfig => None,
+        }
+    }
 }
 
 /// Parses the exact static format documented by Agent Knowledge.
@@ -162,7 +226,12 @@ impl std::error::Error for AuthorizedKeysImportError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthorizedKeysImportError, parse_authorized_keys};
+    use std::path::Path;
+
+    use super::{
+        AuthorizedKeysImportError, AuthorizedKeysRenderError, parse_authorized_keys,
+        write_authorized_keys,
+    };
 
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti fictional@example.invalid";
 
@@ -214,6 +283,20 @@ mod tests {
                 parse_authorized_keys(&input),
                 Err(AuthorizedKeysImportError::InvalidLine { .. })
                     | Err(AuthorizedKeysImportError::ClientId(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_gateway_configuration_paths() {
+        for path in [
+            "relative/gateway.yaml",
+            "/etc/agent knowledge/gateway.yaml",
+            "/etc/agent-knowledge/gateway\".yaml",
+        ] {
+            assert!(matches!(
+                write_authorized_keys(None, Path::new(path), Vec::new()),
+                Err(AuthorizedKeysRenderError::InvalidGatewayConfig)
             ));
         }
     }
