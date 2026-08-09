@@ -206,7 +206,21 @@ The read-only `access authorized-keys` command is intended for a
 root-controlled OpenSSH `AuthorizedKeysCommand`. It validates the configured
 registry owner, emits only active keys, and returns no keys unless the requested
 login user matches the configured Gateway user. Deployment integration remains
-opt-in.
+opt-in. The systemd package creates a non-login `agent-knowledge-access` reader
+and a root-owned `/var/lib/agent-knowledge-access` registry directory. Enable
+lookup only after enrolling a key, then add this to the existing hardened
+OpenSSH configuration (with the deployment's actual Gateway account):
+
+```text
+Match User fictional-agent-knowledge-gateway
+    AuthorizedKeysFile none
+    AuthorizedKeysCommand /nix/var/nix/profiles/agent-knowledge/bin/agent-knowledge access authorized-keys --registry-root /var/lib/agent-knowledge-access --gateway-config /etc/agent-knowledge/gateway.yaml --trusted-owner-uid 0 --gateway-user fictional-agent-knowledge-gateway --requested-user %u
+    AuthorizedKeysCommandUser agent-knowledge-access
+```
+
+Validate the complete configuration with `sshd -t` before reloading OpenSSH.
+Without this explicit configuration, the static file remains the authentication
+source.
 
 ## Linux systemd deployment
 

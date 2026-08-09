@@ -9,6 +9,8 @@ Notable changes are recorded here. This project follows Semantic Versioning.
   the documented static `authorized_keys` format.
 - Add a read-only OpenSSH adapter that emits active registry keys with their
   restricted Gateway command.
+- Add opt-in systemd/OpenSSH registry lookup with a dedicated read-only account
+  and end-to-end enrollment, login, and suspension coverage.
 
 ## 0.2.0
 
