@@ -357,6 +357,28 @@ fn parses_client_registry_administration_commands() {
             }
         ) if expected_fingerprint == "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ"
     ));
+
+    let serve = parse_arguments([
+        "agent-knowledge".into(),
+        "admin".into(),
+        "clients".into(),
+        "serve".into(),
+        "--registry-root".into(),
+        "/srv/fictional-access".into(),
+        "--listen".into(),
+        "127.0.0.1:9080".into(),
+    ])
+    .unwrap_or_else(|error| panic!("client Web UI command must parse: {error}"));
+    assert!(matches!(
+        serve,
+        Command::AdminClients(
+            crate::admin::clients::ClientAdminCommand::Serve {
+                registry_root,
+                listen,
+            }
+        ) if registry_root == Path::new("/srv/fictional-access")
+            && listen.to_string() == "127.0.0.1:9080"
+    ));
 }
 
 #[test]

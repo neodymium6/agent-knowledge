@@ -40,6 +40,7 @@ const COMMON_USAGE: &str = "usage:\n\
     agent-knowledge admin clients enable --registry-root <path> --client-id <id>\n\
     agent-knowledge admin clients rotate-key --registry-root <path> --client-id <id> --expected-fingerprint <fingerprint> --public-key-file <path>\n\
     agent-knowledge admin clients import-authorized-keys --registry-root <path> --authorized-keys-file <path>\n\
+    agent-knowledge admin clients serve --registry-root <path> --listen <loopback-address>\n\
     agent-knowledge access authorized-keys --registry-root <path> --gateway-config <path> --trusted-owner-uid <uid> --gateway-user <name> --requested-user <name>\n\
     agent-knowledge client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
     agent-knowledge client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\

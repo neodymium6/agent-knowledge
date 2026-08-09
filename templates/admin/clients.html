@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Knowledge clients</title>
+  <link rel="stylesheet" href="/assets/clients.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">Agent Knowledge</p>
+        <h1>SSH clients</h1>
+      </div>
+      {% match generation_id %}
+      {% when Some with (id) %}<code class="generation">Generation {{ id }}</code>
+      {% when None %}<span class="generation">Empty registry</span>
+      {% endmatch %}
+    </header>
+
+    <p class="warning">This service does not authenticate users. Keep it behind an authenticated, same-host proxy.</p>
+    {% if notice != "" %}<p class="message success" role="status">{{ notice }}</p>{% endif %}
+    {% if error != "" %}<p class="message error" role="alert">{{ error }}</p>{% endif %}
+
+    <section aria-labelledby="add-client-heading">
+      <h2 id="add-client-heading">Add client</h2>
+      <form method="post" action="/clients" class="stacked-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="client-id">Client ID</label>
+        <input id="client-id" name="client_id" required pattern="[a-z0-9](?:[a-z0-9-]*[a-z0-9])?" autocomplete="off" placeholder="fictional-node-a">
+        <label for="public-key">Ed25519 public key</label>
+        <textarea id="public-key" name="public_key" required rows="3" spellcheck="false" placeholder="ssh-ed25519 AAAA..."></textarea>
+        <button type="submit">Add client</button>
+      </form>
+    </section>
+
+    <section aria-labelledby="registered-clients-heading">
+      <h2 id="registered-clients-heading">Registered clients</h2>
+      {% if clients.is_empty() %}
+      <p>No clients are registered.</p>
+      {% else %}
+      <div class="client-list">
+        {% for client in clients %}
+        <article class="client">
+          <div class="client-summary">
+            <div>
+              <h3><code>{{ client.client_id }}</code></h3>
+              <code class="fingerprint">{{ client.fingerprint }}</code>
+            </div>
+            {% if client.active %}<span class="status active">Active</span>{% else %}<span class="status disabled">Disabled</span>{% endif %}
+          </div>
+
+          <div class="actions">
+            {% if client.active %}
+            <form method="post" action="/clients/{{ client.client_id }}/disable">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="secondary">Disable</button>
+            </form>
+            {% else %}
+            <form method="post" action="/clients/{{ client.client_id }}/enable">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="secondary">Enable</button>
+            </form>
+            {% endif %}
+          </div>
+
+          <details>
+            <summary>Rotate key</summary>
+            <form method="post" action="/clients/{{ client.client_id }}/rotate-key" class="stacked-form compact">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="expected_fingerprint" value="{{ client.fingerprint }}">
+              <label for="key-{{ client.client_id }}">New Ed25519 public key</label>
+              <textarea id="key-{{ client.client_id }}" name="public_key" required rows="3" spellcheck="false" placeholder="ssh-ed25519 AAAA..."></textarea>
+              <button type="submit">Rotate key</button>
+            </form>
+          </details>
+        </article>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </section>
+  </main>
+</body>
+</html>

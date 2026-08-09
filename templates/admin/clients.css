@@ -1,0 +1,165 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+  line-height: 1.5;
+}
+
+body {
+  margin: 0;
+  background: Canvas;
+  color: CanvasText;
+}
+
+main {
+  box-sizing: border-box;
+  width: min(64rem, 100%);
+  margin: 0 auto;
+  padding: 2rem 1rem 4rem;
+}
+
+header,
+.client-summary,
+.actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+.eyebrow {
+  margin-bottom: 0.25rem;
+  color: GrayText;
+  font-size: 0.875rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.generation,
+.fingerprint {
+  overflow-wrap: anywhere;
+  color: GrayText;
+}
+
+.warning,
+.message {
+  padding: 0.75rem 1rem;
+  border-left: 0.25rem solid #c78600;
+  background: color-mix(in srgb, #c78600 12%, Canvas);
+}
+
+.message.success {
+  border-color: #16834a;
+  background: color-mix(in srgb, #16834a 12%, Canvas);
+}
+
+.message.error {
+  border-color: #c73737;
+  background: color-mix(in srgb, #c73737 12%, Canvas);
+}
+
+section {
+  margin-top: 2rem;
+}
+
+.stacked-form {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.stacked-form.compact {
+  margin-top: 1rem;
+}
+
+input,
+textarea,
+button {
+  box-sizing: border-box;
+  max-width: 100%;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid GrayText;
+  border-radius: 0.3rem;
+  font: inherit;
+}
+
+textarea {
+  width: 100%;
+  font-family: ui-monospace, monospace;
+  resize: vertical;
+}
+
+button {
+  width: fit-content;
+  border-color: #1769aa;
+  background: #1769aa;
+  color: white;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+button.secondary {
+  border-color: GrayText;
+  background: transparent;
+  color: CanvasText;
+}
+
+.client-list {
+  display: grid;
+  gap: 1rem;
+}
+
+.client {
+  padding: 1rem;
+  border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas);
+  border-radius: 0.5rem;
+}
+
+.client h3 {
+  margin-bottom: 0.25rem;
+}
+
+.status {
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.status.active {
+  background: color-mix(in srgb, #16834a 18%, Canvas);
+  color: #16834a;
+}
+
+.status.disabled {
+  background: color-mix(in srgb, #c73737 18%, Canvas);
+  color: #c73737;
+}
+
+.actions {
+  justify-content: flex-start;
+  margin-top: 1rem;
+}
+
+details {
+  margin-top: 1rem;
+}
+
+summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+@media (max-width: 40rem) {
+  header,
+  .client-summary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
