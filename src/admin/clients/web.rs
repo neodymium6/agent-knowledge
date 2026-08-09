@@ -1,6 +1,7 @@
 use std::fmt;
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::fs;
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use agent_knowledge_access::{
@@ -76,10 +77,8 @@ struct ClientView {
     active: bool,
 }
 
-pub(super) fn run(registry_root: PathBuf, listen: SocketAddr) -> Result<(), ClientAdminWebError> {
-    if !listen.ip().is_loopback() {
-        return Err(ClientAdminWebError::NonLoopbackAddress(listen));
-    }
+pub(super) fn run(registry_root: PathBuf, socket_path: PathBuf) -> Result<(), ClientAdminWebError> {
+    validate_socket_path(&socket_path)?;
     let registry = AccessRegistry::open_for_effective_user(registry_root)
         .map_err(ClientAdminWebError::Registry)?;
     let state = WebState {
@@ -90,20 +89,141 @@ pub(super) fn run(registry_root: PathBuf, listen: SocketAddr) -> Result<(), Clie
         .enable_io()
         .build()
         .map_err(ClientAdminWebError::Runtime)?
-        .block_on(serve(state, listen))
+        .block_on(serve(state, socket_path))
 }
 
-async fn serve(state: WebState, listen: SocketAddr) -> Result<(), ClientAdminWebError> {
-    let listener = tokio::net::TcpListener::bind(listen)
-        .await
-        .map_err(|source| ClientAdminWebError::Bind {
-            address: listen,
-            source,
-        })?;
+async fn serve(state: WebState, socket_path: PathBuf) -> Result<(), ClientAdminWebError> {
+    let listener = bind_listener(&socket_path).map_err(|source| ClientAdminWebError::Bind {
+        path: socket_path.clone(),
+        source,
+    })?;
+    let bound_socket = BoundSocket::new(socket_path)?;
+    bound_socket.set_permissions()?;
     axum::serve(listener, router(state))
         .with_graceful_shutdown(wait_for_shutdown())
         .await
         .map_err(ClientAdminWebError::Serve)
+}
+
+fn validate_socket_path(socket_path: &FsPath) -> Result<(), ClientAdminWebError> {
+    if !socket_path.is_absolute() || socket_path.file_name().is_none() {
+        return Err(ClientAdminWebError::InvalidSocketPath(
+            socket_path.to_path_buf(),
+        ));
+    }
+    let parent = socket_path
+        .parent()
+        .ok_or_else(|| ClientAdminWebError::InvalidSocketPath(socket_path.to_path_buf()))?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|source| ClientAdminWebError::SocketDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    if canonical_parent != parent {
+        return Err(ClientAdminWebError::InsecureSocketDirectory(
+            parent.to_path_buf(),
+        ));
+    }
+
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    for ancestor in parent.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor).map_err(|source| {
+            ClientAdminWebError::SocketDirectory {
+                path: ancestor.to_path_buf(),
+                source,
+            }
+        })?;
+        let trusted_owner = metadata.uid() == 0 || metadata.uid() == effective_uid;
+        if !metadata.file_type().is_dir()
+            || !trusted_owner
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(ClientAdminWebError::InsecureSocketDirectory(
+                ancestor.to_path_buf(),
+            ));
+        }
+    }
+    let parent_metadata =
+        fs::symlink_metadata(parent).map_err(|source| ClientAdminWebError::SocketDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    if parent_metadata.uid() != effective_uid {
+        return Err(ClientAdminWebError::InsecureSocketDirectory(
+            parent.to_path_buf(),
+        ));
+    }
+
+    match fs::symlink_metadata(socket_path) {
+        Ok(_) => Err(ClientAdminWebError::SocketAlreadyExists(
+            socket_path.to_path_buf(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ClientAdminWebError::SocketPath {
+            path: socket_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+#[cfg(not(test))]
+fn bind_listener(socket_path: &FsPath) -> std::io::Result<tokio::net::UnixListener> {
+    let previous_umask = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o117));
+    let listener = tokio::net::UnixListener::bind(socket_path);
+    nix::sys::stat::umask(previous_umask);
+    listener
+}
+
+#[cfg(test)]
+fn bind_listener(socket_path: &FsPath) -> std::io::Result<tokio::net::UnixListener> {
+    tokio::net::UnixListener::bind(socket_path)
+}
+
+struct BoundSocket {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl BoundSocket {
+    fn new(path: PathBuf) -> Result<Self, ClientAdminWebError> {
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|source| ClientAdminWebError::SocketPath {
+                path: path.clone(),
+                source,
+            })?;
+        if !metadata.file_type().is_socket() {
+            return Err(ClientAdminWebError::InvalidBoundSocket(path));
+        }
+        Ok(Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn set_permissions(&self) -> Result<(), ClientAdminWebError> {
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o660)).map_err(|source| {
+            ClientAdminWebError::SocketPath {
+                path: self.path.clone(),
+                source,
+            }
+        })
+    }
+}
+
+impl Drop for BoundSocket {
+    fn drop(&mut self) {
+        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if metadata.file_type().is_socket()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn router(state: WebState) -> Router {
@@ -440,11 +560,22 @@ impl fmt::Display for WebOperationError {
 /// Failure to run the optional local client-administration Web UI.
 #[derive(Debug)]
 pub(crate) enum ClientAdminWebError {
-    NonLoopbackAddress(SocketAddr),
+    InvalidSocketPath(PathBuf),
+    InsecureSocketDirectory(PathBuf),
+    SocketAlreadyExists(PathBuf),
+    InvalidBoundSocket(PathBuf),
+    SocketDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    SocketPath {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Registry(AccessRegistryError),
     Runtime(std::io::Error),
     Bind {
-        address: SocketAddr,
+        path: PathBuf,
         source: std::io::Error,
     },
     Serve(std::io::Error),
@@ -453,9 +584,35 @@ pub(crate) enum ClientAdminWebError {
 impl fmt::Display for ClientAdminWebError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NonLoopbackAddress(address) => write!(
+            Self::InvalidSocketPath(path) => write!(
                 formatter,
-                "client administration Web UI must listen on a loopback address, not {address}"
+                "client administration socket path must be absolute and name one socket: {}",
+                path.display()
+            ),
+            Self::InsecureSocketDirectory(path) => write!(
+                formatter,
+                "client administration socket directory is not private and trusted: {}",
+                path.display()
+            ),
+            Self::SocketAlreadyExists(path) => write!(
+                formatter,
+                "client administration socket path already exists: {}",
+                path.display()
+            ),
+            Self::InvalidBoundSocket(path) => write!(
+                formatter,
+                "client administration listener did not create a socket: {}",
+                path.display()
+            ),
+            Self::SocketDirectory { path, source } => write!(
+                formatter,
+                "could not inspect client administration socket directory {}: {source}",
+                path.display()
+            ),
+            Self::SocketPath { path, source } => write!(
+                formatter,
+                "could not manage client administration socket {}: {source}",
+                path.display()
             ),
             Self::Registry(error) => error.fmt(formatter),
             Self::Runtime(error) => {
@@ -464,9 +621,10 @@ impl fmt::Display for ClientAdminWebError {
                     "could not start client administration runtime: {error}"
                 )
             }
-            Self::Bind { address, source } => write!(
+            Self::Bind { path, source } => write!(
                 formatter,
-                "could not bind client administration listener at {address}: {source}"
+                "could not bind client administration listener at {}: {source}",
+                path.display()
             ),
             Self::Serve(error) => write!(formatter, "client administration server failed: {error}"),
         }
@@ -476,7 +634,11 @@ impl fmt::Display for ClientAdminWebError {
 impl std::error::Error for ClientAdminWebError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::NonLoopbackAddress(_) => None,
+            Self::InvalidSocketPath(_)
+            | Self::InsecureSocketDirectory(_)
+            | Self::SocketAlreadyExists(_)
+            | Self::InvalidBoundSocket(_) => None,
+            Self::SocketDirectory { source, .. } | Self::SocketPath { source, .. } => Some(source),
             Self::Registry(error) => Some(error),
             Self::Runtime(error) | Self::Serve(error) => Some(error),
             Self::Bind { source, .. } => Some(source),
@@ -709,16 +871,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_loopback_listener() {
+    fn rejects_relative_socket_path() {
         let result = run(
             PathBuf::from("/srv/fictional-access"),
-            "192.0.2.10:8080"
-                .parse()
-                .unwrap_or_else(|error| panic!("test address must parse: {error}")),
+            PathBuf::from("fictional-admin.sock"),
         );
         assert!(matches!(
             result,
-            Err(ClientAdminWebError::NonLoopbackAddress(_))
+            Err(ClientAdminWebError::InvalidSocketPath(_))
         ));
+    }
+
+    #[test]
+    fn creates_a_group_restricted_unix_socket_and_removes_it() {
+        let root = TestDirectory::create();
+        let socket_path = root.path().join("admin.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+            .unwrap_or_else(|error| panic!("test socket must bind: {error}"));
+        let socket = BoundSocket::new(socket_path.clone())
+            .unwrap_or_else(|error| panic!("bound socket must validate: {error}"));
+        socket
+            .set_permissions()
+            .unwrap_or_else(|error| panic!("socket permissions must be set: {error}"));
+        assert_eq!(
+            fs::symlink_metadata(&socket_path)
+                .unwrap_or_else(|error| panic!("socket metadata must be readable: {error}"))
+                .permissions()
+                .mode()
+                & 0o777,
+            0o660
+        );
+        drop(listener);
+        drop(socket);
+        assert!(!socket_path.exists());
     }
 }

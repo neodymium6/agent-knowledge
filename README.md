@@ -208,13 +208,16 @@ enable, and rotate operations without JavaScript:
 ```sh
 agent-knowledge admin clients serve \
   --registry-root /srv/fictional-agent-knowledge-access \
-  --listen 127.0.0.1:8080
+  --socket-path /run/fictional-agent-knowledge-admin/admin.sock
 ```
 
-The UI is off unless this command runs and refuses non-loopback listeners. It
-has CSRF protection but no authentication or TLS. Run a persistent instance as
-the dedicated non-root owner of its registry, then publish it only through an
-authenticated same-host reverse proxy. Do not run a persistent UI as root.
+The UI is off unless this command runs and does not open a TCP listener. Its
+pre-created socket directory must be owned by the process identity and not
+writable by group or other users; the socket itself is mode `0660`. It has CSRF
+protection but no authentication or TLS. Run a persistent instance as the
+dedicated non-root owner of its registry, then grant only the authenticated
+same-host reverse proxy access through the socket group. Do not run a
+persistent UI as root.
 
 The read-only `access authorized-keys` command is intended for a
 root-controlled OpenSSH `AuthorizedKeysCommand`. It validates the configured

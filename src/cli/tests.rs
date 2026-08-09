@@ -365,8 +365,8 @@ fn parses_client_registry_administration_commands() {
         "serve".into(),
         "--registry-root".into(),
         "/srv/fictional-access".into(),
-        "--listen".into(),
-        "127.0.0.1:9080".into(),
+        "--socket-path".into(),
+        "/run/fictional-agent-knowledge/admin.sock".into(),
     ])
     .unwrap_or_else(|error| panic!("client Web UI command must parse: {error}"));
     assert!(matches!(
@@ -374,10 +374,10 @@ fn parses_client_registry_administration_commands() {
         Command::AdminClients(
             crate::admin::clients::ClientAdminCommand::Serve {
                 registry_root,
-                listen,
+                socket_path,
             }
         ) if registry_root == Path::new("/srv/fictional-access")
-            && listen.to_string() == "127.0.0.1:9080"
+            && socket_path == Path::new("/run/fictional-agent-knowledge/admin.sock")
     ));
 }
 

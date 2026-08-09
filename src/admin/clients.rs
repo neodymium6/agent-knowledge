@@ -1,7 +1,6 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use agent_knowledge_access::{
@@ -49,7 +48,7 @@ pub(crate) enum ClientAdminCommand {
     },
     Serve {
         registry_root: PathBuf,
-        listen: SocketAddr,
+        socket_path: PathBuf,
     },
 }
 
@@ -66,7 +65,7 @@ where
     let mut public_key_file = None;
     let mut expected_fingerprint = None;
     let mut authorized_keys_file = None;
-    let mut listen = None;
+    let mut socket_path = None;
     while let Some(flag) = arguments.next() {
         let value = arguments.next().ok_or(())?;
         match flag.to_str() {
@@ -95,8 +94,8 @@ where
             Some("--authorized-keys-file") if authorized_keys_file.is_none() => {
                 authorized_keys_file = Some(PathBuf::from(value));
             }
-            Some("--listen") if listen.is_none() => {
-                listen = Some(value.to_str().ok_or(())?.parse().map_err(|_| ())?);
+            Some("--socket-path") if socket_path.is_none() => {
+                socket_path = Some(PathBuf::from(value));
             }
             _ => return Err(()),
         }
@@ -108,14 +107,14 @@ where
                 && public_key_file.is_none()
                 && expected_fingerprint.is_none()
                 && authorized_keys_file.is_none()
-                && listen.is_none() =>
+                && socket_path.is_none() =>
         {
             Ok(ClientAdminCommand::List { registry_root })
         }
         "add"
             if expected_fingerprint.is_none()
                 && authorized_keys_file.is_none()
-                && listen.is_none() =>
+                && socket_path.is_none() =>
         {
             Ok(ClientAdminCommand::Add {
                 registry_root,
@@ -127,7 +126,7 @@ where
             if public_key_file.is_none()
                 && expected_fingerprint.is_none()
                 && authorized_keys_file.is_none()
-                && listen.is_none() =>
+                && socket_path.is_none() =>
         {
             Ok(ClientAdminCommand::Disable {
                 registry_root,
@@ -138,14 +137,14 @@ where
             if public_key_file.is_none()
                 && expected_fingerprint.is_none()
                 && authorized_keys_file.is_none()
-                && listen.is_none() =>
+                && socket_path.is_none() =>
         {
             Ok(ClientAdminCommand::Enable {
                 registry_root,
                 client_id: client_id.ok_or(())?,
             })
         }
-        "rotate-key" if authorized_keys_file.is_none() && listen.is_none() => {
+        "rotate-key" if authorized_keys_file.is_none() && socket_path.is_none() => {
             Ok(ClientAdminCommand::RotateKey {
                 registry_root,
                 client_id: client_id.ok_or(())?,
@@ -157,7 +156,7 @@ where
             if client_id.is_none()
                 && public_key_file.is_none()
                 && expected_fingerprint.is_none()
-                && listen.is_none() =>
+                && socket_path.is_none() =>
         {
             Ok(ClientAdminCommand::ImportAuthorizedKeys {
                 registry_root,
@@ -172,7 +171,7 @@ where
         {
             Ok(ClientAdminCommand::Serve {
                 registry_root,
-                listen: listen.ok_or(())?,
+                socket_path: socket_path.ok_or(())?,
             })
         }
         _ => Err(()),
@@ -253,8 +252,8 @@ pub(crate) fn execute(
         }
         ClientAdminCommand::Serve {
             registry_root,
-            listen,
-        } => web::run(registry_root, listen).map_err(ClientAdminError::Web),
+            socket_path,
+        } => web::run(registry_root, socket_path).map_err(ClientAdminError::Web),
     }
 }
 
