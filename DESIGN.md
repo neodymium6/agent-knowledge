@@ -943,7 +943,13 @@ trusted owner and immutable generation, and emits active keys with the exact
 versioned Gateway forced command. It emits nothing when OpenSSH's requested
 login user differs from the configured Gateway account. The root-controlled
 OpenSSH configuration supplies both user values, the trusted owner UID, the
-registry root, and the Gateway configuration path.
+registry root, and the Gateway configuration path. The systemd package provides
+a non-login `agent-knowledge-access` identity for `AuthorizedKeysCommand` and a
+root-owned, set-group-ID registry root that identity can read but cannot modify.
+Registry child modes preserve that read access independently of the
+administrator's process umask. The packaged `tmpfiles.d` rules also normalize
+the reserved registry layout when upgrading from a version that created
+root-only child modes.
 
 The OpenSSH `Match User` configuration requires public-key authentication and
 disables password and keyboard-interactive authentication, forwarding, PTYs,

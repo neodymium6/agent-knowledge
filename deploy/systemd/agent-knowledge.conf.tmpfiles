@@ -25,5 +25,15 @@ z /var/lib/agent-knowledge/repository 2750 - - -
 z /var/lib/agent-knowledge/content 2750 - - -
 d /var/lib/agent-knowledge/work 0750 agent-knowledge agent-knowledge -
 d /var/lib/agent-knowledge/releases 0750 agent-knowledge agent-knowledge -
+d /var/lib/agent-knowledge-access 2750 root agent-knowledge-access -
+z /var/lib/agent-knowledge-access 2750 - - -
+d /var/lib/agent-knowledge-access/by-id 2750 root agent-knowledge-access -
+z /var/lib/agent-knowledge-access/by-id 2750 - - -
+d /var/lib/agent-knowledge-access/.staging 2750 root agent-knowledge-access -
+z /var/lib/agent-knowledge-access/.staging 2750 - - -
+z /var/lib/agent-knowledge-access/by-id/* 0750 root agent-knowledge-access -
+z /var/lib/agent-knowledge-access/by-id/*/registry.json 0640 root agent-knowledge-access -
+z /var/lib/agent-knowledge-access/.staging/* 0750 root agent-knowledge-access -
+z /var/lib/agent-knowledge-access/.staging/*/registry.json 0640 root agent-knowledge-access -
 d /run/agent-knowledge 2750 agent-knowledge-queue agent-knowledge-ingress -
 z /run/agent-knowledge 2750 - - -

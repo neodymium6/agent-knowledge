@@ -84,6 +84,8 @@ test "$(grep -Ec '^u agent-knowledge - "Agent Knowledge Worker service account" 
 test "$(grep -Ec '^u agent-knowledge-queue - "Agent Knowledge queue ingress account" /var/lib/agent-knowledge -$' "$sysusers")" -eq 1
 test "$(grep -Ec '^g agent-knowledge-gateway - -$' "$sysusers")" -eq 1
 test "$(grep -Ec '^g agent-knowledge-ingress - -$' "$sysusers")" -eq 1
+test "$(grep -Ec '^g agent-knowledge-access - -$' "$sysusers")" -eq 1
+test "$(grep -Ec '^u agent-knowledge-access - "Agent Knowledge access registry reader" /var/empty -$' "$sysusers")" -eq 1
 test "$(grep -Ec '^m agent-knowledge agent-knowledge-queue$' "$sysusers")" -eq 1
 if grep -Fq '/bin/sh' "$sysusers"; then
   echo "Worker account must not have a login shell" >&2
@@ -97,5 +99,11 @@ test "$(grep -Ec '^f /var/lib/agent-knowledge/queue/\.locks/(queue|repository-wr
 test "$(grep -Ec '^d /var/lib/agent-knowledge/(repository|content) 2750 agent-knowledge agent-knowledge-gateway -$' "$tmpfiles")" -eq 2
 test "$(grep -Ec '^z /var/lib/agent-knowledge/(repository|content) 2750 - - -$' "$tmpfiles")" -eq 2
 test "$(grep -Ec '^d /var/lib/agent-knowledge/(work|releases) 0750 agent-knowledge agent-knowledge -$' "$tmpfiles")" -eq 2
+test "$(grep -Ec '^d /var/lib/agent-knowledge-access 2750 root agent-knowledge-access -$' "$tmpfiles")" -eq 1
+test "$(grep -Ec '^z /var/lib/agent-knowledge-access 2750 - - -$' "$tmpfiles")" -eq 1
+test "$(grep -Ec '^d /var/lib/agent-knowledge-access/(by-id|\.staging) 2750 root agent-knowledge-access -$' "$tmpfiles")" -eq 2
+test "$(grep -Ec '^z /var/lib/agent-knowledge-access/(by-id|\.staging) 2750 - - -$' "$tmpfiles")" -eq 2
+test "$(grep -Ec '^z /var/lib/agent-knowledge-access/(by-id|\.staging)/\* 0750 root agent-knowledge-access -$' "$tmpfiles")" -eq 2
+test "$(grep -Ec '^z /var/lib/agent-knowledge-access/(by-id|\.staging)/\*/registry\.json 0640 root agent-knowledge-access -$' "$tmpfiles")" -eq 2
 test "$(grep -Ec '^d /run/agent-knowledge 2750 agent-knowledge-queue agent-knowledge-ingress -$' "$tmpfiles")" -eq 1
 test "$(grep -Ec '^z /run/agent-knowledge 2750 - - -$' "$tmpfiles")" -eq 1
