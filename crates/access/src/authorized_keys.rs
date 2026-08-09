@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
@@ -57,22 +58,54 @@ fn parse_line(line: &str) -> Result<ImportedClient, AuthorizedKeysImportError> {
         .strip_prefix(FORCED_COMMAND_PREFIX)
         .and_then(|value| value.strip_suffix(FORCED_COMMAND_SUFFIX))
         .ok_or(AuthorizedKeysImportError::InvalidLine { line: None })?;
-    let mut fields = command.split_ascii_whitespace();
-    let version = fields.next();
+    Ok(ImportedClient {
+        client_id: parse_forced_command(command)?,
+        public_key: NormalizedPublicKey::parse(key).map_err(AuthorizedKeysImportError::Key)?,
+    })
+}
+
+fn parse_forced_command(command: &str) -> Result<ClientId, AuthorizedKeysImportError> {
+    let mut fields = command.split(' ');
+    let first = fields
+        .next()
+        .ok_or(AuthorizedKeysImportError::InvalidLine { line: None })?;
+    if first == FORCED_COMMAND_VERSION {
+        let config = fields
+            .next()
+            .ok_or(AuthorizedKeysImportError::InvalidLine { line: None })?;
+        let client_id = fields
+            .next()
+            .ok_or(AuthorizedKeysImportError::InvalidLine { line: None })?;
+        if !Path::new(config).is_absolute() || fields.next().is_some() {
+            return Err(AuthorizedKeysImportError::InvalidLine { line: None });
+        }
+        return ClientId::from_str(client_id).map_err(AuthorizedKeysImportError::ClientId);
+    }
+
+    let subcommand = fields.next();
+    let config_flag = fields.next();
     let config = fields.next();
+    let client_id_flag = fields.next();
     let client_id = fields.next();
-    if version != Some(FORCED_COMMAND_VERSION)
-        || config.is_none_or(|config| !Path::new(config).is_absolute())
+    if !is_safe_direct_path(first)
+        || Path::new(first).file_name() != Some(OsStr::new("agent-knowledge"))
+        || subcommand != Some("gateway")
+        || config_flag != Some("--config")
+        || config.is_none_or(|value| !is_safe_direct_path(value))
+        || client_id_flag != Some("--client-id")
         || client_id.is_none()
         || fields.next().is_some()
     {
         return Err(AuthorizedKeysImportError::InvalidLine { line: None });
     }
-    Ok(ImportedClient {
-        client_id: ClientId::from_str(client_id.unwrap_or_default())
-            .map_err(AuthorizedKeysImportError::ClientId)?,
-        public_key: NormalizedPublicKey::parse(key).map_err(AuthorizedKeysImportError::Key)?,
-    })
+    ClientId::from_str(client_id.unwrap_or_default()).map_err(AuthorizedKeysImportError::ClientId)
+}
+
+fn is_safe_direct_path(value: &str) -> bool {
+    Path::new(value).is_absolute()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'+' | b'-')
+        })
 }
 
 /// Failure to migrate a static Agent Knowledge `authorized_keys` file.
@@ -131,14 +164,24 @@ mod tests {
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti fictional@example.invalid";
 
     #[test]
-    fn imports_the_documented_forced_command_format() {
+    fn imports_the_documented_forced_command_formats() {
         let input = format!(
-            "# fictional deployment\n\nrestrict,command=\"akg-v1 /etc/agent-knowledge/gateway.yaml fictional-node-a\" {KEY}\n"
+            concat!(
+                "# fictional deployment\n\n",
+                "restrict,command=\"akg-v1 /etc/agent-knowledge/gateway.yaml fictional-node-a\" {KEY}\n",
+                "restrict,command=\"/nix/var/nix/profiles/agent-knowledge/bin/agent-knowledge gateway --config /etc/agent-knowledge/gateway.yaml --client-id fictional-node-b\" {KEY_B}\n",
+            ),
+            KEY = KEY,
+            KEY_B = KEY.replace(
+                "ILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti",
+                "IKWz8j8C3gyf7u8sVvD6cGx0iW9F8uQ5yT6u7V8wX9yZ"
+            ),
         );
         let clients = parse_authorized_keys(&input)
             .unwrap_or_else(|error| panic!("fixture must import: {error}"));
-        assert_eq!(clients.len(), 1);
+        assert_eq!(clients.len(), 2);
         assert_eq!(clients[0].client_id.as_str(), "fictional-node-a");
+        assert_eq!(clients[1].client_id.as_str(), "fictional-node-b");
     }
 
     #[test]
@@ -147,6 +190,15 @@ mod tests {
             KEY.to_owned(),
             format!(
                 "restrict,command=\"akg-v1 /etc/agent-knowledge/gateway.yaml fictional-node-a;id\" {KEY}"
+            ),
+            format!(
+                "restrict,command=\"akg-v1  /etc/agent-knowledge/gateway.yaml fictional-node-a\" {KEY}"
+            ),
+            format!(
+                "restrict,command=\"akg-v1\t/etc/agent-knowledge/gateway.yaml\tfictional-node-a\" {KEY}"
+            ),
+            format!(
+                "restrict,command=\"/opt/agent-knowledge gateway --config /etc/agent-knowledge/gateway.yaml --client-id fictional-node-a extra\" {KEY}"
             ),
         ] {
             assert!(matches!(
