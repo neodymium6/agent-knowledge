@@ -58,6 +58,9 @@ fn parse_line(line: &str) -> Result<ImportedClient, AuthorizedKeysImportError> {
         .strip_prefix(FORCED_COMMAND_PREFIX)
         .and_then(|value| value.strip_suffix(FORCED_COMMAND_SUFFIX))
         .ok_or(AuthorizedKeysImportError::InvalidLine { line: None })?;
+    if command.contains('"') || command.contains('\\') {
+        return Err(AuthorizedKeysImportError::InvalidLine { line: None });
+    }
     Ok(ImportedClient {
         client_id: parse_forced_command(command)?,
         public_key: NormalizedPublicKey::parse(key).map_err(AuthorizedKeysImportError::Key)?,
@@ -196,6 +199,12 @@ mod tests {
             ),
             format!(
                 "restrict,command=\"akg-v1\t/etc/agent-knowledge/gateway.yaml\tfictional-node-a\" {KEY}"
+            ),
+            format!(
+                "restrict,command=\"akg-v1 /etc/agent-knowledge/gateway.yaml\" fictional-node-a\" {KEY}"
+            ),
+            format!(
+                "restrict,command=\"akg-v1 /etc/agent-knowledge/gateway.yaml\\\\ fictional-node-a\" {KEY}"
             ),
             format!(
                 "restrict,command=\"/opt/agent-knowledge gateway --config /etc/agent-knowledge/gateway.yaml --client-id fictional-node-a extra\" {KEY}"
