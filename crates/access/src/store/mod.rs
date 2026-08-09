@@ -452,6 +452,7 @@ impl AccessRegistry {
             .map_err(AccessRegistryError::Time)?;
         if !mutation(&mut clients, &now)? {
             let snapshot = current.ok_or(AccessRegistryError::NoActiveGeneration)?;
+            self.validate_layout()?;
             return Ok(MutationOutcome {
                 changed: false,
                 snapshot,
