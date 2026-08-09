@@ -4,6 +4,8 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.3.0
+
 - Add a durable, file-based SSH client registry and local administration CLI
   for enrollment, suspension, re-enablement, key rotation, and migration from
   the documented static `authorized_keys` format.
