@@ -107,6 +107,21 @@ fn write_package(root: &Path) -> PathBuf {
     package
 }
 
+fn owner_uid(path: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path)
+            .unwrap_or_else(|error| panic!("fixture owner must be readable: {error}"))
+            .uid()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        0
+    }
+}
+
 fn arguments(root: &Path, package: &Path) -> Vec<OsString> {
     vec![
         "agent-knowledge".into(),
@@ -426,6 +441,144 @@ fn adds_and_lists_a_client_through_the_admin_cli() {
         .unwrap_or_else(|error| panic!("list output must be JSON: {error}"));
     assert_eq!(listed["clients"][0]["client_id"], "fictional-node-a");
     assert_eq!(listed["clients"][0]["status"], "active");
+}
+
+#[test]
+fn parses_the_authorized_keys_adapter_command() {
+    let command = parse_arguments([
+        "agent-knowledge".into(),
+        "access".into(),
+        "authorized-keys".into(),
+        "--registry-root".into(),
+        "/srv/fictional-access".into(),
+        "--gateway-config".into(),
+        "/etc/agent-knowledge/gateway.yaml".into(),
+        "--trusted-owner-uid".into(),
+        "61201".into(),
+        "--gateway-user".into(),
+        "fictional-ak-gateway".into(),
+        "--requested-user".into(),
+        "fictional-ak-gateway".into(),
+    ])
+    .unwrap_or_else(|error| panic!("authorized-keys command must parse: {error}"));
+    assert!(matches!(
+        command,
+        Command::AuthorizedKeys(crate::access_adapter::AuthorizedKeysSettings {
+            registry_root,
+            gateway_config,
+            trusted_owner_uid: 61201,
+            gateway_user,
+            requested_user,
+        }) if registry_root == Path::new("/srv/fictional-access")
+            && gateway_config == Path::new("/etc/agent-knowledge/gateway.yaml")
+            && gateway_user == "fictional-ak-gateway"
+            && requested_user == "fictional-ak-gateway"
+    ));
+
+    for arguments in [
+        vec![
+            "agent-knowledge".into(),
+            "access".into(),
+            "authorized-keys".into(),
+        ],
+        vec![
+            "agent-knowledge".into(),
+            "access".into(),
+            "authorized-keys".into(),
+            "--registry-root".into(),
+            "/srv/fictional-access".into(),
+            "--gateway-config".into(),
+            "/etc/agent-knowledge/gateway.yaml".into(),
+            "--trusted-owner-uid".into(),
+            "not-a-uid".into(),
+            "--gateway-user".into(),
+            "fictional-ak-gateway".into(),
+            "--requested-user".into(),
+            "fictional-ak-gateway".into(),
+        ],
+    ] {
+        assert!(matches!(parse_arguments(arguments), Err(CliError::Usage)));
+    }
+}
+
+#[test]
+fn writes_only_active_keys_for_the_configured_gateway_user() {
+    const PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti fictional-node@example.invalid\n";
+    let root = TestDirectory::create();
+    let public_key = root.path().join("fictional-node.pub");
+    fs::write(&public_key, PUBLIC_KEY)
+        .unwrap_or_else(|error| panic!("public-key fixture must be written: {error}"));
+    let registry = root.path().join("access");
+    run(
+        [
+            "agent-knowledge".into(),
+            "admin".into(),
+            "clients".into(),
+            "add".into(),
+            "--registry-root".into(),
+            registry.as_os_str().to_owned(),
+            "--client-id".into(),
+            "fictional-node-a".into(),
+            "--public-key-file".into(),
+            public_key.into_os_string(),
+        ],
+        Vec::new(),
+    )
+    .unwrap_or_else(|error| panic!("client add must succeed: {error}"));
+    let trusted_owner_uid = owner_uid(&registry).to_string();
+    let adapter_arguments = |requested_user: &str| {
+        [
+            "agent-knowledge".into(),
+            "access".into(),
+            "authorized-keys".into(),
+            "--registry-root".into(),
+            registry.as_os_str().to_owned(),
+            "--gateway-config".into(),
+            "/etc/agent-knowledge/gateway.yaml".into(),
+            "--trusted-owner-uid".into(),
+            trusted_owner_uid.clone().into(),
+            "--gateway-user".into(),
+            "fictional-ak-gateway".into(),
+            "--requested-user".into(),
+            requested_user.into(),
+        ]
+    };
+
+    let output = SharedOutput::default();
+    run(adapter_arguments("fictional-ak-gateway"), output.clone())
+        .unwrap_or_else(|error| panic!("authorized keys must render: {error}"));
+    assert_eq!(
+        String::from_utf8(output.contents())
+            .unwrap_or_else(|error| panic!("authorized_keys output must be UTF-8: {error}")),
+        concat!(
+            "restrict,command=\"akg-v1 /etc/agent-knowledge/gateway.yaml fictional-node-a\" ",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti\n",
+        )
+    );
+
+    let output = SharedOutput::default();
+    run(adapter_arguments("fictional-other-user"), output.clone())
+        .unwrap_or_else(|error| panic!("other login user must be ignored: {error}"));
+    assert!(output.contents().is_empty());
+
+    run(
+        [
+            "agent-knowledge".into(),
+            "admin".into(),
+            "clients".into(),
+            "disable".into(),
+            "--registry-root".into(),
+            registry.as_os_str().to_owned(),
+            "--client-id".into(),
+            "fictional-node-a".into(),
+        ],
+        Vec::new(),
+    )
+    .unwrap_or_else(|error| panic!("client disable must succeed: {error}"));
+    let output = SharedOutput::default();
+    run(adapter_arguments("fictional-ak-gateway"), output.clone())
+        .unwrap_or_else(|error| panic!("disabled registry must render: {error}"));
+    assert!(output.contents().is_empty());
 }
 
 #[cfg(target_os = "linux")]

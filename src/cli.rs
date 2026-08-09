@@ -17,6 +17,7 @@ use agent_knowledge_queue::{
 use nix::unistd::Uid;
 use serde::Serialize;
 
+use crate::access_adapter::{AuthorizedKeysAdapterError, AuthorizedKeysSettings};
 use crate::admin::clients::{ClientAdminCommand, ClientAdminError};
 use crate::admin::{self, AdminRetentionError, AdminStatusError};
 #[cfg(target_os = "linux")]
@@ -39,6 +40,7 @@ const COMMON_USAGE: &str = "usage:\n\
     agent-knowledge admin clients enable --registry-root <path> --client-id <id>\n\
     agent-knowledge admin clients rotate-key --registry-root <path> --client-id <id> --expected-fingerprint <fingerprint> --public-key-file <path>\n\
     agent-knowledge admin clients import-authorized-keys --registry-root <path> --authorized-keys-file <path>\n\
+    agent-knowledge access authorized-keys --registry-root <path> --gateway-config <path> --trusted-owner-uid <uid> --gateway-user <name> --requested-user <name>\n\
     agent-knowledge client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
     agent-knowledge client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge client recent --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
@@ -94,6 +96,9 @@ where
             .map_err(CliError::AdminRetention),
         Command::AdminClients(command) => {
             crate::admin::clients::execute(command, output).map_err(CliError::AdminClients)
+        }
+        Command::AuthorizedKeys(settings) => {
+            crate::access_adapter::execute(settings, output).map_err(CliError::AuthorizedKeys)
         }
         #[cfg(target_os = "linux")]
         Command::AdminBootstrapStorage(settings) => {
@@ -172,6 +177,7 @@ enum Command {
         timeout: Duration,
     },
     AdminClients(ClientAdminCommand),
+    AuthorizedKeys(AuthorizedKeysSettings),
     #[cfg(target_os = "linux")]
     AdminBootstrapStorage(StorageBootstrap),
     #[cfg(target_os = "linux")]
@@ -252,6 +258,14 @@ where
         {
             crate::admin::clients::parse(arguments)
                 .map(Command::AdminClients)
+                .map_err(|()| CliError::Usage)
+        }
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("access")
+                && action == std::ffi::OsStr::new("authorized-keys") =>
+        {
+            crate::access_adapter::parse(arguments)
+                .map(Command::AuthorizedKeys)
                 .map_err(|()| CliError::Usage)
         }
         #[cfg(target_os = "linux")]
@@ -674,6 +688,7 @@ pub enum CliError {
     AdminStatus(AdminStatusError),
     AdminRetention(AdminRetentionError),
     AdminClients(ClientAdminError),
+    AuthorizedKeys(AuthorizedKeysAdapterError),
     #[cfg(target_os = "linux")]
     StorageMigration(StorageMigrationError),
     #[cfg(target_os = "linux")]
@@ -724,6 +739,7 @@ impl fmt::Display for CliError {
             Self::AdminStatus(error) => error.fmt(formatter),
             Self::AdminRetention(error) => error.fmt(formatter),
             Self::AdminClients(error) => error.fmt(formatter),
+            Self::AuthorizedKeys(error) => error.fmt(formatter),
             #[cfg(target_os = "linux")]
             Self::StorageMigration(error) => error.fmt(formatter),
             #[cfg(target_os = "linux")]
@@ -749,6 +765,7 @@ impl std::error::Error for CliError {
             Self::AdminStatus(error) => Some(error),
             Self::AdminRetention(error) => Some(error),
             Self::AdminClients(error) => Some(error),
+            Self::AuthorizedKeys(error) => Some(error),
             #[cfg(target_os = "linux")]
             Self::StorageMigration(error) => Some(error),
             #[cfg(target_os = "linux")]
