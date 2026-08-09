@@ -932,9 +932,11 @@ as one generation. Duplicate client IDs and fingerprints fail the entire
 operation. The root, fixed directories, generations, and snapshots must all
 belong to the explicitly trusted administrative UID. The registry root's parent
 path is part of the trust boundary and must not be writable by untrusted users.
-Mutations revalidate the configured root binding before reporting success.
-Until the OpenSSH registry adapter is configured, the static root-controlled
-file remains the effective authentication source.
+It must exist before the registry is opened; creation of the registry root is
+made durable by synchronizing both the new directory and its parent. Mutations
+revalidate the configured root binding before reporting success. Until the
+OpenSSH registry adapter is configured, the static root-controlled file remains
+the effective authentication source.
 
 The authorized-key file and all of its parent directories are controlled by
 root and are not writable by the Gateway account. The OpenSSH `Match User`

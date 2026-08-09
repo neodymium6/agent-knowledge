@@ -169,7 +169,7 @@ impl AccessRegistry {
         Self::open(root, trusted_owner_uid)
     }
 
-    /// Creates or opens an access-registry layout.
+    /// Creates or opens an access-registry layout below an existing parent.
     ///
     /// # Errors
     ///
@@ -723,13 +723,19 @@ fn ensure_directory(path: &Path) -> Result<(), AccessRegistryError> {
             {
                 use std::os::unix::fs::DirBuilderExt;
                 let mut builder = fs::DirBuilder::new();
-                builder.recursive(true).mode(0o750);
-                builder.create(path).map_err(AccessRegistryError::Io)
+                builder.mode(0o750);
+                builder.create(path).map_err(AccessRegistryError::Io)?;
             }
             #[cfg(not(unix))]
             {
-                fs::create_dir_all(path).map_err(AccessRegistryError::Io)
+                fs::create_dir(path).map_err(AccessRegistryError::Io)?;
             }
+            sync_directory(path)?;
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            sync_directory(parent)
         }
         Err(error) => Err(AccessRegistryError::Io(error)),
     }
@@ -1326,5 +1332,21 @@ mod tests {
                 actual_uid: observed_uid,
             }) if expected_uid == foreign_uid && observed_uid == actual_uid
         ));
+    }
+
+    #[test]
+    fn does_not_create_missing_registry_parents() {
+        let root = TestDirectory::create();
+        let missing_parent = root.path().join("missing");
+        let registry_root = missing_parent.join("registry");
+        let owner_uid = trusted_owner_uid(root.path())
+            .unwrap_or_else(|error| panic!("fixture owner must be readable: {error}"));
+
+        assert!(matches!(
+            AccessRegistry::open(&registry_root, owner_uid),
+            Err(AccessRegistryError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(!missing_parent.exists());
     }
 }
