@@ -149,22 +149,43 @@ pub struct AccessRegistry {
     configured_root: PathBuf,
     stable_root: PathBuf,
     root_handle: Arc<File>,
+    trusted_owner_uid: u32,
     mutation_available: Arc<AtomicBool>,
 }
 
 impl AccessRegistry {
+    /// Creates or opens a registry trusted to the process's effective UID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root or fixed entries are unsafe or owned by
+    /// another user, or when the selected generation is invalid.
+    pub fn open_for_effective_user(root: impl AsRef<Path>) -> Result<Self, AccessRegistryError> {
+        #[cfg(unix)]
+        let trusted_owner_uid = nix::unistd::Uid::effective().as_raw();
+        #[cfg(not(unix))]
+        let trusted_owner_uid = 0;
+
+        Self::open(root, trusted_owner_uid)
+    }
+
     /// Creates or opens an access-registry layout.
     ///
     /// # Errors
     ///
-    /// Returns an error when the root or fixed entries are unsafe or the
-    /// selected registry generation is invalid.
-    pub fn open(root: impl AsRef<Path>) -> Result<Self, AccessRegistryError> {
+    /// Returns an error when the root or fixed entries are unsafe or not owned
+    /// by `trusted_owner_uid`, or when the selected generation is invalid.
+    pub fn open(
+        root: impl AsRef<Path>,
+        trusted_owner_uid: u32,
+    ) -> Result<Self, AccessRegistryError> {
         ensure_directory(root.as_ref())?;
         let configured_root = fs::canonicalize(root.as_ref()).map_err(AccessRegistryError::Io)?;
         let root_handle = Arc::new(open_directory(&configured_root)?);
         let stable_root = stable_directory_path(&root_handle, &configured_root)?;
         validate_pinned_directory(&configured_root, &root_handle)?;
+        let root_metadata = root_handle.metadata().map_err(AccessRegistryError::Io)?;
+        validate_registry_directory(&root_metadata, &root_metadata, trusted_owner_uid)?;
         ensure_directory(&stable_root.join(BY_ID_DIRECTORY))?;
         ensure_directory(&stable_root.join(STAGING_DIRECTORY))?;
         sync_directory(&stable_root)?;
@@ -172,6 +193,7 @@ impl AccessRegistry {
             configured_root,
             stable_root,
             root_handle,
+            trusted_owner_uid,
             mutation_available: Arc::new(AtomicBool::new(true)),
         };
         registry.validate_layout()?;
@@ -204,11 +226,15 @@ impl AccessRegistry {
                 .root_handle
                 .metadata()
                 .map_err(AccessRegistryError::Io)?,
+            self.trusted_owner_uid,
         )?;
         let stable_generation = stable_directory_path(&generation_handle, &generation)?;
         let mut file = PinnedRegularFile::open_no_follow(stable_generation.join(REGISTRY_FILE))
             .map_err(AccessRegistryError::RegistryFile)?;
-        validate_registry_file(&file.metadata().map_err(AccessRegistryError::Io)?)?;
+        validate_registry_file(
+            &file.metadata().map_err(AccessRegistryError::Io)?,
+            self.trusted_owner_uid,
+        )?;
         if file.byte_length() > MAXIMUM_REGISTRY_BYTES {
             return Err(AccessRegistryError::RegistryTooLarge);
         }
@@ -467,13 +493,25 @@ impl AccessRegistry {
             .join(&snapshot.generation_id);
         create_private_directory(&staging)?;
         let write_result = (|| {
+            let root_metadata = self
+                .root_handle
+                .metadata()
+                .map_err(AccessRegistryError::Io)?;
+            let staging_metadata =
+                fs::symlink_metadata(&staging).map_err(AccessRegistryError::Io)?;
+            validate_registry_directory(&staging_metadata, &root_metadata, self.trusted_owner_uid)?;
             let mut bytes =
                 serde_json::to_vec_pretty(snapshot).map_err(AccessRegistryError::Json)?;
             bytes.push(b'\n');
             if bytes.len() as u64 > MAXIMUM_REGISTRY_BYTES {
                 return Err(AccessRegistryError::RegistryTooLarge);
             }
-            write_new_file(&staging.join(REGISTRY_FILE), &bytes)?;
+            let registry_file = staging.join(REGISTRY_FILE);
+            write_new_file(&registry_file, &bytes)?;
+            validate_registry_file(
+                &fs::symlink_metadata(&registry_file).map_err(AccessRegistryError::Io)?,
+                self.trusted_owner_uid,
+            )?;
             sync_directory(&staging)?;
             fs::rename(&staging, &destination).map_err(AccessRegistryError::Io)?;
             sync_directory(&self.stable_root.join(BY_ID_DIRECTORY))?;
@@ -505,14 +543,14 @@ impl AccessRegistry {
             .root_handle
             .metadata()
             .map_err(AccessRegistryError::Io)?;
-        validate_registry_directory(&root_metadata, &root_metadata)?;
+        validate_registry_directory(&root_metadata, &root_metadata, self.trusted_owner_uid)?;
         for entry in [BY_ID_DIRECTORY, STAGING_DIRECTORY] {
             let metadata = fs::symlink_metadata(self.stable_root.join(entry))
                 .map_err(AccessRegistryError::Io)?;
             if !metadata.file_type().is_dir() {
                 return Err(AccessRegistryError::InvalidStorage);
             }
-            validate_registry_directory(&metadata, &root_metadata)?;
+            validate_registry_directory(&metadata, &root_metadata, self.trusted_owner_uid)?;
         }
         match fs::symlink_metadata(self.stable_root.join(CURRENT_ENTRY)) {
             Ok(metadata) if metadata.file_type().is_symlink() => Ok(()),
@@ -779,8 +817,15 @@ fn validate_pinned_directory(path: &Path, pinned: &File) -> Result<(), AccessReg
 fn validate_registry_directory(
     metadata: &fs::Metadata,
     root_metadata: &fs::Metadata,
+    trusted_owner_uid: u32,
 ) -> Result<(), AccessRegistryError> {
     use std::os::unix::fs::MetadataExt;
+    if metadata.uid() != trusted_owner_uid {
+        return Err(AccessRegistryError::UnexpectedOwner {
+            expected_uid: trusted_owner_uid,
+            actual_uid: metadata.uid(),
+        });
+    }
     if metadata.mode() & 0o022 != 0 {
         return Err(AccessRegistryError::InsecurePermissions);
     }
@@ -794,13 +839,23 @@ fn validate_registry_directory(
 fn validate_registry_directory(
     _metadata: &fs::Metadata,
     _root_metadata: &fs::Metadata,
+    _trusted_owner_uid: u32,
 ) -> Result<(), AccessRegistryError> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn validate_registry_file(metadata: &fs::Metadata) -> Result<(), AccessRegistryError> {
+fn validate_registry_file(
+    metadata: &fs::Metadata,
+    trusted_owner_uid: u32,
+) -> Result<(), AccessRegistryError> {
     use std::os::unix::fs::MetadataExt;
+    if metadata.uid() != trusted_owner_uid {
+        return Err(AccessRegistryError::UnexpectedOwner {
+            expected_uid: trusted_owner_uid,
+            actual_uid: metadata.uid(),
+        });
+    }
     if metadata.mode() & 0o022 != 0 {
         return Err(AccessRegistryError::InsecurePermissions);
     }
@@ -811,7 +866,10 @@ fn validate_registry_file(metadata: &fs::Metadata) -> Result<(), AccessRegistryE
 }
 
 #[cfg(not(unix))]
-fn validate_registry_file(_metadata: &fs::Metadata) -> Result<(), AccessRegistryError> {
+fn validate_registry_file(
+    _metadata: &fs::Metadata,
+    _trusted_owner_uid: u32,
+) -> Result<(), AccessRegistryError> {
     Ok(())
 }
 
@@ -861,6 +919,8 @@ pub enum AccessRegistryError {
     StorageBindingChanged,
     /// Registry storage was writable by an unrelated group or user.
     InsecurePermissions,
+    /// Registry storage was not owned by the configured administrative UID.
+    UnexpectedOwner { expected_uid: u32, actual_uid: u32 },
     /// Fixed registry directories did not share one filesystem.
     CrossFilesystemStorage,
     /// An immutable registry file had another hard link.
@@ -908,6 +968,13 @@ impl fmt::Display for AccessRegistryError {
             Self::InsecurePermissions => {
                 formatter.write_str("access registry storage has insecure write permissions")
             }
+            Self::UnexpectedOwner {
+                expected_uid,
+                actual_uid,
+            } => write!(
+                formatter,
+                "access registry storage owner is UID {actual_uid}, expected UID {expected_uid}"
+            ),
             Self::CrossFilesystemStorage => {
                 formatter.write_str("access registry directories must share one filesystem")
             }
@@ -959,6 +1026,7 @@ impl std::error::Error for AccessRegistryError {
             | Self::InvalidStorage
             | Self::StorageBindingChanged
             | Self::InsecurePermissions
+            | Self::UnexpectedOwner { .. }
             | Self::CrossFilesystemStorage
             | Self::HardLinkedRegistryFile
             | Self::InvalidCurrentEntry
@@ -1033,10 +1101,36 @@ mod tests {
             .unwrap_or_else(|error| panic!("fixture key must be valid: {error}"))
     }
 
+    fn trusted_owner_uid(path: &Path) -> Result<u32, AccessRegistryError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let owner_path = if path.exists() {
+                path
+            } else {
+                path.parent().unwrap_or(path)
+            };
+            Ok(fs::metadata(owner_path)
+                .map_err(AccessRegistryError::Io)?
+                .uid())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(0)
+        }
+    }
+
+    fn open_registry(path: impl AsRef<Path>) -> Result<AccessRegistry, AccessRegistryError> {
+        let path = path.as_ref();
+        AccessRegistry::open(path, trusted_owner_uid(path)?)
+    }
+
     #[test]
     fn adds_disables_enables_and_rotates_without_deleting_history() {
         let root = TestDirectory::create();
-        let registry = AccessRegistry::open(root.path().join("registry"))
+        let registry = open_registry(root.path().join("registry"))
             .unwrap_or_else(|error| panic!("registry must open: {error}"));
         let id = client_id("fictional-node-a");
         let added = registry
@@ -1074,7 +1168,7 @@ mod tests {
     #[test]
     fn treats_identical_add_and_status_changes_as_idempotent() {
         let root = TestDirectory::create();
-        let registry = AccessRegistry::open(root.path().join("registry"))
+        let registry = open_registry(root.path().join("registry"))
             .unwrap_or_else(|error| panic!("registry must open: {error}"));
         let id = client_id("fictional-node-a");
         let added = registry
@@ -1100,7 +1194,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_keys_and_stale_rotation() {
         let root = TestDirectory::create();
-        let registry = AccessRegistry::open(root.path().join("registry"))
+        let registry = open_registry(root.path().join("registry"))
             .unwrap_or_else(|error| panic!("registry must open: {error}"));
         let id = client_id("fictional-node-a");
         registry
@@ -1119,7 +1213,7 @@ mod tests {
     #[test]
     fn imports_multiple_clients_in_one_generation() {
         let root = TestDirectory::create();
-        let registry = AccessRegistry::open(root.path().join("registry"))
+        let registry = open_registry(root.path().join("registry"))
             .unwrap_or_else(|error| panic!("registry must open: {error}"));
         let outcome = registry
             .import_authorized_keys(
@@ -1146,7 +1240,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_entries_within_one_import() {
         let root = TestDirectory::create();
-        let registry = AccessRegistry::open(root.path().join("registry"))
+        let registry = open_registry(root.path().join("registry"))
             .unwrap_or_else(|error| panic!("registry must open: {error}"));
         assert!(matches!(
             registry.import_authorized_keys(
@@ -1171,13 +1265,13 @@ mod tests {
     fn rejects_a_non_symlink_current_entry() {
         let root = TestDirectory::create();
         let registry_root = root.path().join("registry");
-        let registry = AccessRegistry::open(&registry_root)
+        let registry = open_registry(&registry_root)
             .unwrap_or_else(|error| panic!("registry must open: {error}"));
         drop(registry);
         fs::write(registry_root.join("current"), b"not a selector")
             .unwrap_or_else(|error| panic!("invalid selector fixture must be written: {error}"));
         assert!(matches!(
-            AccessRegistry::open(&registry_root),
+            open_registry(&registry_root),
             Err(AccessRegistryError::InvalidCurrentEntry)
         ));
     }
@@ -1194,12 +1288,12 @@ mod tests {
         fs::set_permissions(&insecure_root, fs::Permissions::from_mode(0o770))
             .unwrap_or_else(|error| panic!("fixture permissions must be changed: {error}"));
         assert!(matches!(
-            AccessRegistry::open(&insecure_root),
+            open_registry(&insecure_root),
             Err(AccessRegistryError::InsecurePermissions)
         ));
 
         let registry_root = root.path().join("registry");
-        let registry = AccessRegistry::open(&registry_root)
+        let registry = open_registry(&registry_root)
             .unwrap_or_else(|error| panic!("registry must open: {error}"));
         registry
             .add(client_id("fictional-node-a"), key(KEY_A), "local-admin")
@@ -1212,6 +1306,24 @@ mod tests {
         assert!(matches!(
             registry.current(),
             Err(AccessRegistryError::HardLinkedRegistryFile)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_storage_owned_by_a_different_uid() {
+        let root = TestDirectory::create();
+        let registry_root = root.path().join("registry");
+        let actual_uid = trusted_owner_uid(&registry_root)
+            .unwrap_or_else(|error| panic!("fixture owner must be readable: {error}"));
+        let foreign_uid = actual_uid.wrapping_add(1);
+
+        assert!(matches!(
+            AccessRegistry::open(&registry_root, foreign_uid),
+            Err(AccessRegistryError::UnexpectedOwner {
+                expected_uid,
+                actual_uid: observed_uid,
+            }) if expected_uid == foreign_uid && observed_uid == actual_uid
         ));
     }
 }

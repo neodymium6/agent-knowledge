@@ -153,8 +153,7 @@ pub(crate) fn execute(
 ) -> Result<(), ClientAdminError> {
     match command {
         ClientAdminCommand::List { registry_root } => {
-            let registry =
-                AccessRegistry::open(registry_root).map_err(ClientAdminError::Registry)?;
+            let registry = open_registry(registry_root)?;
             write_list(
                 registry.current().map_err(ClientAdminError::Registry)?,
                 &mut output,
@@ -166,8 +165,7 @@ pub(crate) fn execute(
             public_key_file,
         } => {
             let key = read_public_key(public_key_file)?;
-            let registry =
-                AccessRegistry::open(registry_root).map_err(ClientAdminError::Registry)?;
+            let registry = open_registry(registry_root)?;
             let outcome = registry
                 .add(client_id, key, LOCAL_ADMIN_ACTOR)
                 .map_err(ClientAdminError::Registry)?;
@@ -177,8 +175,7 @@ pub(crate) fn execute(
             registry_root,
             client_id,
         } => {
-            let registry =
-                AccessRegistry::open(registry_root).map_err(ClientAdminError::Registry)?;
+            let registry = open_registry(registry_root)?;
             let outcome = registry
                 .disable(&client_id, LOCAL_ADMIN_ACTOR)
                 .map_err(ClientAdminError::Registry)?;
@@ -188,8 +185,7 @@ pub(crate) fn execute(
             registry_root,
             client_id,
         } => {
-            let registry =
-                AccessRegistry::open(registry_root).map_err(ClientAdminError::Registry)?;
+            let registry = open_registry(registry_root)?;
             let outcome = registry
                 .enable(&client_id, LOCAL_ADMIN_ACTOR)
                 .map_err(ClientAdminError::Registry)?;
@@ -202,8 +198,7 @@ pub(crate) fn execute(
             public_key_file,
         } => {
             let key = read_public_key(public_key_file)?;
-            let registry =
-                AccessRegistry::open(registry_root).map_err(ClientAdminError::Registry)?;
+            let registry = open_registry(registry_root)?;
             let outcome = registry
                 .rotate_key(&client_id, &expected_fingerprint, key, LOCAL_ADMIN_ACTOR)
                 .map_err(ClientAdminError::Registry)?;
@@ -218,14 +213,17 @@ pub(crate) fn execute(
                     .map_err(ClientAdminError::Input)?;
             let input = std::str::from_utf8(&bytes).map_err(ClientAdminError::Utf8)?;
             let clients = parse_authorized_keys(input).map_err(ClientAdminError::Import)?;
-            let registry =
-                AccessRegistry::open(registry_root).map_err(ClientAdminError::Registry)?;
+            let registry = open_registry(registry_root)?;
             let outcome = registry
                 .import_authorized_keys(clients, LOCAL_ADMIN_ACTOR)
                 .map_err(ClientAdminError::Registry)?;
             write_mutation(&outcome, &mut output)
         }
     }
+}
+
+fn open_registry(registry_root: PathBuf) -> Result<AccessRegistry, ClientAdminError> {
+    AccessRegistry::open_for_effective_user(registry_root).map_err(ClientAdminError::Registry)
 }
 
 fn read_public_key(path: PathBuf) -> Result<NormalizedPublicKey, ClientAdminError> {
