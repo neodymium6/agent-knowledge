@@ -372,8 +372,46 @@ pkgs.testers.runNixOSTest {
         + "--public-key-file /root/.ssh/id_ed25519.pub"
     )
     machine.succeed(
+        "test \"$(stat -c '%U:%G:%a' "
+        "/var/lib/agent-knowledge-access/by-id)\" "
+        "= 'root:agent-knowledge-access:2750'; "
+        "test \"$(stat -c '%U:%G:%a' "
+        "/var/lib/agent-knowledge-access/.staging)\" "
+        "= 'root:agent-knowledge-access:2750'; "
+        "test \"$(stat -Lc '%U:%G:%a' "
+        "/var/lib/agent-knowledge-access/current)\" "
+        "= 'root:agent-knowledge-access:2750'; "
+        "test \"$(stat -Lc '%U:%G:%a' "
+        "/var/lib/agent-knowledge-access/current/registry.json)\" "
+        "= 'root:agent-knowledge-access:640'"
+    )
+    machine.succeed(
+        "chgrp -R root /var/lib/agent-knowledge-access/by-id "
+        "/var/lib/agent-knowledge-access/.staging; "
+        "find /var/lib/agent-knowledge-access/by-id "
+        "/var/lib/agent-knowledge-access/.staging -type d "
+        "-exec chmod 0700 '{}' +; "
+        "find /var/lib/agent-knowledge-access/by-id "
+        "/var/lib/agent-knowledge-access/.staging -type f "
+        "-exec chmod 0600 '{}' +; "
+        + "${pkgs.systemd}/bin/systemd-tmpfiles --create "
+        + "${package}/lib/tmpfiles.d/agent-knowledge.conf"
+    )
+    machine.succeed(
         "test \"$(stat -c '%U:%G:%a' /var/lib/agent-knowledge-access)\" "
         "= 'root:agent-knowledge-access:2750'; "
+        "test \"$(stat -c '%U:%G:%a' "
+        "/var/lib/agent-knowledge-access/by-id)\" "
+        "= 'root:agent-knowledge-access:2750'; "
+        "test \"$(stat -c '%U:%G:%a' "
+        "/var/lib/agent-knowledge-access/.staging)\" "
+        "= 'root:agent-knowledge-access:2750'; "
+        "test \"$(stat -Lc '%U:%G:%a' "
+        "/var/lib/agent-knowledge-access/current)\" "
+        "= 'root:agent-knowledge-access:750'; "
+        "test \"$(stat -Lc '%U:%G:%a' "
+        "/var/lib/agent-knowledge-access/current/registry.json)\" "
+        "= 'root:agent-knowledge-access:640'; "
         "runuser -u agent-knowledge-access -- "
         + client
         + " access authorized-keys "
@@ -510,6 +548,24 @@ pkgs.testers.runNixOSTest {
         + " admin clients disable "
         + "--registry-root /var/lib/agent-knowledge-access "
         + "--client-id fictional-systemd-node"
+    )
+    machine.succeed(
+        "test \"$(stat -Lc '%U:%G:%a' "
+        "/var/lib/agent-knowledge-access/current)\" "
+        "= 'root:agent-knowledge-access:2750'; "
+        "test \"$(stat -Lc '%U:%G:%a' "
+        "/var/lib/agent-knowledge-access/current/registry.json)\" "
+        "= 'root:agent-knowledge-access:640'; "
+        "runuser -u agent-knowledge-access -- "
+        + client
+        + " access authorized-keys "
+        + "--registry-root /var/lib/agent-knowledge-access "
+        + "--gateway-config /etc/agent-knowledge/gateway.yaml "
+        + "--trusted-owner-uid 0 "
+        + "--gateway-user fictional-ak-gateway "
+        + "--requested-user fictional-ak-gateway "
+        + ">/tmp/fictional-disabled-authorized-keys; "
+        + "test ! -s /tmp/fictional-disabled-authorized-keys"
     )
     machine.succeed(
         "set +e; "

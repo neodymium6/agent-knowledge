@@ -947,7 +947,9 @@ registry root, and the Gateway configuration path. The systemd package provides
 a non-login `agent-knowledge-access` identity for `AuthorizedKeysCommand` and a
 root-owned, set-group-ID registry root that identity can read but cannot modify.
 Registry child modes preserve that read access independently of the
-administrator's process umask.
+administrator's process umask. The packaged `tmpfiles.d` rules also normalize
+the reserved registry layout when upgrading from a version that created
+root-only child modes.
 
 The OpenSSH `Match User` configuration requires public-key authentication and
 disables password and keyboard-interactive authentication, forwarding, PTYs,
