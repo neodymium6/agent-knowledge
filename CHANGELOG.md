@@ -4,6 +4,10 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add a durable, file-based SSH client registry and local administration CLI
+  for enrollment, suspension, re-enablement, key rotation, and migration from
+  the documented static `authorized_keys` format.
+
 ## 0.2.0
 
 - Serve exact-commit BM25 search from Worker-published Tantivy indexes. Missing,
