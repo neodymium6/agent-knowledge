@@ -927,10 +927,12 @@ private keys and deployment credentials are never stored.
 Local administration serializes mutations with an exclusive filesystem lock.
 It supports listing, adding, disabling, re-enabling, and conflict-checked key
 rotation without physical deletion. Migration from the documented static
-`authorized_keys` form validates every forced command and imports all clients
+`authorized_keys` forms validates every forced command and imports all clients
 as one generation. Duplicate client IDs and fingerprints fail the entire
-operation. Until the OpenSSH registry adapter is configured, the static
-root-controlled file remains the effective authentication source.
+operation. The root, fixed directories, generations, and snapshots must all
+belong to the explicitly trusted administrative UID. Until the OpenSSH registry
+adapter is configured, the static root-controlled file remains the effective
+authentication source.
 
 The authorized-key file and all of its parent directories are controlled by
 root and are not writable by the Gateway account. The OpenSSH `Match User`
