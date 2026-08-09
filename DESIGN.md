@@ -916,6 +916,28 @@ original client command remains available to the Gateway as
 Each key maps to one configured client ID. The Gateway overwrites or rejects
 any client-supplied identity that conflicts with the authenticated identity.
 
+SSH client enrollment is canonical in a separate access registry rather than
+knowledge content, Git history, or the request queue. The file-based registry
+uses bounded immutable generations and an atomically replaced relative
+`current` selector. Each generation records its predecessor, timestamp,
+operation, actor class, and complete client set. Records contain only a client
+ID, canonical Ed25519 public key, SHA-256 fingerprint, status, and timestamps;
+private keys and deployment credentials are never stored.
+
+Local administration serializes mutations with an exclusive filesystem lock.
+It supports listing, adding, disabling, re-enabling, and conflict-checked key
+rotation without physical deletion. Migration from the documented static
+`authorized_keys` forms validates every forced command and imports all clients
+as one generation. Duplicate client IDs and fingerprints fail the entire
+operation. The root, fixed directories, generations, and snapshots must all
+belong to the explicitly trusted administrative UID. The registry root's parent
+path is part of the trust boundary and must not be writable by untrusted users.
+It must exist before the registry is opened; creation of the registry root is
+made durable by synchronizing both the new directory and its parent. Mutations
+revalidate the configured root binding before reporting success. Until the
+OpenSSH registry adapter is configured, the static root-controlled file remains
+the effective authentication source.
+
 The authorized-key file and all of its parent directories are controlled by
 root and are not writable by the Gateway account. The OpenSSH `Match User`
 configuration requires public-key authentication and disables password and

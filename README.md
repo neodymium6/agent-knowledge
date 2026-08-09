@@ -177,6 +177,31 @@ Replace the fictional SHA with a release commit that contains the plugin. A
 semantic tag selects a version but is not itself an immutable pin.
 The plugin is included from release `v0.1.1`.
 
+## SSH client registry
+
+The server CLI maintains SSH client enrollment in a separate durable registry.
+It accepts Ed25519 public keys, retains disabled clients and prior immutable
+generations, and rejects duplicate keys. It never stores private keys.
+
+```sh
+sudo agent-knowledge admin clients add \
+  --registry-root /var/lib/agent-knowledge-access \
+  --client-id fictional-node-a \
+  --public-key-file ./fictional-node-a.pub
+
+sudo agent-knowledge admin clients list \
+  --registry-root /var/lib/agent-knowledge-access
+```
+
+The same namespace provides `disable`, `enable`, and optimistic `rotate-key`
+operations. `import-authorized-keys` migrates either restricted form described
+in `DESIGN.md` as one atomic generation. Registry storage must be owned by the
+administrative UID running the command, and its parent path must not be
+writable by untrusted users. Create that parent before the first command. The
+current OpenSSH deployment
+continues to use its static root-controlled file until the registry lookup
+adapter is configured; registry changes alone do not change accepted SSH keys.
+
 ## Linux systemd deployment
 
 The Nix package contains hardened Worker and socket-activated Queue Ingress

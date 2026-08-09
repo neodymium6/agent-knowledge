@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/access",
     "crates/client",
     "crates/core",
     "crates/gateway",
@@ -30,6 +31,7 @@ unimplemented = "deny"
 unwrap_used = "deny"
 
 [workspace.dependencies]
+base64 = "0.23.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde-saphyr = { version = "0.0.29", default-features = false, features = ["deserialize", "serialize"] }
@@ -59,6 +61,7 @@ path = "src/bin/agent_knowledge_ssh_shell.rs"
 workspace = true
 
 [dependencies]
+agent-knowledge-access = { path = "crates/access" }
 agent-knowledge-client = { path = "crates/client" }
 agent-knowledge-core = { path = "crates/core" }
 agent-knowledge-gateway = { path = "crates/gateway" }
