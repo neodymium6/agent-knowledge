@@ -3,6 +3,7 @@
 let
   gatewayUid = 41003;
   accessUid = 41005;
+  authorizedKeysCommand = "/usr/local/libexec/agent-knowledge/authorized-keys-command";
   quartzFixture = pkgs.writeShellApplication {
     name = "build-site";
     runtimeInputs = [ pkgs.coreutils ];
@@ -239,6 +240,9 @@ pkgs.testers.runNixOSTest {
           install -m 0555 -o root -g root \
             ${quartzFixture}/bin/build-site \
             /opt/fictional-quartz/bin/build-site
+          install -D -m 0555 -o root -g root \
+            ${package}/bin/agent-knowledge \
+            ${authorizedKeysCommand}
           install -d -m 0751 -o root -g agent-knowledge-queue \
             /var/lib/agent-knowledge
           install -d -m 2750 -o agent-knowledge-queue \
@@ -278,7 +282,7 @@ pkgs.testers.runNixOSTest {
           PermitRootLogin = "no";
         };
         extraConfig = ''
-          AuthorizedKeysCommand ${package}/bin/agent-knowledge access authorized-keys --registry-root /var/lib/agent-knowledge-access --gateway-config /etc/agent-knowledge/gateway.yaml --trusted-owner-uid 0 --gateway-user fictional-ak-gateway --requested-user %u
+          AuthorizedKeysCommand ${authorizedKeysCommand} access authorized-keys --registry-root /var/lib/agent-knowledge-access --gateway-config /etc/agent-knowledge/gateway.yaml --trusted-owner-uid 0 --gateway-user fictional-ak-gateway --requested-user %u
           AuthorizedKeysCommandUser agent-knowledge-access
           AllowUsers fictional-ak-gateway
           AllowGroups agent-knowledge-gateway
@@ -338,6 +342,12 @@ pkgs.testers.runNixOSTest {
     )
     machine.succeed(
         "test \"$(id -G fictional-ak-gateway)\" = '41003 41004'"
+    )
+    machine.succeed(
+        "test \"$(stat -c '%U:%G:%a' "
+        "${authorizedKeysCommand})\" = 'root:root:555'; "
+        "test \"$(stat -c '%U:%G:%a' "
+        "/usr/local/libexec/agent-knowledge)\" = 'root:root:755'"
     )
     machine.succeed(
         "systemctl cat agent-knowledge-worker.service "

@@ -208,13 +208,26 @@ registry owner, emits only active keys, and returns no keys unless the requested
 login user matches the configured Gateway user. Deployment integration remains
 opt-in. The systemd package creates a non-login `agent-knowledge-access` reader
 and a root-owned `/var/lib/agent-knowledge-access` registry directory. Enable
-lookup only after enrolling a key, then add this to the existing hardened
-OpenSSH configuration (with the deployment's actual Gateway account):
+lookup only after enrolling a key. OpenSSH requires its command and every
+parent directory to be root-owned and not writable by group or other users, so
+install a copy outside the Nix store:
+
+```sh
+sudo install -d -o root -g root -m 0755 \
+  /usr/local/libexec/agent-knowledge
+sudo install -o root -g root -m 0555 \
+  /nix/var/nix/profiles/agent-knowledge/bin/agent-knowledge \
+  /usr/local/libexec/agent-knowledge/authorized-keys-command
+```
+
+Repeat the second command after upgrading the package. Then add this to the
+existing hardened OpenSSH configuration, using the deployment's actual
+Gateway account:
 
 ```text
 Match User fictional-agent-knowledge-gateway
     AuthorizedKeysFile none
-    AuthorizedKeysCommand /nix/var/nix/profiles/agent-knowledge/bin/agent-knowledge access authorized-keys --registry-root /var/lib/agent-knowledge-access --gateway-config /etc/agent-knowledge/gateway.yaml --trusted-owner-uid 0 --gateway-user fictional-agent-knowledge-gateway --requested-user %u
+    AuthorizedKeysCommand /usr/local/libexec/agent-knowledge/authorized-keys-command access authorized-keys --registry-root /var/lib/agent-knowledge-access --gateway-config /etc/agent-knowledge/gateway.yaml --trusted-owner-uid 0 --gateway-user fictional-agent-knowledge-gateway --requested-user %u
     AuthorizedKeysCommandUser agent-knowledge-access
 ```
 

@@ -78,6 +78,7 @@ trap cleanup EXIT
 gateway_uid=61100
 gateway_gid=61100
 ingress_gid=61103
+access_gid=61106
 queue_uid=61101
 queue_gid=61101
 worker_uid=61102
@@ -113,6 +114,7 @@ sed \
   -e "s/ agent-knowledge agent-knowledge-gateway / $worker_uid $gateway_gid /g" \
   -e "s/ agent-knowledge agent-knowledge / $worker_uid $worker_gid /g" \
   -e "s/ agent-knowledge-queue agent-knowledge-ingress / $queue_uid $ingress_gid /g" \
+  -e "s/ root agent-knowledge-access / 0 $access_gid /g" \
   "$tmpfiles_config" >"$fresh_config"
 systemd-tmpfiles --create --root="$fresh_root" "$fresh_config"
 test "$(stat -c '%u:%g:%a' "$fresh_root/var/lib/agent-knowledge")" = \
@@ -121,6 +123,10 @@ test "$(stat -c '%u:%g:%a' "$fresh_root/var/lib/agent-knowledge/queue")" = \
   "$queue_uid:$queue_gid:2770"
 test "$(stat -c '%u:%g:%a' "$fresh_root/var/lib/agent-knowledge/repository")" = \
   "$worker_uid:$gateway_gid:2750"
+test "$(stat -c '%u:%g:%a' "$fresh_root/var/lib/agent-knowledge-access")" = \
+  "0:$access_gid:2750"
+test "$(stat -c '%u:%g:%a' "$fresh_root/var/lib/agent-knowledge-access/by-id")" = \
+  "0:$access_gid:2750"
 test "$(stat -c '%u:%g:%a' "$fresh_root/run/agent-knowledge")" = \
   "$queue_uid:$ingress_gid:2750"
 install -D -m 0644 "$fresh_config" \
