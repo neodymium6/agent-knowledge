@@ -7,6 +7,8 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 - Add a durable, file-based SSH client registry and local administration CLI
   for enrollment, suspension, re-enablement, key rotation, and migration from
   the documented static `authorized_keys` format.
+- Add a read-only OpenSSH adapter that emits active registry keys with their
+  restricted Gateway command.
 
 ## 0.2.0
 
