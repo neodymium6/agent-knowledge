@@ -10,6 +10,8 @@ use agent_knowledge_worker::{
 };
 use time::OffsetDateTime;
 
+pub(crate) mod clients;
+
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]

@@ -290,6 +290,144 @@ fn parses_and_bounds_the_release_retention_command() {
     }
 }
 
+#[test]
+fn parses_client_registry_administration_commands() {
+    let add = parse_arguments([
+        "agent-knowledge".into(),
+        "admin".into(),
+        "clients".into(),
+        "add".into(),
+        "--registry-root".into(),
+        "/srv/fictional-access".into(),
+        "--client-id".into(),
+        "fictional-node-a".into(),
+        "--public-key-file".into(),
+        "/tmp/fictional-node-a.pub".into(),
+    ])
+    .unwrap_or_else(|error| panic!("client add command must parse: {error}"));
+    assert!(matches!(
+        add,
+        Command::AdminClients(
+            crate::admin::clients::ClientAdminCommand::Add {
+                registry_root,
+                client_id,
+                public_key_file,
+            }
+        ) if registry_root == Path::new("/srv/fictional-access")
+            && client_id.as_str() == "fictional-node-a"
+            && public_key_file == Path::new("/tmp/fictional-node-a.pub")
+    ));
+
+    let rotate = parse_arguments([
+        "agent-knowledge".into(),
+        "admin".into(),
+        "clients".into(),
+        "rotate-key".into(),
+        "--registry-root".into(),
+        "/srv/fictional-access".into(),
+        "--client-id".into(),
+        "fictional-node-a".into(),
+        "--expected-fingerprint".into(),
+        "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ".into(),
+        "--public-key-file".into(),
+        "/tmp/fictional-node-a-next.pub".into(),
+    ])
+    .unwrap_or_else(|error| panic!("client rotate command must parse: {error}"));
+    assert!(matches!(
+        rotate,
+        Command::AdminClients(
+            crate::admin::clients::ClientAdminCommand::RotateKey {
+                expected_fingerprint,
+                ..
+            }
+        ) if expected_fingerprint == "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ"
+    ));
+}
+
+#[test]
+fn rejects_incomplete_client_registry_commands() {
+    for arguments in [
+        vec![
+            "agent-knowledge".into(),
+            "admin".into(),
+            "clients".into(),
+            "list".into(),
+        ],
+        vec![
+            "agent-knowledge".into(),
+            "admin".into(),
+            "clients".into(),
+            "add".into(),
+            "--registry-root".into(),
+            "/srv/fictional-access".into(),
+        ],
+        vec![
+            "agent-knowledge".into(),
+            "admin".into(),
+            "clients".into(),
+            "rotate-key".into(),
+            "--registry-root".into(),
+            "/srv/fictional-access".into(),
+            "--client-id".into(),
+            "fictional-node-a".into(),
+            "--expected-fingerprint".into(),
+            "not-a-fingerprint".into(),
+            "--public-key-file".into(),
+            "/tmp/fictional.pub".into(),
+        ],
+    ] {
+        assert!(matches!(parse_arguments(arguments), Err(CliError::Usage)));
+    }
+}
+
+#[test]
+fn adds_and_lists_a_client_through_the_admin_cli() {
+    const PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti fictional-node@example.invalid\n";
+    let root = TestDirectory::create();
+    let public_key = root.path().join("fictional-node.pub");
+    fs::write(&public_key, PUBLIC_KEY)
+        .unwrap_or_else(|error| panic!("public-key fixture must be written: {error}"));
+    let registry = root.path().join("access");
+    let output = SharedOutput::default();
+    run(
+        [
+            "agent-knowledge".into(),
+            "admin".into(),
+            "clients".into(),
+            "add".into(),
+            "--registry-root".into(),
+            registry.as_os_str().to_owned(),
+            "--client-id".into(),
+            "fictional-node-a".into(),
+            "--public-key-file".into(),
+            public_key.as_os_str().to_owned(),
+        ],
+        output.clone(),
+    )
+    .unwrap_or_else(|error| panic!("client add must succeed: {error}"));
+    let added: serde_json::Value = serde_json::from_slice(&output.contents())
+        .unwrap_or_else(|error| panic!("add output must be JSON: {error}"));
+    assert_eq!(added["status"], "updated");
+
+    let output = SharedOutput::default();
+    run(
+        [
+            "agent-knowledge".into(),
+            "admin".into(),
+            "clients".into(),
+            "list".into(),
+            "--registry-root".into(),
+            registry.into_os_string(),
+        ],
+        output.clone(),
+    )
+    .unwrap_or_else(|error| panic!("client list must succeed: {error}"));
+    let listed: serde_json::Value = serde_json::from_slice(&output.contents())
+        .unwrap_or_else(|error| panic!("list output must be JSON: {error}"));
+    assert_eq!(listed["clients"][0]["client_id"], "fictional-node-a");
+    assert_eq!(listed["clients"][0]["status"], "active");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn parses_the_descriptor_relative_storage_migration_command() {

@@ -17,6 +17,7 @@ use agent_knowledge_queue::{
 use nix::unistd::Uid;
 use serde::Serialize;
 
+use crate::admin::clients::{ClientAdminCommand, ClientAdminError};
 use crate::admin::{self, AdminRetentionError, AdminStatusError};
 #[cfg(target_os = "linux")]
 use crate::admin::{StorageMigration, StorageMigrationError};
@@ -32,6 +33,12 @@ const COMMON_USAGE: &str = "usage:\n\
     agent-knowledge admin submit --queue-root <path> --package-root <path>\n\
     agent-knowledge admin status --config <path> [--maximum-queue-entries <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge admin prune-releases --config <path> [--dry-run] [--timeout-seconds <seconds>]\n\
+    agent-knowledge admin clients list --registry-root <path>\n\
+    agent-knowledge admin clients add --registry-root <path> --client-id <id> --public-key-file <path>\n\
+    agent-knowledge admin clients disable --registry-root <path> --client-id <id>\n\
+    agent-knowledge admin clients enable --registry-root <path> --client-id <id>\n\
+    agent-knowledge admin clients rotate-key --registry-root <path> --client-id <id> --expected-fingerprint <fingerprint> --public-key-file <path>\n\
+    agent-knowledge admin clients import-authorized-keys --registry-root <path> --authorized-keys-file <path>\n\
     agent-knowledge client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
     agent-knowledge client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge client recent --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
@@ -85,6 +92,9 @@ where
             timeout,
         } => admin::prune_releases(&config, dry_run, timeout, output)
             .map_err(CliError::AdminRetention),
+        Command::AdminClients(command) => {
+            crate::admin::clients::execute(command, output).map_err(CliError::AdminClients)
+        }
         #[cfg(target_os = "linux")]
         Command::AdminBootstrapStorage(settings) => {
             crate::storage_bootstrap::bootstrap_storage(&settings, output)
@@ -161,6 +171,7 @@ enum Command {
         dry_run: bool,
         timeout: Duration,
     },
+    AdminClients(ClientAdminCommand),
     #[cfg(target_os = "linux")]
     AdminBootstrapStorage(StorageBootstrap),
     #[cfg(target_os = "linux")]
@@ -234,6 +245,14 @@ where
                 && action == std::ffi::OsStr::new("prune-releases") =>
         {
             parse_admin_prune_releases_arguments(arguments)
+        }
+        (Some(namespace), Some(action))
+            if namespace == std::ffi::OsStr::new("admin")
+                && action == std::ffi::OsStr::new("clients") =>
+        {
+            crate::admin::clients::parse(arguments)
+                .map(Command::AdminClients)
+                .map_err(|()| CliError::Usage)
         }
         #[cfg(target_os = "linux")]
         (Some(namespace), Some(action))
@@ -654,6 +673,7 @@ pub enum CliError {
     RuntimeIdentity(RuntimeIdentityError),
     AdminStatus(AdminStatusError),
     AdminRetention(AdminRetentionError),
+    AdminClients(ClientAdminError),
     #[cfg(target_os = "linux")]
     StorageMigration(StorageMigrationError),
     #[cfg(target_os = "linux")]
@@ -703,6 +723,7 @@ impl fmt::Display for CliError {
             }
             Self::AdminStatus(error) => error.fmt(formatter),
             Self::AdminRetention(error) => error.fmt(formatter),
+            Self::AdminClients(error) => error.fmt(formatter),
             #[cfg(target_os = "linux")]
             Self::StorageMigration(error) => error.fmt(formatter),
             #[cfg(target_os = "linux")]
@@ -727,6 +748,7 @@ impl std::error::Error for CliError {
             Self::RuntimeIdentity(error) => Some(error),
             Self::AdminStatus(error) => Some(error),
             Self::AdminRetention(error) => Some(error),
+            Self::AdminClients(error) => Some(error),
             #[cfg(target_os = "linux")]
             Self::StorageMigration(error) => Some(error),
             #[cfg(target_os = "linux")]
