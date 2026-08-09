@@ -1,5 +1,6 @@
 use std::fmt;
 use std::fs;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
@@ -22,6 +23,8 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use nix::errno::Errno;
+use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
@@ -154,15 +157,87 @@ fn validate_socket_path(socket_path: &FsPath) -> Result<(), ClientAdminWebError>
         ));
     }
 
-    match fs::symlink_metadata(socket_path) {
-        Ok(_) => Err(ClientAdminWebError::SocketAlreadyExists(
+    clear_stale_socket(socket_path)
+}
+
+fn clear_stale_socket(socket_path: &FsPath) -> Result<(), ClientAdminWebError> {
+    let observed = match fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => metadata,
+        Ok(_) => {
+            return Err(ClientAdminWebError::SocketAlreadyExists(
+                socket_path.to_path_buf(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ClientAdminWebError::SocketPath {
+                path: socket_path.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    match probe_socket(socket_path)? {
+        SocketProbe::Live => Err(ClientAdminWebError::SocketAlreadyExists(
             socket_path.to_path_buf(),
         )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(ClientAdminWebError::SocketPath {
-            path: socket_path.to_path_buf(),
-            source,
-        }),
+        SocketProbe::Missing => Ok(()),
+        SocketProbe::Stale => {
+            let current = match fs::symlink_metadata(socket_path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(source) => {
+                    return Err(ClientAdminWebError::SocketPath {
+                        path: socket_path.to_path_buf(),
+                        source,
+                    });
+                }
+            };
+            if !current.file_type().is_socket()
+                || current.dev() != observed.dev()
+                || current.ino() != observed.ino()
+            {
+                return Err(ClientAdminWebError::SocketAlreadyExists(
+                    socket_path.to_path_buf(),
+                ));
+            }
+            fs::remove_file(socket_path).map_err(|source| ClientAdminWebError::SocketPath {
+                path: socket_path.to_path_buf(),
+                source,
+            })
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SocketProbe {
+    Live,
+    Stale,
+    Missing,
+}
+
+fn probe_socket(socket_path: &FsPath) -> Result<SocketProbe, ClientAdminWebError> {
+    let descriptor = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        None,
+    )
+    .map_err(|error| socket_error(socket_path, error))?;
+    let address = UnixAddr::new(socket_path).map_err(|error| socket_error(socket_path, error))?;
+    match connect(descriptor.as_raw_fd(), &address) {
+        Ok(()) => Ok(SocketProbe::Live),
+        Err(Errno::ECONNREFUSED) => Ok(SocketProbe::Stale),
+        Err(Errno::ENOENT) => Ok(SocketProbe::Missing),
+        Err(Errno::EAGAIN | Errno::EINPROGRESS | Errno::EALREADY) => Ok(SocketProbe::Live),
+        Err(error) => Err(socket_error(socket_path, error)),
+    }
+}
+
+fn socket_error(socket_path: &FsPath, error: Errno) -> ClientAdminWebError {
+    ClientAdminWebError::SocketPath {
+        path: socket_path.to_path_buf(),
+        source: std::io::Error::from_raw_os_error(error as i32),
     }
 }
 
@@ -903,6 +978,25 @@ mod tests {
         );
         drop(listener);
         drop(socket);
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn refuses_a_live_socket_and_reclaims_it_after_the_listener_stops() {
+        let root = TestDirectory::create();
+        let socket_path = root.path().join("admin.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+            .unwrap_or_else(|error| panic!("test socket must bind: {error}"));
+
+        assert!(matches!(
+            clear_stale_socket(&socket_path),
+            Err(ClientAdminWebError::SocketAlreadyExists(_))
+        ));
+        assert!(socket_path.exists());
+
+        drop(listener);
+        clear_stale_socket(&socket_path)
+            .unwrap_or_else(|error| panic!("stale socket must be reclaimed: {error}"));
         assert!(!socket_path.exists());
     }
 }

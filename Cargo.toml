@@ -88,5 +88,5 @@ ulid.workspace = true
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.30.1", features = ["dir", "fs", "poll", "process", "signal", "user"] }
+nix = { version = "0.30.1", features = ["dir", "fs", "poll", "process", "signal", "socket", "user"] }
 xattr = { version = "1.6.1", default-features = false }
