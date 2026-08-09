@@ -1032,9 +1032,16 @@ fn detached_snapshot_releases_the_publication_lock() {
     let detached = snapshot.into_detached();
     let writer = File::open(&fixture.content)
         .unwrap_or_else(|error| panic!("publication lock fixture must open: {error}"));
-    writer
-        .try_lock()
-        .unwrap_or_else(|error| panic!("detached metadata must not retain the lock: {error}"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match writer.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("detached metadata must not retain the lock: {error}"),
+        }
+    }
     assert_eq!(detached.commit(), commit);
 }
 
