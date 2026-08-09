@@ -1,6 +1,7 @@
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use axum::routing::{get, post};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -81,7 +83,7 @@ struct ClientView {
 }
 
 pub(super) fn run(registry_root: PathBuf, socket_path: PathBuf) -> Result<(), ClientAdminWebError> {
-    validate_socket_path(&socket_path)?;
+    let socket_lock = prepare_socket_path(&socket_path)?;
     let registry = AccessRegistry::open_for_effective_user(registry_root)
         .map_err(ClientAdminWebError::Registry)?;
     let state = WebState {
@@ -92,10 +94,14 @@ pub(super) fn run(registry_root: PathBuf, socket_path: PathBuf) -> Result<(), Cl
         .enable_io()
         .build()
         .map_err(ClientAdminWebError::Runtime)?
-        .block_on(serve(state, socket_path))
+        .block_on(serve(state, socket_path, socket_lock))
 }
 
-async fn serve(state: WebState, socket_path: PathBuf) -> Result<(), ClientAdminWebError> {
+async fn serve(
+    state: WebState,
+    socket_path: PathBuf,
+    _socket_lock: SocketLock,
+) -> Result<(), ClientAdminWebError> {
     let listener = bind_listener(&socket_path).map_err(|source| ClientAdminWebError::Bind {
         path: socket_path.clone(),
         source,
@@ -108,7 +114,7 @@ async fn serve(state: WebState, socket_path: PathBuf) -> Result<(), ClientAdminW
         .map_err(ClientAdminWebError::Serve)
 }
 
-fn validate_socket_path(socket_path: &FsPath) -> Result<(), ClientAdminWebError> {
+fn prepare_socket_path(socket_path: &FsPath) -> Result<SocketLock, ClientAdminWebError> {
     if !socket_path.is_absolute() || socket_path.file_name().is_none() {
         return Err(ClientAdminWebError::InvalidSocketPath(
             socket_path.to_path_buf(),
@@ -157,7 +163,61 @@ fn validate_socket_path(socket_path: &FsPath) -> Result<(), ClientAdminWebError>
         ));
     }
 
-    clear_stale_socket(socket_path)
+    let socket_lock = SocketLock::acquire(socket_path)?;
+    clear_stale_socket(socket_path)?;
+    Ok(socket_lock)
+}
+
+struct SocketLock {
+    _file: Flock<File>,
+}
+
+impl SocketLock {
+    fn acquire(socket_path: &FsPath) -> Result<Self, ClientAdminWebError> {
+        let mut lock_name = socket_path
+            .file_name()
+            .ok_or_else(|| ClientAdminWebError::InvalidSocketPath(socket_path.to_path_buf()))?
+            .to_os_string();
+        lock_name.push(".lock");
+        let lock_path = socket_path
+            .parent()
+            .ok_or_else(|| ClientAdminWebError::InvalidSocketPath(socket_path.to_path_buf()))?
+            .join(lock_name);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|source| ClientAdminWebError::SocketLock {
+                path: lock_path.clone(),
+                source,
+            })?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| ClientAdminWebError::SocketLock {
+                path: lock_path.clone(),
+                source,
+            })?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(ClientAdminWebError::InvalidSocketLock(lock_path));
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|source| ClientAdminWebError::SocketLock {
+                path: lock_path,
+                source,
+            })?;
+        let file =
+            Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_file, error)| {
+                if error == Errno::EWOULDBLOCK || error == Errno::EAGAIN {
+                    ClientAdminWebError::SocketAlreadyRunning(socket_path.to_path_buf())
+                } else {
+                    socket_error(socket_path, error)
+                }
+            })?;
+        Ok(Self { _file: file })
+    }
 }
 
 fn clear_stale_socket(socket_path: &FsPath) -> Result<(), ClientAdminWebError> {
@@ -638,12 +698,18 @@ pub(crate) enum ClientAdminWebError {
     InvalidSocketPath(PathBuf),
     InsecureSocketDirectory(PathBuf),
     SocketAlreadyExists(PathBuf),
+    SocketAlreadyRunning(PathBuf),
     InvalidBoundSocket(PathBuf),
+    InvalidSocketLock(PathBuf),
     SocketDirectory {
         path: PathBuf,
         source: std::io::Error,
     },
     SocketPath {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    SocketLock {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -674,9 +740,19 @@ impl fmt::Display for ClientAdminWebError {
                 "client administration socket path already exists: {}",
                 path.display()
             ),
+            Self::SocketAlreadyRunning(path) => write!(
+                formatter,
+                "another client administration server owns socket {}",
+                path.display()
+            ),
             Self::InvalidBoundSocket(path) => write!(
                 formatter,
                 "client administration listener did not create a socket: {}",
+                path.display()
+            ),
+            Self::InvalidSocketLock(path) => write!(
+                formatter,
+                "client administration socket lock is not a private regular file: {}",
                 path.display()
             ),
             Self::SocketDirectory { path, source } => write!(
@@ -687,6 +763,11 @@ impl fmt::Display for ClientAdminWebError {
             Self::SocketPath { path, source } => write!(
                 formatter,
                 "could not manage client administration socket {}: {source}",
+                path.display()
+            ),
+            Self::SocketLock { path, source } => write!(
+                formatter,
+                "could not lock client administration socket {}: {source}",
                 path.display()
             ),
             Self::Registry(error) => error.fmt(formatter),
@@ -712,8 +793,12 @@ impl std::error::Error for ClientAdminWebError {
             Self::InvalidSocketPath(_)
             | Self::InsecureSocketDirectory(_)
             | Self::SocketAlreadyExists(_)
-            | Self::InvalidBoundSocket(_) => None,
-            Self::SocketDirectory { source, .. } | Self::SocketPath { source, .. } => Some(source),
+            | Self::SocketAlreadyRunning(_)
+            | Self::InvalidBoundSocket(_)
+            | Self::InvalidSocketLock(_) => None,
+            Self::SocketDirectory { source, .. }
+            | Self::SocketPath { source, .. }
+            | Self::SocketLock { source, .. } => Some(source),
             Self::Registry(error) => Some(error),
             Self::Runtime(error) | Self::Serve(error) => Some(error),
             Self::Bind { source, .. } => Some(source),
@@ -998,5 +1083,22 @@ mod tests {
         clear_stale_socket(&socket_path)
             .unwrap_or_else(|error| panic!("stale socket must be reclaimed: {error}"));
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn socket_lock_rejects_a_concurrent_owner() {
+        let root = TestDirectory::create();
+        let socket_path = root.path().join("admin.sock");
+        let lock = SocketLock::acquire(&socket_path)
+            .unwrap_or_else(|error| panic!("first socket lock must succeed: {error}"));
+
+        assert!(matches!(
+            SocketLock::acquire(&socket_path),
+            Err(ClientAdminWebError::SocketAlreadyRunning(_))
+        ));
+
+        drop(lock);
+        SocketLock::acquire(&socket_path)
+            .unwrap_or_else(|error| panic!("released socket lock must be reusable: {error}"));
     }
 }
