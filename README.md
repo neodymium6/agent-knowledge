@@ -202,6 +202,23 @@ current OpenSSH deployment continues to use its static root-controlled file
 until the registry lookup adapter is configured; registry changes alone do not
 change accepted SSH keys.
 
+An optional server-rendered administration UI provides the same add, disable,
+enable, and rotate operations without JavaScript:
+
+```sh
+agent-knowledge admin clients serve \
+  --registry-root /srv/fictional-agent-knowledge-access \
+  --socket-path /run/fictional-agent-knowledge-admin/admin.sock
+```
+
+The UI is off unless this command runs and does not open a TCP listener. Its
+pre-created socket directory must be owned by the process identity and not
+writable by group or other users; the socket itself is mode `0660`. It has CSRF
+protection but no authentication or TLS. Run a persistent instance as the
+dedicated non-root owner of its registry, then grant only the authenticated
+same-host reverse proxy access through the socket group. Do not run a
+persistent UI as root.
+
 The read-only `access authorized-keys` command is intended for a
 root-controlled OpenSSH `AuthorizedKeysCommand`. It validates the configured
 registry owner, emits only active keys, and returns no keys unless the requested

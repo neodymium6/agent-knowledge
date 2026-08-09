@@ -15,6 +15,8 @@ const LOCAL_ADMIN_ACTOR: &str = "local-admin";
 const MAXIMUM_PUBLIC_KEY_FILE_BYTES: u64 = 16 * 1024;
 const MAXIMUM_AUTHORIZED_KEYS_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
+mod web;
+
 /// One local client-registry administration command.
 #[derive(Debug)]
 pub(crate) enum ClientAdminCommand {
@@ -44,6 +46,10 @@ pub(crate) enum ClientAdminCommand {
         registry_root: PathBuf,
         authorized_keys_file: PathBuf,
     },
+    Serve {
+        registry_root: PathBuf,
+        socket_path: PathBuf,
+    },
 }
 
 pub(crate) fn parse<I>(mut arguments: I) -> Result<ClientAdminCommand, ()>
@@ -59,6 +65,7 @@ where
     let mut public_key_file = None;
     let mut expected_fingerprint = None;
     let mut authorized_keys_file = None;
+    let mut socket_path = None;
     while let Some(flag) = arguments.next() {
         let value = arguments.next().ok_or(())?;
         match flag.to_str() {
@@ -87,6 +94,9 @@ where
             Some("--authorized-keys-file") if authorized_keys_file.is_none() => {
                 authorized_keys_file = Some(PathBuf::from(value));
             }
+            Some("--socket-path") if socket_path.is_none() => {
+                socket_path = Some(PathBuf::from(value));
+            }
             _ => return Err(()),
         }
     }
@@ -96,11 +106,16 @@ where
             if client_id.is_none()
                 && public_key_file.is_none()
                 && expected_fingerprint.is_none()
-                && authorized_keys_file.is_none() =>
+                && authorized_keys_file.is_none()
+                && socket_path.is_none() =>
         {
             Ok(ClientAdminCommand::List { registry_root })
         }
-        "add" if expected_fingerprint.is_none() && authorized_keys_file.is_none() => {
+        "add"
+            if expected_fingerprint.is_none()
+                && authorized_keys_file.is_none()
+                && socket_path.is_none() =>
+        {
             Ok(ClientAdminCommand::Add {
                 registry_root,
                 client_id: client_id.ok_or(())?,
@@ -110,7 +125,8 @@ where
         "disable"
             if public_key_file.is_none()
                 && expected_fingerprint.is_none()
-                && authorized_keys_file.is_none() =>
+                && authorized_keys_file.is_none()
+                && socket_path.is_none() =>
         {
             Ok(ClientAdminCommand::Disable {
                 registry_root,
@@ -120,27 +136,42 @@ where
         "enable"
             if public_key_file.is_none()
                 && expected_fingerprint.is_none()
-                && authorized_keys_file.is_none() =>
+                && authorized_keys_file.is_none()
+                && socket_path.is_none() =>
         {
             Ok(ClientAdminCommand::Enable {
                 registry_root,
                 client_id: client_id.ok_or(())?,
             })
         }
-        "rotate-key" if authorized_keys_file.is_none() => Ok(ClientAdminCommand::RotateKey {
-            registry_root,
-            client_id: client_id.ok_or(())?,
-            expected_fingerprint: expected_fingerprint.ok_or(())?,
-            public_key_file: public_key_file.ok_or(())?,
-        }),
+        "rotate-key" if authorized_keys_file.is_none() && socket_path.is_none() => {
+            Ok(ClientAdminCommand::RotateKey {
+                registry_root,
+                client_id: client_id.ok_or(())?,
+                expected_fingerprint: expected_fingerprint.ok_or(())?,
+                public_key_file: public_key_file.ok_or(())?,
+            })
+        }
         "import-authorized-keys"
             if client_id.is_none()
                 && public_key_file.is_none()
-                && expected_fingerprint.is_none() =>
+                && expected_fingerprint.is_none()
+                && socket_path.is_none() =>
         {
             Ok(ClientAdminCommand::ImportAuthorizedKeys {
                 registry_root,
                 authorized_keys_file: authorized_keys_file.ok_or(())?,
+            })
+        }
+        "serve"
+            if client_id.is_none()
+                && public_key_file.is_none()
+                && expected_fingerprint.is_none()
+                && authorized_keys_file.is_none() =>
+        {
+            Ok(ClientAdminCommand::Serve {
+                registry_root,
+                socket_path: socket_path.ok_or(())?,
             })
         }
         _ => Err(()),
@@ -219,6 +250,10 @@ pub(crate) fn execute(
                 .map_err(ClientAdminError::Registry)?;
             write_mutation(&outcome, &mut output)
         }
+        ClientAdminCommand::Serve {
+            registry_root,
+            socket_path,
+        } => web::run(registry_root, socket_path).map_err(ClientAdminError::Web),
     }
 }
 
@@ -292,6 +327,7 @@ pub(crate) enum ClientAdminError {
     Registry(AccessRegistryError),
     Json(serde_json::Error),
     Io(io::Error),
+    Web(web::ClientAdminWebError),
 }
 
 impl fmt::Display for ClientAdminError {
@@ -304,6 +340,7 @@ impl fmt::Display for ClientAdminError {
             Self::Registry(error) => error.fmt(formatter),
             Self::Json(error) => write!(formatter, "could not encode client output: {error}"),
             Self::Io(error) => write!(formatter, "could not write client output: {error}"),
+            Self::Web(error) => error.fmt(formatter),
         }
     }
 }
@@ -318,6 +355,7 @@ impl std::error::Error for ClientAdminError {
             Self::Registry(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Io(error) => Some(error),
+            Self::Web(error) => Some(error),
         }
     }
 }

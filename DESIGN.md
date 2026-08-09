@@ -929,7 +929,16 @@ It supports listing, adding, disabling, re-enabling, and conflict-checked key
 rotation without physical deletion. Migration from the documented static
 `authorized_keys` forms validates every forced command and imports all clients
 as one generation. Duplicate client IDs and fingerprints fail the entire
-operation. The root, fixed directories, generations, and snapshots must all
+operation. An optional server-rendered administration UI calls the same
+registry operations and is disabled unless its explicit serve command runs.
+It accepts only a Unix domain socket inside a directory owned by the process
+identity and not writable by other identities, has no authentication or TLS,
+protects mutations with a process-local CSRF token, and requires an
+authenticated same-host proxy for browser access. The socket mode grants
+access only to its owner and group. A persistent UI runs as a dedicated
+non-root identity that owns its registry.
+
+The root, fixed directories, generations, and snapshots must all
 belong to the explicitly trusted administrative UID. The registry root's parent
 path is part of the trust boundary and must not be writable by untrusted users.
 It must exist before the registry is opened; creation of the registry root is

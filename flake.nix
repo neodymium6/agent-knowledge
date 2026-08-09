@@ -159,6 +159,7 @@
                 ./deploy/systemd/agent-knowledge.conf.sysusers
                 ./deploy/systemd/agent-knowledge.conf.tmpfiles
                 ./src
+                ./templates
               ];
             };
             cargoLock.lockFile = ./Cargo.lock;
