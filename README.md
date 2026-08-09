@@ -196,7 +196,8 @@ sudo agent-knowledge admin clients list \
 The same namespace provides `disable`, `enable`, and optimistic `rotate-key`
 operations. `import-authorized-keys` migrates either restricted form described
 in `DESIGN.md` as one atomic generation. Registry storage must be owned by the
-administrative UID running the command. The current OpenSSH deployment
+administrative UID running the command, and its parent path must not be
+writable by untrusted users. The current OpenSSH deployment
 continues to use its static root-controlled file until the registry lookup
 adapter is configured; registry changes alone do not change accepted SSH keys.
 

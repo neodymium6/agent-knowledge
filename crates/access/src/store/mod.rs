@@ -476,6 +476,7 @@ impl AccessRegistry {
         };
         validate_snapshot(&snapshot, &generation_id)?;
         self.persist(&snapshot)?;
+        self.validate_layout()?;
         Ok(MutationOutcome {
             changed: true,
             snapshot,
