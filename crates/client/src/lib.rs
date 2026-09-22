@@ -32,6 +32,8 @@ mod mcp;
 mod mcp_archive;
 mod mcp_create;
 mod mcp_package;
+pub mod updates;
+pub mod version;
 
 const SSH_PROGRAM: &str = "ssh";
 const MAXIMUM_RESPONSE_BYTES: u64 = 64 * 1024;

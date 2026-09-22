@@ -40,6 +40,7 @@ trait KnowledgeBackend: Clone + Send + Sync + 'static {
         error.to_string()
     }
 
+    fn server_version(&self) -> crate::version::ServerVersion;
     fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error>;
     fn list(&self, request: &ListRequest) -> Result<ListResponse, Self::Error>;
     fn recent(&self, request: &ListRequest) -> Result<ListResponse, Self::Error>;
@@ -51,6 +52,10 @@ trait KnowledgeBackend: Clone + Send + Sync + 'static {
 
 impl KnowledgeBackend for SshClient {
     type Error = ClientCommandError;
+
+    fn server_version(&self) -> crate::version::ServerVersion {
+        SshClient::server_version(self)
+    }
 
     fn format_error(error: &Self::Error) -> String {
         error.mcp_message()
@@ -195,6 +200,15 @@ struct DocumentParameters {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct VersionParameters {
+    /// Check upstream if the shared 24-hour cache is due. Defaults to false (cache only).
+    /// AGENT_KNOWLEDGE_UPDATE_CHECK=off overrides this option.
+    #[serde(default)]
+    check_updates: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct StatusParameters {
     /// Permanent request ULID returned by knowledge_submit_package.
     request_id: String,
@@ -224,6 +238,29 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
 
 #[tool_router]
 impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
+    #[tool(
+        name = "knowledge_version",
+        description = "Read client/Gateway versions, protocol capabilities, and stable release/cache status. Optional upstream checks use the shared 24-hour cache and honor disabled checks. Release differences do not imply incompatibility.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn version(
+        &self,
+        Parameters(parameters): Parameters<VersionParameters>,
+    ) -> Result<CallToolResult, String> {
+        let client = self.client.clone();
+        let report = run_blocking(
+            move || {
+                Ok::<_, C::Error>(crate::version::VersionReport::new(
+                    client.server_version(),
+                    parameters.check_updates,
+                ))
+            },
+            C::format_error,
+        )
+        .await?;
+        structured(report)
+    }
+
     #[tool(
         name = "knowledge_search_excerpts",
         description = "Search committed knowledge and return bounded raw query-term excerpts with field names.",
@@ -641,11 +678,30 @@ mod tests {
         },
     };
 
+    fn local_http_client() -> reqwest::Client {
+        // HTTP fixtures do not depend on platform roots or global provider initialization.
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap_or_else(|e| panic!("TLS fixture: {e}"))
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        reqwest::Client::builder()
+            .no_proxy()
+            .tls_backend_preconfigured(tls)
+            .build()
+            .unwrap_or_else(|e| panic!("HTTP fixture: {e}"))
+    }
+
     #[derive(Clone, Debug)]
     struct FakeBackend;
 
     impl KnowledgeBackend for FakeBackend {
         type Error = Infallible;
+        fn server_version(&self) -> crate::version::ServerVersion {
+            crate::version::ServerVersion::Unsupported
+        }
 
         fn submit(&self, _package_root: &std::path::Path) -> Result<SubmitResponse, Self::Error> {
             unreachable!()
@@ -684,6 +740,9 @@ mod tests {
 
     impl KnowledgeBackend for TestSubmitBackend {
         type Error = &'static str;
+        fn server_version(&self) -> crate::version::ServerVersion {
+            crate::version::ServerVersion::Unavailable
+        }
 
         fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error> {
             let package = agent_knowledge_queue::validate_package(
@@ -740,6 +799,9 @@ mod tests {
 
     impl KnowledgeBackend for ArchiveBackend {
         type Error = &'static str;
+        fn server_version(&self) -> crate::version::ServerVersion {
+            crate::version::ServerVersion::Unavailable
+        }
 
         fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error> {
             let package = agent_knowledge_queue::validate_package(
@@ -847,6 +909,7 @@ mod tests {
                 "knowledge_search",
                 "knowledge_search_excerpts",
                 "knowledge_submit_package",
+                "knowledge_version",
             ]
         );
 
@@ -1154,7 +1217,8 @@ mod tests {
                 .await
         });
 
-        let transport = StreamableHttpClientTransport::from_config(
+        let transport = StreamableHttpClientTransport::with_client(
+            local_http_client(),
             StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
         );
         let client = ClientInfo::default()
@@ -1176,6 +1240,18 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("fictional-commit")
         );
+        let version = client
+            .call_tool(
+                CallToolRequestParams::new("knowledge_version")
+                    .with_arguments(serde_json::Map::new()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("version tool: {e}"));
+        let version = version
+            .structured_content
+            .unwrap_or_else(|| panic!("structured version"));
+        assert_eq!(version["client_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(version["server"]["status"], "unsupported");
         client
             .cancel()
             .await
@@ -1214,7 +1290,8 @@ mod tests {
                 .await
         });
 
-        let transport = StreamableHttpClientTransport::from_config(
+        let transport = StreamableHttpClientTransport::with_client(
+            local_http_client(),
             StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
         );
         let client = ClientInfo::default()

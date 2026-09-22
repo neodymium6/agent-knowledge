@@ -19,6 +19,8 @@ const USAGE: &str = "usage:\n\
     agent-knowledge-client history --destination <ssh-destination> --document-id <id> [--anchor-commit <hash>] [--cursor <hash>] [--maximum-results <count>]\n\
     agent-knowledge-client get-at --destination <ssh-destination> --document-id <id> --commit <hash>\n\
     agent-knowledge-client diff --destination <ssh-destination> --document-id <id> --from-commit <hash> --to-commit <hash>\n\
+    agent-knowledge-client update-check [--destination <ssh-destination>]\n\
+    agent-knowledge-client version [--destination <ssh-destination>]\n\
     agent-knowledge-client --version\n\
     agent-knowledge-client mcp --destination <ssh-destination> [--listen <loopback-address>] [--timeout-seconds <seconds>]\n\
     agent-knowledge-client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
@@ -41,6 +43,11 @@ pub enum Command {
         timeout: Duration,
     },
     Version,
+    VersionReport {
+        destination: Option<OsString>,
+        check_updates: bool,
+    },
+    UpdateCache,
     Mcp {
         destination: OsString,
         listen: Option<SocketAddr>,
@@ -91,11 +98,57 @@ where
     execute(command, output)
 }
 
-pub fn execute<W>(command: Command, mut output: W) -> Result<(), CliError>
+pub fn execute<W>(command: Command, output: W) -> Result<(), CliError>
+where
+    W: Write,
+{
+    let automatic = if matches!(
+        &command,
+        Command::Version
+            | Command::VersionReport { .. }
+            | Command::Mcp { .. }
+            | Command::UpdateCache
+    ) {
+        None
+    } else {
+        crate::updates::start_automatic()
+    };
+    let result = execute_inner(command, output);
+    if result.is_ok()
+        && let Some(config) = automatic
+    {
+        crate::updates::notify(&config, io::stderr());
+    }
+    result
+}
+
+fn execute_inner<W>(command: Command, mut output: W) -> Result<(), CliError>
 where
     W: Write,
 {
     match command {
+        Command::UpdateCache => {
+            let _ = crate::updates::status(true);
+            Ok(())
+        }
+        Command::VersionReport {
+            destination,
+            check_updates,
+        } => {
+            let server = match destination {
+                Some(destination) => crate::SshClient::new(destination, Duration::from_secs(5))
+                    .map_err(CliError::Command)?
+                    .server_version(),
+                None => crate::version::ServerVersion::NotRequested,
+            };
+            serde_json::to_writer(
+                &mut output,
+                &crate::version::VersionReport::new(server, check_updates),
+            )
+            .map_err(|e| CliError::Command(ClientCommandError::EncodeResponse(e)))?;
+            writeln!(output).map_err(CliError::Output)
+        }
+
         Command::Inspect {
             destination,
             request,
@@ -179,6 +232,33 @@ where
     if action == "--version" {
         return if arguments.next().is_none() {
             Ok(Command::Version)
+        } else {
+            Err(ParseError)
+        };
+    }
+    if action == "__update-cache" {
+        return if arguments.next().is_none() {
+            Ok(Command::UpdateCache)
+        } else {
+            Err(ParseError)
+        };
+    }
+    if action == "version" || action == "update-check" {
+        let destination = match arguments.next() {
+            None => None,
+            Some(flag) if flag == "--destination" => Some(
+                arguments
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .ok_or(ParseError)?,
+            ),
+            _ => return Err(ParseError),
+        };
+        return if arguments.next().is_none() {
+            Ok(Command::VersionReport {
+                destination,
+                check_updates: action == "update-check",
+            })
         } else {
             Err(ParseError)
         };
