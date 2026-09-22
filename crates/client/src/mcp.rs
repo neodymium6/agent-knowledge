@@ -200,6 +200,15 @@ struct DocumentParameters {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct VersionParameters {
+    /// Check upstream if the shared 24-hour cache is due. Defaults to false (cache only).
+    /// AGENT_KNOWLEDGE_UPDATE_CHECK=off overrides this option.
+    #[serde(default)]
+    check_updates: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct StatusParameters {
     /// Permanent request ULID returned by knowledge_submit_package.
     request_id: String,
@@ -231,13 +240,21 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
 impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     #[tool(
         name = "knowledge_version",
-        description = "Read local client and connected Gateway versions and advertised protocol capabilities. Release differences do not imply incompatibility.",
+        description = "Read client/Gateway versions, protocol capabilities, and stable release/cache status. Optional upstream checks use the shared 24-hour cache and honor disabled checks. Release differences do not imply incompatibility.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn version(&self) -> Result<CallToolResult, String> {
+    async fn version(
+        &self,
+        Parameters(parameters): Parameters<VersionParameters>,
+    ) -> Result<CallToolResult, String> {
         let client = self.client.clone();
         let report = run_blocking(
-            move || Ok::<_, C::Error>(crate::version::VersionReport::new(client.server_version())),
+            move || {
+                Ok::<_, C::Error>(crate::version::VersionReport::new(
+                    client.server_version(),
+                    parameters.check_updates,
+                ))
+            },
             C::format_error,
         )
         .await?;
@@ -660,6 +677,22 @@ mod tests {
             streamable_http_server::StreamableHttpServerConfig,
         },
     };
+
+    fn local_http_client() -> reqwest::Client {
+        // HTTP fixtures do not depend on platform roots or global provider initialization.
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap_or_else(|e| panic!("TLS fixture: {e}"))
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        reqwest::Client::builder()
+            .no_proxy()
+            .tls_backend_preconfigured(tls)
+            .build()
+            .unwrap_or_else(|e| panic!("HTTP fixture: {e}"))
+    }
 
     #[derive(Clone, Debug)]
     struct FakeBackend;
@@ -1184,7 +1217,8 @@ mod tests {
                 .await
         });
 
-        let transport = StreamableHttpClientTransport::from_config(
+        let transport = StreamableHttpClientTransport::with_client(
+            local_http_client(),
             StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
         );
         let client = ClientInfo::default()
@@ -1207,7 +1241,10 @@ mod tests {
             Some("fictional-commit")
         );
         let version = client
-            .call_tool(CallToolRequestParams::new("knowledge_version"))
+            .call_tool(
+                CallToolRequestParams::new("knowledge_version")
+                    .with_arguments(serde_json::Map::new()),
+            )
             .await
             .unwrap_or_else(|e| panic!("version tool: {e}"));
         let version = version
@@ -1253,7 +1290,8 @@ mod tests {
                 .await
         });
 
-        let transport = StreamableHttpClientTransport::from_config(
+        let transport = StreamableHttpClientTransport::with_client(
+            local_http_client(),
             StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
         );
         let client = ClientInfo::default()

@@ -32,6 +32,7 @@ fn archives_a_document_through_the_stdio_mcp_server() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-knowledge-client"))
         .args(["mcp", "--destination", "fictional-knowledge"])
+        .env("AGENT_KNOWLEDGE_UPDATE_CHECK", "off")
         .env("PATH", search_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -77,7 +78,7 @@ fn archives_a_document_through_the_stdio_mcp_server() {
         })
     )
     .unwrap_or_else(|error| panic!("archive tool request must be written: {error}"));
-    writeln!(input, "{}", serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"knowledge_version","arguments":{}}})).unwrap_or_else(|e| panic!("version request: {e}"));
+    writeln!(input, "{}", serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"knowledge_version","arguments":{"check_updates":true}}})).unwrap_or_else(|e| panic!("version request: {e}"));
     drop(input);
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -158,6 +159,10 @@ fn archives_a_document_through_the_stdio_mcp_server() {
     assert_eq!(
         version["result"]["structuredContent"]["server"]["status"],
         "unavailable"
+    );
+    assert_eq!(
+        version["result"]["structuredContent"]["upstream"]["status"],
+        "disabled"
     );
     assert!(diagnostic.is_empty());
     assert!(submitted_archive.is_file());
@@ -250,6 +255,7 @@ fn reads_context_through_cli_and_stdio_without_a_shared_package() {
     )
     .unwrap_or_else(|e| panic!("PATH: {e}"));
     let output = Command::new(env!("CARGO_BIN_EXE_agent-knowledge-client"))
+        .env("AGENT_KNOWLEDGE_UPDATE_CHECK", "off")
         .env("PATH", &path)
         .args([
             "context",
@@ -272,6 +278,7 @@ fn reads_context_through_cli_and_stdio_without_a_shared_package() {
             .unwrap_or_else(|e| panic!("JSON: {e}"));
     assert_eq!(wire["query"]["maximum_characters"], 123);
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-knowledge-client"))
+        .env("AGENT_KNOWLEDGE_UPDATE_CHECK", "off")
         .env("PATH", &path)
         .args(["mcp", "--destination", "fictional-knowledge"])
         .stdin(Stdio::piped())

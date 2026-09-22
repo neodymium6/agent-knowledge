@@ -41,16 +41,36 @@ pub struct VersionReport {
     pub client_protocol_version: u16,
     /// Best-effort Gateway observation.
     pub server: ServerVersion,
+    /// Latest stable upstream metadata and explicit check/cache state.
+    pub upstream: crate::updates::UpdateStatus,
+    /// Whether the latest known release is newer than this client; null if unknown.
+    pub client_update_available: Option<bool>,
+    /// Independent comparison with the Gateway release; null when unavailable.
+    pub server_update_available: Option<bool>,
 }
 
 impl VersionReport {
     /// Creates a report from a bounded Gateway observation.
     #[must_use]
-    pub const fn new(server: ServerVersion) -> Self {
+    pub fn new(server: ServerVersion, check_updates: bool) -> Self {
+        Self::with_status(server, crate::updates::status(check_updates))
+    }
+
+    fn with_status(server: ServerVersion, upstream: crate::updates::UpdateStatus) -> Self {
+        let server_update_available = match &server {
+            ServerVersion::Available { gateway, .. } => {
+                upstream.newer_than(&gateway.gateway_version)
+            }
+            _ => None,
+        };
+        let client_update_available = upstream.newer_than(env!("CARGO_PKG_VERSION"));
         Self {
             client_version: env!("CARGO_PKG_VERSION"),
             client_protocol_version: CURRENT_GATEWAY_PROTOCOL_VERSION,
             server,
+            upstream,
+            client_update_available,
+            server_update_available,
         }
     }
 }

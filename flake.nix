@@ -109,7 +109,8 @@
             mkdir -p "$out/bin"
             makeBinaryWrapper ${client}/bin/agent-knowledge-client \
               "$out/bin/agent-knowledge-client" \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.openssh ]}
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.openssh ]} \
+              --set-default SSL_CERT_FILE ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
           '';
       clientReleaseArchiveFor =
         system:
