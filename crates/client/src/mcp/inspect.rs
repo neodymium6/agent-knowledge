@@ -65,11 +65,73 @@ impl ContextParameters {
         }))
     }
 }
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct HistoryParameters {
+    document_id: String,
+    /// Reuse the returned anchor_commit to keep pagination on the same snapshot.
+    #[serde(default)]
+    anchor_commit: Option<String>,
+    /// Reuse next_cursor with anchor_commit for the next page, even if entries is empty.
+    #[serde(default)]
+    cursor: Option<String>,
+    /// Maximum changes returned. At most 100 commits are scanned per page. Defaults to 20.
+    #[serde(default)]
+    maximum_results: Option<usize>,
+}
+impl HistoryParameters {
+    pub(super) fn request(self) -> Result<InspectRequest, String> {
+        Ok(request(InspectQuery::History {
+            document_id: id(&self.document_id)?,
+            anchor_commit: self.anchor_commit,
+            cursor: self.cursor,
+            maximum_results: bounded(self.maximum_results.unwrap_or(20), MAXIMUM_RESULTS)?,
+        }))
+    }
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GetAtParameters {
+    document_id: String,
+    /// Full lowercase Git commit ID from official history, never a ref or expression.
+    commit: String,
+}
+impl GetAtParameters {
+    pub(super) fn request(self) -> Result<InspectRequest, String> {
+        Ok(request(InspectQuery::GetAt {
+            document_id: id(&self.document_id)?,
+            commit: self.commit,
+        }))
+    }
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DiffParameters {
+    document_id: String,
+    /// Full lowercase Git commit ID for the earlier selected state.
+    from_commit: String,
+    /// Full lowercase Git commit ID for the later selected state.
+    to_commit: String,
+}
+impl DiffParameters {
+    pub(super) fn request(self) -> Result<InspectRequest, String> {
+        Ok(request(InspectQuery::Diff {
+            document_id: id(&self.document_id)?,
+            from_commit: self.from_commit,
+            to_commit: self.to_commit,
+        }))
+    }
+}
 fn request(query: InspectQuery) -> InspectRequest {
     InspectRequest {
         protocol_version: CURRENT_GATEWAY_PROTOCOL_VERSION,
         query,
     }
+}
+fn id(value: &str) -> Result<DocumentId, String> {
+    value
+        .parse()
+        .map_err(|_| "document_id must be a canonical ULID".into())
 }
 fn bounded(value: usize, maximum: usize) -> Result<usize, String> {
     if value == 0 || value > maximum {

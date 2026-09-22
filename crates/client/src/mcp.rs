@@ -1,6 +1,8 @@
 mod inspect;
 use agent_knowledge_protocol::{InspectRequest, InspectResponse};
-use inspect::{ContextParameters, ExcerptParameters};
+use inspect::{
+    ContextParameters, DiffParameters, ExcerptParameters, GetAtParameters, HistoryParameters,
+};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -244,6 +246,48 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     async fn context(
         &self,
         Parameters(parameters): Parameters<ContextParameters>,
+    ) -> Result<CallToolResult, String> {
+        let request = parameters.request()?;
+        let client = self.client.clone();
+        structured(run_blocking(move || client.inspect(&request), C::format_error).await?)
+    }
+
+    #[tool(
+        name = "knowledge_history",
+        description = "List document Markdown and path changes in official commit history, following permanent identity across moves. Use anchor_commit and next_cursor for stable pagination.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn history(
+        &self,
+        Parameters(parameters): Parameters<HistoryParameters>,
+    ) -> Result<CallToolResult, String> {
+        let request = parameters.request()?;
+        let client = self.client.clone();
+        structured(run_blocking(move || client.inspect(&request), C::format_error).await?)
+    }
+
+    #[tool(
+        name = "knowledge_get_at",
+        description = "Read exact Markdown for a document at an official historical commit.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn get_at(
+        &self,
+        Parameters(parameters): Parameters<GetAtParameters>,
+    ) -> Result<CallToolResult, String> {
+        let request = parameters.request()?;
+        let client = self.client.clone();
+        structured(run_blocking(move || client.inspect(&request), C::format_error).await?)
+    }
+
+    #[tool(
+        name = "knowledge_diff",
+        description = "Compare one document at two official commits. Returns before/after metadata and a contiguous changed body line range.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn diff(
+        &self,
+        Parameters(parameters): Parameters<DiffParameters>,
     ) -> Result<CallToolResult, String> {
         let request = parameters.request()?;
         let client = self.client.clone();
@@ -793,7 +837,10 @@ mod tests {
                 "knowledge_archive_document",
                 "knowledge_context",
                 "knowledge_create_document",
+                "knowledge_diff",
                 "knowledge_get",
+                "knowledge_get_at",
+                "knowledge_history",
                 "knowledge_list",
                 "knowledge_recent",
                 "knowledge_request_status",

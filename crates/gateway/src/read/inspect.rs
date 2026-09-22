@@ -2,10 +2,15 @@
 use super::*;
 use agent_knowledge_core::{DocumentId, DocumentStatus, DocumentType, markdown_body};
 use agent_knowledge_protocol::{
-    ContextDocument, Excerpt, InspectQuery, InspectRequest, InspectResponse, Inspection, SearchHit,
+    BodyDiff, ContextDocument, Excerpt, HistoryEntry, InspectQuery, InspectRequest,
+    InspectResponse, Inspection, SearchHit,
 };
-use agent_knowledge_repository::{CommittedSnapshot, TantivySearchIndex, linear_excerpts};
+use agent_knowledge_repository::{
+    CommittedSnapshot, HistoricalDocument, HistoryReader, TantivySearchIndex, linear_excerpts,
+};
 use std::collections::HashSet;
+
+const HISTORY_SCAN_COMMITS: usize = 100;
 
 pub(crate) fn inspect_until(
     settings: &GatewaySettings,
@@ -106,7 +111,57 @@ pub(crate) fn inspect_until(
                 deadline,
             )?
         }
-        _ => return Err(invalid()),
+        InspectQuery::History {
+            document_id,
+            anchor_commit,
+            cursor,
+            maximum_results,
+        } => {
+            validate_result_limit(settings, *maximum_results)?;
+            let mut reader = history_reader(settings, store, deadline)?;
+            if let Some(anchor) = anchor_commit {
+                reader.restrict_to(anchor).map_err(committed)?;
+            }
+            if cursor.is_some() && anchor_commit.is_none() {
+                return Err(invalid());
+            }
+            history(
+                &mut reader,
+                *document_id,
+                cursor.as_deref(),
+                *maximum_results,
+            )?
+        }
+        InspectQuery::GetAt {
+            document_id,
+            commit,
+        } => {
+            let mut reader = history_reader(settings, store, deadline)?;
+            Inspection::GetAt {
+                commit: commit.clone(),
+                document: Box::new(historical(&mut reader, commit, *document_id)?),
+            }
+        }
+        InspectQuery::Diff {
+            document_id,
+            from_commit,
+            to_commit,
+        } => {
+            let mut reader = history_reader(settings, store, deadline)?;
+            let before = historical(&mut reader, from_commit, *document_id)?;
+            let after = historical(&mut reader, to_commit, *document_id)?;
+            let diff = body_diff(
+                body(&before.markdown, *document_id)?,
+                body(&after.markdown, *document_id)?,
+            );
+            Inspection::Diff {
+                from_commit: from_commit.clone(),
+                to_commit: to_commit.clone(),
+                before: Box::new(before.summary),
+                after: Box::new(after.summary),
+                body: diff,
+            }
+        }
     };
     prepare_response(
         settings,
@@ -389,4 +444,123 @@ fn context(
         additional,
         truncated,
     })
+}
+fn history_reader(
+    settings: &GatewaySettings,
+    store: &CommittedStore,
+    deadline: Instant,
+) -> Result<HistoryReader, GatewayError> {
+    store
+        .history_reader(ContentPolicy {
+            maximum_entry_count: settings.maximum_index_entries(),
+            maximum_total_markdown_bytes: settings.maximum_index_markdown_bytes(),
+            scan_deadline: Some(deadline),
+            ..ContentPolicy::default()
+        })
+        .map_err(committed)
+}
+fn historical(
+    reader: &mut HistoryReader,
+    commit: &str,
+    id: DocumentId,
+) -> Result<DocumentContent, GatewayError> {
+    let doc = reader
+        .document(commit, id)
+        .map_err(committed)?
+        .ok_or_else(|| committed(CommittedReadError::DocumentNotFound { document_id: id }))?;
+    Ok(DocumentContent {
+        summary: document_summary(&doc.record)?,
+        markdown: doc.markdown,
+    })
+}
+fn history(
+    reader: &mut HistoryReader,
+    id: DocumentId,
+    cursor: Option<&str>,
+    maximum: usize,
+) -> Result<Inspection, GatewayError> {
+    let anchor = reader.anchor().to_owned();
+    if reader.document(&anchor, id).map_err(committed)?.is_none() {
+        return Err(committed(CommittedReadError::DocumentNotFound {
+            document_id: id,
+        }));
+    }
+    let commits = reader
+        .commits(cursor, HISTORY_SCAN_COMMITS + 1)
+        .map_err(committed)?;
+    let mut current = if let Some(commit) = commits.first() {
+        reader.document(commit, id).map_err(committed)?
+    } else {
+        None
+    };
+    let mut entries = Vec::new();
+    let mut next_cursor = None;
+    for (i, commit) in commits.iter().take(HISTORY_SCAN_COMMITS).enumerate() {
+        let previous = commits
+            .get(i + 1)
+            .map(|parent| reader.document(parent, id).map_err(committed))
+            .transpose()?
+            .flatten();
+        if let Some(doc) = &current {
+            let changed = previous.as_ref().is_none_or(|p: &HistoricalDocument| {
+                p.record.revision() != doc.record.revision()
+                    || p.record.relative_path() != doc.record.relative_path()
+            });
+            if changed {
+                entries.push(HistoryEntry {
+                    commit: commit.clone(),
+                    document: document_summary(&doc.record)?,
+                    previous_revision: previous.as_ref().map(|p| p.record.revision()),
+                });
+            }
+        }
+        next_cursor = commits.get(i + 1).cloned();
+        if entries.len() >= maximum {
+            break;
+        }
+        current = previous;
+    }
+    Ok(Inspection::History {
+        anchor_commit: anchor,
+        entries,
+        next_cursor,
+    })
+}
+fn body_diff(before: &str, after: &str) -> BodyDiff {
+    let old = before.split_inclusive('\n').collect::<Vec<_>>();
+    let new = after.split_inclusive('\n').collect::<Vec<_>>();
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    BodyDiff {
+        from_line: prefix + 1,
+        to_line: prefix + 1,
+        removed: old[prefix..old.len() - suffix].concat(),
+        added: new[prefix..new.len() - suffix].concat(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::body_diff;
+    #[test]
+    fn body_ranges_preserve_unicode_newlines_insertions_and_removals() {
+        for (old, new, line, removed, added) in [
+            ("same\n", "same\n", 2, "", ""),
+            ("first\nlast\n", "first\n追加\nlast\n", 2, "", "追加\n"),
+            ("first\n削除\nlast", "first\nlast", 2, "削除\n", ""),
+            ("last\n", "last", 1, "last\n", "last"),
+            ("", "new", 1, "", "new"),
+        ] {
+            let diff = body_diff(old, new);
+            assert_eq!(diff.from_line, line);
+            assert_eq!(diff.to_line, line);
+            assert_eq!(diff.removed, removed);
+            assert_eq!(diff.added, added);
+        }
+    }
 }

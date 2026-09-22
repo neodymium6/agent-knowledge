@@ -16,6 +16,9 @@ use crate::ClientCommandError;
 const USAGE: &str = "usage:\n\
     agent-knowledge-client search-excerpts --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--excerpt-characters <count>]\n\
     agent-knowledge-client context --destination <ssh-destination> --project <id> [--query <text>] [--maximum-documents <count>] [--maximum-characters <count>]\n\
+    agent-knowledge-client history --destination <ssh-destination> --document-id <id> [--anchor-commit <hash>] [--cursor <hash>] [--maximum-results <count>]\n\
+    agent-knowledge-client get-at --destination <ssh-destination> --document-id <id> --commit <hash>\n\
+    agent-knowledge-client diff --destination <ssh-destination> --document-id <id> --from-commit <hash> --to-commit <hash>\n\
     agent-knowledge-client --version\n\
     agent-knowledge-client mcp --destination <ssh-destination> [--listen <loopback-address>] [--timeout-seconds <seconds>]\n\
     agent-knowledge-client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
@@ -181,7 +184,9 @@ where
         };
     }
     match action.to_str() {
-        Some(action @ ("search-excerpts" | "context")) => inspect::parse(action, arguments),
+        Some(action @ ("search-excerpts" | "context" | "history" | "get-at" | "diff")) => {
+            inspect::parse(action, arguments)
+        }
         Some("submit") => parse_submit_arguments(arguments),
         Some("mcp") => parse_mcp_arguments(arguments),
         Some("list") => parse_list_arguments(arguments, false),

@@ -189,9 +189,139 @@ fn context_deduplicates_guidance_and_excludes_deprecated_documents() {
 }
 
 #[test]
-fn rejects_invalid_excerpt_limits() {
+fn history_follows_move_archive_and_pages_at_a_fixed_anchor() {
     let root = TestDirectory::create();
     let gateway = read_gateway(&root);
+    let initial = head(&gateway);
+    let content = root.path().join("content");
+    let old = content.join(PATH);
+    let changed = fs::read_to_string(&old)
+        .unwrap_or_else(|e| panic!("read: {e}"))
+        .replace("safely", "carefully");
+    fs::write(&old, changed).unwrap_or_else(|e| panic!("write: {e}"));
+    commit(&root);
+    let updated = head(&gateway);
+    let archived = content.join(PATH.replace("/runbooks/", "/archive/runbooks/"));
+    fs::create_dir_all(archived.parent().unwrap_or_else(|| panic!("parent")))
+        .unwrap_or_else(|e| panic!("mkdir: {e}"));
+    fs::rename(&old, &archived).unwrap_or_else(|e| panic!("move: {e}"));
+    let text = fs::read_to_string(&archived).unwrap_or_else(|e| panic!("read: {e}"));
+    fs::write(
+        &archived,
+        text.replace("status: active", "status: archived"),
+    )
+    .unwrap_or_else(|e| panic!("write: {e}"));
+    // Move the attachment with its document bundle.
+    fs::rename(
+        old.with_file_name("procedure.json"),
+        archived.with_file_name("procedure.json"),
+    )
+    .unwrap_or_else(|e| panic!("move attachment: {e}"));
+    commit(&root);
+    let archived_commit = head(&gateway);
+    let Inspection::History {
+        anchor_commit,
+        entries,
+        next_cursor,
+    } = inspect(
+        &gateway,
+        InspectQuery::History {
+            document_id: id(),
+            anchor_commit: None,
+            cursor: None,
+            maximum_results: 1,
+        },
+    )
+    else {
+        panic!("history response")
+    };
+    assert_eq!(anchor_commit, archived_commit);
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].document.archived);
+    assert_eq!(next_cursor.as_deref(), Some(updated.as_str()));
+    // Publication after page one must not move the original pagination anchor.
+    let text = fs::read_to_string(&archived).unwrap_or_else(|e| panic!("read: {e}"));
+    fs::write(&archived, text.replace("carefully", "calmly"))
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    commit(&root);
+    assert_ne!(head(&gateway), anchor_commit);
+
+    let Inspection::History {
+        entries,
+        next_cursor,
+        ..
+    } = inspect(
+        &gateway,
+        InspectQuery::History {
+            document_id: id(),
+            anchor_commit: Some(anchor_commit),
+            cursor: next_cursor,
+            maximum_results: 10,
+        },
+    )
+    else {
+        panic!("history response")
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e.commit.as_str())
+            .collect::<Vec<_>>(),
+        [updated.as_str(), initial.as_str()]
+    );
+    assert!(next_cursor.is_none());
+    let Inspection::GetAt { document, .. } = inspect(
+        &gateway,
+        InspectQuery::GetAt {
+            document_id: id(),
+            commit: initial.clone(),
+        },
+    ) else {
+        panic!("get response")
+    };
+    assert!(document.markdown.contains("safely"));
+    assert!(!document.summary.archived);
+    let Inspection::Diff {
+        before,
+        after,
+        body,
+        ..
+    } = inspect(
+        &gateway,
+        InspectQuery::Diff {
+            document_id: id(),
+            from_commit: initial,
+            to_commit: archived_commit,
+        },
+    )
+    else {
+        panic!("diff response")
+    };
+    assert!(!before.archived && after.archived);
+    assert!(body.removed.contains("safely"));
+    assert!(body.added.contains("carefully"));
+    assert!(!body.removed.contains("schema_version"));
+}
+
+#[test]
+fn rejects_unpublished_commits_expressions_and_invalid_limits() {
+    let root = TestDirectory::create();
+    let gateway = read_gateway(&root);
+    for commit in [
+        "HEAD",
+        "main~1",
+        "--all",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        let error = gateway
+            .inspect(&request(InspectQuery::GetAt {
+                document_id: id(),
+                commit: commit.into(),
+            }))
+            .err()
+            .unwrap_or_else(|| panic!("request must fail"));
+        assert_eq!(error.error_code(), ErrorCode::InvalidRequest);
+    }
     let mut query = search("service");
     if let InspectQuery::SearchExcerpts {
         excerpt_characters, ..
@@ -206,6 +336,42 @@ fn rejects_invalid_excerpt_limits() {
             .unwrap_or_else(|| panic!("request must fail"))
             .error_code(),
         ErrorCode::LimitExceeded
+    );
+    // Import a real, unpublished commit without advancing the official branch.
+    let seed = root.path().join("seed");
+    fs::write(seed.join("fictional-draft.txt"), "unpublished")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    run_git(Some(&seed), &["add", "."]);
+    run_git(Some(&seed), &["commit", "-m", "Unpublished fictional work"]);
+    let draft = Command::new("git")
+        .current_dir(&seed)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap_or_else(|e| panic!("git: {e}"));
+    let draft = String::from_utf8(draft.stdout)
+        .unwrap_or_else(|e| panic!("utf8: {e}"))
+        .trim()
+        .to_owned();
+    run_git(
+        None,
+        &[
+            "--git-dir",
+            path_text(&root.path().join("repository")),
+            "fetch",
+            path_text(&seed),
+            "main:refs/heads/fictional-draft",
+        ],
+    );
+    assert_eq!(
+        gateway
+            .inspect(&request(InspectQuery::GetAt {
+                document_id: id(),
+                commit: draft
+            }))
+            .err()
+            .unwrap_or_else(|| panic!("request must fail"))
+            .error_code(),
+        ErrorCode::InvalidRequest
     );
 }
 

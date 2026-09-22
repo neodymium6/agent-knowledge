@@ -48,6 +48,21 @@ pub(super) fn parse(
             )?,
             maximum_characters: number(&mut values, "--maximum-characters", 20000, 100000)?,
         },
+        "history" => InspectQuery::History {
+            document_id: required(&mut values, "--document-id")?,
+            anchor_commit: optional(&mut values, "--anchor-commit")?,
+            cursor: optional(&mut values, "--cursor")?,
+            maximum_results: number(&mut values, "--maximum-results", 20, MAXIMUM_READ_RESULTS)?,
+        },
+        "get-at" => InspectQuery::GetAt {
+            document_id: required(&mut values, "--document-id")?,
+            commit: required(&mut values, "--commit")?,
+        },
+        "diff" => InspectQuery::Diff {
+            document_id: required(&mut values, "--document-id")?,
+            from_commit: required(&mut values, "--from-commit")?,
+            to_commit: required(&mut values, "--to-commit")?,
+        },
         _ => return Err(ParseError),
     };
     if !values.is_empty() {
@@ -103,6 +118,30 @@ mod tests {
         let cases = [
             ("search-excerpts", vec!["--query", "fictional service"]),
             ("context", vec!["--project", "fictional-project"]),
+            (
+                "history",
+                vec!["--document-id", "01K00000000000000000000001"],
+            ),
+            (
+                "get-at",
+                vec![
+                    "--document-id",
+                    "01K00000000000000000000001",
+                    "--commit",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ],
+            ),
+            (
+                "diff",
+                vec![
+                    "--document-id",
+                    "01K00000000000000000000001",
+                    "--from-commit",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--to-commit",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ],
+            ),
         ];
         for (action, flags) in cases {
             let mut args = vec!["--destination", "fictional-knowledge"];

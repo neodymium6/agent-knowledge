@@ -10,6 +10,9 @@ list, recent, get, export, search, and status wire formats remain unchanged.
 | --- | --- | --- |
 | `search-excerpts` | `knowledge_search_excerpts` | Ranked hits with raw field excerpts |
 | `context` | `knowledge_context` | Selected project documents from one snapshot |
+| `history` | `knowledge_history` | Committed Markdown and path changes |
+| `get-at` | `knowledge_get_at` | Exact Markdown at an official commit |
+| `diff` | `knowledge_diff` | Metadata and body changes between two commits |
 
 Every CLI command accepts `--destination` and the existing optional
 `--timeout-seconds`. The full package exposes them under `agent-knowledge client`.
@@ -82,3 +85,60 @@ otherwise it uses the body prefix. Partial Markdown can end inside a block.
 `truncated` indicates omitted or shortened selected content. It is a bounded
 reading list, not a complete project export or an automatically maintained
 project summary. A project with no eligible records returns empty lists.
+
+## History, historical reads, and differences
+
+```sh
+agent-knowledge-client history \
+  --destination fictional-knowledge \
+  --document-id 01K00000000000000000000001 \
+  --maximum-results 20
+```
+
+History identifies documents by front matter, so a move, reclassification, or
+archive does not break their identity. Entries report the changing commit,
+its document metadata/path/revision, and the previous Markdown revision.
+Unrelated commits and attachment-only changes are omitted.
+
+A page scans at most 100 first-parent commits and returns at most the requested
+number of changes (20 by default). Continue with both returned `anchor_commit`
+and `next_cursor`, including when an intermediate page has no entries. The
+anchor keeps subsequent pages stable when new commits are published. A null
+cursor ends the history. Tree-entry counts, cumulative Markdown bytes, Git
+output, and the operation deadline bound historical inspection; a budget
+failure is an error, not a successful incomplete history. The initial reader
+scans committed trees directly, so large repositories may require smaller pages
+or a future derived history index.
+
+Use full lowercase commit IDs returned by reads/history for historical reads
+and comparisons. The following hashes are fictional placeholders:
+
+```sh
+agent-knowledge-client get-at \
+  --destination fictional-knowledge \
+  --document-id 01K00000000000000000000001 \
+  --commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+agent-knowledge-client diff \
+  --destination fictional-knowledge \
+  --document-id 01K00000000000000000000001 \
+  --from-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --to-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+```
+
+Both commits must be reachable from the official commit pinned at operation
+start. Abbreviations, revision expressions, and unpublished transaction commits
+are rejected. If the document does not exist at a requested endpoint, the
+operation returns `DOCUMENT_NOT_FOUND`.
+
+`get-at` returns exact Markdown including front matter. `diff` returns complete
+before/after metadata and a body-only changed line range, trimming identical
+prefix and suffix lines. The range uses one-based body line numbers and
+preserves line endings. Multiple separated edits appear in one contiguous
+replacement range; this is not a minimal multi-hunk patch. An unchanged body
+has empty added/removed strings, even when metadata or the path changed.
+
+History is commit-granular. Multiple accepted requests can share one commit;
+intermediate states within that batch are not exposed as separate revisions.
+These tools provide reads, not rollback. Archived historical content remains
+readable under the same existing access model.

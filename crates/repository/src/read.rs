@@ -1,3 +1,6 @@
+mod history;
+pub use history::{HistoricalDocument, HistoryReader};
+
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, TryLockError};
@@ -966,6 +969,8 @@ impl SearchBackend for LinearSearch {
 /// Failure while opening or querying an exact committed read snapshot.
 #[derive(Debug)]
 pub enum CommittedReadError {
+    /// A historical selector is malformed or outside the official ancestry.
+    InvalidHistorySelector,
     /// Repository validation or Git execution failed.
     Repository(Box<GitTransactionError>),
     /// Filesystem I/O failed outside repository validation.
@@ -1042,6 +1047,9 @@ pub enum CommittedReadError {
 impl fmt::Display for CommittedReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidHistorySelector => {
+                formatter.write_str("invalid historical commit or cursor")
+            }
             Self::Repository(error) => {
                 write!(formatter, "committed repository read failed: {error}")
             }

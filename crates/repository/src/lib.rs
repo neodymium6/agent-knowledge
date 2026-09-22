@@ -19,8 +19,9 @@ pub use index::{
 };
 pub use read::{
     CommittedBundle, CommittedBundleEntry, CommittedDocument, CommittedReadError,
-    CommittedSnapshot, CommittedStore, DetachedSnapshot, FieldExcerpt, LinearSearch, ReadFilter,
-    SearchBackend, SearchMetadataFields, SearchPolicy, linear_excerpts,
+    CommittedSnapshot, CommittedStore, DetachedSnapshot, FieldExcerpt, HistoricalDocument,
+    HistoryReader, LinearSearch, ReadFilter, SearchBackend, SearchMetadataFields, SearchPolicy,
+    linear_excerpts,
 };
 pub use replication::{
     RemoteReplicationError, RemoteReplicationOutcome, RemoteReplicationPolicy,

@@ -514,9 +514,9 @@ fn committed(error: CommittedReadError) -> GatewayError {
 pub(super) fn committed_error_code(error: &CommittedReadError) -> ErrorCode {
     match error {
         CommittedReadError::DocumentNotFound { .. } => ErrorCode::DocumentNotFound,
-        CommittedReadError::EmptyQuery | CommittedReadError::InvalidResultLimit => {
-            ErrorCode::InvalidRequest
-        }
+        CommittedReadError::InvalidHistorySelector
+        | CommittedReadError::EmptyQuery
+        | CommittedReadError::InvalidResultLimit => ErrorCode::InvalidRequest,
         CommittedReadError::QueryTooLong { .. }
         | CommittedReadError::SearchDocumentLimitExceeded { .. }
         | CommittedReadError::SearchMarkdownByteLimitExceeded { .. }
