@@ -101,14 +101,16 @@ revision, returning BM25-ranked results. A configured index that is absent,
 stale, or unreadable is a retryable failure. Deployments that omit
 `search_index_root` retain the bounded Markdown scan backend.
 
-Additional read tools provide search excerpts:
+Additional read tools provide search excerpts and bounded project context:
 
 ```sh
 agent-knowledge-client search-excerpts --destination fictional-knowledge \
   --project fictional-project --query "fictional restart"
+agent-knowledge-client context --destination fictional-knowledge \
+  --project fictional-project --maximum-characters 20000
 ```
 
-The corresponding MCP tool is `knowledge_search_excerpts`.
+The corresponding MCP tools are `knowledge_search_excerpts` and `knowledge_context`.
 See [read operations](docs/read-operations.md) for bounds and compatibility.
 
 SSH host aliases, identities, host-key policy, and proxies belong in the

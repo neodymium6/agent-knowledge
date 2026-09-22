@@ -37,6 +37,17 @@ pub(super) fn parse(
             maximum_results: number(&mut values, "--maximum-results", 10, MAXIMUM_READ_RESULTS)?,
             excerpt_characters: number(&mut values, "--excerpt-characters", 300, 2000)?,
         },
+        "context" => InspectQuery::Context {
+            project: required(&mut values, "--project")?,
+            query: optional(&mut values, "--query")?,
+            maximum_documents: number(
+                &mut values,
+                "--maximum-documents",
+                10,
+                MAXIMUM_READ_RESULTS,
+            )?,
+            maximum_characters: number(&mut values, "--maximum-characters", 20000, 100000)?,
+        },
         _ => return Err(ParseError),
     };
     if !values.is_empty() {
@@ -89,7 +100,10 @@ mod tests {
     use super::*;
     #[test]
     fn parses_inspection_commands_and_rejects_irrelevant_or_duplicate_flags() {
-        let cases = [("search-excerpts", vec!["--query", "fictional service"])];
+        let cases = [
+            ("search-excerpts", vec!["--query", "fictional service"]),
+            ("context", vec!["--project", "fictional-project"]),
+        ];
         for (action, flags) in cases {
             let mut args = vec!["--destination", "fictional-knowledge"];
             args.extend(flags);
@@ -101,18 +115,28 @@ mod tests {
             assert!(parse(action, args.iter().map(OsString::from)).is_err());
         }
         for flags in [
-            vec!["--query", "fictional", "--excerpt-characters", "0"],
-            vec!["--query", "fictional", "--excerpt-characters", "2001"],
-            vec!["--query", "fictional", "--query", "other"],
             vec![
-                "--query",
-                "fictional",
-                "--include-archived",
-                "--include-archived",
+                "--project",
+                "fictional-project",
+                "--maximum-characters",
+                "0",
             ],
+            vec![
+                "--project",
+                "fictional-project",
+                "--maximum-characters",
+                "100001",
+            ],
+            vec![
+                "--project",
+                "fictional-project",
+                "--project",
+                "fictional-other",
+            ],
+            vec!["--project", "fictional-project", "--include-archived"],
         ] {
             let args = [vec!["--destination", "fictional-knowledge"], flags].concat();
-            assert!(parse("search-excerpts", args.iter().map(OsString::from)).is_err());
+            assert!(parse("context", args.iter().map(OsString::from)).is_err());
         }
     }
 }

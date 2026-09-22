@@ -116,6 +116,79 @@ fn excerpt_queries_keep_index_syntax_and_fail_closed_on_stale_index() {
 }
 
 #[test]
+fn context_uses_one_snapshot_prioritizes_index_and_reports_unicode_truncation() {
+    let root = TestDirectory::create();
+    let gateway = read_gateway(&root);
+    let text = "---\nschema_version: 1\ndocument_id: 01K00000000000000000000003\ntitle: Fictional project\ncreated: 2026-07-31T03:50:00Z\nrequest_id: 01K00000000000000000000004\ntags: []\nstatus: active\n---\n日本語のプロジェクト概要です。\n";
+    fs::write(
+        root.path()
+            .join("content/projects/fictional-project/index.md"),
+        text,
+    )
+    .unwrap_or_else(|e| panic!("write: {e}"));
+    commit(&root);
+    let query = InspectQuery::Context {
+        project: "fictional-project"
+            .parse()
+            .unwrap_or_else(|e| panic!("project: {e}")),
+        query: None,
+        maximum_documents: 5,
+        maximum_characters: 5,
+    };
+    let Inspection::Context {
+        commit,
+        documents,
+        additional,
+        truncated,
+    } = inspect(&gateway, query)
+    else {
+        panic!("context response")
+    };
+    assert_eq!(commit, head(&gateway));
+    assert!(truncated);
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0].reason, "project_index");
+    assert_eq!(documents[0].body.chars().count(), 5);
+    assert!(documents[0].truncated);
+    assert_eq!(additional.len(), 1);
+    assert_eq!(additional[0].metadata.document_id, id());
+}
+
+#[test]
+fn context_deduplicates_guidance_and_excludes_deprecated_documents() {
+    let root = TestDirectory::create();
+    let gateway = read_gateway(&root);
+    let query = || InspectQuery::Context {
+        project: "fictional-project"
+            .parse()
+            .unwrap_or_else(|e| panic!("project: {e}")),
+        query: Some("service".into()),
+        maximum_documents: 10,
+        maximum_characters: 1000,
+    };
+    let Inspection::Context {
+        documents,
+        truncated,
+        ..
+    } = inspect(&gateway, query())
+    else {
+        panic!("context response")
+    };
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0].reason, "related_guidance");
+    assert!(!truncated);
+    let path = root.path().join("content").join(PATH);
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read: {e}"));
+    fs::write(path, text.replace("status: active", "status: deprecated"))
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    commit(&root);
+    let Inspection::Context { documents, .. } = inspect(&gateway, query()) else {
+        panic!("context response")
+    };
+    assert!(documents.is_empty());
+}
+
+#[test]
 fn rejects_invalid_excerpt_limits() {
     let root = TestDirectory::create();
     let gateway = read_gateway(&root);

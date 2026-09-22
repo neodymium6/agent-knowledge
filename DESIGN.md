@@ -1735,6 +1735,10 @@ Search excerpts retain one committed snapshot while selecting and reading
 bounded source text. Character budgets count Unicode scalar values; the
 existing encoded response-byte limit covers metadata and JSON framing as well.
 
+Context selection uses the same snapshot and is deterministic. It excludes
+archived, deprecated, and superseded documents, with a total character budget
+across selected bodies and bounded references to additional documents.
+
 See [read operations](docs/read-operations.md) for the complete public contract.
 
 ## 24. Search

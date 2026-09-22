@@ -1,10 +1,11 @@
 //! Read-only inspection of a committed snapshot or official ancestry.
 use super::*;
-use agent_knowledge_core::{DocumentId, markdown_body};
+use agent_knowledge_core::{DocumentId, DocumentStatus, DocumentType, markdown_body};
 use agent_knowledge_protocol::{
-    Excerpt, InspectQuery, InspectRequest, InspectResponse, Inspection, SearchHit,
+    ContextDocument, Excerpt, InspectQuery, InspectRequest, InspectResponse, Inspection, SearchHit,
 };
 use agent_knowledge_repository::{CommittedSnapshot, TantivySearchIndex, linear_excerpts};
+use std::collections::HashSet;
 
 pub(crate) fn inspect_until(
     settings: &GatewaySettings,
@@ -68,6 +69,39 @@ pub(crate) fn inspect_until(
                         commit: snapshot.commit().into(),
                         hits,
                     })
+                },
+                deadline,
+            )?
+        }
+        InspectQuery::Context {
+            project,
+            query,
+            maximum_documents,
+            maximum_characters,
+        } => {
+            validate_result_limit(settings, *maximum_documents)?;
+            bounded(*maximum_characters, 100_000)?;
+            let snapshot = snapshot(settings, store, deadline)?;
+            let settings = settings.clone();
+            let filter = ReadFilterRequest {
+                project: Some(project.clone()),
+                ..ReadFilterRequest::default()
+            };
+            let query = query.clone();
+            let maximum = *maximum_documents;
+            let characters = *maximum_characters;
+            run_until(
+                move || {
+                    context(
+                        &settings,
+                        snapshot,
+                        search_indexes,
+                        &filter,
+                        query.as_deref(),
+                        maximum,
+                        characters,
+                        deadline,
+                    )
                 },
                 deadline,
             )?
@@ -227,5 +261,132 @@ fn read_document(
     Ok(DocumentContent {
         summary: document_summary(record)?,
         markdown,
+    })
+}
+#[allow(clippy::too_many_arguments)]
+fn context(
+    settings: &GatewaySettings,
+    snapshot: CommittedSnapshot,
+    search_indexes: Option<PathAttestation>,
+    filter: &ReadFilterRequest,
+    query: Option<&str>,
+    maximum: usize,
+    characters: usize,
+    deadline: Instant,
+) -> Result<Inspection, GatewayError> {
+    let eligible = |record: &&DocumentRecord| {
+        !matches!(
+            record.metadata().status,
+            DocumentStatus::Deprecated | DocumentStatus::Archived
+        ) && record.metadata().superseded_by.is_none()
+    };
+    let all = snapshot
+        .list(&repository_filter(filter), settings.maximum_index_entries())
+        .map_err(committed)?;
+    let mut candidates = Vec::new();
+    for record in all
+        .iter()
+        .copied()
+        .filter(eligible)
+        .filter(|r| r.location().document_type() == DocumentType::Index)
+    {
+        candidates.push((record, "project_index"));
+    }
+    let index = if query.is_some() {
+        open_index(search_indexes, snapshot.commit())?
+    } else {
+        None
+    };
+    if let Some(query) = query {
+        let ranked = ranked(
+            settings,
+            &snapshot,
+            index.as_ref(),
+            query,
+            filter,
+            settings.maximum_index_entries(),
+            deadline,
+        )?;
+        for kind in [true, false] {
+            for record in ranked.iter().copied().filter(eligible).filter(|r| {
+                matches!(
+                    r.location().document_type(),
+                    DocumentType::Decision | DocumentType::Runbook
+                ) == kind
+            }) {
+                candidates.push((
+                    record,
+                    if kind {
+                        "related_guidance"
+                    } else {
+                        "query_match"
+                    },
+                ));
+            }
+        }
+    } else {
+        for record in all.iter().copied().filter(eligible).filter(|r| {
+            matches!(
+                r.location().document_type(),
+                DocumentType::Decision | DocumentType::Runbook
+            )
+        }) {
+            candidates.push((record, "project_guidance"));
+        }
+    }
+    let recent = snapshot
+        .recent(&repository_filter(filter), settings.maximum_index_entries())
+        .map_err(committed)?;
+    candidates.extend(
+        recent
+            .into_iter()
+            .filter(eligible)
+            .take(3)
+            .map(|r| (r, "recent")),
+    );
+    let mut seen = HashSet::new();
+    candidates.retain(|(r, _)| seen.insert(r.metadata().document_id));
+    let mut documents = Vec::new();
+    let mut additional = Vec::new();
+    let mut remaining = characters;
+    let mut bytes = 0;
+    let mut truncated = false;
+    for (record, reason) in candidates {
+        check_deadline(deadline)?;
+        if documents.len() >= maximum || remaining == 0 {
+            truncated = true;
+            if additional.len() < maximum {
+                additional.push(document_summary(record)?);
+            }
+            continue;
+        }
+        let doc = read_document(settings, &snapshot, record, &mut bytes)?;
+        let raw = body(&doc.markdown, record.metadata().document_id)?;
+        let text = if raw.chars().count() <= remaining {
+            raw.to_owned()
+        } else if let Some(query) = query {
+            excerpts(settings, index.as_ref(), record, raw, query, remaining)?
+                .into_iter()
+                .find(|e| e.field == "body")
+                .map(|e| e.text)
+                .unwrap_or_else(|| raw.chars().take(remaining).collect())
+        } else {
+            raw.chars().take(remaining).collect()
+        };
+        let shortened = text != raw;
+        remaining = remaining.saturating_sub(text.chars().count());
+        truncated |= shortened;
+        documents.push(ContextDocument {
+            document: doc.summary,
+            reason: reason.into(),
+            body: text,
+            truncated: shortened,
+        });
+    }
+    Ok(Inspection::Context {
+        commit: snapshot.commit().into(),
+        documents,
+        additional,
+        truncated,
     })
 }

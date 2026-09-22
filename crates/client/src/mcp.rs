@@ -1,6 +1,6 @@
 mod inspect;
 use agent_knowledge_protocol::{InspectRequest, InspectResponse};
-use inspect::ExcerptParameters;
+use inspect::{ContextParameters, ExcerptParameters};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -230,6 +230,20 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
     async fn search_excerpts(
         &self,
         Parameters(parameters): Parameters<ExcerptParameters>,
+    ) -> Result<CallToolResult, String> {
+        let request = parameters.request()?;
+        let client = self.client.clone();
+        structured(run_blocking(move || client.inspect(&request), C::format_error).await?)
+    }
+
+    #[tool(
+        name = "knowledge_context",
+        description = "Read a project index, relevant guidance and recent records from one commit within a body character budget. Returns selection reasons and truncation flags.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn context(
+        &self,
+        Parameters(parameters): Parameters<ContextParameters>,
     ) -> Result<CallToolResult, String> {
         let request = parameters.request()?;
         let client = self.client.clone();
@@ -777,6 +791,7 @@ mod tests {
             names,
             [
                 "knowledge_archive_document",
+                "knowledge_context",
                 "knowledge_create_document",
                 "knowledge_get",
                 "knowledge_list",

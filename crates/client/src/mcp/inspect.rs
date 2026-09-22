@@ -40,6 +40,31 @@ impl ExcerptParameters {
         }))
     }
 }
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ContextParameters {
+    /// Project whose index, guidance and recent records should be selected.
+    project: String,
+    /// Optional task-related search expression.
+    #[serde(default)]
+    query: Option<String>,
+    /// Maximum selected documents. Defaults to 10.
+    #[serde(default)]
+    maximum_documents: Option<usize>,
+    /// Total Unicode characters in returned bodies, 1..100000. Defaults to 20000.
+    #[serde(default)]
+    maximum_characters: Option<usize>,
+}
+impl ContextParameters {
+    pub(super) fn request(self) -> Result<InspectRequest, String> {
+        Ok(request(InspectQuery::Context {
+            project: self.project.parse().map_err(|_| "invalid project slug")?,
+            query: self.query,
+            maximum_documents: bounded(self.maximum_documents.unwrap_or(10), MAXIMUM_RESULTS)?,
+            maximum_characters: bounded(self.maximum_characters.unwrap_or(20000), 100000)?,
+        }))
+    }
+}
 fn request(query: InspectQuery) -> InspectRequest {
     InspectRequest {
         protocol_version: CURRENT_GATEWAY_PROTOCOL_VERSION,

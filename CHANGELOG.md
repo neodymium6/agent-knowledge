@@ -6,6 +6,8 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 - Add CLI and MCP search excerpts with source fields and truncation markers,
   preserving the configured search semantics and exact committed snapshot.
+- Add bounded project context assembled from its index, related guidance,
+  and recent records, with selection reasons and omitted-document references.
 
 ## 0.3.0
 

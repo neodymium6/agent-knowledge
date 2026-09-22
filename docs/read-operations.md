@@ -9,6 +9,7 @@ list, recent, get, export, search, and status wire formats remain unchanged.
 | CLI command | MCP tool | Purpose |
 | --- | --- | --- |
 | `search-excerpts` | `knowledge_search_excerpts` | Ranked hits with raw field excerpts |
+| `context` | `knowledge_context` | Selected project documents from one snapshot |
 
 Every CLI command accepts `--destination` and the existing optional
 `--timeout-seconds`. The full package exposes them under `agent-knowledge client`.
@@ -44,3 +45,40 @@ The new operation retains a committed snapshot until extraction completes.
 Ranking and source text cannot straddle publication. Selected Markdown reads,
 response bytes, and the entire operation have enforced bounds. A configured
 missing or stale index remains a retryable failure.
+
+## Project context
+
+```sh
+agent-knowledge-client context \
+  --destination fictional-knowledge \
+  --project fictional-project \
+  --query 'fictional recovery' \
+  --maximum-documents 10 \
+  --maximum-characters 20000
+```
+
+Selection is deterministic and requires no model or external service:
+
+1. Include the project's index document.
+2. With a query, select matching decisions and runbooks in search order, then
+   other matching documents. Without a query, select decisions and runbooks
+   in canonical path order.
+3. Include up to three recent eligible records.
+4. Deduplicate by permanent document ID and apply the budgets.
+
+Archived, deprecated, and superseded records are excluded from context.
+Completed records remain eligible. Every selected document has a reason,
+metadata/revision, a raw Markdown body, and a truncation flag. Bodies exclude
+YAML front matter. All results come from the same commit.
+
+The default budget is 10 documents and 20000 Unicode scalar values across
+returned bodies, with a hard character maximum of 100000. Metadata is outside
+that body budget but remains subject to the encoded response-byte limit. The
+budget is not a model-specific token count. A large document may consume the
+remaining budget. A shortened query-related body prefers a matching excerpt;
+otherwise it uses the body prefix. Partial Markdown can end inside a block.
+
+`additional` contains up to `maximum_documents` omitted candidate summaries;
+`truncated` indicates omitted or shortened selected content. It is a bounded
+reading list, not a complete project export or an automatically maintained
+project summary. A project with no eligible records returns empty lists.
