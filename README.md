@@ -420,3 +420,6 @@ Changes are recorded in [CHANGELOG.md](CHANGELOG.md). Security reports follow
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
+
+See [client and Gateway versions](docs/versions-and-updates.md) for version and
+capability reporting through CLI and MCP.

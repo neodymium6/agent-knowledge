@@ -77,6 +77,7 @@ fn archives_a_document_through_the_stdio_mcp_server() {
         })
     )
     .unwrap_or_else(|error| panic!("archive tool request must be written: {error}"));
+    writeln!(input, "{}", serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"knowledge_version","arguments":{}}})).unwrap_or_else(|e| panic!("version request: {e}"));
     drop(input);
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -146,6 +147,19 @@ fn archives_a_document_through_the_stdio_mcp_server() {
         archive["result"]["structuredContent"]["request_id"],
         REQUEST_ID
     );
+    let version = responses
+        .iter()
+        .find(|response| response["id"] == 4)
+        .unwrap_or_else(|| panic!("version response: {output}"));
+    assert_eq!(
+        version["result"]["structuredContent"]["client_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(
+        version["result"]["structuredContent"]["server"]["status"],
+        "unavailable"
+    );
+    assert!(diagnostic.is_empty());
     assert!(submitted_archive.is_file());
 }
 

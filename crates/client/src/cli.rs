@@ -19,6 +19,7 @@ const USAGE: &str = "usage:\n\
     agent-knowledge-client history --destination <ssh-destination> --document-id <id> [--anchor-commit <hash>] [--cursor <hash>] [--maximum-results <count>]\n\
     agent-knowledge-client get-at --destination <ssh-destination> --document-id <id> --commit <hash>\n\
     agent-knowledge-client diff --destination <ssh-destination> --document-id <id> --from-commit <hash> --to-commit <hash>\n\
+    agent-knowledge-client version [--destination <ssh-destination>]\n\
     agent-knowledge-client --version\n\
     agent-knowledge-client mcp --destination <ssh-destination> [--listen <loopback-address>] [--timeout-seconds <seconds>]\n\
     agent-knowledge-client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
@@ -41,6 +42,9 @@ pub enum Command {
         timeout: Duration,
     },
     Version,
+    VersionReport {
+        destination: Option<OsString>,
+    },
     Mcp {
         destination: OsString,
         listen: Option<SocketAddr>,
@@ -96,6 +100,18 @@ where
     W: Write,
 {
     match command {
+        Command::VersionReport { destination } => {
+            let server = match destination {
+                Some(destination) => crate::SshClient::new(destination, Duration::from_secs(5))
+                    .map_err(CliError::Command)?
+                    .server_version(),
+                None => crate::version::ServerVersion::NotRequested,
+            };
+            serde_json::to_writer(&mut output, &crate::version::VersionReport::new(server))
+                .map_err(|e| CliError::Command(ClientCommandError::EncodeResponse(e)))?;
+            writeln!(output).map_err(CliError::Output)
+        }
+
         Command::Inspect {
             destination,
             request,
@@ -179,6 +195,23 @@ where
     if action == "--version" {
         return if arguments.next().is_none() {
             Ok(Command::Version)
+        } else {
+            Err(ParseError)
+        };
+    }
+    if action == "version" {
+        let destination = match arguments.next() {
+            None => None,
+            Some(flag) if flag == "--destination" => Some(
+                arguments
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .ok_or(ParseError)?,
+            ),
+            _ => return Err(ParseError),
+        };
+        return if arguments.next().is_none() {
+            Ok(Command::VersionReport { destination })
         } else {
             Err(ParseError)
         };

@@ -152,6 +152,33 @@ where
                 .map_err(gateway_error)?;
             write_encoded_response_until(output, encoded, deadline)
         }
+        GatewayCommand::Version => {
+            let request: agent_knowledge_protocol::VersionRequest = decode_control_request(input)?;
+            if request.protocol_version != CURRENT_GATEWAY_PROTOCOL_VERSION {
+                return Err(GatewayCommandError::Gateway(Box::new(
+                    GatewayError::ReadRequest(
+                        agent_knowledge_gateway::ReadRequestError::UnsupportedProtocolVersion {
+                            found: request.protocol_version,
+                        },
+                    ),
+                )));
+            }
+            let deadline = read_deadline(&settings);
+            let response =
+                agent_knowledge_protocol::VersionResponse::current(env!("CARGO_PKG_VERSION"));
+            let mut encoded = serde_json::to_vec(&response).map_err(GatewayCommandError::Json)?;
+            encoded.push(b'\n');
+            if encoded.len() as u64 > settings.maximum_response_bytes() {
+                return Err(GatewayCommandError::Gateway(Box::new(
+                    GatewayError::ReadRequest(
+                        agent_knowledge_gateway::ReadRequestError::ResponseTooLarge {
+                            maximum: settings.maximum_response_bytes(),
+                        },
+                    ),
+                )));
+            }
+            write_encoded_response_until(output, encoded, deadline)
+        }
         GatewayCommand::Status => {
             let request: agent_knowledge_protocol::StatusRequest = decode_control_request(input)?;
             if request.protocol_version != CURRENT_GATEWAY_PROTOCOL_VERSION {
@@ -510,6 +537,58 @@ mod tests {
     use super::GatewayCommandError;
     #[cfg(target_os = "linux")]
     use super::{DeadlineReader, write_encoded_response_until};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn version_reporting_needs_no_repository_or_queue_and_obeys_limits() {
+        let config = "schema_version: 4\nidentity:\n  gateway_uid: 61001\nstorage:\n  queue_socket: /run/agent-knowledge/queue-ingress.sock\n  git_directory: /srv/fictional-knowledge/repository\n  content_root: /srv/fictional-knowledge/content\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 10000\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n";
+        let invoke = |config: &str, request: &[u8]| {
+            let (writer, mut reader) =
+                UnixStream::pair().unwrap_or_else(|e| panic!("fixture: {e}"));
+            let settings = agent_knowledge_gateway::GatewaySettings::decode(config)
+                .unwrap_or_else(|e| panic!("fixture: {e}"));
+            let result = super::run_with_settings(
+                settings,
+                OsStr::new("fictional-client"),
+                Some("akp-v1 version".into()),
+                request,
+                writer,
+            );
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
+                .unwrap_or_else(|e| panic!("fixture: {e}"));
+            (result, bytes)
+        };
+        let (result, bytes) = invoke(config, br#"{"protocol_version":1}"#);
+        assert!(result.is_ok());
+        let response: agent_knowledge_protocol::VersionResponse =
+            serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("response: {e}"));
+        assert_eq!(response.gateway_version, env!("CARGO_PKG_VERSION"));
+        assert!(
+            response
+                .commands
+                .iter()
+                .any(|value| value == "akp-v1 version")
+        );
+        for request in [
+            br#"{"protocol_version":2}"#.as_slice(),
+            br#"{"protocol_version":1,"extra":true}"#,
+        ] {
+            let (result, bytes) = invoke(config, request);
+            assert!(result.is_err());
+            assert!(bytes.is_empty());
+        }
+        let (result, bytes) = invoke(
+            &config.replace(
+                "maximum_response_bytes: 268435456",
+                "maximum_response_bytes: 1",
+            ),
+            br#"{"protocol_version":1}"#,
+        );
+        assert!(result.is_err());
+        assert!(bytes.is_empty());
+    }
 
     #[test]
     fn command_selection_failures_emit_only_a_versioned_protocol_error() {

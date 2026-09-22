@@ -7,6 +7,8 @@ pub use inspect::{
     InspectResponse, Inspection, SearchHit,
 };
 mod status;
+mod version;
+pub use version::{VersionRequest, VersionResponse};
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -39,11 +41,15 @@ pub const SEARCH_COMMAND: &str = "akp-v1 search";
 pub const STATUS_COMMAND: &str = "akp-v1 status";
 /// The additive committed inspection command.
 pub const INSPECT_COMMAND: &str = "akp-v1 inspect";
+/// The additive Gateway version and capability command.
+pub const VERSION_COMMAND: &str = "akp-v1 version";
 const MAXIMUM_CLIENT_ID_BYTES: usize = 63;
 
 /// One operation selected by an authenticated SSH session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GatewayCommand {
+    /// Reports the running Gateway binary and its supported operations.
+    Version,
     /// Retrieves excerpts, context, or committed document history.
     Inspect,
     /// Streams one uncompressed request-package tar archive on standard input.
@@ -71,6 +77,7 @@ impl GatewayCommand {
     /// commands, including leading or trailing whitespace.
     pub fn parse(original: &OsStr) -> Result<Self, GatewayCommandError> {
         match original {
+            value if value == OsStr::new(VERSION_COMMAND) => Ok(Self::Version),
             value if value == OsStr::new(INSPECT_COMMAND) => Ok(Self::Inspect),
             value if value == OsStr::new(SUBMIT_COMMAND) => Ok(Self::Submit),
             value if value == OsStr::new(LIST_COMMAND) => Ok(Self::List),
@@ -87,6 +94,7 @@ impl GatewayCommand {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Version => VERSION_COMMAND,
             Self::Inspect => INSPECT_COMMAND,
             Self::Submit => SUBMIT_COMMAND,
             Self::List => LIST_COMMAND,
@@ -299,6 +307,7 @@ mod tests {
             Ok(GatewayCommand::Submit)
         );
         for (command, expected) in [
+            (super::VERSION_COMMAND, GatewayCommand::Version),
             (LIST_COMMAND, GatewayCommand::List),
             (RECENT_COMMAND, GatewayCommand::Recent),
             (GET_COMMAND, GatewayCommand::Get),

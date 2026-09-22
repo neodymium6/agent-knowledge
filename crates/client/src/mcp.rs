@@ -40,6 +40,7 @@ trait KnowledgeBackend: Clone + Send + Sync + 'static {
         error.to_string()
     }
 
+    fn server_version(&self) -> crate::version::ServerVersion;
     fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error>;
     fn list(&self, request: &ListRequest) -> Result<ListResponse, Self::Error>;
     fn recent(&self, request: &ListRequest) -> Result<ListResponse, Self::Error>;
@@ -51,6 +52,10 @@ trait KnowledgeBackend: Clone + Send + Sync + 'static {
 
 impl KnowledgeBackend for SshClient {
     type Error = ClientCommandError;
+
+    fn server_version(&self) -> crate::version::ServerVersion {
+        SshClient::server_version(self)
+    }
 
     fn format_error(error: &Self::Error) -> String {
         error.mcp_message()
@@ -224,6 +229,21 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
 
 #[tool_router]
 impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
+    #[tool(
+        name = "knowledge_version",
+        description = "Read local client and connected Gateway versions and advertised protocol capabilities. Release differences do not imply incompatibility.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn version(&self) -> Result<CallToolResult, String> {
+        let client = self.client.clone();
+        let report = run_blocking(
+            move || Ok::<_, C::Error>(crate::version::VersionReport::new(client.server_version())),
+            C::format_error,
+        )
+        .await?;
+        structured(report)
+    }
+
     #[tool(
         name = "knowledge_search_excerpts",
         description = "Search committed knowledge and return bounded raw query-term excerpts with field names.",
@@ -646,6 +666,9 @@ mod tests {
 
     impl KnowledgeBackend for FakeBackend {
         type Error = Infallible;
+        fn server_version(&self) -> crate::version::ServerVersion {
+            crate::version::ServerVersion::Unsupported
+        }
 
         fn submit(&self, _package_root: &std::path::Path) -> Result<SubmitResponse, Self::Error> {
             unreachable!()
@@ -684,6 +707,9 @@ mod tests {
 
     impl KnowledgeBackend for TestSubmitBackend {
         type Error = &'static str;
+        fn server_version(&self) -> crate::version::ServerVersion {
+            crate::version::ServerVersion::Unavailable
+        }
 
         fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error> {
             let package = agent_knowledge_queue::validate_package(
@@ -740,6 +766,9 @@ mod tests {
 
     impl KnowledgeBackend for ArchiveBackend {
         type Error = &'static str;
+        fn server_version(&self) -> crate::version::ServerVersion {
+            crate::version::ServerVersion::Unavailable
+        }
 
         fn submit(&self, package_root: &Path) -> Result<SubmitResponse, Self::Error> {
             let package = agent_knowledge_queue::validate_package(
@@ -847,6 +876,7 @@ mod tests {
                 "knowledge_search",
                 "knowledge_search_excerpts",
                 "knowledge_submit_package",
+                "knowledge_version",
             ]
         );
 
@@ -1176,6 +1206,15 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("fictional-commit")
         );
+        let version = client
+            .call_tool(CallToolRequestParams::new("knowledge_version"))
+            .await
+            .unwrap_or_else(|e| panic!("version tool: {e}"));
+        let version = version
+            .structured_content
+            .unwrap_or_else(|| panic!("structured version"));
+        assert_eq!(version["client_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(version["server"]["status"], "unsupported");
         client
             .cancel()
             .await
