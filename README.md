@@ -101,6 +101,16 @@ revision, returning BM25-ranked results. A configured index that is absent,
 stale, or unreadable is a retryable failure. Deployments that omit
 `search_index_root` retain the bounded Markdown scan backend.
 
+Additional read tools provide search excerpts:
+
+```sh
+agent-knowledge-client search-excerpts --destination fictional-knowledge \
+  --project fictional-project --query "fictional restart"
+```
+
+The corresponding MCP tool is `knowledge_search_excerpts`.
+See [read operations](docs/read-operations.md) for bounds and compatibility.
+
 SSH host aliases, identities, host-key policy, and proxies belong in the
 client's OpenSSH configuration. The client disables interactive prompts, TTYs,
 and forwarding and enforces bounded request, response, and transfer sizes.

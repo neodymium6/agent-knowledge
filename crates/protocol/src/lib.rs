@@ -1,6 +1,11 @@
 //! Versioned SSH command and JSON wire types shared by Gateway and client.
 
+mod inspect;
 mod read;
+pub use inspect::{
+    BodyDiff, ContextDocument, Excerpt, HistoryEntry, InspectQuery, InspectRequest,
+    InspectResponse, Inspection, SearchHit,
+};
 mod status;
 
 use std::ffi::OsStr;
@@ -32,11 +37,15 @@ pub const EXPORT_COMMAND: &str = "akp-v1 export";
 pub const SEARCH_COMMAND: &str = "akp-v1 search";
 /// The exact remote command used to inspect one durable request state.
 pub const STATUS_COMMAND: &str = "akp-v1 status";
+/// The additive committed inspection command.
+pub const INSPECT_COMMAND: &str = "akp-v1 inspect";
 const MAXIMUM_CLIENT_ID_BYTES: usize = 63;
 
 /// One operation selected by an authenticated SSH session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GatewayCommand {
+    /// Retrieves excerpts, context, or committed document history.
+    Inspect,
     /// Streams one uncompressed request-package tar archive on standard input.
     Submit,
     /// Lists committed document metadata.
@@ -62,6 +71,7 @@ impl GatewayCommand {
     /// commands, including leading or trailing whitespace.
     pub fn parse(original: &OsStr) -> Result<Self, GatewayCommandError> {
         match original {
+            value if value == OsStr::new(INSPECT_COMMAND) => Ok(Self::Inspect),
             value if value == OsStr::new(SUBMIT_COMMAND) => Ok(Self::Submit),
             value if value == OsStr::new(LIST_COMMAND) => Ok(Self::List),
             value if value == OsStr::new(RECENT_COMMAND) => Ok(Self::Recent),
@@ -77,6 +87,7 @@ impl GatewayCommand {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Inspect => INSPECT_COMMAND,
             Self::Submit => SUBMIT_COMMAND,
             Self::List => LIST_COMMAND,
             Self::Recent => RECENT_COMMAND,

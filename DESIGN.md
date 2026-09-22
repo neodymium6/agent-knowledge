@@ -1723,6 +1723,20 @@ delivery to the SSH channel. Deadline-aware Git inspection runs in an isolated
 process group that is terminated and reaped on expiry. The encoded-response
 budget includes the JSON Lines framing newline.
 
+### 23.1 Extended committed inspections
+
+The additive `akp-v1 inspect` command carries a versioned, strictly typed
+operation. The shared schema defines search excerpts, project context, and
+historical reads. Existing read operations retain their original wire shapes.
+CLI and MCP expose implemented inspections separately; no client accesses Git
+directly. Older servers reject the new command explicitly.
+
+Search excerpts retain one committed snapshot while selecting and reading
+bounded source text. Character budgets count Unicode scalar values; the
+existing encoded response-byte limit covers metadata and JSON framing as well.
+
+See [read operations](docs/read-operations.md) for the complete public contract.
+
 ## 24. Search
 
 The Worker publishes an immutable Tantivy index for each committed snapshot and

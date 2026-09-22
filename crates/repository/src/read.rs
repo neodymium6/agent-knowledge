@@ -1129,3 +1129,83 @@ impl std::error::Error for CommittedReadError {
 
 #[cfg(test)]
 mod tests;
+
+/// A plain-text field excerpt. Text is copied without HTML or Markdown rendering.
+#[derive(Clone, Debug)]
+pub struct FieldExcerpt {
+    pub field: String,
+    pub text: String,
+    pub truncated: bool,
+}
+
+pub(crate) fn search_field_values(
+    record: &DocumentRecord,
+    body: &str,
+    fields: SearchMetadataFields,
+) -> Vec<(&'static str, String)> {
+    let metadata = record.metadata();
+    let mut values = vec![
+        ("body", body.to_owned()),
+        ("title", metadata.title.clone()),
+        (
+            "path",
+            record.relative_path().to_string_lossy().into_owned(),
+        ),
+    ];
+    values.extend(metadata.tags.iter().map(|tag| ("tags", tag.clone())));
+    if fields.node
+        && let Some(value) = &metadata.node
+    {
+        values.push(("node", value.clone()));
+    }
+    if fields.agent
+        && let Some(value) = &metadata.agent
+    {
+        values.push(("agent", value.clone()));
+    }
+    if fields.session
+        && let Some(value) = metadata.session
+    {
+        values.push(("session", value.to_string()));
+    }
+    if fields.request_id {
+        values.push(("request_id", metadata.request_id.to_string()));
+    }
+    values
+}
+
+/// Produces at most one raw excerpt per matching field for linear substring search.
+#[must_use]
+pub fn linear_excerpts(
+    record: &DocumentRecord,
+    body: &str,
+    query: &str,
+    fields: SearchMetadataFields,
+    maximum: usize,
+) -> Vec<FieldExcerpt> {
+    let query = query.trim().to_lowercase();
+    let mut excerpts = Vec::new();
+    for (field, text) in search_field_values(record, body, fields) {
+        if excerpts.iter().any(|e: &FieldExcerpt| e.field == field) {
+            continue;
+        }
+        if let Some(offset) = text.to_lowercase().find(&query) {
+            let mut lowered_bytes = 0;
+            let start = text
+                .chars()
+                .take_while(|c| {
+                    lowered_bytes += c.to_lowercase().map(char::len_utf8).sum::<usize>();
+                    lowered_bytes <= offset
+                })
+                .count()
+                .saturating_sub(maximum / 3);
+            let excerpt = text.chars().skip(start).take(maximum).collect::<String>();
+            excerpts.push(FieldExcerpt {
+                field: field.into(),
+                truncated: excerpt != text,
+                text: excerpt,
+            });
+        }
+    }
+    excerpts
+}

@@ -235,6 +235,57 @@ impl TantivySearchIndex {
         self.search_snapshot_with_metadata(snapshot, query, filter, metadata_fields, policy)
     }
 
+    /// Generates query-term excerpts using the same tokenizer and metadata allowlist as search.
+    ///
+    /// # Errors
+    /// Returns query parsing or snippet engine failures.
+    pub fn excerpts(
+        &self,
+        record: &DocumentRecord,
+        body: &str,
+        query: &str,
+        metadata: SearchMetadataFields,
+        maximum: usize,
+    ) -> Result<Vec<crate::FieldExcerpt>, TantivySearchError> {
+        let allowed = self.fields.allowed_metadata(metadata);
+        let schema = SearchFields::schemas(allowed).1;
+        let mut parser = QueryParser::new(
+            schema,
+            self.fields.searchable(allowed),
+            self.index.tokenizers().clone(),
+        );
+        parser.set_conjunction_by_default();
+        let query = parser
+            .parse_query(query)
+            .map_err(TantivySearchError::Query)?;
+        let searcher = self.reader.searcher();
+        let schema = self.index.schema();
+        let mut excerpts = Vec::new();
+        for (name, text) in crate::read::search_field_values(record, body, allowed) {
+            if excerpts
+                .iter()
+                .any(|e: &crate::FieldExcerpt| e.field == name)
+            {
+                continue;
+            }
+            let field = schema.get_field(name).map_err(TantivySearchError::engine)?;
+            let mut generator =
+                tantivy::snippet::SnippetGenerator::create(&searcher, query.as_ref(), field)
+                    .map_err(TantivySearchError::engine)?;
+            generator.set_max_num_chars(maximum);
+            let snippet = generator.snippet(&text);
+            if !snippet.highlighted().is_empty() {
+                let fragment = snippet.fragment().chars().take(maximum).collect::<String>();
+                excerpts.push(crate::FieldExcerpt {
+                    field: name.into(),
+                    truncated: fragment != text,
+                    text: fragment,
+                });
+            }
+        }
+        Ok(excerpts)
+    }
+
     fn search_snapshot_with_metadata<'a>(
         &self,
         snapshot: &'a impl IndexedSnapshot,

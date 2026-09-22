@@ -4,6 +4,9 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add CLI and MCP search excerpts with source fields and truncation markers,
+  preserving the configured search semantics and exact committed snapshot.
+
 ## 0.3.0
 
 - Add a durable, file-based SSH client registry and local administration CLI

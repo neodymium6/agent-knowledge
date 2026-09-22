@@ -1,3 +1,4 @@
+mod inspect;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
@@ -13,6 +14,7 @@ use agent_knowledge_protocol::{
 use crate::ClientCommandError;
 
 const USAGE: &str = "usage:\n\
+    agent-knowledge-client search-excerpts --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--excerpt-characters <count>]\n\
     agent-knowledge-client --version\n\
     agent-knowledge-client mcp --destination <ssh-destination> [--listen <loopback-address>] [--timeout-seconds <seconds>]\n\
     agent-knowledge-client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
@@ -29,6 +31,11 @@ const MAXIMUM_READ_RESULTS: usize = 10_000;
 
 #[derive(Debug)]
 pub enum Command {
+    Inspect {
+        destination: OsString,
+        request: agent_knowledge_protocol::InspectRequest,
+        timeout: Duration,
+    },
     Version,
     Mcp {
         destination: OsString,
@@ -85,6 +92,18 @@ where
     W: Write,
 {
     match command {
+        Command::Inspect {
+            destination,
+            request,
+            timeout,
+        } => {
+            let client = crate::SshClient::new(destination, timeout).map_err(CliError::Command)?;
+            let response = client.inspect(&request).map_err(CliError::Command)?;
+            serde_json::to_writer(&mut output, &response)
+                .map_err(|e| CliError::Command(crate::ClientCommandError::EncodeResponse(e)))?;
+            writeln!(output).map_err(CliError::Output)
+        }
+
         Command::Version => writeln!(
             output,
             "agent-knowledge-client {}",
@@ -161,6 +180,7 @@ where
         };
     }
     match action.to_str() {
+        Some(action @ "search-excerpts") => inspect::parse(action, arguments),
         Some("submit") => parse_submit_arguments(arguments),
         Some("mcp") => parse_mcp_arguments(arguments),
         Some("list") => parse_list_arguments(arguments, false),

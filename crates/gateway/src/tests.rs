@@ -611,3 +611,5 @@ fn distinguishes_transport_failures_from_malformed_archives() {
     };
     assert_eq!(malformed.error_code(), ErrorCode::InvalidRequest);
 }
+
+mod inspect;
