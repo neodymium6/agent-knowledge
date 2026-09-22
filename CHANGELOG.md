@@ -4,6 +4,8 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.4.0
+
 - Add CLI and MCP search excerpts with source fields and truncation markers,
   preserving the configured search semantics and exact committed snapshot.
 - Add bounded project context assembled from its index, related guidance,
@@ -11,6 +13,17 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 - Add document history, exact historical Markdown reads, and body/metadata
   comparisons over official Git history, retaining identity across moves and
   archival. Existing v1 read command and response shapes remain unchanged.
+- Add read-only client and Gateway version and capability reports through CLI
+  commands and the MCP `knowledge_version` tool. Older Gateways and protocol
+  differences are reported explicitly, independently of release version skew.
+- Add client-side stable release checks with a shared 24-hour persistent cache,
+  bounded background requests, and one stderr notice per release during ordinary
+  interactive CLI use. Explicit checks are available through CLI and MCP;
+  disabling checks prevents upstream requests without disabling version reports.
+- Keep update checks independent of knowledge operations and MCP framing,
+  including offline, rate-limited, malformed-response, and cache-failure cases.
+  Only public release metadata is requested; updates are never installed
+  automatically. No durable storage migration is required for this release.
 
 ## 0.3.0
 
