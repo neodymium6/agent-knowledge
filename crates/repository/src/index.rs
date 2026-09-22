@@ -75,6 +75,37 @@ impl AttachmentRecord {
 }
 
 impl DocumentRecord {
+    pub(crate) fn from_markdown(
+        relative_path: PathBuf,
+        bytes: &[u8],
+        policy: ContentPolicy,
+    ) -> Result<Self, ContentIndexError> {
+        let document = decode_document_metadata(bytes, policy.maximum_front_matter_bytes).map_err(
+            |source| ContentIndexError::InvalidDocument {
+                path: relative_path.clone(),
+                source,
+            },
+        )?;
+        let location = classify_document_path(&relative_path)?;
+        validate_canonical_document_path(&relative_path, &location, &document)?;
+        if location.archived != (document.status == DocumentStatus::Archived) {
+            return Err(ContentIndexError::ArchiveStatusMismatch(relative_path));
+        }
+        document
+            .validate(location.document_type, policy.document)
+            .map_err(|source| ContentIndexError::InvalidMetadata {
+                path: relative_path.clone(),
+                source,
+            })?;
+        Ok(Self {
+            relative_path,
+            location,
+            metadata: document,
+            revision: Revision::from_bytes(Sha256::digest(bytes).into()),
+            byte_length: bytes.len() as u64,
+        })
+    }
+
     /// Returns the document path relative to the content root.
     #[must_use]
     pub fn relative_path(&self) -> &Path {
@@ -318,31 +349,8 @@ impl ContentIndex {
                         maximum: policy.maximum_total_markdown_bytes,
                     },
                 )?;
-                let document = decode_document_metadata(&bytes, policy.maximum_front_matter_bytes)
-                    .map_err(|source| ContentIndexError::InvalidDocument {
-                        path: relative_path.clone(),
-                        source,
-                    })?;
-                let location = classify_document_path(&relative_path)?;
-                validate_canonical_document_path(&relative_path, &location, &document)?;
-                if location.archived != (document.status == DocumentStatus::Archived) {
-                    return Err(ContentIndexError::ArchiveStatusMismatch(relative_path));
-                }
-                document
-                    .validate(location.document_type, policy.document)
-                    .map_err(|source| ContentIndexError::InvalidMetadata {
-                        path: relative_path.clone(),
-                        source,
-                    })?;
-                let revision = Revision::from_bytes(Sha256::digest(&bytes).into());
-                let document_id = document.document_id;
-                let record = DocumentRecord {
-                    relative_path: relative_path.clone(),
-                    location,
-                    metadata: document,
-                    revision,
-                    byte_length: bytes.len() as u64,
-                };
+                let record = DocumentRecord::from_markdown(relative_path.clone(), &bytes, policy)?;
+                let document_id = record.metadata.document_id;
                 if let Some(existing) = documents.insert(document_id, record) {
                     return Err(ContentIndexError::DuplicateDocumentId {
                         document_id,

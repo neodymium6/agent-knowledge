@@ -1,3 +1,5 @@
+mod inspect;
+pub(super) use inspect::inspect_until;
 use std::fmt;
 use std::io::{self, Write};
 use std::time::Instant;
@@ -512,9 +514,9 @@ fn committed(error: CommittedReadError) -> GatewayError {
 pub(super) fn committed_error_code(error: &CommittedReadError) -> ErrorCode {
     match error {
         CommittedReadError::DocumentNotFound { .. } => ErrorCode::DocumentNotFound,
-        CommittedReadError::EmptyQuery | CommittedReadError::InvalidResultLimit => {
-            ErrorCode::InvalidRequest
-        }
+        CommittedReadError::InvalidHistorySelector
+        | CommittedReadError::EmptyQuery
+        | CommittedReadError::InvalidResultLimit => ErrorCode::InvalidRequest,
         CommittedReadError::QueryTooLong { .. }
         | CommittedReadError::SearchDocumentLimitExceeded { .. }
         | CommittedReadError::SearchMarkdownByteLimitExceeded { .. }
@@ -557,6 +559,8 @@ pub(super) fn committed_error_code(error: &CommittedReadError) -> ErrorCode {
 /// A deterministic violation of the bounded committed-read request protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadRequestError {
+    /// The inspection selectors are invalid.
+    InvalidInspection,
     /// The request named an unsupported Gateway protocol version.
     UnsupportedProtocolVersion {
         /// Version found in the request.
@@ -601,7 +605,7 @@ impl ReadRequestError {
         match self {
             Self::UnsupportedProtocolVersion { .. } => ErrorCode::InvalidProtocol,
             Self::TagTooLong { .. } | Self::InvalidResultLimit { .. } => ErrorCode::LimitExceeded,
-            Self::InvalidTag => ErrorCode::InvalidRequest,
+            Self::InvalidInspection | Self::InvalidTag => ErrorCode::InvalidRequest,
             Self::InvalidSearchQuery => ErrorCode::InvalidRequest,
             Self::InvalidCommittedPath => ErrorCode::ContentValidationFailed,
             Self::InvalidDeadline => ErrorCode::InternalError,
@@ -629,6 +633,7 @@ impl fmt::Display for ReadRequestError {
                 formatter,
                 "maximum results is {actual}; configured maximum is {maximum}"
             ),
+            Self::InvalidInspection => formatter.write_str("invalid inspection request"),
             Self::InvalidSearchQuery => formatter.write_str("search query syntax is invalid"),
             Self::InvalidCommittedPath => {
                 formatter.write_str("committed document path is not UTF-8")

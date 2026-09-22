@@ -217,3 +217,99 @@ fn write_fake_ssh(
     fs::set_permissions(ssh, fs::Permissions::from_mode(0o700))
         .unwrap_or_else(|error| panic!("fake SSH program must be executable: {error}"));
 }
+
+#[test]
+fn reads_context_through_cli_and_stdio_without_a_shared_package() {
+    let root = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let ssh = root.path().join("ssh");
+    let captured = root.path().join("request.json");
+    let response = serde_json::json!({"protocol_version":1,"result":{"operation":"context","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","documents":[],"additional":[],"truncated":false}});
+    fs::write(&ssh, format!("#!/bin/sh\nset -eu\nfor arg do last=$arg; done\ntest \"$last\" = 'akp-v1 inspect'\ncat > '{}'\nprintf '%s\\n' '{}'\n", captured.display(), response)).unwrap_or_else(|e| panic!("write: {e}"));
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|e| panic!("chmod: {e}"));
+    let path = std::env::join_paths(
+        std::iter::once(root.path().to_path_buf()).chain(
+            std::env::var_os("PATH")
+                .into_iter()
+                .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>()),
+        ),
+    )
+    .unwrap_or_else(|e| panic!("PATH: {e}"));
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-knowledge-client"))
+        .env("PATH", &path)
+        .args([
+            "context",
+            "--destination",
+            "fictional-knowledge",
+            "--project",
+            "fictional-project",
+            "--maximum-characters",
+            "123",
+        ])
+        .output()
+        .unwrap_or_else(|e| panic!("CLI: {e}"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let wire: serde_json::Value =
+        serde_json::from_slice(&fs::read(&captured).unwrap_or_else(|e| panic!("read: {e}")))
+            .unwrap_or_else(|e| panic!("JSON: {e}"));
+    assert_eq!(wire["query"]["maximum_characters"], 123);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-knowledge-client"))
+        .env("PATH", &path)
+        .args(["mcp", "--destination", "fictional-knowledge"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("MCP: {e}"));
+    let mut input = child.stdin.take().unwrap_or_else(|| panic!("stdin"));
+    for message in [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fictional-client","version":"0.0.0"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"knowledge_context","arguments":{"project":"fictional-project","maximum_characters":321}}}),
+    ] {
+        writeln!(input, "{message}").unwrap_or_else(|e| panic!("write: {e}"));
+    }
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child
+        .try_wait()
+        .unwrap_or_else(|e| panic!("status: {e}"))
+        .is_none()
+    {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("MCP deadline");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("output: {e}"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|e| panic!("JSON: {e}"))
+        })
+        .collect::<Vec<_>>();
+    let result = responses
+        .iter()
+        .find(|r| r["id"] == 2)
+        .unwrap_or_else(|| panic!("tool response: {responses:?}"));
+    assert_eq!(
+        result["result"]["structuredContent"]["result"]["operation"],
+        "context"
+    );
+    let wire: serde_json::Value =
+        serde_json::from_slice(&fs::read(&captured).unwrap_or_else(|e| panic!("read: {e}")))
+            .unwrap_or_else(|e| panic!("JSON: {e}"));
+    assert_eq!(wire["query"]["maximum_characters"], 321);
+}

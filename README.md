@@ -101,6 +101,23 @@ revision, returning BM25-ranked results. A configured index that is absent,
 stale, or unreadable is a retryable failure. Deployments that omit
 `search_index_root` retain the bounded Markdown scan backend.
 
+Additional read tools provide search excerpts, bounded project context, and
+commit-based document history:
+
+```sh
+agent-knowledge-client search-excerpts --destination fictional-knowledge \
+  --project fictional-project --query "fictional restart"
+agent-knowledge-client context --destination fictional-knowledge \
+  --project fictional-project --maximum-characters 20000
+agent-knowledge-client history --destination fictional-knowledge \
+  --document-id 01K00000000000000000000001
+```
+
+The corresponding MCP tools are `knowledge_search_excerpts`,
+`knowledge_context`, `knowledge_history`, `knowledge_get_at`, and
+`knowledge_diff`. See [read operations](docs/read-operations.md) for selection
+rules, historical reads, differences, pagination, bounds, and compatibility.
+
 SSH host aliases, identities, host-key policy, and proxies belong in the
 client's OpenSSH configuration. The client disables interactive prompts, TTYs,
 and forwarding and enforces bounded request, response, and transfer sizes.

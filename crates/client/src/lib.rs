@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
 
 pub mod cli;
+mod inspect;
 mod mcp;
 mod mcp_archive;
 mod mcp_create;

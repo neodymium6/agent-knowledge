@@ -1,3 +1,8 @@
+mod inspect;
+use agent_knowledge_protocol::{InspectRequest, InspectResponse};
+use inspect::{
+    ContextParameters, DiffParameters, ExcerptParameters, GetAtParameters, HistoryParameters,
+};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -41,6 +46,7 @@ trait KnowledgeBackend: Clone + Send + Sync + 'static {
     fn search(&self, request: &SearchRequest) -> Result<ListResponse, Self::Error>;
     fn get(&self, request: &GetRequest) -> Result<GetResponse, Self::Error>;
     fn status(&self, request: &StatusRequest) -> Result<StatusResponse, Self::Error>;
+    fn inspect(&self, request: &InspectRequest) -> Result<InspectResponse, Self::Error>;
 }
 
 impl KnowledgeBackend for SshClient {
@@ -68,6 +74,10 @@ impl KnowledgeBackend for SshClient {
 
     fn get(&self, request: &GetRequest) -> Result<GetResponse, Self::Error> {
         SshClient::get(self, request)
+    }
+
+    fn inspect(&self, request: &InspectRequest) -> Result<InspectResponse, Self::Error> {
+        SshClient::inspect(self, request)
     }
 
     fn status(&self, request: &StatusRequest) -> Result<StatusResponse, Self::Error> {
@@ -214,6 +224,76 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
 
 #[tool_router]
 impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
+    #[tool(
+        name = "knowledge_search_excerpts",
+        description = "Search committed knowledge and return bounded raw query-term excerpts with field names.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn search_excerpts(
+        &self,
+        Parameters(parameters): Parameters<ExcerptParameters>,
+    ) -> Result<CallToolResult, String> {
+        let request = parameters.request()?;
+        let client = self.client.clone();
+        structured(run_blocking(move || client.inspect(&request), C::format_error).await?)
+    }
+
+    #[tool(
+        name = "knowledge_context",
+        description = "Read a project index, relevant guidance and recent records from one commit within a body character budget. Returns selection reasons and truncation flags.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn context(
+        &self,
+        Parameters(parameters): Parameters<ContextParameters>,
+    ) -> Result<CallToolResult, String> {
+        let request = parameters.request()?;
+        let client = self.client.clone();
+        structured(run_blocking(move || client.inspect(&request), C::format_error).await?)
+    }
+
+    #[tool(
+        name = "knowledge_history",
+        description = "List document Markdown and path changes in official commit history, following permanent identity across moves. Use anchor_commit and next_cursor for stable pagination.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn history(
+        &self,
+        Parameters(parameters): Parameters<HistoryParameters>,
+    ) -> Result<CallToolResult, String> {
+        let request = parameters.request()?;
+        let client = self.client.clone();
+        structured(run_blocking(move || client.inspect(&request), C::format_error).await?)
+    }
+
+    #[tool(
+        name = "knowledge_get_at",
+        description = "Read exact Markdown for a document at an official historical commit.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn get_at(
+        &self,
+        Parameters(parameters): Parameters<GetAtParameters>,
+    ) -> Result<CallToolResult, String> {
+        let request = parameters.request()?;
+        let client = self.client.clone();
+        structured(run_blocking(move || client.inspect(&request), C::format_error).await?)
+    }
+
+    #[tool(
+        name = "knowledge_diff",
+        description = "Compare one document at two official commits. Returns before/after metadata and a contiguous changed body line range.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn diff(
+        &self,
+        Parameters(parameters): Parameters<DiffParameters>,
+    ) -> Result<CallToolResult, String> {
+        let request = parameters.request()?;
+        let client = self.client.clone();
+        structured(run_blocking(move || client.inspect(&request), C::format_error).await?)
+    }
+
     #[tool(
         name = "knowledge_archive_document",
         description = "Archive one active mutable Agent Knowledge document without a caller-visible request package. Reuse document_id, expected_revision, request_id, and created_at together to retry an uncertain response.",
@@ -535,6 +615,7 @@ impl std::error::Error for McpServerError {
 
 #[cfg(test)]
 mod tests {
+    use agent_knowledge_protocol::{InspectRequest, InspectResponse};
     use std::convert::Infallible;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -586,6 +667,10 @@ mod tests {
             unreachable!()
         }
 
+        fn inspect(&self, _request: &InspectRequest) -> Result<InspectResponse, Self::Error> {
+            unreachable!()
+        }
+
         fn status(&self, _request: &StatusRequest) -> Result<StatusResponse, Self::Error> {
             unreachable!()
         }
@@ -633,6 +718,10 @@ mod tests {
         }
 
         fn get(&self, _request: &GetRequest) -> Result<GetResponse, Self::Error> {
+            unreachable!()
+        }
+
+        fn inspect(&self, _request: &InspectRequest) -> Result<InspectResponse, Self::Error> {
             unreachable!()
         }
 
@@ -691,6 +780,10 @@ mod tests {
             self.document.clone().ok_or("fictional document not found")
         }
 
+        fn inspect(&self, _request: &InspectRequest) -> Result<InspectResponse, Self::Error> {
+            unreachable!()
+        }
+
         fn status(&self, _request: &StatusRequest) -> Result<StatusResponse, Self::Error> {
             unreachable!()
         }
@@ -742,12 +835,17 @@ mod tests {
             names,
             [
                 "knowledge_archive_document",
+                "knowledge_context",
                 "knowledge_create_document",
+                "knowledge_diff",
                 "knowledge_get",
+                "knowledge_get_at",
+                "knowledge_history",
                 "knowledge_list",
                 "knowledge_recent",
                 "knowledge_request_status",
                 "knowledge_search",
+                "knowledge_search_excerpts",
                 "knowledge_submit_package",
             ]
         );

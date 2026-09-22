@@ -1723,6 +1723,35 @@ delivery to the SSH channel. Deadline-aware Git inspection runs in an isolated
 process group that is terminated and reaped on expiry. The encoded-response
 budget includes the JSON Lines framing newline.
 
+### 23.1 Extended committed inspections
+
+The additive `akp-v1 inspect` command carries a versioned, strictly typed
+operation for search excerpts, project context, document history, historical
+lookup, or comparison. Existing read operations retain their original wire
+shapes. CLI and MCP expose each inspection separately; no client accesses Git
+directly. Older servers reject the new command explicitly.
+
+Search excerpts and context retain one committed snapshot while selecting and
+reading bounded source text. Context selection is deterministic and excludes
+archived, deprecated, and superseded documents. Character budgets count
+Unicode scalar values in bodies; the existing encoded response-byte limit
+covers metadata and JSON framing as well.
+
+Historical operations pin the official commit, then read immutable Git objects
+without retaining the canonical-worktree lock. Full commit IDs must be
+reachable from that official commit. Documents are resolved by permanent ID
+and validated canonical front matter, including across moves and archival.
+Historical inspection enforces cumulative tree-entry and Markdown-byte budgets,
+per-command output bounds, and the same absolute operation deadline.
+
+History pages scan at most 100 first-parent commits. Pagination carries an
+immutable anchor and the next inclusive commit cursor. Entries represent
+Markdown or path changes at commit granularity, not every request in a batch.
+Comparisons return before/after metadata and one contiguous body replacement
+range, without exposing a Git checkout or providing rollback.
+
+See [read operations](docs/read-operations.md) for the complete public contract.
+
 ## 24. Search
 
 The Worker publishes an immutable Tantivy index for each committed snapshot and

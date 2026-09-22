@@ -4,6 +4,14 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add CLI and MCP search excerpts with source fields and truncation markers,
+  preserving the configured search semantics and exact committed snapshot.
+- Add bounded project context assembled from its index, related guidance,
+  and recent records, with selection reasons and omitted-document references.
+- Add document history, exact historical Markdown reads, and body/metadata
+  comparisons over official Git history, retaining identity across moves and
+  archival. Existing v1 read command and response shapes remain unchanged.
+
 ## 0.3.0
 
 - Add a durable, file-based SSH client registry and local administration CLI

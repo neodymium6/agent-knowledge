@@ -150,6 +150,37 @@ impl ReadGateway {
         })
     }
 
+    /// Performs one bounded committed inspection.
+    pub fn inspect(
+        &self,
+        request: &agent_knowledge_protocol::InspectRequest,
+    ) -> Result<agent_knowledge_protocol::InspectResponse, GatewayError> {
+        read::inspect_until(
+            &self.settings,
+            &self.committed,
+            self.search_indexes.clone(),
+            request,
+            read::read_deadline(&self.settings)?,
+        )
+        .map(|r| r.response)
+    }
+
+    /// Encodes an inspection using the operation's original absolute deadline.
+    pub fn inspect_encoded_until(
+        &self,
+        request: &agent_knowledge_protocol::InspectRequest,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, GatewayError> {
+        read::inspect_until(
+            &self.settings,
+            &self.committed,
+            self.search_indexes.clone(),
+            request,
+            deadline,
+        )
+        .map(|r| r.encoded)
+    }
+
     /// Lists matching committed documents in canonical path order.
     pub fn list(&self, request: &ListRequest) -> Result<ListResponse, GatewayError> {
         let deadline = read::read_deadline(&self.settings)?;
