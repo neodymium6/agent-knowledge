@@ -7,7 +7,7 @@ const MAX_PATH_LENGTH: usize = 4_096;
 const MAX_COMPONENT_LENGTH: usize = 255;
 const MAX_PROJECT_LENGTH: usize = 63;
 
-/// A configured project identifier.
+/// A validated lowercase project slug used in canonical paths and read scopes.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ProjectId(String);

@@ -16,10 +16,12 @@ pub(super) struct ArchiveDocumentParameters {
     document_id: String,
     /// SHA-256 revision returned by the most recent knowledge_get call.
     expected_revision: String,
-    /// Request ULID. Omit to generate one; reuse it with every other input after an uncertain response.
+    /// Request ULID. Omit to generate one. Supply and retain it for status checks
+    /// after an uncertain response; retries must preserve every input.
     #[serde(default)]
     request_id: Option<String>,
-    /// RFC 3339 request time. Omit to use the current time; reuse it with every other input after an uncertain response.
+    /// RFC 3339 request time. Omit to use the current time. It is not returned in the
+    /// acceptance response; supply and retain it when retries must reproduce the request.
     #[serde(default)]
     created_at: Option<String>,
 }

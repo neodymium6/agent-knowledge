@@ -94,7 +94,7 @@ impl KnowledgeBackend for SshClient {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReadParameters {
-    /// Restrict results to one configured project slug.
+    /// Restrict results to one project slug. Do not combine with projects.
     #[serde(default)]
     project: Option<String>,
     /// Restrict results to any of 1..32 distinct project slugs. Do not combine with project.
@@ -175,9 +175,10 @@ impl ReadParameters {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SearchParameters {
-    /// Case-insensitive text to find in committed Markdown and permitted metadata.
+    /// Search expression using the configured backend: Tantivy query syntax when indexed,
+    /// or case-insensitive substring matching when indexing is disabled.
     query: String,
-    /// Restrict results to one configured project slug.
+    /// Restrict results to one project slug. Do not combine with projects.
     #[serde(default)]
     project: Option<String>,
     /// Restrict results to any of 1..32 distinct project slugs. Do not combine with project.
@@ -236,14 +237,14 @@ struct VersionParameters {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct StatusParameters {
-    /// Permanent request ULID returned by knowledge_submit_package.
+    /// Permanent request ULID from package submission, structured creation, or archival.
     request_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SubmitParameters {
-    /// Local directory containing request.json and payload/ for one change request.
+    /// Directory on the MCP server's filesystem containing request.json and payload/.
     package_root: String,
 }
 
@@ -427,7 +428,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
 
     #[tool(
         name = "knowledge_recent",
-        description = "List recently committed Agent Knowledge documents, newest first.",
+        description = "List committed Agent Knowledge documents by recorded updated time (or created time when absent), newest first.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn recent(
@@ -527,7 +528,7 @@ impl<C: KnowledgeBackend> ServerHandler for KnowledgeMcpServer<C> {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Read committed knowledge with list, recent, search, and get. Use create_document for ordinary Markdown creation and archive_document to archive an active mutable document. Use submit_package only for advanced operations that already have a complete local request package. The SSH destination and credentials are configured on this machine.",
+                "Use knowledge_projects for project discovery; knowledge_list, knowledge_recent, knowledge_search, knowledge_search_excerpts, knowledge_context, and knowledge_get for committed reads; knowledge_history, knowledge_get_at, and knowledge_diff for official history. knowledge_version reports client/Gateway versions and Gateway capabilities. knowledge_create_document and knowledge_archive_document accept structured writes; knowledge_submit_package accepts a complete package directory on this MCP server's filesystem. knowledge_request_status tracks accepted requests. The SSH destination and credentials are configured on this machine.",
             )
     }
 }

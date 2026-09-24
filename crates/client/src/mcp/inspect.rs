@@ -8,7 +8,7 @@ pub(super) struct ExcerptParameters {
     query: String,
     #[serde(default)]
     project: Option<String>,
-    /// Union of project slugs; mutually exclusive with project.
+    /// Union of 1..32 distinct project slugs; mutually exclusive with project.
     #[serde(default)]
     projects: Option<Vec<String>>,
     #[serde(default)]
@@ -62,7 +62,8 @@ pub(super) struct ContextParameters {
     /// reserves recent log slots, and prioritizes durable guidance over logs.
     #[serde(default)]
     selection: ContextSelection,
-    /// Reserved recent logs in balanced mode. Defaults to min(2, maximum_documents - 2).
+    /// Reserved recent logs in balanced mode. Defaults to min(2, maximum_documents - 2),
+    /// floored at zero.
     #[serde(default)]
     recent_documents: Option<usize>,
 }
