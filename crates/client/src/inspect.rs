@@ -47,6 +47,12 @@ fn validate(
                 maximum_documents,
                 maximum_characters,
                 ..
+            }
+            | InspectQuery::ContextBalanced {
+                project,
+                maximum_documents,
+                maximum_characters,
+                ..
             },
             Inspection::Context {
                 documents,
@@ -61,6 +67,11 @@ fn validate(
                     .map(|d| d.body.chars().count())
                     .sum::<usize>()
                     <= *maximum_characters
+                && (!matches!(request.query, InspectQuery::ContextBalanced { .. })
+                    || (*maximum_documents > 0
+                        && documents.iter().all(|d| {
+                            d.body.chars().count() <= maximum_characters / maximum_documents
+                        })))
                 && documents
                     .iter()
                     .all(|d| d.document.project.as_ref() == Some(project))
@@ -126,6 +137,34 @@ fn validate(
                 && before.metadata.document_id == *document_id
                 && after.metadata.document_id == *document_id
         }
+        (
+            InspectQuery::DiffHunks {
+                document_id,
+                from_commit,
+                to_commit,
+                maximum_hunks,
+                maximum_diff_bytes,
+                ..
+            },
+            Inspection::DiffHunks {
+                from_commit: from,
+                to_commit: to,
+                before,
+                after,
+                body,
+            },
+        ) => {
+            from_commit == from
+                && to_commit == to
+                && before.metadata.document_id == *document_id
+                && after.metadata.document_id == *document_id
+                && body.hunks.len() <= *maximum_hunks
+                && body.truncated == body.truncation_reason.is_some()
+                && (body.changed || (body.hunks.is_empty() && !body.truncated))
+                && (!body.changed || !body.hunks.is_empty() || body.truncated)
+                && body.hunks.iter().all(|h| h.from_line > 0 && h.to_line > 0)
+                && serde_json::to_vec(body).is_ok_and(|bytes| bytes.len() <= *maximum_diff_bytes)
+        }
         _ => false,
     };
     if valid {
@@ -169,5 +208,47 @@ mod tests {
             },
         };
         assert!(validate(&request, &response).is_ok());
+    }
+    #[test]
+    fn concise_diff_rejects_excess_bytes_counts_and_mismatched_endpoints() {
+        let summary = serde_json::json!({"path":"projects/fictional-project/index.md","document_type":"index","project":"fictional-project","archived":false,"revision":format!("sha256:{}", "a".repeat(64)),"metadata":{"schema_version":1,"document_id":"01K00000000000000000000001","title":"Fictional project","created":"2026-09-24T00:00:00Z","request_id":"01K00000000000000000000002","status":"active"}});
+        let wire = serde_json::json!({"protocol_version":1,"result":{"operation":"diff_hunks","from_commit":"a".repeat(40),"to_commit":"b".repeat(40),"before":summary,"after":summary,"body":{"changed":true,"hunks":[{"from_line":1,"to_line":1,"removed":"old","added":"new"}],"truncated":false,"truncation_reason":null}}});
+        let request = InspectRequest {
+            protocol_version: 1,
+            query: InspectQuery::DiffHunks {
+                document_id: "01K00000000000000000000001"
+                    .parse()
+                    .unwrap_or_else(|e| panic!("ID: {e}")),
+                from_commit: "a".repeat(40),
+                to_commit: "b".repeat(40),
+                context_lines: 0,
+                maximum_hunks: 1,
+                maximum_diff_bytes: 256,
+            },
+        };
+        let valid_response: InspectResponse =
+            serde_json::from_value(wire.clone()).unwrap_or_else(|e| panic!("JSON: {e}"));
+        assert!(validate(&request, &valid_response).is_ok());
+        let mut cases = Vec::new();
+        let mut value = wire.clone();
+        value["result"]["from_commit"] = "c".repeat(40).into();
+        cases.push(value);
+        let mut value = wire.clone();
+        value["result"]["body"]["hunks"][0]["added"] = "x".repeat(256).into();
+        cases.push(value);
+        let mut value = wire.clone();
+        value["result"]["body"]["hunks"] = serde_json::json!([
+            wire["result"]["body"]["hunks"][0],
+            wire["result"]["body"]["hunks"][0]
+        ]);
+        cases.push(value);
+        let mut value = wire;
+        value["result"]["body"]["truncated"] = true.into();
+        cases.push(value);
+        for value in cases {
+            let response: InspectResponse =
+                serde_json::from_value(value).unwrap_or_else(|e| panic!("JSON: {e}"));
+            assert!(validate(&request, &response).is_err());
+        }
     }
 }

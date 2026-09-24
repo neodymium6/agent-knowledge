@@ -4,6 +4,12 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Omit nearly empty shortened context bodies while preserving complete short
+  documents. Add opt-in balanced context with per-document shares, reserved
+  recent logs, and durable guidance prioritized over repeated operational logs.
+- Add opt-in bounded multi-hunk body differences through CLI and MCP, preserving
+  the default contiguous-range wire contract and exact official commit metadata.
+
 ## 0.4.0
 
 - Add CLI and MCP search excerpts with source fields and truncation markers,

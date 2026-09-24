@@ -123,7 +123,10 @@ fn context_uses_one_snapshot_prioritizes_index_and_reports_unicode_truncation() 
     fs::write(
         root.path()
             .join("content/projects/fictional-project/index.md"),
-        text,
+        text.replace(
+            "日本語のプロジェクト概要です。",
+            &"日本語のプロジェクト概要です。".repeat(20),
+        ),
     )
     .unwrap_or_else(|e| panic!("write: {e}"));
     commit(&root);
@@ -133,7 +136,7 @@ fn context_uses_one_snapshot_prioritizes_index_and_reports_unicode_truncation() 
             .unwrap_or_else(|e| panic!("project: {e}")),
         query: None,
         maximum_documents: 5,
-        maximum_characters: 5,
+        maximum_characters: 80,
     };
     let Inspection::Context {
         commit,
@@ -148,7 +151,7 @@ fn context_uses_one_snapshot_prioritizes_index_and_reports_unicode_truncation() 
     assert!(truncated);
     assert_eq!(documents.len(), 1);
     assert_eq!(documents[0].reason, "project_index");
-    assert_eq!(documents[0].body.chars().count(), 5);
+    assert_eq!(documents[0].body.chars().count(), 80);
     assert!(documents[0].truncated);
     assert_eq!(additional.len(), 1);
     assert_eq!(additional[0].metadata.document_id, id());
@@ -398,4 +401,227 @@ fn linear_excerpts_map_expanded_lowercase_back_to_original_unicode() {
     };
     assert_eq!(hits[0].excerpts[0].field, "body");
     assert_eq!(hits[0].excerpts[0].text, "İ");
+}
+
+fn fixture_document(
+    root: &TestDirectory,
+    number: usize,
+    kind: &str,
+    day: usize,
+    body: &str,
+) -> DocumentId {
+    let identifier = format!("01K{number:023}");
+    let date = format!("2026-09-{day:02}");
+    let location = match kind {
+        "index" => "projects/fictional-project/index.md".to_owned(),
+        "logs" => {
+            format!("projects/fictional-project/logs/2026/09/{day:02}/120000-{identifier}/index.md")
+        }
+        _ => format!("projects/fictional-project/{kind}/{date}-{identifier}/index.md"),
+    };
+    let path = root.path().join("content").join(location);
+    fs::create_dir_all(path.parent().unwrap_or_else(|| panic!("parent")))
+        .unwrap_or_else(|e| panic!("mkdir: {e}"));
+    let log_fields = if kind == "logs" {
+        "node: fictional-node\nagent: fictional-agent\nsession: 01K00000000000000000000999\n"
+    } else {
+        ""
+    };
+    fs::write(path, format!("---\nschema_version: 1\ndocument_id: {identifier}\ntitle: Fictional service record\ncreated: {date}T12:00:00Z\nrequest_id: 01K00000000000000000000998\n{log_fields}tags: []\nstatus: active\n---\n{body}")).unwrap_or_else(|e| panic!("write: {e}"));
+    identifier.parse().unwrap_or_else(|e| panic!("ID: {e}"))
+}
+
+#[test]
+fn context_omits_tiny_fragments_but_preserves_complete_short_bodies() {
+    for indexed in [false, true] {
+        let root = TestDirectory::create();
+        initialize_committed_content(&root);
+        let index = fixture_document(&root, 10, "index", 1, &"界".repeat(80));
+        let short = fixture_document(&root, 11, "references", 2, "ok");
+        commit(&root);
+        if indexed {
+            publish_search_index(&root);
+        }
+        let config = if indexed {
+            settings(&root)
+        } else {
+            settings_without_search_index(&root)
+        };
+        let gateway =
+            ReadGateway::open_until(&config, None).unwrap_or_else(|e| panic!("open: {e}"));
+        for remaining in 1..=4 {
+            let Inspection::Context {
+                documents,
+                additional,
+                truncated,
+                commit,
+                ..
+            } = inspect(
+                &gateway,
+                InspectQuery::Context {
+                    project: "fictional-project"
+                        .parse()
+                        .unwrap_or_else(|e| panic!("project: {e}")),
+                    query: Some("service".into()),
+                    maximum_documents: 4,
+                    maximum_characters: 80 + remaining,
+                },
+            )
+            else {
+                panic!("context");
+            };
+            assert_eq!(commit, head(&gateway));
+            assert!(truncated);
+            assert_eq!(documents[0].document.metadata.document_id, index);
+            assert!(documents.iter().all(|d| !d.truncated));
+            assert!(additional.iter().any(|d| d.metadata.document_id == id()));
+            assert_eq!(
+                documents
+                    .iter()
+                    .any(|d| d.document.metadata.document_id == short && d.body == "ok"),
+                remaining >= 2
+            );
+            assert!(
+                documents
+                    .iter()
+                    .map(|d| d.body.chars().count())
+                    .sum::<usize>()
+                    <= 80 + remaining
+            );
+        }
+    }
+}
+
+#[test]
+fn balanced_context_keeps_guidance_and_requested_recent_logs_despite_long_index_and_old_matches() {
+    for indexed in [false, true] {
+        let root = TestDirectory::create();
+        initialize_committed_content(&root);
+        let index = fixture_document(&root, 10, "index", 1, &"概要".repeat(1500));
+        let reference = fixture_document(
+            &root,
+            20,
+            "references",
+            1,
+            &"backup durable guidance. ".repeat(20),
+        );
+        for day in 1..=20 {
+            fixture_document(&root, 30 + day, "logs", day, &"backup ".repeat(300));
+        }
+        let recent = fixture_document(
+            &root,
+            60,
+            "logs",
+            21,
+            "The newest fictional observation has different wording.",
+        );
+        commit(&root);
+        if indexed {
+            publish_search_index(&root);
+        }
+        let config = if indexed {
+            settings(&root)
+        } else {
+            settings_without_search_index(&root)
+        };
+        let gateway =
+            ReadGateway::open_until(&config, None).unwrap_or_else(|e| panic!("open: {e}"));
+        let query = || InspectQuery::ContextBalanced {
+            project: "fictional-project"
+                .parse()
+                .unwrap_or_else(|e| panic!("project: {e}")),
+            query: Some("backup".into()),
+            maximum_documents: 3,
+            maximum_characters: 600,
+            recent_documents: 1,
+        };
+        let first = inspect(&gateway, query());
+        let second = inspect(&gateway, query());
+        assert_eq!(
+            serde_json::to_value(&first).ok(),
+            serde_json::to_value(second).ok()
+        );
+        let Inspection::Context {
+            documents,
+            additional,
+            commit,
+            truncated,
+        } = first
+        else {
+            panic!("context");
+        };
+        assert_eq!(commit, head(&gateway));
+        assert_eq!(
+            documents
+                .iter()
+                .map(|d| d.document.metadata.document_id)
+                .collect::<Vec<_>>(),
+            [index, recent, reference]
+        );
+        assert_eq!(documents[1].reason, "recent_observation");
+        assert_eq!(documents[2].reason, "related_guidance");
+        assert!(documents.iter().all(|d| d.body.chars().count() <= 200));
+        assert!(
+            documents
+                .iter()
+                .all(|d| !d.truncated || d.body.chars().count() >= 80)
+        );
+        assert!(truncated && !additional.is_empty());
+        assert!(additional.len() <= 3);
+        let Inspection::Context { documents, .. } = inspect(
+            &gateway,
+            InspectQuery::Context {
+                project: "fictional-project"
+                    .parse()
+                    .unwrap_or_else(|e| panic!("project: {e}")),
+                query: Some("backup".into()),
+                maximum_documents: 3,
+                maximum_characters: 600,
+            },
+        ) else {
+            panic!("context");
+        };
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].body.chars().count(), 600);
+    }
+}
+
+#[test]
+fn concise_diff_keeps_exact_identities_and_reports_metadata_only_changes() {
+    let root = TestDirectory::create();
+    let gateway = read_gateway(&root);
+    let path = root.path().join("content").join(PATH);
+    let original = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read: {e}"));
+    let before = head(&gateway);
+    fs::write(
+        &path,
+        original.replace("Fictional restart guide", "Fictional updated guide"),
+    )
+    .unwrap_or_else(|e| panic!("write: {e}"));
+    commit(&root);
+    let after = head(&gateway);
+    let Inspection::DiffHunks {
+        from_commit,
+        to_commit,
+        before: old,
+        after: new,
+        body,
+    } = inspect(
+        &gateway,
+        InspectQuery::DiffHunks {
+            document_id: id(),
+            from_commit: before.clone(),
+            to_commit: after.clone(),
+            context_lines: 3,
+            maximum_hunks: 20,
+            maximum_diff_bytes: 64000,
+        },
+    )
+    else {
+        panic!("diff");
+    };
+    assert_eq!(from_commit, before);
+    assert_eq!(to_commit, after);
+    assert_ne!(old.metadata.title, new.metadata.title);
+    assert!(!body.changed && !body.truncated && body.hunks.is_empty());
 }
