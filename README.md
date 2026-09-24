@@ -102,7 +102,8 @@ stale, or unreadable is a retryable failure. Deployments that omit
 `search_index_root` retain the bounded Markdown scan backend.
 
 Project discovery lists project summaries or ranks projects by matching document
-counts. Document reads also accept repeated `--project` flags to select a union
+counts. Add `--hits-per-project 3` in documents mode to include ranked matching
+documents and source excerpts with each project. Document reads also accept repeated `--project` flags to select a union
 of projects.
 
 Additional read tools provide search excerpts, bounded project context, and

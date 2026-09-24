@@ -4,6 +4,9 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add opt-in ranked document hits and source excerpts to project discovery, with
+  exact counts, bounded per-project samples, and explicit Gateway capability checks.
+
 - Add committed project discovery through CLI and MCP, with index descriptions,
   total document counts, and optional ranking by exact document-search hit counts.
 - Add bounded multi-project scopes to list, recent, search, and search excerpts,
