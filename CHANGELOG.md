@@ -4,6 +4,11 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add committed project discovery through CLI and MCP, with index descriptions,
+  total document counts, and optional ranking by exact document-search hit counts.
+- Add bounded multi-project scopes to list, recent, search, and search excerpts,
+  preserving single-project wire shapes and globally ranked/limited results.
+
 ## 0.5.0
 
 - Omit nearly empty shortened context bodies while preserving complete short

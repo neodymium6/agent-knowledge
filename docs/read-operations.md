@@ -8,6 +8,7 @@ list, recent, get, export, search, and status wire formats remain unchanged.
 
 | CLI command | MCP tool | Purpose |
 | --- | --- | --- |
+| `projects` | `knowledge_projects` | Discover projects by overview or document hit counts |
 | `search-excerpts` | `knowledge_search_excerpts` | Ranked hits with raw field excerpts |
 | `context` | `knowledge_context` | Selected project documents from one snapshot |
 | `history` | `knowledge_history` | Committed Markdown and path changes |
@@ -17,6 +18,91 @@ list, recent, get, export, search, and status wire formats remain unchanged.
 Every CLI command accepts `--destination` and the existing optional
 `--timeout-seconds`. The full package exposes them under `agent-knowledge client`.
 MCP uses the server's configured destination and timeout.
+
+## Project discovery
+
+Project discovery reads one committed snapshot and derives projects from their
+stored documents; no registry or new metadata is required. Projects without an
+index are included, with a null `index` and empty description. Unclassified
+inbox documents and the root index do not form projects. Archived documents are
+excluded unless `--include-archived` is set; archive-only projects therefore
+appear only with that option.
+
+```sh
+# List projects in slug order.
+agent-knowledge-client projects --destination fictional-knowledge
+
+# Find project slugs, index titles, or index bodies containing this text.
+agent-knowledge-client projects --destination fictional-knowledge --query astronomy
+
+# Search documents and rank their projects by the number of matching documents.
+agent-knowledge-client projects --destination fictional-knowledge \
+  --query backup --search-in documents --maximum-results 10
+```
+
+The default `--search-in project` mode uses case-insensitive substring matching
+on the project slug, index title, and complete index body. A query is optional;
+results are ordered by project slug. It does not search other documents or
+require a Tantivy index.
+
+`--search-in documents` requires a query and uses the same backend, query syntax,
+metadata allowlist, and archive policy as ordinary document search. All matches
+within the enforced search bounds are counted by project **before** limiting the
+number of returned projects. A matching index document counts as one document.
+Projects with zero matches are omitted. Results are ordered by matching document
+count descending, then slug ascending. Repeated terms in one document still
+count as one matching document; this ranking measures hit count, not normalized
+relevance or a percentage of the project's documents.
+
+The response includes the exact `commit`, `projects`, and a `truncated` flag for
+omitted projects. Each project includes:
+
+- `project`: the project slug;
+- `index`: index document metadata, including its title and permanent ID, or null;
+- `description`: a raw prefix of the index body, never a generated summary;
+- `description_truncated`: whether that prefix omits index text;
+- `document_count`: all project documents within the requested archive scope;
+- `matching_documents`: the exact hit count in documents mode, or null otherwise.
+
+`--maximum-results` defaults to 100, subject to the Gateway's result limit.
+`--description-characters` defaults to 300 Unicode scalar values, with a range
+of 1..2000. Read bytes, response bytes, scan sizes, and the operation deadline
+remain bounded. Exhausting a scan or computation bound is an error rather than
+a successful response with partial hit counts. Document search requires the
+configured index to match the same commit; a stale or missing index is an error.
+
+MCP `knowledge_projects` uses `query`, `search_in`, `maximum_results`,
+`description_characters`, and `include_archived` with the same defaults.
+Discovery uses the additive `projects` inspection query advertised by Gateway
+version reports and requires a supporting Gateway.
+
+## Multiple project scopes
+
+Repeat `--project` to select the union of several projects in `search`,
+`search-excerpts`, `list`, or `recent`:
+
+```sh
+agent-knowledge-client search --destination fictional-knowledge \
+  --query backup --project fictional-lab --project fictional-home \
+  --maximum-results 20
+```
+
+MCP uses `projects: ["fictional-lab", "fictional-home"]` on the corresponding
+read tools. At most one of `project` and `projects` may be supplied. A `projects`
+array must contain 1..32 distinct valid slugs; empty arrays, duplicates, and
+ambiguous single/multiple selections are rejected. An unknown slug matches
+nothing and never widens the scope. Tag and session filters are ANDed with the
+project union, and archive exclusions still apply.
+
+The union is filtered before ranking and limiting results, inside one snapshot
+and one search operation. `maximum_results` limits the combined result, not each
+project separately. Search retains its configured backend order, list uses path
+order, and recent uses recorded update/creation time.
+
+One CLI `--project` retains the original single-project wire shape. Omitting
+project filters retains cross-project reads. The additive `projects` filter
+requires an updated Gateway; older Gateways reject it rather than silently
+searching all projects. Context selection remains a single-project operation.
 
 ## Search excerpts
 

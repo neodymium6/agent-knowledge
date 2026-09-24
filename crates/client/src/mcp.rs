@@ -2,6 +2,7 @@ mod inspect;
 use agent_knowledge_protocol::{InspectRequest, InspectResponse};
 use inspect::{
     ContextParameters, DiffParameters, ExcerptParameters, GetAtParameters, HistoryParameters,
+    ProjectsParameters,
 };
 use std::fmt;
 use std::net::SocketAddr;
@@ -96,6 +97,9 @@ struct ReadParameters {
     /// Restrict results to one configured project slug.
     #[serde(default)]
     project: Option<String>,
+    /// Restrict results to any of 1..32 distinct project slugs. Do not combine with project.
+    #[serde(default)]
+    projects: Option<Vec<String>>,
     /// Restrict results to one exact tag.
     #[serde(default)]
     tag: Option<String>,
@@ -127,6 +131,19 @@ impl ReadParameters {
                     .map_err(|_| "project must be a valid project slug".to_owned())
             })
             .transpose()?;
+        let projects = self
+            .projects
+            .map(|values| {
+                values
+                    .into_iter()
+                    .map(|value| {
+                        value
+                            .parse::<ProjectId>()
+                            .map_err(|_| "projects must contain valid project slugs".to_owned())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
         let session = self
             .session
             .map(|value| {
@@ -138,15 +155,20 @@ impl ReadParameters {
         if self.tag.as_deref().is_some_and(str::is_empty) {
             return Err("tag must not be empty".to_owned());
         }
-        Ok(ListRequest::new(
-            ReadFilterRequest {
-                project,
-                tag: self.tag,
-                session,
-                include_archived: self.include_archived,
-            },
-            maximum_results,
-        ))
+        let filter = ReadFilterRequest {
+            project,
+            projects,
+            tag: self.tag,
+            session,
+            include_archived: self.include_archived,
+        };
+        if !filter.valid_project_selection() {
+            return Err(
+                "projects must contain 1..32 distinct slugs and cannot be combined with project"
+                    .into(),
+            );
+        }
+        Ok(ListRequest::new(filter, maximum_results))
     }
 }
 
@@ -158,6 +180,9 @@ struct SearchParameters {
     /// Restrict results to one configured project slug.
     #[serde(default)]
     project: Option<String>,
+    /// Restrict results to any of 1..32 distinct project slugs. Do not combine with project.
+    #[serde(default)]
+    projects: Option<Vec<String>>,
     /// Restrict results to one exact tag.
     #[serde(default)]
     tag: Option<String>,
@@ -181,6 +206,7 @@ impl SearchParameters {
         let query = self.query;
         let list = ReadParameters {
             project: self.project,
+            projects: self.projects,
             tag: self.tag,
             session: self.session,
             include_archived: self.include_archived,
@@ -259,6 +285,20 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
         )
         .await?;
         structured(report)
+    }
+
+    #[tool(
+        name = "knowledge_projects",
+        description = "Discover projects by slug/index text, or search their documents and rank projects by matching document count. Returns bounded descriptions and document counts; includes projects without an index.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn projects(
+        &self,
+        Parameters(parameters): Parameters<ProjectsParameters>,
+    ) -> Result<CallToolResult, String> {
+        let request = parameters.request()?;
+        let client = self.client.clone();
+        structured(run_blocking(move || client.inspect(&request), C::format_error).await?)
     }
 
     #[tool(
@@ -678,6 +718,33 @@ mod tests {
         },
     };
 
+    #[test]
+    fn project_filters_reject_ambiguous_or_empty_scopes_and_preserve_legacy_wire() {
+        for value in [
+            serde_json::json!({"query":"needle", "projects":[]}),
+            serde_json::json!({"query":"needle", "project":"fictional-a", "projects":["fictional-b"]}),
+            serde_json::json!({"query":"needle", "projects":["fictional-a","fictional-a"]}),
+            serde_json::json!({"query":"needle", "projects":["../invalid"]}),
+        ] {
+            let params: super::SearchParameters =
+                serde_json::from_value(value).unwrap_or_else(|e| panic!("parameters: {e}"));
+            assert!(params.into_request().is_err());
+        }
+        let params: super::SearchParameters =
+            serde_json::from_value(serde_json::json!({"query":"needle","project":"fictional-a"}))
+                .unwrap_or_else(|e| panic!("parameters: {e}"));
+        let value = serde_json::to_value(
+            params
+                .into_request()
+                .unwrap_or_else(|e| panic!("request: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("JSON: {e}"));
+        assert_eq!(
+            value,
+            serde_json::json!({"protocol_version":1,"query":"needle","project":"fictional-a","maximum_results":100})
+        );
+    }
+
     fn local_http_client() -> reqwest::Client {
         // HTTP fixtures do not depend on platform roots or global provider initialization.
         let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -726,6 +793,20 @@ mod tests {
         fn inspect(&self, request: &InspectRequest) -> Result<InspectResponse, Self::Error> {
             use agent_knowledge_protocol::{BodyDiff, BodyHunks, InspectQuery, Inspection};
             let result = match &request.query {
+                InspectQuery::Projects {
+                    search_in, query, ..
+                } => {
+                    assert_eq!(
+                        *search_in,
+                        agent_knowledge_protocol::ProjectSearchScope::Documents
+                    );
+                    assert_eq!(query.as_deref(), Some("needle"));
+                    Inspection::Projects {
+                        commit: "a".repeat(40),
+                        projects: vec![],
+                        truncated: false,
+                    }
+                }
                 InspectQuery::ContextBalanced {
                     recent_documents,
                     maximum_documents,
@@ -951,6 +1032,7 @@ mod tests {
                 "knowledge_get_at",
                 "knowledge_history",
                 "knowledge_list",
+                "knowledge_projects",
                 "knowledge_recent",
                 "knowledge_request_status",
                 "knowledge_search",
@@ -1210,6 +1292,7 @@ mod tests {
             .block_on(
                 KnowledgeMcpServer::new(FakeBackend).list(Parameters(ReadParameters {
                     project: None,
+                    projects: None,
                     tag: None,
                     session: None,
                     include_archived: false,
@@ -1288,6 +1371,11 @@ mod tests {
             Some("fictional-commit")
         );
         for (tool, arguments, operation) in [
+            (
+                "knowledge_projects",
+                serde_json::json!({"query":"needle","search_in":"documents"}),
+                "projects",
+            ),
             (
                 "knowledge_context",
                 serde_json::json!({"project":"fictional-project","selection":"balanced","maximum_documents":3,"recent_documents":1}),

@@ -449,6 +449,7 @@ fn repository_filter(filter: &ReadFilterRequest) -> ReadFilter {
         filter.session,
         filter.include_archived,
     )
+    .with_projects(filter.projects.clone())
 }
 
 fn document_summary(record: &DocumentRecord) -> Result<DocumentSummary, GatewayError> {
@@ -479,6 +480,11 @@ pub(super) fn validate_version(version: u16) -> Result<(), GatewayError> {
 }
 
 fn validate_filter(filter: &ReadFilterRequest) -> Result<(), GatewayError> {
+    if !filter.valid_project_selection() {
+        return Err(GatewayError::ReadRequest(
+            ReadRequestError::InvalidProjectSelection,
+        ));
+    }
     if let Some(tag) = &filter.tag {
         let limits = DocumentLimits::default();
         if tag.trim().is_empty() || tag.chars().any(char::is_control) {
@@ -561,6 +567,8 @@ pub(super) fn committed_error_code(error: &CommittedReadError) -> ErrorCode {
 pub enum ReadRequestError {
     /// The inspection selectors are invalid.
     InvalidInspection,
+    /// Project selection is empty, duplicated, excessive, or ambiguous.
+    InvalidProjectSelection,
     /// The request named an unsupported Gateway protocol version.
     UnsupportedProtocolVersion {
         /// Version found in the request.
@@ -605,7 +613,9 @@ impl ReadRequestError {
         match self {
             Self::UnsupportedProtocolVersion { .. } => ErrorCode::InvalidProtocol,
             Self::TagTooLong { .. } | Self::InvalidResultLimit { .. } => ErrorCode::LimitExceeded,
-            Self::InvalidInspection | Self::InvalidTag => ErrorCode::InvalidRequest,
+            Self::InvalidInspection | Self::InvalidProjectSelection | Self::InvalidTag => {
+                ErrorCode::InvalidRequest
+            }
             Self::InvalidSearchQuery => ErrorCode::InvalidRequest,
             Self::InvalidCommittedPath => ErrorCode::ContentValidationFailed,
             Self::InvalidDeadline => ErrorCode::InternalError,
@@ -632,6 +642,9 @@ impl fmt::Display for ReadRequestError {
             Self::InvalidResultLimit { maximum, actual } => write!(
                 formatter,
                 "maximum results is {actual}; configured maximum is {maximum}"
+            ),
+            Self::InvalidProjectSelection => formatter.write_str(
+                "projects must contain 1..32 distinct slugs and cannot be combined with project",
             ),
             Self::InvalidInspection => formatter.write_str("invalid inspection request"),
             Self::InvalidSearchQuery => formatter.write_str("search query syntax is invalid"),

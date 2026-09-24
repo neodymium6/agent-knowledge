@@ -17,6 +17,14 @@ pub struct InspectRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InspectQuery {
+    Projects {
+        query: Option<String>,
+        #[serde(default)]
+        search_in: ProjectSearchScope,
+        maximum_results: usize,
+        description_characters: usize,
+        include_archived: bool,
+    },
     SearchExcerpts {
         query: String,
         filter: ReadFilterRequest,
@@ -59,6 +67,33 @@ pub enum InspectQuery {
         maximum_hunks: usize,
         maximum_diff_bytes: usize,
     },
+}
+
+/// Fields used to discover projects.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectSearchScope {
+    /// Case-insensitive substring of the slug, index title, or index body.
+    #[default]
+    Project,
+    /// The configured document search backend, aggregated by project.
+    Documents,
+}
+
+/// One project derived from committed documents, including projects without an index.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSummary {
+    pub project: ProjectId,
+    /// The project index supplies the display title and description, when present.
+    pub index: Option<DocumentSummary>,
+    /// Raw prefix of the index body; never an inferred or generated summary.
+    pub description: String,
+    pub description_truncated: bool,
+    /// Number of documents within the requested archive scope.
+    pub document_count: usize,
+    /// Exact matching document count in documents mode; absent in project mode.
+    pub matching_documents: Option<usize>,
 }
 
 /// A raw, Unicode-safe excerpt of a document field.
@@ -132,6 +167,11 @@ pub struct BodyHunks {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Inspection {
+    Projects {
+        commit: String,
+        projects: Vec<ProjectSummary>,
+        truncated: bool,
+    },
     SearchExcerpts {
         commit: String,
         hits: Vec<SearchHit>,

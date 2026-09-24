@@ -625,3 +625,426 @@ fn concise_diff_keeps_exact_identities_and_reports_metadata_only_changes() {
     assert_ne!(old.metadata.title, new.metadata.title);
     assert!(!body.changed && !body.truncated && body.hunks.is_empty());
 }
+
+fn project_document(
+    root: &TestDirectory,
+    project: Option<&str>,
+    number: usize,
+    text: &str,
+    index: bool,
+    archived: bool,
+) {
+    let identifier = format!("01K{number:023}");
+    let prefix = match (project, archived) {
+        (Some(project), false) => format!("projects/{project}"),
+        (Some(project), true) => format!("projects/{project}/archive"),
+        (None, false) => "inbox".into(),
+        (None, true) => "archive".into(),
+    };
+    let location = if index {
+        format!("{prefix}/index.md")
+    } else {
+        format!("{prefix}/references/2026-09-24-{identifier}/index.md")
+    };
+    let path = root.path().join("content").join(location);
+    fs::create_dir_all(path.parent().unwrap_or_else(|| panic!("parent")))
+        .unwrap_or_else(|e| panic!("mkdir: {e}"));
+    let status = if archived { "archived" } else { "active" };
+    let tag = if number.is_multiple_of(2) {
+        "shared"
+    } else {
+        "alternate"
+    };
+    fs::write(path, format!("---\nschema_version: 1\ndocument_id: {identifier}\ntitle: Fictional project overview\ncreated: 2026-09-24T12:00:00Z\nrequest_id: 01K00000000000000000000998\ntags: [{tag}]\nstatus: {status}\n---\n{text}")).unwrap_or_else(|e| panic!("write: {e}"));
+}
+
+fn project_query(
+    query: Option<&str>,
+    documents: bool,
+    maximum: usize,
+    archived: bool,
+) -> InspectQuery {
+    use agent_knowledge_protocol::ProjectSearchScope;
+    InspectQuery::Projects {
+        query: query.map(str::to_owned),
+        search_in: if documents {
+            ProjectSearchScope::Documents
+        } else {
+            ProjectSearchScope::Project
+        },
+        maximum_results: maximum,
+        description_characters: 2,
+        include_archived: archived,
+    }
+}
+
+#[test]
+fn project_discovery_uses_index_text_and_ranks_complete_document_hit_counts() {
+    for indexed in [false, true] {
+        let root = TestDirectory::create();
+        initialize_committed_content(&root);
+        project_document(
+            &root,
+            Some("fictional-alpha"),
+            1000,
+            "宇宙研究 and distant galaxies",
+            true,
+            false,
+        );
+        for (project, start, count) in [
+            ("fictional-alpha", 1010, 2),
+            ("fictional-beta", 1020, 3),
+            ("fictional-gamma", 1030, 1),
+        ] {
+            for number in start..start + count {
+                project_document(
+                    &root,
+                    Some(project),
+                    number,
+                    "needle observation",
+                    false,
+                    false,
+                );
+            }
+        }
+        project_document(
+            &root,
+            Some("fictional-gamma"),
+            1040,
+            "needle archived observation",
+            false,
+            true,
+        );
+        project_document(
+            &root,
+            Some("fictional-archived"),
+            1042,
+            "needle archived only",
+            false,
+            true,
+        );
+        project_document(&root, None, 1050, "needle unclassified", false, false);
+        commit(&root);
+        let config = if indexed {
+            publish_search_index(&root);
+            settings(&root)
+        } else {
+            settings_without_search_index(&root)
+        };
+        let gateway =
+            ReadGateway::open_until(&config, None).unwrap_or_else(|e| panic!("open: {e}"));
+        let Inspection::Projects {
+            commit,
+            projects,
+            truncated,
+        } = inspect(&gateway, project_query(None, false, 1, false))
+        else {
+            panic!("projects")
+        };
+        assert_eq!(commit, head(&gateway));
+        assert!(truncated);
+        assert_eq!(projects[0].project.as_str(), "fictional-alpha");
+        assert_eq!(projects[0].description, "宇宙");
+        assert!(projects[0].description_truncated);
+        assert_eq!(projects[0].document_count, 3);
+        assert!(projects[0].matching_documents.is_none());
+        // Match the complete index body, including text beyond the returned prefix.
+        for query in [
+            "GALAXIES",
+            "宇宙研究",
+            "fictional-alpha",
+            "project overview",
+        ] {
+            let Inspection::Projects { projects, .. } =
+                inspect(&gateway, project_query(Some(query), false, 10, false))
+            else {
+                panic!("projects")
+            };
+            assert_eq!(projects.len(), 1);
+            assert_eq!(projects[0].project.as_str(), "fictional-alpha");
+        }
+        let Inspection::Projects { projects, .. } =
+            inspect(&gateway, project_query(Some("needle"), false, 10, false))
+        else {
+            panic!("projects")
+        };
+        assert!(projects.is_empty());
+        let Inspection::Projects {
+            projects,
+            truncated,
+            ..
+        } = inspect(&gateway, project_query(Some("needle"), true, 1, false))
+        else {
+            panic!("projects")
+        };
+        assert!(truncated);
+        assert_eq!(projects[0].project.as_str(), "fictional-beta");
+        assert_eq!(projects[0].matching_documents, Some(3));
+        assert_eq!(projects[0].document_count, 3);
+        assert!(projects[0].index.is_none());
+        assert!(projects[0].description.is_empty());
+        let Inspection::Projects {
+            projects,
+            truncated,
+            ..
+        } = inspect(&gateway, project_query(Some("needle"), true, 10, true))
+        else {
+            panic!("projects")
+        };
+        assert!(!truncated);
+        assert_eq!(
+            projects
+                .iter()
+                .map(|p| (p.project.as_str(), p.matching_documents))
+                .collect::<Vec<_>>(),
+            [
+                ("fictional-beta", Some(3)),
+                ("fictional-alpha", Some(2)),
+                ("fictional-gamma", Some(2)),
+                ("fictional-archived", Some(1))
+            ]
+        );
+        let Inspection::Projects { projects, .. } =
+            inspect(&gateway, project_query(None, false, 10, false))
+        else {
+            panic!("projects")
+        };
+        assert_eq!(projects.len(), 4); // Inbox and archive-only project are excluded.
+        assert!(
+            gateway
+                .inspect(&request(project_query(None, true, 10, false)))
+                .is_err()
+        );
+        assert!(
+            gateway
+                .inspect(&request(project_query(Some(" "), false, 10, false)))
+                .is_err()
+        );
+        // A dirty canonical checkout must never produce discovery or hit counts.
+        project_document(
+            &root,
+            Some("fictional-unpublished"),
+            1060,
+            "needle",
+            false,
+            false,
+        );
+        assert!(
+            gateway
+                .inspect(&request(project_query(Some("needle"), true, 10, false)))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn multiple_projects_filter_inside_search_before_global_limit_on_both_backends() {
+    for indexed in [false, true] {
+        let root = TestDirectory::create();
+        initialize_committed_content(&root);
+        for (project, number) in [
+            ("fictional-alpha", 2000),
+            ("fictional-beta", 2001),
+            ("fictional-gamma", 2002),
+        ] {
+            project_document(
+                &root,
+                Some(project),
+                number,
+                "needle observation",
+                false,
+                false,
+            );
+        }
+        project_document(
+            &root,
+            Some("fictional-alpha"),
+            2010,
+            "needle archived",
+            false,
+            true,
+        );
+        project_document(&root, None, 2020, "needle unclassified", false, false);
+        commit(&root);
+        let config = if indexed {
+            publish_search_index(&root);
+            settings(&root)
+        } else {
+            settings_without_search_index(&root)
+        };
+        let gateway =
+            ReadGateway::open_until(&config, None).unwrap_or_else(|e| panic!("open: {e}"));
+        let filter: ReadFilterRequest = serde_json::from_value(
+            serde_json::json!({"projects":["fictional-gamma","fictional-alpha"],"tag":"shared"}),
+        )
+        .unwrap_or_else(|e| panic!("filter: {e}"));
+        let result = gateway
+            .search(&SearchRequest::new("needle".into(), filter.clone(), 10))
+            .unwrap_or_else(|e| panic!("search: {e}"));
+        assert_eq!(result.documents.len(), 2);
+        let global = gateway
+            .search(&SearchRequest::new(
+                "needle".into(),
+                ReadFilterRequest {
+                    tag: Some("shared".into()),
+                    ..ReadFilterRequest::default()
+                },
+                10,
+            ))
+            .unwrap_or_else(|e| panic!("global search: {e}"));
+        let expected = global
+            .documents
+            .iter()
+            .filter(|d| {
+                d.project.as_ref().is_some_and(|p| {
+                    p.as_str() == "fictional-alpha" || p.as_str() == "fictional-gamma"
+                })
+            })
+            .map(|d| d.metadata.document_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            result
+                .documents
+                .iter()
+                .map(|d| d.metadata.document_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        assert!(result.documents.iter().all(|d| {
+            d.project
+                .as_ref()
+                .is_some_and(|p| p.as_str() == "fictional-alpha" || p.as_str() == "fictional-gamma")
+        }));
+        assert_eq!(
+            gateway
+                .list(&ListRequest::new(filter.clone(), 10))
+                .unwrap_or_else(|e| panic!("list: {e}"))
+                .documents
+                .len(),
+            2
+        );
+        assert_eq!(
+            gateway
+                .recent(&ListRequest::new(filter.clone(), 1))
+                .unwrap_or_else(|e| panic!("recent: {e}"))
+                .documents
+                .len(),
+            1
+        );
+        let Inspection::SearchExcerpts { hits, .. } = inspect(
+            &gateway,
+            InspectQuery::SearchExcerpts {
+                query: "needle".into(),
+                filter: filter.clone(),
+                maximum_results: 1,
+                excerpt_characters: 50,
+            },
+        ) else {
+            panic!("excerpts")
+        };
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].excerpts.iter().any(|e| e.text.contains("needle")));
+        let mut archived = filter.clone();
+        archived.include_archived = true;
+        assert_eq!(
+            gateway
+                .search(&SearchRequest::new("needle".into(), archived, 10))
+                .unwrap_or_else(|e| panic!("search: {e}"))
+                .documents
+                .len(),
+            3
+        );
+        let mut absent = filter.clone();
+        absent.tag = Some("missing".into());
+        assert!(
+            gateway
+                .search(&SearchRequest::new("needle".into(), absent, 10))
+                .unwrap_or_else(|e| panic!("search: {e}"))
+                .documents
+                .is_empty()
+        );
+        let only_gamma: ReadFilterRequest = serde_json::from_value(
+            serde_json::json!({"projects":["fictional-gamma","fictional-missing"]}),
+        )
+        .unwrap_or_else(|e| panic!("filter: {e}"));
+        let result = gateway
+            .search(&SearchRequest::new("needle".into(), only_gamma, 1))
+            .unwrap_or_else(|e| panic!("search: {e}"));
+        assert_eq!(
+            result.documents[0].project.as_ref().map(|p| p.as_str()),
+            Some("fictional-gamma")
+        );
+        for value in [
+            serde_json::json!({"projects":[]}),
+            serde_json::json!({"projects":["fictional-alpha","fictional-alpha"]}),
+            serde_json::json!({"project":"fictional-alpha","projects":["fictional-gamma"]}),
+            serde_json::json!({"projects":(0..33).map(|i| format!("fictional-{i}")).collect::<Vec<_>>()}),
+        ] {
+            let invalid: ReadFilterRequest =
+                serde_json::from_value(value).unwrap_or_else(|e| panic!("filter: {e}"));
+            assert_eq!(
+                gateway
+                    .search(&SearchRequest::new("needle".into(), invalid.clone(), 10))
+                    .err()
+                    .unwrap_or_else(|| panic!("must fail"))
+                    .error_code(),
+                ErrorCode::InvalidRequest
+            );
+            assert!(gateway.list(&ListRequest::new(invalid, 10)).is_err());
+        }
+    }
+}
+
+#[test]
+fn project_document_counts_fail_on_stale_indexes_and_scan_limits() {
+    let root = TestDirectory::create();
+    initialize_committed_content(&root);
+    project_document(&root, Some("fictional-alpha"), 3000, "needle", true, false);
+    commit(&root);
+    publish_search_index(&root);
+    let gateway =
+        ReadGateway::open_until(&settings(&root), None).unwrap_or_else(|e| panic!("open: {e}"));
+    project_document(&root, Some("fictional-alpha"), 3001, "needle", false, false);
+    commit(&root);
+    assert!(
+        gateway
+            .inspect(&request(project_query(Some("needle"), true, 10, false)))
+            .is_err()
+    );
+    // Discovery by index text does not depend on the stale derived search index.
+    let Inspection::Projects { projects, .. } =
+        inspect(&gateway, project_query(Some("needle"), false, 10, false))
+    else {
+        panic!("projects")
+    };
+    assert_eq!(projects[0].document_count, 2);
+    let yaml = format!(
+        "schema_version: 4\nidentity:\n  gateway_uid: 61001\nstorage:\n  queue_socket: {}\n  git_directory: {}\n  content_root: {}\nrepository:\n  official_branch: main\nreads:\n  maximum_results: 100\n  maximum_query_characters: 512\n  maximum_index_entries: 100000\n  maximum_index_markdown_bytes: 536870912\n  maximum_search_documents: 1\n  maximum_search_markdown_bytes: 536870912\n  operation_timeout_seconds: 30\n  maximum_response_bytes: 268435456\n  search_metadata:\n    node: true\n    agent: true\n    session: true\n    request_id: true\ntransport:\n  submit_timeout_seconds: 300\n",
+        root.path().join("queue").display(),
+        root.path().join("repository").display(),
+        root.path().join("content").display()
+    );
+    let config = GatewaySettings::decode(&yaml).unwrap_or_else(|e| panic!("settings: {e}"));
+    let gateway = ReadGateway::open_until(&config, None).unwrap_or_else(|e| panic!("open: {e}"));
+    assert_eq!(
+        gateway
+            .inspect(&request(project_query(Some("needle"), true, 1, false)))
+            .err()
+            .unwrap_or_else(|| panic!("must fail rather than return partial counts"))
+            .error_code(),
+        ErrorCode::LimitExceeded
+    );
+    for query in [
+        InspectQuery::Projects {
+            query: None,
+            search_in: agent_knowledge_protocol::ProjectSearchScope::Project,
+            maximum_results: 10,
+            description_characters: 0,
+            include_archived: false,
+        },
+        project_query(None, false, 0, false),
+    ] {
+        assert!(gateway.inspect(&request(query)).is_err());
+    }
+}

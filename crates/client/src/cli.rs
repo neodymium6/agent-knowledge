@@ -14,7 +14,8 @@ use agent_knowledge_protocol::{
 use crate::ClientCommandError;
 
 const USAGE: &str = "usage:\n\
-    agent-knowledge-client search-excerpts --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--excerpt-characters <count>]\n\
+    agent-knowledge-client projects --destination <ssh-destination> [--query <text>] [--search-in project|documents] [--maximum-results <count>] [--description-characters <count>] [--include-archived]\n\
+    agent-knowledge-client search-excerpts --destination <ssh-destination> --query <text> [--project <id> ...] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--excerpt-characters <count>]\n\
     agent-knowledge-client context --destination <ssh-destination> --project <id> [--query <text>] [--maximum-documents <count>] [--maximum-characters <count>] [--selection relevance|balanced] [--recent-documents <count>]\n\
     agent-knowledge-client history --destination <ssh-destination> --document-id <id> [--anchor-commit <hash>] [--cursor <hash>] [--maximum-results <count>]\n\
     agent-knowledge-client get-at --destination <ssh-destination> --document-id <id> --commit <hash>\n\
@@ -24,12 +25,12 @@ const USAGE: &str = "usage:\n\
     agent-knowledge-client --version\n\
     agent-knowledge-client mcp --destination <ssh-destination> [--listen <loopback-address>] [--timeout-seconds <seconds>]\n\
     agent-knowledge-client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
-    agent-knowledge-client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
-    agent-knowledge-client recent --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
+    agent-knowledge-client list --destination <ssh-destination> [--project <id> ...] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
+    agent-knowledge-client recent --destination <ssh-destination> [--project <id> ...] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge-client get --destination <ssh-destination> --document-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge-client export --destination <ssh-destination> --document-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge-client status --destination <ssh-destination> --request-id <id> [--timeout-seconds <seconds>]\n\
-    agent-knowledge-client search --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]";
+    agent-knowledge-client search --destination <ssh-destination> --query <text> [--project <id> ...] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
 const MAXIMUM_TIMEOUT_SECONDS: u64 = 3_600;
 const DEFAULT_READ_RESULTS: usize = 100;
@@ -264,9 +265,9 @@ where
         };
     }
     match action.to_str() {
-        Some(action @ ("search-excerpts" | "context" | "history" | "get-at" | "diff")) => {
-            inspect::parse(action, arguments)
-        }
+        Some(
+            action @ ("projects" | "search-excerpts" | "context" | "history" | "get-at" | "diff"),
+        ) => inspect::parse(action, arguments),
         Some("submit") => parse_submit_arguments(arguments),
         Some("mcp") => parse_mcp_arguments(arguments),
         Some("list") => parse_list_arguments(arguments, false),
@@ -384,7 +385,7 @@ where
     I: Iterator<Item = OsString>,
 {
     let mut destination = None;
-    let mut project = None;
+    let mut projects = Vec::new();
     let mut tag = None;
     let mut session = None;
     let mut include_archived = false;
@@ -402,8 +403,8 @@ where
         let value = arguments.next().ok_or(ParseError)?;
         match flag.to_str() {
             Some("--destination") if destination.is_none() => destination = Some(value),
-            Some("--project") if project.is_none() => {
-                project = Some(
+            Some("--project") => {
+                projects.push(
                     value
                         .to_str()
                         .and_then(|value| value.parse().ok())
@@ -433,18 +434,32 @@ where
             _ => return Err(ParseError),
         }
     }
+    let mut filter = project_filter(projects)?;
+    filter.tag = tag;
+    filter.session = session;
+    filter.include_archived = include_archived;
     Ok(ParsedReadArguments {
         destination: destination.ok_or(ParseError)?,
-        filter: ReadFilterRequest {
-            project,
-            tag,
-            session,
-            include_archived,
-        },
+        filter,
         maximum_results: maximum_results.unwrap_or(DEFAULT_READ_RESULTS),
         query,
         timeout: Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS)),
     })
+}
+
+fn project_filter(
+    mut projects: Vec<agent_knowledge_core::ProjectId>,
+) -> Result<ReadFilterRequest, ParseError> {
+    let mut filter = ReadFilterRequest::default();
+    if projects.len() == 1 {
+        filter.project = projects.pop();
+    } else if !projects.is_empty() {
+        filter.projects = Some(projects);
+    }
+    if !filter.valid_project_selection() {
+        return Err(ParseError);
+    }
+    Ok(filter)
 }
 
 fn parse_document_arguments<I>(mut arguments: I, export: bool) -> Result<Command, ParseError>
@@ -708,5 +723,70 @@ mod tests {
         };
         assert!(matches!(error, CliError::Usage));
         assert!(error.to_string().starts_with("usage:"));
+    }
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_projects_form_a_union_and_single_project_keeps_original_wire() {
+        for action in ["list", "recent", "search"] {
+            for projects in [vec!["fictional-a"], vec!["fictional-a", "fictional-b"]] {
+                let mut args = vec![action, "--destination", "fictional-knowledge"];
+                if action == "search" {
+                    args.extend(["--query", "needle"]);
+                }
+                for project in &projects {
+                    args.extend(["--project", project]);
+                }
+                let command = parse_arguments(args.into_iter().map(OsString::from))
+                    .unwrap_or_else(|e| panic!("parse: {e:?}"));
+                let filter = match command {
+                    Command::List { request, .. } => request.filter,
+                    Command::Search { request, .. } => request.filter,
+                    _ => panic!("read command"),
+                };
+                let value = serde_json::to_value(filter).unwrap_or_else(|e| panic!("JSON: {e}"));
+                if projects.len() == 1 {
+                    assert_eq!(value, serde_json::json!({"project":"fictional-a"}));
+                } else {
+                    assert_eq!(
+                        value,
+                        serde_json::json!({"projects":["fictional-a","fictional-b"]})
+                    );
+                }
+            }
+        }
+        for args in [
+            vec![
+                "search",
+                "--query",
+                "needle",
+                "--project",
+                "fictional-a",
+                "--project",
+                "fictional-a",
+            ],
+            vec!["projects", "--search-in", "documents"],
+            vec!["projects", "--query", "needle", "--search-in", "unknown"],
+            vec![
+                "context",
+                "--project",
+                "fictional-a",
+                "--project",
+                "fictional-b",
+            ],
+        ] {
+            assert!(
+                parse_arguments(
+                    args.into_iter()
+                        .chain(["--destination", "fictional-knowledge"])
+                        .map(OsString::from)
+                )
+                .is_err()
+            );
+        }
     }
 }

@@ -8,13 +8,27 @@ pub(super) fn parse(
 ) -> Result<Command, ParseError> {
     let mut values = BTreeMap::new();
     let mut archived = false;
+    let mut projects = Vec::new();
     while let Some(flag) = args.next() {
         let flag = flag.into_string().map_err(|_| ParseError)?;
-        if flag == "--include-archived" && action == "search-excerpts" && !archived {
+        if flag == "--include-archived"
+            && matches!(action, "search-excerpts" | "projects")
+            && !archived
+        {
             archived = true;
             continue;
         }
         let value = args.next().ok_or(ParseError)?;
+        if flag == "--project" && action == "search-excerpts" {
+            projects.push(
+                value
+                    .to_str()
+                    .ok_or(ParseError)?
+                    .parse()
+                    .map_err(|_| ParseError)?,
+            );
+            continue;
+        }
         if values.insert(flag, value).is_some() {
             return Err(ParseError);
         }
@@ -26,13 +40,27 @@ pub(super) fn parse(
         .transpose()?
         .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
     let query = match action {
+        "projects" => InspectQuery::Projects {
+            query: optional(&mut values, "--query")?,
+            search_in: match optional::<String>(&mut values, "--search-in")?
+                .as_deref()
+                .unwrap_or("project")
+            {
+                "project" => agent_knowledge_protocol::ProjectSearchScope::Project,
+                "documents" => agent_knowledge_protocol::ProjectSearchScope::Documents,
+                _ => return Err(ParseError),
+            },
+            maximum_results: number(&mut values, "--maximum-results", 100, MAXIMUM_READ_RESULTS)?,
+            description_characters: number(&mut values, "--description-characters", 300, 2000)?,
+            include_archived: archived,
+        },
         "search-excerpts" => InspectQuery::SearchExcerpts {
             query: required(&mut values, "--query")?,
             filter: ReadFilterRequest {
-                project: optional(&mut values, "--project")?,
                 tag: optional(&mut values, "--tag")?,
                 session: optional(&mut values, "--session")?,
                 include_archived: archived,
+                ..project_filter(projects)?
             },
             maximum_results: number(&mut values, "--maximum-results", 10, MAXIMUM_READ_RESULTS)?,
             excerpt_characters: number(&mut values, "--excerpt-characters", 300, 2000)?,
@@ -117,6 +145,16 @@ pub(super) fn parse(
         }
         _ => return Err(ParseError),
     };
+    if matches!(
+        &query,
+        InspectQuery::Projects {
+            query: None,
+            search_in: agent_knowledge_protocol::ProjectSearchScope::Documents,
+            ..
+        }
+    ) {
+        return Err(ParseError);
+    }
     if !values.is_empty() {
         return Err(ParseError);
     }
