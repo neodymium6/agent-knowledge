@@ -4,13 +4,17 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.6.0
+
 - Add opt-in ranked document hits and source excerpts to project discovery, with
   exact counts, bounded per-project samples, and explicit Gateway capability checks.
-
 - Add committed project discovery through CLI and MCP, with index descriptions,
   total document counts, and optional ranking by exact document-search hit counts.
 - Add bounded multi-project scopes to list, recent, search, and search excerpts,
   preserving single-project wire shapes and globally ranked/limited results.
+- Upgrade the client and Gateway to use the new discovery and multi-project
+  operations. Existing calls retain their wire shapes; no durable storage
+  migration or search-index rebuild is required for this release.
 
 ## 0.5.0
 
