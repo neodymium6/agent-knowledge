@@ -4,11 +4,15 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.5.0
+
 - Omit nearly empty shortened context bodies while preserving complete short
   documents. Add opt-in balanced context with per-document shares, reserved
   recent logs, and durable guidance prioritized over repeated operational logs.
 - Add opt-in bounded multi-hunk body differences through CLI and MCP, preserving
   the default contiguous-range wire contract and exact official commit metadata.
+- Advertise the new read modes as additive Gateway capabilities. Upgrade the
+  client and Gateway to use them; no durable storage migration is required.
 
 ## 0.4.0
 
