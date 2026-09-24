@@ -8,6 +8,9 @@ pub(super) struct ExcerptParameters {
     query: String,
     #[serde(default)]
     project: Option<String>,
+    /// Union of project slugs; mutually exclusive with project.
+    #[serde(default)]
+    projects: Option<Vec<String>>,
     #[serde(default)]
     tag: Option<String>,
     #[serde(default)]
@@ -26,6 +29,7 @@ impl ExcerptParameters {
         let search = SearchParameters {
             query: self.query,
             project: self.project,
+            projects: self.projects,
             tag: self.tag,
             session: self.session,
             include_archived: self.include_archived,
@@ -313,5 +317,54 @@ mod tests {
         let parameters: DiffParameters =
             serde_json::from_value(invalid).unwrap_or_else(|e| panic!("parameters: {e}"));
         assert!(parameters.request().is_err());
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProjectsParameters {
+    /// Project searches slug/index text. Documents ranks projects by matching document count and requires query.
+    #[serde(default)]
+    search_in: ProjectSearchMode,
+    /// Project-text substring, or a required backend search expression in documents mode.
+    #[serde(default)]
+    query: Option<String>,
+    /// Maximum returned projects, 1..10000. Defaults to 100.
+    #[serde(default)]
+    maximum_results: Option<usize>,
+    /// Maximum Unicode characters of each index body, 1..2000. Defaults to 300.
+    #[serde(default)]
+    description_characters: Option<usize>,
+    /// Include archived documents when discovering projects and counting documents.
+    #[serde(default)]
+    include_archived: bool,
+}
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ProjectSearchMode {
+    #[default]
+    Project,
+    Documents,
+}
+impl ProjectsParameters {
+    pub(super) fn request(self) -> Result<InspectRequest, String> {
+        if self.query.as_deref().is_some_and(|q| q.trim().is_empty()) {
+            return Err("query must not be empty".into());
+        }
+        if matches!(self.search_in, ProjectSearchMode::Documents) && self.query.is_none() {
+            return Err("documents search requires query".into());
+        }
+        Ok(request(InspectQuery::Projects {
+            query: self.query,
+            search_in: match self.search_in {
+                ProjectSearchMode::Project => agent_knowledge_protocol::ProjectSearchScope::Project,
+                ProjectSearchMode::Documents => {
+                    agent_knowledge_protocol::ProjectSearchScope::Documents
+                }
+            },
+            maximum_results: bounded(self.maximum_results.unwrap_or(100), MAXIMUM_RESULTS)?,
+            description_characters: bounded(self.description_characters.unwrap_or(300), 2000)?,
+            include_archived: self.include_archived,
+        }))
     }
 }

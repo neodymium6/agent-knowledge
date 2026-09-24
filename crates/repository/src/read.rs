@@ -692,6 +692,7 @@ impl CommittedDocument<'_> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReadFilter {
     project: Option<ProjectId>,
+    projects: Option<Vec<ProjectId>>,
     tag: Option<String>,
     session: Option<SessionId>,
     include_archived: bool,
@@ -708,10 +709,23 @@ impl ReadFilter {
     ) -> Self {
         Self {
             project,
+            projects: None,
             tag,
             session,
             include_archived,
         }
+    }
+
+    /// Adds a union of project identities. An empty union matches nothing.
+    /// When a single project is also set, both restrictions apply.
+    #[must_use]
+    pub fn with_projects(mut self, projects: Option<Vec<ProjectId>>) -> Self {
+        self.projects = projects;
+        self
+    }
+
+    pub(crate) fn projects(&self) -> Option<&[ProjectId]> {
+        self.projects.as_deref()
     }
 
     pub(crate) const fn project(&self) -> Option<&ProjectId> {
@@ -736,6 +750,12 @@ impl ReadFilter {
                 .project
                 .as_ref()
                 .is_none_or(|project| document.location().project() == Some(project))
+            && self.projects.as_ref().is_none_or(|projects| {
+                document
+                    .location()
+                    .project()
+                    .is_some_and(|p| projects.contains(p))
+            })
             && self.tag.as_ref().is_none_or(|tag| {
                 document
                     .metadata()

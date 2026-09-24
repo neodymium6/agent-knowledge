@@ -4,7 +4,7 @@ mod inspect;
 mod read;
 pub use inspect::{
     BodyDiff, BodyHunks, ContextDocument, DiffTruncation, Excerpt, HistoryEntry, InspectQuery,
-    InspectRequest, InspectResponse, Inspection, SearchHit,
+    InspectRequest, InspectResponse, Inspection, ProjectSearchScope, ProjectSummary, SearchHit,
 };
 mod status;
 mod version;

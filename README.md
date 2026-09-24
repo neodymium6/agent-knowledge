@@ -101,10 +101,17 @@ revision, returning BM25-ranked results. A configured index that is absent,
 stale, or unreadable is a retryable failure. Deployments that omit
 `search_index_root` retain the bounded Markdown scan backend.
 
+Project discovery lists project summaries or ranks projects by matching document
+counts. Document reads also accept repeated `--project` flags to select a union
+of projects.
+
 Additional read tools provide search excerpts, bounded project context, and
 commit-based document history:
 
 ```sh
+agent-knowledge-client projects --destination fictional-knowledge
+agent-knowledge-client projects --destination fictional-knowledge \
+  --query backup --search-in documents
 agent-knowledge-client search-excerpts --destination fictional-knowledge \
   --project fictional-project --query "fictional restart"
 agent-knowledge-client context --destination fictional-knowledge \
@@ -113,7 +120,7 @@ agent-knowledge-client history --destination fictional-knowledge \
   --document-id 01K00000000000000000000001
 ```
 
-The corresponding MCP tools are `knowledge_search_excerpts`,
+The corresponding MCP tools are `knowledge_projects`, `knowledge_search_excerpts`,
 `knowledge_context`, `knowledge_history`, `knowledge_get_at`, and
 `knowledge_diff`. See [read operations](docs/read-operations.md) for selection
 rules, historical reads, differences, pagination, bounds, and compatibility.

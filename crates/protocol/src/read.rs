@@ -12,6 +12,9 @@ pub struct ReadFilterRequest {
     /// Restricts results to one project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<ProjectId>,
+    /// Union of 1..32 distinct projects, mutually exclusive with `project`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects: Option<Vec<ProjectId>>,
     /// Restricts results to one exact tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
@@ -21,6 +24,21 @@ pub struct ReadFilterRequest {
     /// Includes documents below archive directories.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_archived: bool,
+}
+
+impl ReadFilterRequest {
+    /// Whether the project selection is bounded, nonempty, and unambiguous.
+    #[must_use]
+    pub fn valid_project_selection(&self) -> bool {
+        self.projects.as_ref().is_none_or(|projects| {
+            self.project.is_none()
+                && (1..=32).contains(&projects.len())
+                && projects
+                    .iter()
+                    .enumerate()
+                    .all(|(i, p)| !projects[..i].contains(p))
+        })
+    }
 }
 
 /// Input for committed `list` and `recent` operations.

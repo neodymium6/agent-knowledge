@@ -7,7 +7,9 @@ use std::time::Instant;
 use agent_knowledge_core::{DocumentId, markdown_body};
 use tantivy::collector::sort_key::{SortBySimilarityScore, SortByString};
 use tantivy::collector::{Collector, SegmentCollector, TopDocs};
-use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, QueryParserError, TermQuery};
+use tantivy::query::{
+    BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser, QueryParserError, TermQuery,
+};
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, NumericOptions, STORED, STRING, Schema, TEXT, TantivyDocument,
     Term, TextOptions, Value,
@@ -643,6 +645,25 @@ impl SearchFields {
         let mut clauses = vec![(Occur::Must, query)];
         if let Some(project) = filter.project() {
             clauses.push((Occur::Must, self.term_query(self.project, project.as_str())));
+        }
+        if let Some(projects) = filter.projects() {
+            let union = projects
+                .iter()
+                .map(|project| {
+                    (
+                        Occur::Should,
+                        self.term_query(self.project, project.as_str()),
+                    )
+                })
+                .collect();
+            // Scope membership must not boost rare projects over common ones.
+            clauses.push((
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(
+                    Box::new(BooleanQuery::new(union)),
+                    0.0,
+                )),
+            ));
         }
         if let Some(tag) = filter.tag() {
             clauses.push((Occur::Must, self.term_query(self.exact_tags, tag)));

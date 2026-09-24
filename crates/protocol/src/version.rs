@@ -55,6 +55,7 @@ impl VersionResponse {
             .map(|command| command.as_str().to_owned())
             .collect(),
             inspect_queries: [
+                "projects",
                 "search_excerpts",
                 "context",
                 "context_balanced",
@@ -88,6 +89,6 @@ mod tests {
         for command in response.commands {
             assert!(crate::GatewayCommand::parse(std::ffi::OsStr::new(&command)).is_ok());
         }
-        assert_eq!(response.inspect_queries.len(), 7);
+        assert_eq!(response.inspect_queries.len(), 8);
     }
 }

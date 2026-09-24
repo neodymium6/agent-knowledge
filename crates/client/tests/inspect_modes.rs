@@ -14,7 +14,7 @@ fn cli_and_stdio_forward_explicit_modes_and_preserve_json_framing() {
     let captured = root.path().join("request.json");
     let response_file = root.path().join("response.json");
     let ssh = root.path().join("ssh");
-    fs::write(&ssh, "#!/bin/sh\nset -eu\nfor arg do last=$arg; done\ntest \"$last\" = 'akp-v1 inspect'\ncat > \"$AK_CAPTURE\"\ncat \"$AK_RESPONSE\"\n").unwrap_or_else(|e| panic!("write: {e}"));
+    fs::write(&ssh, "#!/bin/sh\nset -eu\nfor arg do last=$arg; done\ntest \"$last\" = \"$AK_COMMAND\"\ncat > \"$AK_CAPTURE\"\ncat \"$AK_RESPONSE\"\n").unwrap_or_else(|e| panic!("write: {e}"));
     fs::set_permissions(ssh, fs::Permissions::from_mode(0o700))
         .unwrap_or_else(|e| panic!("chmod: {e}"));
     let path = std::env::join_paths(
@@ -27,6 +27,59 @@ fn cli_and_stdio_forward_explicit_modes_and_preserve_json_framing() {
     .unwrap_or_else(|e| panic!("PATH: {e}"));
     let summary = json!({"path":"projects/fictional-project/references/2026-09-24-01K00000000000000000000001/index.md","document_type":"reference","project":"fictional-project","archived":false,"revision":format!("sha256:{}", "a".repeat(64)),"metadata":{"schema_version":1,"document_id":"01K00000000000000000000001","title":"Fictional reference","created":"2026-09-24T00:00:00Z","updated":null,"request_id":"01K00000000000000000000002","status":"active"}});
     for (action, flags, tool, parameters, query, result) in [
+        (
+            "projects",
+            vec![
+                "--query",
+                "needle",
+                "--search-in",
+                "documents",
+                "--maximum-results",
+                "2",
+            ],
+            "knowledge_projects",
+            json!({"query":"needle","search_in":"documents","maximum_results":2}),
+            json!({"operation":"projects","query":"needle","search_in":"documents","maximum_results":2,"description_characters":300,"include_archived":false}),
+            json!({"operation":"projects","commit":"a".repeat(40),"projects":[{"project":"fictional-project","index":null,"description":"","description_truncated":false,"document_count":3,"matching_documents":2}],"truncated":false}),
+        ),
+        (
+            "projects",
+            vec![],
+            "knowledge_projects",
+            json!({}),
+            json!({"operation":"projects","query":null,"search_in":"project","maximum_results":100,"description_characters":300,"include_archived":false}),
+            json!({"operation":"projects","commit":"a".repeat(40),"projects":[],"truncated":false}),
+        ),
+        (
+            "search-excerpts",
+            vec![
+                "--query",
+                "needle",
+                "--project",
+                "fictional-alpha",
+                "--project",
+                "fictional-beta",
+            ],
+            "knowledge_search_excerpts",
+            json!({"query":"needle","projects":["fictional-alpha","fictional-beta"]}),
+            json!({"operation":"search_excerpts","query":"needle","filter":{"projects":["fictional-alpha","fictional-beta"]},"maximum_results":10,"excerpt_characters":300}),
+            json!({"operation":"search_excerpts","commit":"a".repeat(40),"hits":[]}),
+        ),
+        (
+            "search",
+            vec![
+                "--query",
+                "needle",
+                "--project",
+                "fictional-alpha",
+                "--project",
+                "fictional-beta",
+            ],
+            "knowledge_search",
+            json!({"query":"needle","projects":["fictional-alpha","fictional-beta"]}),
+            json!({"protocol_version":1,"query":"needle","projects":["fictional-alpha","fictional-beta"],"maximum_results":100}),
+            json!({"protocol_version":1,"commit":"a".repeat(40),"documents":[]}),
+        ),
         (
             "context",
             vec![
@@ -64,13 +117,31 @@ fn cli_and_stdio_forward_explicit_modes_and_preserve_json_framing() {
             json!({"operation":"diff_hunks","from_commit":"a".repeat(40),"to_commit":"b".repeat(40),"before":summary,"after":summary,"body":{"changed":true,"hunks":[{"from_line":1,"to_line":1,"removed":"old\n","added":"追加\n"}],"truncated":false,"truncation_reason":null}}),
         ),
     ] {
-        let response = json!({"protocol_version":1,"result":result});
+        let inspection = query.get("operation").is_some();
+        let expected_request = if inspection {
+            json!({"protocol_version":1,"query":query})
+        } else {
+            query.clone()
+        };
+        let response = if inspection {
+            json!({"protocol_version":1,"result":result})
+        } else {
+            result
+        };
         fs::write(&response_file, response.to_string()).unwrap_or_else(|e| panic!("response: {e}"));
         let command = || {
             let mut command = Command::new(env!("CARGO_BIN_EXE_agent-knowledge-client"));
             command
                 .env("PATH", &path)
                 .env("AGENT_KNOWLEDGE_UPDATE_CHECK", "off")
+                .env(
+                    "AK_COMMAND",
+                    if inspection {
+                        "akp-v1 inspect"
+                    } else {
+                        "akp-v1 search"
+                    },
+                )
                 .env("AK_CAPTURE", &captured)
                 .env("AK_RESPONSE", &response_file);
             command
@@ -95,7 +166,7 @@ fn cli_and_stdio_forward_explicit_modes_and_preserve_json_framing() {
             )
             .unwrap_or_else(|e| panic!("JSON: {e}"))
         };
-        assert_eq!(read_request()["query"], query);
+        assert_eq!(read_request(), expected_request);
         let mut child = command()
             .args(["mcp", "--destination", "fictional-knowledge"])
             .stdin(Stdio::piped())
@@ -143,6 +214,6 @@ fn cli_and_stdio_forward_explicit_modes_and_preserve_json_framing() {
             .find(|m| m["id"] == 2)
             .unwrap_or_else(|| panic!("tool response"));
         assert_eq!(call["result"]["structuredContent"], response);
-        assert_eq!(read_request()["query"], query);
+        assert_eq!(read_request(), expected_request);
     }
 }

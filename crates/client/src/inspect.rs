@@ -27,18 +27,72 @@ fn validate(
 ) -> Result<(), ClientCommandError> {
     let valid = match (&request.query, &response.result) {
         (
+            InspectQuery::Projects {
+                maximum_results,
+                description_characters,
+                search_in,
+                ..
+            },
+            Inspection::Projects {
+                projects,
+                truncated,
+                ..
+            },
+        ) => {
+            use agent_knowledge_protocol::ProjectSearchScope;
+            let documents = *search_in == ProjectSearchScope::Documents;
+            let mut seen = std::collections::HashSet::new();
+            projects.len() <= *maximum_results
+                && (!truncated || projects.len() == *maximum_results)
+                && projects.iter().all(|p| {
+                    p.document_count > 0
+                        && seen.insert(&p.project)
+                        && p.description.chars().count() <= *description_characters
+                        && p.matching_documents.is_some() == documents
+                        && p.matching_documents
+                            .is_none_or(|n| n > 0 && n <= p.document_count)
+                        && p.index.as_ref().map_or_else(
+                            || p.description.is_empty() && !p.description_truncated,
+                            |d| {
+                                d.project.as_ref() == Some(&p.project)
+                                    && d.document_type == agent_knowledge_core::DocumentType::Index
+                            },
+                        )
+                })
+                && projects.windows(2).all(|pair| {
+                    if documents {
+                        pair[0].matching_documents > pair[1].matching_documents
+                            || (pair[0].matching_documents == pair[1].matching_documents
+                                && pair[0].project < pair[1].project)
+                    } else {
+                        pair[0].project < pair[1].project
+                    }
+                })
+        }
+        (
             InspectQuery::SearchExcerpts {
                 maximum_results,
                 excerpt_characters,
+                filter,
                 ..
             },
             Inspection::SearchExcerpts { hits, .. },
         ) => {
             hits.len() <= *maximum_results
                 && hits.iter().all(|h| {
-                    h.excerpts
-                        .iter()
-                        .all(|e| e.text.chars().count() <= *excerpt_characters)
+                    filter
+                        .project
+                        .as_ref()
+                        .is_none_or(|p| h.document.project.as_ref() == Some(p))
+                        && filter.projects.as_ref().is_none_or(|projects| {
+                            h.document
+                                .project
+                                .as_ref()
+                                .is_some_and(|p| projects.contains(p))
+                        })
+                        && h.excerpts
+                            .iter()
+                            .all(|e| e.text.chars().count() <= *excerpt_characters)
                 })
         }
         (
@@ -248,6 +302,34 @@ mod tests {
         for value in cases {
             let response: InspectResponse =
                 serde_json::from_value(value).unwrap_or_else(|e| panic!("JSON: {e}"));
+            assert!(validate(&request, &response).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_rejects_impossible_counts_order_and_overlong_descriptions() {
+        let request: InspectRequest = serde_json::from_value(serde_json::json!({"protocol_version":1,"query":{"operation":"projects","query":"needle","search_in":"documents","maximum_results":2,"description_characters":3,"include_archived":false}})).unwrap_or_else(|e| panic!("request: {e}"));
+        let project = serde_json::json!({"project":"fictional-a","index":null,"description":"","description_truncated":false,"document_count":3,"matching_documents":2});
+        let wire = serde_json::json!({"protocol_version":1,"result":{"operation":"projects","commit":"a".repeat(40),"projects":[project],"truncated":false}});
+        let response: InspectResponse =
+            serde_json::from_value(wire.clone()).unwrap_or_else(|e| panic!("response: {e}"));
+        assert!(validate(&request, &response).is_ok());
+        let mut bad = wire.clone();
+        bad["result"]["projects"][0]["matching_documents"] = 4.into();
+        let mut order = wire.clone();
+        order["result"]["projects"] = serde_json::json!([project, project]);
+        let mut description = wire.clone();
+        description["result"]["projects"][0]["description"] = "long text".into();
+        let mut mode = wire;
+        mode["result"]["projects"][0]["matching_documents"] = serde_json::Value::Null;
+        for value in [bad, order, description, mode] {
+            let response =
+                serde_json::from_value(value).unwrap_or_else(|e| panic!("response: {e}"));
             assert!(validate(&request, &response).is_err());
         }
     }

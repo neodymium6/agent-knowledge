@@ -1,5 +1,6 @@
 //! Read-only inspection of a committed snapshot or official ancestry.
 mod diff;
+mod projects;
 use super::*;
 use agent_knowledge_core::{DocumentId, DocumentStatus, DocumentType, markdown_body};
 use agent_knowledge_protocol::{
@@ -23,6 +24,50 @@ pub(crate) fn inspect_until(
 ) -> Result<PreparedResponse<InspectResponse>, GatewayError> {
     validate_version(request.protocol_version)?;
     let result = match &request.query {
+        InspectQuery::Projects {
+            query,
+            search_in,
+            maximum_results,
+            description_characters,
+            include_archived,
+        } => {
+            validate_result_limit(settings, *maximum_results)?;
+            bounded(*description_characters, 2000)?;
+            if query.as_ref().is_some_and(|q| {
+                q.trim().is_empty()
+                    || q.chars().count() > settings.maximum_search_query_characters()
+            }) {
+                return Err(invalid());
+            }
+            if *search_in == agent_knowledge_protocol::ProjectSearchScope::Documents
+                && query.is_none()
+            {
+                return Err(invalid());
+            }
+            let search_in = *search_in;
+            let snapshot = snapshot(settings, store, deadline)?;
+            let settings = settings.clone();
+            let query = query.clone();
+            let maximum = *maximum_results;
+            let characters = *description_characters;
+            let archived = *include_archived;
+            run_until(
+                move || {
+                    projects::list(
+                        &settings,
+                        &snapshot,
+                        search_indexes,
+                        query.as_deref(),
+                        search_in,
+                        maximum,
+                        characters,
+                        archived,
+                        deadline,
+                    )
+                },
+                deadline,
+            )?
+        }
         InspectQuery::SearchExcerpts {
             query,
             filter,
