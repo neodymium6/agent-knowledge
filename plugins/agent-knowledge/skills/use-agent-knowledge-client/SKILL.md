@@ -1,12 +1,21 @@
 ---
 name: use-agent-knowledge-client
-description: Use the Agent Knowledge SSH client to search, list, retrieve, export, submit, and track centralized coding-agent knowledge. Use when an agent needs to read committed Markdown or attachments, find prior work, create an atomic change request, update or archive a mutable document with optimistic locking, add an attachment, or check request status.
+description: Use the Agent Knowledge SSH client to search, list, retrieve, export, submit, and track centralized coding-agent knowledge. Use when an agent needs to read committed Markdown or attachments, find prior work, create an atomic change request, update or archive a mutable document with optimistic locking, add an attachment, or check request status. Proactively consult relevant prior records for project-specific work without waiting for an explicit request.
 ---
 
 # Use Agent Knowledge Client
 
 Use `agent-knowledge-client` for all remote operations (or `agent-knowledge
 client` from the full package), never Git, raw SSH, or server filesystems.
+
+## Proactive use
+
+For project-specific work, consult relevant Agent Knowledge records
+without waiting for an explicit request. Reuse context already read;
+skip unrelated questions. Verify current state when needed.
+
+When a reusable decision, finding, or procedure emerges, ask whether
+to record it in Agent Knowledge unless recording was already requested.
 
 ## Establish context
 
