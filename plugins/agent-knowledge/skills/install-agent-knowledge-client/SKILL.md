@@ -114,14 +114,20 @@ adding it; keyscan alone proves nothing. Never disable checking or use
 
 1. Use `ssh -G <alias>` to inspect the resolved endpoint, identity, host-key
    policy, and forwarding without connecting.
-2. After the public key is registered and `known_hosts` is verified, test the
-   restricted protocol rather than requesting a shell:
+2. After the public key is registered and `known_hosts` is verified, inspect
+   Gateway capabilities and test a committed read:
 
    ```sh
+   agent-knowledge-client version --destination fictional-knowledge
    agent-knowledge-client recent \
      --destination fictional-knowledge \
      --maximum-results 1
    ```
+
+   `--version` identifies only the local client. The structured `version`
+   report distinguishes an unavailable Gateway from one that does not support
+   version reporting. Check capabilities needed by the task, such as `projects`
+   or `context_balanced`; different release numbers alone are not a failure.
 
 3. Require `ssh fictional-knowledge true` to fail without shell output;
    arbitrary shell access is a deployment failure.

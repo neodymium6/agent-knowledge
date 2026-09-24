@@ -60,13 +60,16 @@ pub(super) struct CreateDocumentParameters {
     /// Cross-cutting classification labels.
     #[serde(default)]
     tags: Vec<String>,
-    /// Request ULID. Omit to generate one; reuse it with document_id and created_at after an uncertain response.
+    /// Request ULID. Omit to generate one. For recoverable retries, supply and retain it
+    /// with document_id and created_at; generated values are not all returned.
     #[serde(default)]
     request_id: Option<String>,
-    /// Document ULID. Omit to generate one; reuse it with request_id and created_at after an uncertain response.
+    /// Document ULID. Omit to generate one. Supply and retain it with request_id and
+    /// created_at when retries must reproduce the same request.
     #[serde(default)]
     document_id: Option<String>,
-    /// RFC 3339 creation time. Omit to use the current time; reuse it with both IDs after an uncertain response.
+    /// RFC 3339 creation time. Omit to use the current time. Supply and retain it with
+    /// both IDs when retries must reproduce the same request.
     #[serde(default)]
     created_at: Option<String>,
 }

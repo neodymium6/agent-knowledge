@@ -42,13 +42,23 @@ const COMMON_USAGE: &str = "usage:\n\
     agent-knowledge admin clients import-authorized-keys --registry-root <path> --authorized-keys-file <path>\n\
     agent-knowledge admin clients serve --registry-root <path> --socket-path <path>\n\
     agent-knowledge access authorized-keys --registry-root <path> --gateway-config <path> --trusted-owner-uid <uid> --gateway-user <name> --requested-user <name>\n\
+    agent-knowledge client projects --destination <ssh-destination> [--query <text>] [--search-in project|documents] [--maximum-results <count>] [--description-characters <count>] [--hits-per-project <count>] [--excerpt-characters <count>] [--include-archived] [--timeout-seconds <seconds>]\n\
+    agent-knowledge client search-excerpts --destination <ssh-destination> --query <text> [--project <id> ...] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--excerpt-characters <count>] [--timeout-seconds <seconds>]\n\
+    agent-knowledge client context --destination <ssh-destination> --project <id> [--query <text>] [--maximum-documents <count>] [--maximum-characters <count>] [--selection relevance|balanced] [--recent-documents <count>] [--timeout-seconds <seconds>]\n\
+    agent-knowledge client history --destination <ssh-destination> --document-id <id> [--anchor-commit <hash>] [--cursor <hash>] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
+    agent-knowledge client get-at --destination <ssh-destination> --document-id <id> --commit <hash> [--timeout-seconds <seconds>]\n\
+    agent-knowledge client diff --destination <ssh-destination> --document-id <id> --from-commit <hash> --to-commit <hash> [--format contiguous|hunks] [--context-lines <count>] [--maximum-hunks <count>] [--maximum-diff-bytes <count>] [--timeout-seconds <seconds>]\n\
+    agent-knowledge client update-check [--destination <ssh-destination>]\n\
+    agent-knowledge client version [--destination <ssh-destination>]\n\
+    agent-knowledge client --version\n\
+    agent-knowledge client mcp --destination <ssh-destination> [--listen <loopback-address>] [--timeout-seconds <seconds>]\n\
     agent-knowledge client submit --destination <ssh-destination> --package-root <path> [--timeout-seconds <seconds>]\n\
-    agent-knowledge client list --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
-    agent-knowledge client recent --destination <ssh-destination> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
+    agent-knowledge client list --destination <ssh-destination> [--project <id> ...] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
+    agent-knowledge client recent --destination <ssh-destination> [--project <id> ...] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge client get --destination <ssh-destination> --document-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge client export --destination <ssh-destination> --document-id <id> [--timeout-seconds <seconds>]\n\
     agent-knowledge client status --destination <ssh-destination> --request-id <id> [--timeout-seconds <seconds>]\n\
-    agent-knowledge client search --destination <ssh-destination> --query <text> [--project <id>] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
+    agent-knowledge client search --destination <ssh-destination> --query <text> [--project <id> ...] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--timeout-seconds <seconds>]\n\
     agent-knowledge gateway --config <path> --client-id <id>\n\
     agent-knowledge queue-ingress serve --queue-root <path> --socket-path <path>\n\
     agent-knowledge queue-ingress listen --queue-root <path> --socket-path <path> [--maximum-connections <count>] [--connection-timeout-seconds <seconds>]\n\

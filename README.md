@@ -103,8 +103,9 @@ stale, or unreadable is a retryable failure. Deployments that omit
 
 Project discovery lists project summaries or ranks projects by matching document
 counts. Add `--hits-per-project 3` in documents mode to include ranked matching
-documents and source excerpts with each project. Document reads also accept repeated `--project` flags to select a union
-of projects.
+documents and source excerpts with each project. `search`, `search-excerpts`,
+`list`, and `recent` accept repeated `--project` flags to select a union of
+projects. `context` remains scoped to one project.
 
 Additional read tools provide search excerpts, bounded project context, and
 commit-based document history:

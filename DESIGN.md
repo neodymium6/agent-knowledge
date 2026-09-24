@@ -2,9 +2,9 @@
 
 ## 1. Status
 
-This document is the design baseline for Agent Knowledge. It describes the
-initial implementation and the invariants that later implementations must
-preserve.
+This document describes the implemented architecture and its invariants.
+Public read-operation details are maintained in [read operations](docs/read-operations.md),
+and release-specific additions are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 The implementation language is Rust. The initial deployment target is a
 conventional Linux host with a local POSIX-style file system. The design should
@@ -89,11 +89,12 @@ Gateway, Worker, client CLI, and administrative commands are implemented in one
 Rust workspace. They share domain types, validation rules, path handling,
 queue-state transitions, revision calculation, and error codes.
 
-The initial release produces one main application executable with subcommands:
+The main application executable exposes these command namespaces:
 
 ```text
 agent-knowledge client ...
 agent-knowledge gateway ...
+agent-knowledge access ...
 agent-knowledge queue-ingress serve ...
 agent-knowledge queue-ingress listen ...
 agent-knowledge worker ...
@@ -185,8 +186,9 @@ and drop to the fixed Gateway identity; it does not require a privileged
 container. Deployment-specific server configuration, host keys, authorized
 keys, and Gateway configuration are mounted inputs rather than image content.
 The Gateway joins the ingress group; the broker does not join the Gateway
-reader group. Container deployments explicitly add supplemental GID `10004`;
-they do not rely on a runtime interpreting `/etc/group` membership. Deployments
+reader group. Standalone one-shot Gateway containers need supplemental GID
+`10004` supplied by the runtime. The Kubernetes base instead uses the packaged
+account memberships and `Merge` policy described in section 6.3. Deployments
 mount configuration, secrets, durable storage, runtime socket storage, and
 writable homes as needed. No conventional shell path, deployment-specific role
 configuration, credentials, keys, or content is included. The OpenSSH package's
@@ -197,14 +199,14 @@ filesystem, drops all Linux capabilities, and forbids privilege escalation.
 The Git package's Nix closure contains internal shell and transport helpers, so
 those runtime controls are part of the image's least-privilege boundary.
 
-The same executable can be used with different entry-point arguments in a
-service or container. Separate binaries may be produced from the same
-workspace later, without changing protocol or domain logic.
+The main executable can be used with different entry-point arguments in a
+service or container. The same workspace also produces the static
+`agent-knowledge-client` binary, exposing the client operations without the
+server's administrative interface.
 
-The implementation starts with synchronous I/O. OpenSSH creates a Gateway
-process for each connection, and the single Worker does not require an
-asynchronous runtime. An async runtime must only be added after a demonstrated
-need.
+Gateway and Worker operations use synchronous I/O. OpenSSH creates a Gateway
+process for each connection. The client MCP server uses a Tokio runtime for
+STDIO and loopback HTTP, with blocking SSH operations dispatched separately.
 
 Production code must not use `unsafe` unless a later design decision documents
 and justifies a specific use.
@@ -529,7 +531,7 @@ The Repository Worker is the only writer to authoritative content. It:
 - marks requests completed or failed; and
 - retries transient publication and Git-remote failures.
 
-### 7.3 Quartz
+### 7.4 Quartz
 
 Quartz receives a committed content tree and produces a static site in a
 temporary release directory. It never changes authoritative content.
@@ -556,7 +558,7 @@ group; the builder kills that group on timeout and after the command wrapper
 exits. The service supervisor remains responsible for terminating any process
 that escapes the group before restarting recovery.
 
-### 7.4 Git remote
+### 7.5 Git remote
 
 The remote is an asynchronous backup target. A remote push failure does not
 roll back a locally committed and published change. The Worker records that the
@@ -717,13 +719,16 @@ experiments/
     └── report.pdf
 ```
 
-Initial attachment categories are:
+The shipped package policy accepts these attachment categories:
 
 - PNG, JPEG, and SVG images;
 - CSV and JSON machine-readable data;
-- PDF reports;
-- HTML reports; and
-- other explicitly configured extensions.
+- PDF reports; and
+- HTML reports.
+
+The lowercase extension allowlist is `png`, `jpg`, `jpeg`, `svg`, `csv`, `json`,
+`pdf`, and `html`. Library callers can construct another package policy; the
+shipped service configuration does not expose an extension-list setting.
 
 Standalone HTML is an attachment, not a replacement for a Markdown document.
 It is linked from Markdown and is not parsed as knowledge content. The static
@@ -856,9 +861,10 @@ shared Rust library. It:
 - prevents case-folding collisions where relevant; and
 - verifies that every resolved path remains below its assigned root.
 
-Project identifiers use a conservative lowercase ASCII slug. Attachment file
-names use a conservative configured character set. Display titles remain
-Unicode and are not used as trusted paths.
+Project identifiers use a validated lowercase ASCII slug; no project registry
+or configured project-name list is required. Attachment names are single visible
+components subject to fixed path validation and the package extension allowlist.
+Display titles remain Unicode and are not used as trusted paths.
 
 ## 13. SSH transport
 
@@ -992,11 +998,16 @@ akp-v1 recent
 akp-v1 get
 akp-v1 export
 akp-v1 search
+akp-v1 inspect
+akp-v1 version
 ```
 
 The Gateway parses this string itself. It never evaluates it as a shell
 command. The current implementation accepts `submit`, `status`, `list`,
-`recent`, `get`, `export`, and `search`.
+`recent`, `get`, `export`, `search`, `inspect`, and `version`. The `inspect`
+request selects a strictly typed read query. `version` reports the running
+Gateway version and supported commands/queries without opening knowledge
+storage; its wire protocol version is independent of its release version.
 
 The current client invokes the equivalent of:
 
@@ -1074,9 +1085,11 @@ ChangeRequest
 Every request has a meaningful, client-supplied title. The central service
 never generates a title with an LLM.
 
-The official client generates the request ULID before opening the SSH
-connection. This lets it safely retry after a lost response. A write request
-without a valid request ID is rejected.
+Package authors supply the request ULID in `request.json` before CLI submission;
+`submit` validates and transmits that package without generating its IDs.
+Structured MCP create/archive tools can generate omitted request IDs before
+opening SSH. A write request without a valid request ID is rejected. Retries
+after an uncertain response must preserve the request ID and exact content.
 
 Initial operations are:
 
@@ -1435,9 +1448,9 @@ queue result. This permits recovery after a crash partway through the
 successful and failed queue transitions. The journal is removed only after all
 of those transitions are durable. Queue reconciliation is idempotent and
 returns an opaque proof bound to the queue, batch, claim tokens, and failure
-codes; journal finalization accepts only that proof. Until release activation
-and this proof are implemented together, the repository crate does not expose
-terminal queue reconciliation or journal finalization.
+codes. Journal finalization requires that reconciliation proof and, for a
+committed batch, proof that its release is active. The Worker supplies both
+through the repository transaction API before removing the journal.
 
 A synchronized `publication_started` journal marker is written before the
 official ref can advance. It authorizes recovery to replace partially updated
@@ -1726,16 +1739,33 @@ budget includes the JSON Lines framing newline.
 ### 23.1 Extended committed inspections
 
 The additive `akp-v1 inspect` command carries a versioned, strictly typed
-operation for search excerpts, project context, document history, historical
-lookup, or comparison. Existing read operations retain their original wire
-shapes. CLI and MCP expose each inspection separately; no client accesses Git
-directly. Older servers reject the new command explicitly.
+operation for project discovery, search excerpts, project context, document
+history, historical lookup, or comparison. Existing single-project read
+operations retain their original wire shapes. CLI and MCP expose each
+inspection separately; no client accesses Git directly. Older servers reject
+unsupported commands or query variants explicitly.
+
+Project discovery derives projects from committed documents, including projects
+without an index. It can match project slug/index text or rank projects by exact
+document-search hit counts. Optional per-project hits include ranked documents
+and source excerpts from the same snapshot. Counts are computed before the
+project result limit; exhausted computation bounds fail rather than returning
+partial counts. Discovery does not introduce a project registry.
+
+List, recent, search, and search excerpts also accept a union of up to 32 distinct
+projects, combined with tag/session filters before ranking and the shared result
+limit. Context remains single-project. These additive scopes require a
+supporting Gateway; an unknown project never broadens a read.
 
 Search excerpts and context retain one committed snapshot while selecting and
 reading bounded source text. Context selection is deterministic and excludes
 archived, deprecated, and superseded documents. Character budgets count
 Unicode scalar values in bodies; the existing encoded response-byte limit
 covers metadata and JSON framing as well.
+The default context mode follows relevance candidate order. Opt-in balanced
+selection shares the body budget across document slots and reserves recent
+logs. Truncation and omitted-document references expose the bounded coverage;
+context is selected source text, not a generated summary.
 
 Historical operations pin the official commit, then read immutable Git objects
 without retaining the canonical-worktree lock. Full commit IDs must be
@@ -1747,10 +1777,17 @@ per-command output bounds, and the same absolute operation deadline.
 History pages scan at most 100 first-parent commits. Pagination carries an
 immutable anchor and the next inclusive commit cursor. Entries represent
 Markdown or path changes at commit granularity, not every request in a batch.
-Comparisons return before/after metadata and one contiguous body replacement
-range, without exposing a Git checkout or providing rollback.
+Comparisons return before/after metadata and, by default, one contiguous body
+replacement range. Opt-in multi-hunk differences return separate bounded
+ranges with explicit truncation reasons. An empty truncated hunk list does not
+mean the bodies were identical. Neither mode exposes a Git checkout or provides
+rollback.
 
 See [read operations](docs/read-operations.md) for the complete public contract.
+The read-only `akp-v1 version` report advertises supported inspection variants;
+software version differences alone do not imply protocol incompatibility.
+Client release checks and Gateway capability reporting are described in
+[versions and updates](docs/versions-and-updates.md).
 
 ## 24. Search
 
@@ -1851,34 +1888,29 @@ a protocol major version.
 
 ## 27. Configuration
 
-Configuration, rather than architecture, controls:
+Worker and Gateway YAML configuration controls:
 
 - storage paths;
 - debounce interval;
 - maximum batch age;
 - maximum requests per batch;
-- maximum request bytes;
-- maximum individual file bytes;
-- maximum file count;
-- maximum directory and total package-entry counts;
-- maximum payload path components;
-- maximum front-matter bytes;
-- Gateway submit and client transfer timeouts;
+- Gateway submit timeouts;
 - committed-index entry and aggregate Markdown-byte limits;
 - committed-read execution-time and response-byte limits;
 - search document and Markdown-byte limits;
-- encoded read-response byte limits;
-- incoming quarantine and reap age thresholds;
-- allowed attachment extensions;
-- project identifiers;
-- document types;
+- searchable optional metadata fields;
 - Git remote name and branch;
 - Quartz command and configuration;
 - release retention;
-- retry timeouts and backoff;
-- title length;
-- search backend; and
-- CLI output format.
+- retry timeouts and backoff; and
+- whether the derived search-index backend is configured.
+
+Client transfer timeouts and query budgets are command parameters. Package
+sizes, attachment extensions, front-matter limits, and queue maintenance bounds
+also have typed library policies; the shipped commands use their built-in
+defaults where no option is exposed. Project slug syntax and document types
+are protocol/domain constraints, not configurable project registrations.
+Read/control output is JSON; export returns tar, and `--version` prints text.
 
 Configuration uses a versioned, human-readable file. Secret values are
 referenced through deployment-provided files or environment variables and are
@@ -1982,7 +2014,7 @@ Tests and examples use clearly fictional identities and infrastructure values.
 
 ## 31. Delivery sequence
 
-Implementation proceeds in these increments:
+The initial implementation was completed in these increments:
 
 1. Rust workspace, shared domain types, and validation.
 2. Durable file queue and crash-recovery tests.

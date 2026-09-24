@@ -114,7 +114,8 @@ impl ExportRequest {
 pub struct SearchRequest {
     /// Independent Gateway protocol version.
     pub protocol_version: u16,
-    /// Case-insensitive text query.
+    /// Search expression interpreted by the configured backend: Tantivy query syntax
+    /// when indexed, or case-insensitive substring matching when indexing is disabled.
     pub query: String,
     /// Exact-match result filters.
     #[serde(flatten)]

@@ -4,6 +4,10 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Refresh skills and architecture guidance for current project discovery,
+  context, history, and MCP operations. Correct CLI usage and MCP descriptions
+  to match implemented commands, search semantics, and result ordering.
+
 ## 0.6.0
 
 - Add opt-in ranked document hits and source excerpts to project discovery, with

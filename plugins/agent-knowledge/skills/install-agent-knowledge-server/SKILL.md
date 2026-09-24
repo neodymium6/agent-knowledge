@@ -5,10 +5,10 @@ description: Install or prepare a fresh Agent Knowledge server on a conventional
 
 # Install Agent Knowledge Server
 
-Install a commit-pinned release without weakening single-writer, privilege, or
-storage boundaries. Prefer systemd; use Kubernetes only when its prerequisites
-already exist. Stop on an existing deployment: this fresh-install skill does
-not provide the release-specific upgrade and rollback plan it requires.
+Install a commit-pinned release on the selected systemd or Kubernetes target
+without weakening single-writer, privilege, or storage boundaries. This skill
+covers fresh installation; an existing deployment needs a release-specific
+upgrade and rollback plan beyond its scope.
 
 ## Gather deployment inputs
 
