@@ -76,6 +76,48 @@ MCP `knowledge_projects` uses `query`, `search_in`, `maximum_results`,
 Discovery uses the additive `projects` inspection query advertised by Gateway
 version reports and requires a supporting Gateway.
 
+### Matching documents in project discovery
+
+Add `--hits-per-project 3` to a documents-mode project search to include up to
+three matching documents per returned project:
+
+```sh
+agent-knowledge-client projects --destination fictional-knowledge \
+  --query backup --search-in documents --maximum-results 10 \
+  --hits-per-project 3 --excerpt-characters 300
+```
+
+MCP `knowledge_projects` accepts the same `hits_per_project` and
+`excerpt_characters` parameters. `hits_per_project` defaults to 0 and accepts
+0..5; positive values require `search_in: "documents"` and a query.
+`excerpt_characters` accepts 1..2000 Unicode scalar values per field, defaults
+to 300, and may only be supplied with positive `hits_per_project`.
+
+Each project then includes `hits`, using the same `{document, excerpts}` items
+as search excerpts, and `hits_truncated`, which is true when `matching_documents`
+exceeds the number of returned hits. The project order and exact matching counts
+are unchanged. Hits retain ordinary document search order within each project;
+they are examples of the highest-ranked matches, not a diversity selection.
+Both index documents and ordinary documents may appear. Archive selection
+applies to counts and hits alike. A zero-match query returns an empty project
+list. When `hits_per_project` is omitted or 0, both additional response fields
+are omitted and the original request/response shape is preserved.
+
+Counts, descriptions, hit metadata, and excerpts all use one committed snapshot.
+Only selected hits in returned projects have their source text read for excerpts;
+normal read-byte, response-byte, scan, and deadline limits still apply. Exceeding
+a bound fails the operation rather than returning misleading partial counts or
+silently shortened hit lists. Excerpt semantics are identical to search excerpts,
+including title/tag-only matches and queries with no extractable terms.
+
+The client uses the additive `projects_with_hits` inspect query only when hits
+are requested; its response operation remains `projects`. Before submitting it,
+the client checks Gateway capabilities with a version request bounded to five
+seconds (or the configured SSH timeout, whichever is shorter). A Gateway without
+this capability produces an explicit unsupported-operation error. Failure to
+observe capabilities is reported separately; neither case falls back to omitting
+requested hits. Existing project searches do not perform this extra request.
+
 ## Multiple project scopes
 
 Repeat `--project` to select the union of several projects in `search`,

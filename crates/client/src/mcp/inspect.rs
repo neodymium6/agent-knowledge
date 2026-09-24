@@ -335,6 +335,12 @@ pub(super) struct ProjectsParameters {
     /// Maximum Unicode characters of each index body, 1..2000. Defaults to 300.
     #[serde(default)]
     description_characters: Option<usize>,
+    /// Matching documents per project, 0..5. Defaults to 0; positive values require documents mode.
+    #[serde(default)]
+    hits_per_project: Option<usize>,
+    /// Characters per field excerpt, 1..2000. Defaults to 300; requires positive hits_per_project.
+    #[serde(default)]
+    excerpt_characters: Option<usize>,
     /// Include archived documents when discovering projects and counting documents.
     #[serde(default)]
     include_archived: bool,
@@ -354,6 +360,26 @@ impl ProjectsParameters {
         if matches!(self.search_in, ProjectSearchMode::Documents) && self.query.is_none() {
             return Err("documents search requires query".into());
         }
+        let hits_per_project = self.hits_per_project.unwrap_or(0);
+        if hits_per_project > 5 {
+            return Err("hits_per_project must be between 0 and 5".into());
+        }
+        if hits_per_project > 0 {
+            if !matches!(self.search_in, ProjectSearchMode::Documents) {
+                return Err("hits_per_project requires documents search".into());
+            }
+            return Ok(request(InspectQuery::ProjectsWithHits {
+                query: self.query.ok_or("documents search requires query")?,
+                maximum_results: bounded(self.maximum_results.unwrap_or(100), MAXIMUM_RESULTS)?,
+                description_characters: bounded(self.description_characters.unwrap_or(300), 2000)?,
+                include_archived: self.include_archived,
+                hits_per_project,
+                excerpt_characters: bounded(self.excerpt_characters.unwrap_or(300), 2000)?,
+            }));
+        }
+        if self.excerpt_characters.is_some() {
+            return Err("excerpt_characters requires positive hits_per_project".into());
+        }
         Ok(request(InspectQuery::Projects {
             query: self.query,
             search_in: match self.search_in {
@@ -366,5 +392,36 @@ impl ProjectsParameters {
             description_characters: bounded(self.description_characters.unwrap_or(300), 2000)?,
             include_archived: self.include_archived,
         }))
+    }
+}
+
+#[cfg(test)]
+mod project_hits_tests {
+    use super::*;
+    #[test]
+    fn project_hit_options_require_documents_mode_and_valid_bounds() {
+        for value in [
+            serde_json::json!({"query":"needle","hits_per_project":1}),
+            serde_json::json!({"search_in":"documents","hits_per_project":1}),
+            serde_json::json!({"query":"needle","search_in":"documents","hits_per_project":6}),
+            serde_json::json!({"query":"needle","search_in":"documents","excerpt_characters":30}),
+            serde_json::json!({"query":"needle","search_in":"documents","hits_per_project":0,"excerpt_characters":30}),
+            serde_json::json!({"query":"needle","search_in":"documents","hits_per_project":1,"excerpt_characters":0}),
+            serde_json::json!({"query":"needle","search_in":"documents","hits_per_project":1,"excerpt_characters":2001}),
+        ] {
+            let parameters: ProjectsParameters =
+                serde_json::from_value(value).unwrap_or_else(|e| panic!("parameters: {e}"));
+            assert!(parameters.request().is_err());
+        }
+        let parameters: ProjectsParameters =
+            serde_json::from_value(serde_json::json!({"hits_per_project":0}))
+                .unwrap_or_else(|e| panic!("parameters: {e}"));
+        assert!(matches!(
+            parameters
+                .request()
+                .unwrap_or_else(|e| panic!("request: {e}"))
+                .query,
+            InspectQuery::Projects { .. }
+        ));
     }
 }

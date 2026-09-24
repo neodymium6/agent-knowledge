@@ -1207,6 +1207,8 @@ pub enum ClientCommandError {
     UnsupportedProtocolVersion {
         actual: u16,
     },
+    UnsupportedInspection(&'static str),
+    GatewayCapabilitiesUnavailable,
     ResponseMismatch,
     DocumentResponseMismatch,
     InvalidExportArchive(io::Error),
@@ -1356,6 +1358,12 @@ impl fmt::Display for ClientCommandError {
                 formatter,
                 "Gateway protocol version {actual} is unsupported; expected {CURRENT_GATEWAY_PROTOCOL_VERSION}"
             ),
+            Self::UnsupportedInspection(operation) => write!(
+                formatter,
+                "Gateway does not support {operation}; upgrade the Gateway to use this option"
+            ),
+            Self::GatewayCapabilitiesUnavailable => formatter
+                .write_str("could not verify Gateway capabilities; no inspection was submitted"),
             Self::ResponseMismatch => formatter.write_str(
                 "Gateway response request ID or digest does not match the submitted package",
             ),
@@ -1418,6 +1426,8 @@ impl std::error::Error for ClientCommandError {
             | Self::SshFailed { .. }
             | Self::GatewayRejected(_)
             | Self::UnsupportedProtocolVersion { .. }
+            | Self::UnsupportedInspection(_)
+            | Self::GatewayCapabilitiesUnavailable
             | Self::ExportDocumentMismatch
             | Self::ResponseMismatch
             | Self::DocumentResponseMismatch

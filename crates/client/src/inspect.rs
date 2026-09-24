@@ -9,6 +9,35 @@ impl SshClient {
     /// # Errors
     /// Rejects invalid transport responses or a response for another operation/document.
     pub fn inspect(&self, request: &InspectRequest) -> Result<InspectResponse, ClientCommandError> {
+        if matches!(request.query, InspectQuery::ProjectsWithHits { .. }) {
+            match self.server_version() {
+                crate::version::ServerVersion::Available {
+                    gateway,
+                    protocol_matches,
+                } => {
+                    if !protocol_matches {
+                        return Err(ClientCommandError::UnsupportedProtocolVersion {
+                            actual: gateway.protocol_version,
+                        });
+                    }
+                    if !gateway
+                        .inspect_queries
+                        .iter()
+                        .any(|q| q == "projects_with_hits")
+                    {
+                        return Err(ClientCommandError::UnsupportedInspection(
+                            "projects_with_hits",
+                        ));
+                    }
+                }
+                crate::version::ServerVersion::Unsupported => {
+                    return Err(ClientCommandError::UnsupportedInspection(
+                        "projects_with_hits",
+                    ));
+                }
+                _ => return Err(ClientCommandError::GatewayCapabilitiesUnavailable),
+            }
+        }
         let (response, _) = control_response_with_program::<_, InspectResponse>(
             OsStr::new(SSH_PROGRAM),
             &self.destination,
@@ -30,7 +59,11 @@ fn validate(
             InspectQuery::Projects {
                 maximum_results,
                 description_characters,
-                search_in,
+                ..
+            }
+            | InspectQuery::ProjectsWithHits {
+                maximum_results,
+                description_characters,
                 ..
             },
             Inspection::Projects {
@@ -40,12 +73,52 @@ fn validate(
             },
         ) => {
             use agent_knowledge_protocol::ProjectSearchScope;
-            let documents = *search_in == ProjectSearchScope::Documents;
+            let (documents, hit_options, archived) = match &request.query {
+                InspectQuery::Projects {
+                    search_in,
+                    include_archived,
+                    ..
+                } => (
+                    *search_in == ProjectSearchScope::Documents,
+                    None,
+                    *include_archived,
+                ),
+                InspectQuery::ProjectsWithHits {
+                    hits_per_project,
+                    excerpt_characters,
+                    include_archived,
+                    ..
+                } => (
+                    true,
+                    Some((*hits_per_project, *excerpt_characters)),
+                    *include_archived,
+                ),
+                _ => unreachable!(),
+            };
             let mut seen = std::collections::HashSet::new();
             projects.len() <= *maximum_results
                 && (!truncated || projects.len() == *maximum_results)
                 && projects.iter().all(|p| {
-                    p.document_count > 0
+                    let valid_hits = match (hit_options, &p.hits, p.hits_truncated) {
+                        (None, None, None) => true,
+                        (Some((maximum, characters)), Some(hits), Some(truncated)) => {
+                            let count = p.matching_documents.unwrap_or(0);
+                            let mut ids = std::collections::HashSet::new();
+                            hits.len() == count.min(maximum)
+                                && truncated == (count > hits.len())
+                                && hits.iter().all(|hit| {
+                                    hit.document.project.as_ref() == Some(&p.project)
+                                        && (archived || !hit.document.archived)
+                                        && ids.insert(hit.document.metadata.document_id)
+                                        && hit.excerpts.iter().all(|excerpt| {
+                                            excerpt.text.chars().count() <= characters
+                                        })
+                                })
+                        }
+                        _ => false,
+                    };
+                    valid_hits
+                        && p.document_count > 0
                         && seen.insert(&p.project)
                         && p.description.chars().count() <= *description_characters
                         && p.matching_documents.is_some() == documents
@@ -332,5 +405,58 @@ mod project_tests {
                 serde_json::from_value(value).unwrap_or_else(|e| panic!("response: {e}"));
             assert!(validate(&request, &response).is_err());
         }
+    }
+    #[test]
+    fn rejects_malformed_project_hits_and_unrequested_samples() {
+        let document = serde_json::json!({"path":"projects/fictional-project/index.md","document_type":"index","project":"fictional-project","archived":false,"revision":format!("sha256:{}", "a".repeat(64)),"metadata":{"schema_version":1,"document_id":"01K00000000000000000000001","title":"Fictional project","created":"2026-09-24T00:00:00Z","request_id":"01K00000000000000000000002","status":"active"}});
+        let request = InspectRequest {
+            protocol_version: 1,
+            query: InspectQuery::ProjectsWithHits {
+                query: "needle".into(),
+                maximum_results: 10,
+                description_characters: 30,
+                include_archived: false,
+                hits_per_project: 2,
+                excerpt_characters: 3,
+            },
+        };
+        let mut second = document.clone();
+        second["metadata"]["document_id"] = "01K00000000000000000000003".into();
+        let hit = serde_json::json!({"document":document,"excerpts":[{"field":"body","text":"針の例","truncated":true}]});
+        let project = serde_json::json!({"project":"fictional-project","index":null,"description":"","description_truncated":false,"document_count":3,"matching_documents":3,"hits":[hit,{"document":second,"excerpts":[]}],"hits_truncated":true});
+        let decode = |project| {
+            serde_json::from_value::<InspectResponse>(serde_json::json!({"protocol_version":1,"result":{"operation":"projects","commit":"a".repeat(40),"projects":[project],"truncated":false}})).unwrap_or_else(|e| panic!("JSON: {e}"))
+        };
+        assert!(validate(&request, &decode(project.clone())).is_ok());
+        for (pointer, value) in [
+            (
+                "/hits/0/document/project",
+                serde_json::json!("fictional-other"),
+            ),
+            ("/hits/0/document/archived", serde_json::json!(true)),
+            ("/hits/0/excerpts/0/text", serde_json::json!("四文字超え")),
+            ("/hits_truncated", serde_json::json!(false)),
+            ("/hits", serde_json::json!([hit])),
+            ("/hits", serde_json::json!([hit, hit])),
+            ("/hits", serde_json::Value::Null),
+            ("/hits_truncated", serde_json::Value::Null),
+        ] {
+            let mut invalid = project.clone();
+            *invalid
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("pointer")) = value;
+            assert!(validate(&request, &decode(invalid)).is_err(), "{pointer}");
+        }
+        let legacy = InspectRequest {
+            protocol_version: 1,
+            query: InspectQuery::Projects {
+                query: Some("needle".into()),
+                search_in: agent_knowledge_protocol::ProjectSearchScope::Documents,
+                maximum_results: 10,
+                description_characters: 30,
+                include_archived: false,
+            },
+        };
+        assert!(validate(&legacy, &decode(project)).is_err());
     }
 }

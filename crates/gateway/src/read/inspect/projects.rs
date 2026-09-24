@@ -14,6 +14,7 @@ pub(super) fn list(
     maximum: usize,
     characters: usize,
     include_archived: bool,
+    hit_options: Option<(usize, usize)>,
     deadline: Instant,
 ) -> Result<Inspection, GatewayError> {
     let filter = ReadFilter::new(None, None, None, include_archived);
@@ -32,8 +33,13 @@ pub(super) fn list(
         }
     }
     let mut counts: BTreeMap<ProjectId, usize> = BTreeMap::new();
+    let mut top_hits: BTreeMap<ProjectId, Vec<&DocumentRecord>> = BTreeMap::new();
+    let index = if search_in == ProjectSearchScope::Documents {
+        open_index(search_indexes, snapshot.commit())?
+    } else {
+        None
+    };
     if search_in == ProjectSearchScope::Documents {
-        let index = open_index(search_indexes, snapshot.commit())?;
         let filter = ReadFilterRequest {
             include_archived,
             ..ReadFilterRequest::default()
@@ -51,6 +57,12 @@ pub(super) fn list(
             check_deadline(deadline)?;
             if let Some(project) = record.location().project() {
                 *counts.entry(project.clone()).or_default() += 1;
+                if let Some((maximum, _)) = hit_options {
+                    let hits = top_hits.entry(project.clone()).or_default();
+                    if hits.len() < maximum {
+                        hits.push(record);
+                    }
+                }
             }
         }
     }
@@ -59,19 +71,20 @@ pub(super) fn list(
         groups.retain(|(project, _)| counts.contains_key(project));
         groups.sort_by(|(a, _), (b, _)| counts[b].cmp(&counts[a]).then_with(|| a.cmp(b)));
     }
+    let search_query = query;
     let query = query
         .filter(|_| search_in == ProjectSearchScope::Project)
         .map(|q| q.trim().to_lowercase());
     let mut projects = Vec::new();
     let mut bytes = 0;
     let mut truncated = false;
-    for (project, (document_count, index)) in groups {
+    for (project, (document_count, index_document)) in groups {
         check_deadline(deadline)?;
         if query.is_none() && projects.len() == maximum {
             truncated = true;
             break;
         }
-        let document = index
+        let document = index_document
             .map(|r| read_document(settings, snapshot, r, &mut bytes))
             .transpose()?;
         let raw = document
@@ -97,6 +110,35 @@ pub(super) fn list(
         let description = raw.chars().take(characters).collect::<String>();
         let description_truncated = description != raw;
         let matching_documents = counts.get(&project).copied();
+        let hits = hit_options
+            .map(|(_, characters)| {
+                top_hits
+                    .remove(&project)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|record| {
+                        check_deadline(deadline)?;
+                        let document = read_document(settings, snapshot, record, &mut bytes)?;
+                        let raw = body(&document.markdown, record.metadata().document_id)?;
+                        let excerpts = excerpts(
+                            settings,
+                            index.as_ref(),
+                            record,
+                            raw,
+                            search_query.ok_or_else(invalid)?,
+                            characters,
+                        )?;
+                        Ok(SearchHit {
+                            document: document.summary,
+                            excerpts,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, GatewayError>>()
+            })
+            .transpose()?;
+        let hits_truncated = hits
+            .as_ref()
+            .map(|hits| matching_documents.unwrap_or(0) > hits.len());
         projects.push(ProjectSummary {
             project,
             index: document.map(|d| d.summary),
@@ -104,6 +146,8 @@ pub(super) fn list(
             description_truncated,
             document_count,
             matching_documents,
+            hits,
+            hits_truncated,
         });
     }
     Ok(Inspection::Projects {

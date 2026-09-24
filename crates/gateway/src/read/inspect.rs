@@ -25,12 +25,37 @@ pub(crate) fn inspect_until(
     validate_version(request.protocol_version)?;
     let result = match &request.query {
         InspectQuery::Projects {
-            query,
-            search_in,
             maximum_results,
             description_characters,
             include_archived,
+            ..
+        }
+        | InspectQuery::ProjectsWithHits {
+            maximum_results,
+            description_characters,
+            include_archived,
+            ..
         } => {
+            let (query, search_in, hit_options) = match &request.query {
+                InspectQuery::Projects {
+                    query, search_in, ..
+                } => (query.clone(), *search_in, None),
+                InspectQuery::ProjectsWithHits {
+                    query,
+                    hits_per_project,
+                    excerpt_characters,
+                    ..
+                } => {
+                    bounded(*hits_per_project, 5)?;
+                    bounded(*excerpt_characters, 2000)?;
+                    (
+                        Some(query.clone()),
+                        agent_knowledge_protocol::ProjectSearchScope::Documents,
+                        Some((*hits_per_project, *excerpt_characters)),
+                    )
+                }
+                _ => unreachable!(),
+            };
             validate_result_limit(settings, *maximum_results)?;
             bounded(*description_characters, 2000)?;
             if query.as_ref().is_some_and(|q| {
@@ -39,15 +64,13 @@ pub(crate) fn inspect_until(
             }) {
                 return Err(invalid());
             }
-            if *search_in == agent_knowledge_protocol::ProjectSearchScope::Documents
+            if search_in == agent_knowledge_protocol::ProjectSearchScope::Documents
                 && query.is_none()
             {
                 return Err(invalid());
             }
-            let search_in = *search_in;
             let snapshot = snapshot(settings, store, deadline)?;
             let settings = settings.clone();
-            let query = query.clone();
             let maximum = *maximum_results;
             let characters = *description_characters;
             let archived = *include_archived;
@@ -62,6 +85,7 @@ pub(crate) fn inspect_until(
                         maximum,
                         characters,
                         archived,
+                        hit_options,
                         deadline,
                     )
                 },

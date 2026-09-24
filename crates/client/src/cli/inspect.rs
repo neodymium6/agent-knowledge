@@ -155,6 +155,33 @@ pub(super) fn parse(
     ) {
         return Err(ParseError);
     }
+    let query = if action == "projects" {
+        let hits_per_project = zero_number(&mut values, "--hits-per-project", 0, 5)?;
+        if hits_per_project > 0 {
+            let excerpt_characters = number(&mut values, "--excerpt-characters", 300, 2000)?;
+            match query {
+                InspectQuery::Projects {
+                    query: Some(query),
+                    search_in: agent_knowledge_protocol::ProjectSearchScope::Documents,
+                    maximum_results,
+                    description_characters,
+                    include_archived,
+                } => InspectQuery::ProjectsWithHits {
+                    query,
+                    maximum_results,
+                    description_characters,
+                    include_archived,
+                    hits_per_project,
+                    excerpt_characters,
+                },
+                _ => return Err(ParseError),
+            }
+        } else {
+            query
+        }
+    } else {
+        query
+    };
     if !values.is_empty() {
         return Err(ParseError);
     }
@@ -374,5 +401,71 @@ mod tests {
                 .is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod project_hits_tests {
+    use super::*;
+    #[test]
+    fn rejects_invalid_hit_options_and_keeps_zero_on_legacy_wire() {
+        let base = [
+            "--destination",
+            "fictional-knowledge",
+            "--query",
+            "needle",
+            "--search-in",
+            "documents",
+        ];
+        for flags in [
+            vec!["--hits-per-project", "6"],
+            vec!["--hits-per-project", "-1"],
+            vec!["--excerpt-characters", "30"],
+            vec!["--hits-per-project", "0", "--excerpt-characters", "30"],
+            vec!["--hits-per-project", "1", "--excerpt-characters", "0"],
+            vec!["--hits-per-project", "1", "--excerpt-characters", "2001"],
+        ] {
+            assert!(
+                parse(
+                    "projects",
+                    [base.to_vec(), flags].concat().iter().map(OsString::from)
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            parse(
+                "projects",
+                [
+                    "--destination",
+                    "fictional-knowledge",
+                    "--query",
+                    "needle",
+                    "--hits-per-project",
+                    "1"
+                ]
+                .iter()
+                .map(OsString::from)
+            )
+            .is_err()
+        );
+        let command = parse(
+            "projects",
+            [base.to_vec(), vec!["--hits-per-project", "0"]]
+                .concat()
+                .iter()
+                .map(OsString::from),
+        )
+        .unwrap_or_else(|_| panic!("parse"));
+        assert!(matches!(
+            command,
+            Command::Inspect {
+                request: InspectRequest {
+                    query: InspectQuery::Projects { .. },
+                    ..
+                },
+                ..
+            }
+        ));
     }
 }

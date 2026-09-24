@@ -25,6 +25,14 @@ pub enum InspectQuery {
         description_characters: usize,
         include_archived: bool,
     },
+    ProjectsWithHits {
+        query: String,
+        maximum_results: usize,
+        description_characters: usize,
+        include_archived: bool,
+        hits_per_project: usize,
+        excerpt_characters: usize,
+    },
     SearchExcerpts {
         query: String,
         filter: ReadFilterRequest,
@@ -94,6 +102,12 @@ pub struct ProjectSummary {
     pub document_count: usize,
     /// Exact matching document count in documents mode; absent in project mode.
     pub matching_documents: Option<usize>,
+    /// Top matching documents, present only when explicitly requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hits: Option<Vec<SearchHit>>,
+    /// Whether matching documents were omitted; absent when hits are absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hits_truncated: Option<bool>,
 }
 
 /// A raw, Unicode-safe excerpt of a document field.

@@ -14,7 +14,7 @@ use agent_knowledge_protocol::{
 use crate::ClientCommandError;
 
 const USAGE: &str = "usage:\n\
-    agent-knowledge-client projects --destination <ssh-destination> [--query <text>] [--search-in project|documents] [--maximum-results <count>] [--description-characters <count>] [--include-archived]\n\
+    agent-knowledge-client projects --destination <ssh-destination> [--query <text>] [--search-in project|documents] [--maximum-results <count>] [--description-characters <count>] [--hits-per-project <count>] [--excerpt-characters <count>] [--include-archived]\n\
     agent-knowledge-client search-excerpts --destination <ssh-destination> --query <text> [--project <id> ...] [--tag <tag>] [--session <id>] [--include-archived] [--maximum-results <count>] [--excerpt-characters <count>]\n\
     agent-knowledge-client context --destination <ssh-destination> --project <id> [--query <text>] [--maximum-documents <count>] [--maximum-characters <count>] [--selection relevance|balanced] [--recent-documents <count>]\n\
     agent-knowledge-client history --destination <ssh-destination> --document-id <id> [--anchor-commit <hash>] [--cursor <hash>] [--maximum-results <count>]\n\

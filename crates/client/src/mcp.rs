@@ -289,7 +289,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
 
     #[tool(
         name = "knowledge_projects",
-        description = "Discover projects by slug/index text, or search their documents and rank projects by matching document count. Returns bounded descriptions and document counts; includes projects without an index.",
+        description = "Discover projects by slug/index text, or search their documents and rank projects by matching document count. Returns bounded descriptions and document counts; includes projects without an index. Optional hits_per_project (1..5) includes ranked matching documents and excerpts in documents mode.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn projects(
@@ -801,6 +801,21 @@ mod tests {
                         agent_knowledge_protocol::ProjectSearchScope::Documents
                     );
                     assert_eq!(query.as_deref(), Some("needle"));
+                    Inspection::Projects {
+                        commit: "a".repeat(40),
+                        projects: vec![],
+                        truncated: false,
+                    }
+                }
+                InspectQuery::ProjectsWithHits {
+                    query,
+                    hits_per_project,
+                    excerpt_characters,
+                    ..
+                } => {
+                    assert_eq!(query, "needle");
+                    assert_eq!(*hits_per_project, 3);
+                    assert_eq!(*excerpt_characters, 300);
                     Inspection::Projects {
                         commit: "a".repeat(40),
                         projects: vec![],
@@ -1371,6 +1386,11 @@ mod tests {
             Some("fictional-commit")
         );
         for (tool, arguments, operation) in [
+            (
+                "knowledge_projects",
+                serde_json::json!({"query":"needle","search_in":"documents","hits_per_project":3}),
+                "projects",
+            ),
             (
                 "knowledge_projects",
                 serde_json::json!({"query":"needle","search_in":"documents"}),

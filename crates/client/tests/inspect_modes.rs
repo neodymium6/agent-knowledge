@@ -14,7 +14,7 @@ fn cli_and_stdio_forward_explicit_modes_and_preserve_json_framing() {
     let captured = root.path().join("request.json");
     let response_file = root.path().join("response.json");
     let ssh = root.path().join("ssh");
-    fs::write(&ssh, "#!/bin/sh\nset -eu\nfor arg do last=$arg; done\ntest \"$last\" = \"$AK_COMMAND\"\ncat > \"$AK_CAPTURE\"\ncat \"$AK_RESPONSE\"\n").unwrap_or_else(|e| panic!("write: {e}"));
+    fs::write(&ssh, "#!/bin/sh\nset -eu\nfor arg do last=$arg; done\nif [ \"$last\" = \"akp-v1 version\" ]; then cat >/dev/null; printf '%s\\n' '{\"protocol_version\":1,\"gateway_version\":\"0.0.0\",\"commands\":[],\"inspect_queries\":[\"projects_with_hits\"]}'; exit 0; fi\ntest \"$last\" = \"$AK_COMMAND\"\ncat > \"$AK_CAPTURE\"\ncat \"$AK_RESPONSE\"\n").unwrap_or_else(|e| panic!("write: {e}"));
     fs::set_permissions(ssh, fs::Permissions::from_mode(0o700))
         .unwrap_or_else(|e| panic!("chmod: {e}"));
     let path = std::env::join_paths(
@@ -27,6 +27,25 @@ fn cli_and_stdio_forward_explicit_modes_and_preserve_json_framing() {
     .unwrap_or_else(|e| panic!("PATH: {e}"));
     let summary = json!({"path":"projects/fictional-project/references/2026-09-24-01K00000000000000000000001/index.md","document_type":"reference","project":"fictional-project","archived":false,"revision":format!("sha256:{}", "a".repeat(64)),"metadata":{"schema_version":1,"document_id":"01K00000000000000000000001","title":"Fictional reference","created":"2026-09-24T00:00:00Z","updated":null,"request_id":"01K00000000000000000000002","status":"active"}});
     for (action, flags, tool, parameters, query, result) in [
+        (
+            "projects",
+            vec![
+                "--query",
+                "needle",
+                "--search-in",
+                "documents",
+                "--maximum-results",
+                "2",
+                "--hits-per-project",
+                "1",
+                "--excerpt-characters",
+                "30",
+            ],
+            "knowledge_projects",
+            json!({"query":"needle","search_in":"documents","maximum_results":2,"hits_per_project":1,"excerpt_characters":30}),
+            json!({"operation":"projects_with_hits","query":"needle","maximum_results":2,"description_characters":300,"include_archived":false,"hits_per_project":1,"excerpt_characters":30}),
+            json!({"operation":"projects","commit":"a".repeat(40),"projects":[{"project":"fictional-project","index":null,"description":"","description_truncated":false,"document_count":3,"matching_documents":2,"hits":[{"document":summary,"excerpts":[{"field":"body","text":"needle sample","truncated":true}]}],"hits_truncated":true}],"truncated":false}),
+        ),
         (
             "projects",
             vec![
@@ -215,5 +234,76 @@ fn cli_and_stdio_forward_explicit_modes_and_preserve_json_framing() {
             .unwrap_or_else(|| panic!("tool response"));
         assert_eq!(call["result"]["structuredContent"], response);
         assert_eq!(read_request(), expected_request);
+    }
+}
+
+#[test]
+fn project_hits_require_advertised_capability_without_falling_back() {
+    let root = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let ssh = root.path().join("ssh");
+    let capture = root.path().join("commands");
+    let response = root.path().join("version.json");
+    fs::write(
+        &ssh,
+        r#"#!/bin/sh
+set -eu
+for arg do last=$arg; done
+printf '%s\n' "$last" >> "$AK_CAPTURE"
+cat >/dev/null
+cat "$AK_RESPONSE"
+"#,
+    )
+    .unwrap_or_else(|e| panic!("write: {e}"));
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|e| panic!("chmod: {e}"));
+    let path = std::env::join_paths(
+        std::iter::once(root.path().to_path_buf()).chain(
+            std::env::var_os("PATH")
+                .into_iter()
+                .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>()),
+        ),
+    )
+    .unwrap_or_else(|e| panic!("PATH: {e}"));
+    for (wire, diagnostic) in [
+        (
+            json!({"protocol_version":1,"gateway_version":"0.5.0","commands":[],"inspect_queries":["projects"]}),
+            "does not support projects_with_hits",
+        ),
+        (
+            json!({"protocol_version":2,"gateway_version":"99.0.0","commands":[],"inspect_queries":["projects_with_hits"]}),
+            "protocol version 2 is unsupported",
+        ),
+        (json!({}), "could not verify Gateway capabilities"),
+    ] {
+        fs::write(&response, wire.to_string()).unwrap_or_else(|e| panic!("write: {e}"));
+        fs::write(&capture, "").unwrap_or_else(|e| panic!("write: {e}"));
+        let output = Command::new(env!("CARGO_BIN_EXE_agent-knowledge-client"))
+            .env("PATH", &path)
+            .env("AGENT_KNOWLEDGE_UPDATE_CHECK", "off")
+            .env("AK_CAPTURE", &capture)
+            .env("AK_RESPONSE", &response)
+            .args([
+                "projects",
+                "--destination",
+                "fictional-knowledge",
+                "--query",
+                "needle",
+                "--search-in",
+                "documents",
+                "--hits-per-project",
+                "3",
+            ])
+            .output()
+            .unwrap_or_else(|e| panic!("CLI: {e}"));
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&capture).unwrap_or_else(|e| panic!("read: {e}")),
+            "akp-v1 version\n"
+        );
     }
 }
