@@ -54,14 +54,56 @@ pub(super) struct ContextParameters {
     /// Total Unicode characters in returned bodies, 1..100000. Defaults to 20000.
     #[serde(default)]
     maximum_characters: Option<usize>,
+    /// Relevance preserves the original order. Balanced shares the body budget,
+    /// reserves recent log slots, and prioritizes durable guidance over logs.
+    #[serde(default)]
+    selection: ContextSelection,
+    /// Reserved recent logs in balanced mode. Defaults to min(2, maximum_documents - 2).
+    #[serde(default)]
+    recent_documents: Option<usize>,
+}
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ContextSelection {
+    #[default]
+    Relevance,
+    Balanced,
 }
 impl ContextParameters {
     pub(super) fn request(self) -> Result<InspectRequest, String> {
-        Ok(request(InspectQuery::Context {
-            project: self.project.parse().map_err(|_| "invalid project slug")?,
-            query: self.query,
-            maximum_documents: bounded(self.maximum_documents.unwrap_or(10), MAXIMUM_RESULTS)?,
-            maximum_characters: bounded(self.maximum_characters.unwrap_or(20000), 100000)?,
+        let project = self.project.parse().map_err(|_| "invalid project slug")?;
+        let query = self.query;
+        let maximum_documents = bounded(self.maximum_documents.unwrap_or(10), MAXIMUM_RESULTS)?;
+        let maximum_characters = bounded(self.maximum_characters.unwrap_or(20000), 100000)?;
+        Ok(request(match self.selection {
+            ContextSelection::Relevance => {
+                if self.recent_documents.is_some() {
+                    return Err("recent_documents requires balanced selection".into());
+                }
+                InspectQuery::Context {
+                    project,
+                    query,
+                    maximum_documents,
+                    maximum_characters,
+                }
+            }
+            ContextSelection::Balanced => {
+                let maximum_recent = maximum_documents.saturating_sub(2);
+                let recent_documents = self.recent_documents.unwrap_or(2.min(maximum_recent));
+                if recent_documents > maximum_recent {
+                    return Err(
+                        "recent_documents must leave two document slots for index and guidance"
+                            .into(),
+                    );
+                }
+                InspectQuery::ContextBalanced {
+                    project,
+                    query,
+                    maximum_documents,
+                    maximum_characters,
+                    recent_documents,
+                }
+            }
         }))
     }
 }
@@ -112,13 +154,63 @@ pub(super) struct DiffParameters {
     from_commit: String,
     /// Full lowercase Git commit ID for the later selected state.
     to_commit: String,
+    /// Contiguous preserves the original response. Hunks returns bounded separate ranges.
+    #[serde(default)]
+    format: DiffFormat,
+    /// Context lines per hunk, 0..20. Defaults to 3 in hunks mode.
+    #[serde(default)]
+    context_lines: Option<usize>,
+    /// Maximum hunks, 1..100. Defaults to 20 in hunks mode.
+    #[serde(default)]
+    maximum_hunks: Option<usize>,
+    /// Maximum encoded body-diff JSON bytes, 256..1000000. Defaults to 64000.
+    #[serde(default)]
+    maximum_diff_bytes: Option<usize>,
+}
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum DiffFormat {
+    #[default]
+    Contiguous,
+    Hunks,
 }
 impl DiffParameters {
     pub(super) fn request(self) -> Result<InspectRequest, String> {
-        Ok(request(InspectQuery::Diff {
-            document_id: id(&self.document_id)?,
-            from_commit: self.from_commit,
-            to_commit: self.to_commit,
+        let document_id = id(&self.document_id)?;
+        let from_commit = self.from_commit;
+        let to_commit = self.to_commit;
+        Ok(request(match self.format {
+            DiffFormat::Contiguous => {
+                if self.context_lines.is_some()
+                    || self.maximum_hunks.is_some()
+                    || self.maximum_diff_bytes.is_some()
+                {
+                    return Err("hunk limits require hunks format".into());
+                }
+                InspectQuery::Diff {
+                    document_id,
+                    from_commit,
+                    to_commit,
+                }
+            }
+            DiffFormat::Hunks => {
+                let context_lines = self.context_lines.unwrap_or(3);
+                let maximum_hunks = bounded(self.maximum_hunks.unwrap_or(20), 100)?;
+                let maximum_diff_bytes = self.maximum_diff_bytes.unwrap_or(64000);
+                if context_lines > 20 || !(256..=1_000_000).contains(&maximum_diff_bytes) {
+                    return Err(
+                        "context_lines must be 0..20 and maximum_diff_bytes 256..1000000".into(),
+                    );
+                }
+                InspectQuery::DiffHunks {
+                    document_id,
+                    from_commit,
+                    to_commit,
+                    context_lines,
+                    maximum_hunks,
+                    maximum_diff_bytes,
+                }
+            }
         }))
     }
 }
@@ -138,5 +230,88 @@ fn bounded(value: usize, maximum: usize) -> Result<usize, String> {
         Err(format!("limit must be between 1 and {maximum}"))
     } else {
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_modes_are_explicit_and_legacy_requests_keep_their_wire_shape() {
+        let parameters: ContextParameters =
+            serde_json::from_value(serde_json::json!({"project":"fictional-project"}))
+                .unwrap_or_else(|e| panic!("parameters: {e}"));
+        let wire = serde_json::to_value(
+            parameters
+                .request()
+                .unwrap_or_else(|e| panic!("request: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("JSON: {e}"));
+        assert_eq!(
+            wire["query"],
+            serde_json::json!({"operation":"context","project":"fictional-project","query":null,"maximum_documents":10,"maximum_characters":20000})
+        );
+        let parameters: ContextParameters = serde_json::from_value(serde_json::json!({"project":"fictional-project","selection":"balanced","maximum_documents":3})).unwrap_or_else(|e| panic!("parameters: {e}"));
+        assert!(matches!(
+            parameters
+                .request()
+                .unwrap_or_else(|e| panic!("request: {e}"))
+                .query,
+            InspectQuery::ContextBalanced {
+                recent_documents: 1,
+                ..
+            }
+        ));
+        for json in [
+            serde_json::json!({"project":"fictional-project","recent_documents":1}),
+            serde_json::json!({"project":"fictional-project","selection":"balanced","recent_documents":3,"maximum_documents":4}),
+        ] {
+            let parameters: ContextParameters =
+                serde_json::from_value(json).unwrap_or_else(|e| panic!("parameters: {e}"));
+            assert!(parameters.request().is_err());
+        }
+        let base = serde_json::json!({"document_id":"01K00000000000000000000001","from_commit":"a".repeat(40),"to_commit":"b".repeat(40)});
+        let parameters: DiffParameters =
+            serde_json::from_value(base.clone()).unwrap_or_else(|e| panic!("parameters: {e}"));
+        let wire = serde_json::to_value(
+            parameters
+                .request()
+                .unwrap_or_else(|e| panic!("request: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("JSON: {e}"));
+        assert_eq!(wire["query"]["operation"], "diff");
+        assert_eq!(wire["query"].as_object().map(|o| o.len()), Some(4));
+        let mut hunks = base.clone();
+        hunks["format"] = "hunks".into();
+        hunks["context_lines"] = 0.into();
+        let parameters: DiffParameters =
+            serde_json::from_value(hunks.clone()).unwrap_or_else(|e| panic!("parameters: {e}"));
+        assert!(matches!(
+            parameters
+                .request()
+                .unwrap_or_else(|e| panic!("request: {e}"))
+                .query,
+            InspectQuery::DiffHunks {
+                context_lines: 0,
+                ..
+            }
+        ));
+        for (field, value) in [
+            ("context_lines", 21),
+            ("maximum_hunks", 0),
+            ("maximum_diff_bytes", 255),
+        ] {
+            let mut invalid = hunks.clone();
+            invalid[field] = value.into();
+            let parameters: DiffParameters =
+                serde_json::from_value(invalid).unwrap_or_else(|e| panic!("parameters: {e}"));
+            assert!(parameters.request().is_err());
+        }
+        let mut invalid = base;
+        invalid["context_lines"] = 3.into();
+        let parameters: DiffParameters =
+            serde_json::from_value(invalid).unwrap_or_else(|e| panic!("parameters: {e}"));
+        assert!(parameters.request().is_err());
     }
 }

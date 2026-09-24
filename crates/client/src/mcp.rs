@@ -277,7 +277,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
 
     #[tool(
         name = "knowledge_context",
-        description = "Read a project index, relevant guidance and recent records from one commit within a body character budget. Returns selection reasons and truncation flags.",
+        description = "Read a project index, relevant guidance and recent records from one commit within a body character budget. Returns selection reasons and truncation flags. Balanced selection reserves recent logs and shares the body budget.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn context(
@@ -319,7 +319,7 @@ impl<C: KnowledgeBackend> KnowledgeMcpServer<C> {
 
     #[tool(
         name = "knowledge_diff",
-        description = "Compare one document at two official commits. Returns before/after metadata and a contiguous changed body line range.",
+        description = "Compare one document at two official commits. Returns before/after metadata and a contiguous body range by default. Use format hunks for bounded separate ranges with explicit truncation.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn diff(
@@ -723,8 +723,55 @@ mod tests {
             unreachable!()
         }
 
-        fn inspect(&self, _request: &InspectRequest) -> Result<InspectResponse, Self::Error> {
-            unreachable!()
+        fn inspect(&self, request: &InspectRequest) -> Result<InspectResponse, Self::Error> {
+            use agent_knowledge_protocol::{BodyDiff, BodyHunks, InspectQuery, Inspection};
+            let result = match &request.query {
+                InspectQuery::ContextBalanced {
+                    recent_documents,
+                    maximum_documents,
+                    ..
+                } => {
+                    assert_eq!(*recent_documents, 1);
+                    assert_eq!(*maximum_documents, 3);
+                    Inspection::Context {
+                        commit: "a".repeat(40),
+                        documents: vec![],
+                        additional: vec![],
+                        truncated: false,
+                    }
+                }
+                InspectQuery::DiffHunks {
+                    from_commit,
+                    to_commit,
+                    context_lines,
+                    ..
+                } => {
+                    assert_eq!(*context_lines, 0);
+                    let document = archive_response().document.summary;
+                    Inspection::DiffHunks {
+                        from_commit: from_commit.clone(),
+                        to_commit: to_commit.clone(),
+                        before: Box::new(document.clone()),
+                        after: Box::new(document),
+                        body: BodyHunks {
+                            changed: true,
+                            hunks: vec![BodyDiff {
+                                from_line: 1,
+                                to_line: 1,
+                                removed: "old\n".into(),
+                                added: "new\n".into(),
+                            }],
+                            truncated: false,
+                            truncation_reason: None,
+                        },
+                    }
+                }
+                _ => panic!("unexpected inspection"),
+            };
+            Ok(InspectResponse {
+                protocol_version: 1,
+                result,
+            })
         }
 
         fn status(&self, _request: &StatusRequest) -> Result<StatusResponse, Self::Error> {
@@ -1240,6 +1287,38 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("fictional-commit")
         );
+        for (tool, arguments, operation) in [
+            (
+                "knowledge_context",
+                serde_json::json!({"project":"fictional-project","selection":"balanced","maximum_documents":3,"recent_documents":1}),
+                "context",
+            ),
+            (
+                "knowledge_diff",
+                serde_json::json!({"document_id":"01K00000000000000000000004","from_commit":"a".repeat(40),"to_commit":"b".repeat(40),"format":"hunks","context_lines":0}),
+                "diff_hunks",
+            ),
+        ] {
+            let response = client
+                .call_tool(
+                    CallToolRequestParams::new(tool).with_arguments(
+                        arguments
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_else(|| panic!("arguments")),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("inspection over HTTP: {e}"));
+            assert_ne!(response.is_error, Some(true));
+            let value = response
+                .structured_content
+                .unwrap_or_else(|| panic!("structured inspection"));
+            assert_eq!(value["result"]["operation"], operation);
+            if operation == "diff_hunks" {
+                assert_eq!(value["result"]["body"]["hunks"][0]["added"], "new\n");
+            }
+        }
         let version = client
             .call_tool(
                 CallToolRequestParams::new("knowledge_version")

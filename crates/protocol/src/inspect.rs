@@ -29,6 +29,13 @@ pub enum InspectQuery {
         maximum_documents: usize,
         maximum_characters: usize,
     },
+    ContextBalanced {
+        project: ProjectId,
+        query: Option<String>,
+        maximum_documents: usize,
+        maximum_characters: usize,
+        recent_documents: usize,
+    },
     History {
         document_id: DocumentId,
         anchor_commit: Option<String>,
@@ -43,6 +50,14 @@ pub enum InspectQuery {
         document_id: DocumentId,
         from_commit: String,
         to_commit: String,
+    },
+    DiffHunks {
+        document_id: DocumentId,
+        from_commit: String,
+        to_commit: String,
+        context_lines: usize,
+        maximum_hunks: usize,
+        maximum_diff_bytes: usize,
     },
 }
 
@@ -92,6 +107,27 @@ pub struct BodyDiff {
     pub added: String,
 }
 
+/// Why a concise difference omits some changes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffTruncation {
+    InputLineLimit,
+    ComputationLimit,
+    HunkLimit,
+    ByteLimit,
+}
+
+/// Bounded, line-preserving changed ranges with local context.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BodyHunks {
+    /// True when the complete input bodies differ, including line endings.
+    pub changed: bool,
+    pub hunks: Vec<BodyDiff>,
+    pub truncated: bool,
+    pub truncation_reason: Option<DiffTruncation>,
+}
+
 /// Successful inspection; every selected document comes from the named commit.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
@@ -121,6 +157,13 @@ pub enum Inspection {
         before: Box<DocumentSummary>,
         after: Box<DocumentSummary>,
         body: BodyDiff,
+    },
+    DiffHunks {
+        from_commit: String,
+        to_commit: String,
+        before: Box<DocumentSummary>,
+        after: Box<DocumentSummary>,
+        body: BodyHunks,
     },
 }
 

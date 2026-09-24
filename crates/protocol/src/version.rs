@@ -54,10 +54,18 @@ impl VersionResponse {
             .into_iter()
             .map(|command| command.as_str().to_owned())
             .collect(),
-            inspect_queries: ["search_excerpts", "context", "history", "get_at", "diff"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            inspect_queries: [
+                "search_excerpts",
+                "context",
+                "context_balanced",
+                "history",
+                "get_at",
+                "diff",
+                "diff_hunks",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         }
     }
 }
@@ -80,6 +88,6 @@ mod tests {
         for command in response.commands {
             assert!(crate::GatewayCommand::parse(std::ffi::OsStr::new(&command)).is_ok());
         }
-        assert_eq!(response.inspect_queries.len(), 5);
+        assert_eq!(response.inspect_queries.len(), 7);
     }
 }

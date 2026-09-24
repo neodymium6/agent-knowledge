@@ -1,4 +1,5 @@
 //! Read-only inspection of a committed snapshot or official ancestry.
+mod diff;
 use super::*;
 use agent_knowledge_core::{DocumentId, DocumentStatus, DocumentType, markdown_body};
 use agent_knowledge_protocol::{
@@ -11,6 +12,7 @@ use agent_knowledge_repository::{
 use std::collections::HashSet;
 
 const HISTORY_SCAN_COMMITS: usize = 100;
+const MINIMUM_CONTEXT_EXCERPT_CHARACTERS: usize = 80;
 
 pub(crate) fn inspect_until(
     settings: &GatewaySettings,
@@ -83,7 +85,25 @@ pub(crate) fn inspect_until(
             query,
             maximum_documents,
             maximum_characters,
+        }
+        | InspectQuery::ContextBalanced {
+            project,
+            query,
+            maximum_documents,
+            maximum_characters,
+            ..
         } => {
+            let recent_documents = match &request.query {
+                InspectQuery::ContextBalanced {
+                    recent_documents, ..
+                } => {
+                    if *recent_documents > maximum_documents.saturating_sub(2) {
+                        return Err(invalid());
+                    }
+                    Some(*recent_documents)
+                }
+                _ => None,
+            };
             validate_result_limit(settings, *maximum_documents)?;
             bounded(*maximum_characters, 100_000)?;
             let snapshot = snapshot(settings, store, deadline)?;
@@ -105,6 +125,7 @@ pub(crate) fn inspect_until(
                         query.as_deref(),
                         maximum,
                         characters,
+                        recent_documents,
                         deadline,
                     )
                 },
@@ -160,6 +181,37 @@ pub(crate) fn inspect_until(
                 before: Box::new(before.summary),
                 after: Box::new(after.summary),
                 body: diff,
+            }
+        }
+        InspectQuery::DiffHunks {
+            document_id,
+            from_commit,
+            to_commit,
+            context_lines,
+            maximum_hunks,
+            maximum_diff_bytes,
+        } => {
+            if *context_lines > 20 || !(256..=1_000_000).contains(maximum_diff_bytes) {
+                return Err(invalid());
+            }
+            bounded(*maximum_hunks, 100)?;
+            let mut reader = history_reader(settings, store, deadline)?;
+            let before = historical(&mut reader, from_commit, *document_id)?;
+            let after = historical(&mut reader, to_commit, *document_id)?;
+            let body = diff::hunks(
+                body(&before.markdown, *document_id)?,
+                body(&after.markdown, *document_id)?,
+                *context_lines,
+                *maximum_hunks,
+                *maximum_diff_bytes,
+                deadline,
+            )?;
+            Inspection::DiffHunks {
+                from_commit: from_commit.clone(),
+                to_commit: to_commit.clone(),
+                before: Box::new(before.summary),
+                after: Box::new(after.summary),
+                body,
             }
         }
     };
@@ -327,6 +379,7 @@ fn context(
     query: Option<&str>,
     maximum: usize,
     characters: usize,
+    recent_documents: Option<usize>,
     deadline: Instant,
 ) -> Result<Inspection, GatewayError> {
     let eligible = |record: &&DocumentRecord| {
@@ -347,6 +400,27 @@ fn context(
     {
         candidates.push((record, "project_index"));
     }
+    let recent = snapshot
+        .recent(&repository_filter(filter), settings.maximum_index_entries())
+        .map_err(committed)?;
+    if let Some(count) = recent_documents {
+        candidates.extend(
+            recent
+                .iter()
+                .copied()
+                .filter(eligible)
+                .filter(|r| r.location().document_type() == DocumentType::Log)
+                .take(count)
+                .map(|r| (r, "recent_observation")),
+        );
+    }
+    let guidance = |record: &DocumentRecord| {
+        matches!(
+            record.location().document_type(),
+            DocumentType::Decision | DocumentType::Runbook
+        ) || (recent_documents.is_some()
+            && record.location().document_type() == DocumentType::Reference)
+    };
     let index = if query.is_some() {
         open_index(search_indexes, snapshot.commit())?
     } else {
@@ -363,12 +437,12 @@ fn context(
             deadline,
         )?;
         for kind in [true, false] {
-            for record in ranked.iter().copied().filter(eligible).filter(|r| {
-                matches!(
-                    r.location().document_type(),
-                    DocumentType::Decision | DocumentType::Runbook
-                ) == kind
-            }) {
+            for record in ranked
+                .iter()
+                .copied()
+                .filter(eligible)
+                .filter(|r| guidance(r) == kind)
+            {
                 candidates.push((
                     record,
                     if kind {
@@ -380,18 +454,10 @@ fn context(
             }
         }
     } else {
-        for record in all.iter().copied().filter(eligible).filter(|r| {
-            matches!(
-                r.location().document_type(),
-                DocumentType::Decision | DocumentType::Runbook
-            )
-        }) {
+        for record in all.iter().copied().filter(eligible).filter(|r| guidance(r)) {
             candidates.push((record, "project_guidance"));
         }
     }
-    let recent = snapshot
-        .recent(&repository_filter(filter), settings.maximum_index_entries())
-        .map_err(committed)?;
     candidates.extend(
         recent
             .into_iter()
@@ -415,20 +481,40 @@ fn context(
             }
             continue;
         }
+        let allowance = if recent_documents.is_some() {
+            remaining.min(characters / maximum)
+        } else {
+            remaining
+        };
         let doc = read_document(settings, &snapshot, record, &mut bytes)?;
         let raw = body(&doc.markdown, record.metadata().document_id)?;
-        let text = if raw.chars().count() <= remaining {
+        let mut text = if raw.chars().count() <= allowance {
             raw.to_owned()
+        } else if allowance == 0 {
+            String::new()
         } else if let Some(query) = query {
-            excerpts(settings, index.as_ref(), record, raw, query, remaining)?
+            excerpts(settings, index.as_ref(), record, raw, query, allowance)?
                 .into_iter()
                 .find(|e| e.field == "body")
                 .map(|e| e.text)
-                .unwrap_or_else(|| raw.chars().take(remaining).collect())
+                .unwrap_or_else(|| raw.chars().take(allowance).collect())
         } else {
-            raw.chars().take(remaining).collect()
+            raw.chars().take(allowance).collect()
         };
+        if text != raw
+            && text.chars().count() < MINIMUM_CONTEXT_EXCERPT_CHARACTERS
+            && allowance >= MINIMUM_CONTEXT_EXCERPT_CHARACTERS
+        {
+            text = raw.chars().take(allowance).collect();
+        }
         let shortened = text != raw;
+        if shortened && text.chars().count() < MINIMUM_CONTEXT_EXCERPT_CHARACTERS {
+            truncated = true;
+            if additional.len() < maximum {
+                additional.push(doc.summary);
+            }
+            continue;
+        }
         remaining = remaining.saturating_sub(text.chars().count());
         truncated |= shortened;
         documents.push(ContextDocument {

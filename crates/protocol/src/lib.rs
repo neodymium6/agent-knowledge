@@ -3,8 +3,8 @@
 mod inspect;
 mod read;
 pub use inspect::{
-    BodyDiff, ContextDocument, Excerpt, HistoryEntry, InspectQuery, InspectRequest,
-    InspectResponse, Inspection, SearchHit,
+    BodyDiff, BodyHunks, ContextDocument, DiffTruncation, Excerpt, HistoryEntry, InspectQuery,
+    InspectRequest, InspectResponse, Inspection, SearchHit,
 };
 mod status;
 mod version;
