@@ -4,6 +4,13 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.6.2
+
+- Explicitly release canonical content locks after publication and committed
+  reads, even when a concurrently spawned child retains a duplicate descriptor.
+  This prevents spurious busy errors during search-index publication and delays
+  in subsequent writes.
+
 ## 0.6.1
 
 - Refresh skills and architecture guidance for current project discovery,

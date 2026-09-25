@@ -17,9 +17,10 @@ use agent_knowledge_queue::PackagePolicy;
 use sha2::{Digest, Sha256};
 
 use crate::git::{
-    ensure_canonical_worktree_clean_until, ensure_real_directory, ensure_supported_git_until,
-    open_stable_directory, parse_object_id, run_git_for_read, run_git_for_read_with_output_limit,
-    validate_local_git_config_until, validate_repository_layout_until,
+    CanonicalContentLock, ensure_canonical_worktree_clean_until, ensure_real_directory,
+    ensure_supported_git_until, open_stable_directory, parse_object_id, run_git_for_read,
+    run_git_for_read_with_output_limit, validate_local_git_config_until,
+    validate_repository_layout_until,
 };
 use crate::{
     AttachmentRecord, ContentIndex, ContentIndexError, ContentPolicy, DocumentRecord,
@@ -186,13 +187,12 @@ impl CommittedStore {
     fn pin_current_commit(
         &self,
         deadline: Option<Instant>,
-    ) -> Result<(File, String), CommittedReadError> {
-        let content_lock = File::open(&self.content_root).map_err(CommittedReadError::Io)?;
-        match content_lock.try_lock_shared() {
-            Ok(()) => {}
+    ) -> Result<(CanonicalContentLock, String), CommittedReadError> {
+        let content_lock = match CanonicalContentLock::try_shared(&self.content_root) {
+            Ok(lock) => lock,
             Err(TryLockError::WouldBlock) => return Err(CommittedReadError::Busy),
             Err(TryLockError::Error(error)) => return Err(CommittedReadError::Io(error)),
-        }
+        };
         validate_same_directory(&self.configured_git_directory, &self.git_root_handle)?;
         validate_same_directory(&self.configured_content_root, &self.content_root_handle)?;
         check_operation_deadline(deadline)?;
@@ -275,7 +275,7 @@ pub struct CommittedSnapshot {
     maximum_bundle_entries: usize,
     deadline: Option<Instant>,
     _git_root_handle: Arc<File>,
-    _content_lock: File,
+    _content_lock: CanonicalContentLock,
 }
 
 /// Owned committed metadata detached from the canonical-worktree read lock.
