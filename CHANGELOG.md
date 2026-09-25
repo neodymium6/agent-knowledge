@@ -4,9 +4,14 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.6.1
+
 - Refresh skills and architecture guidance for current project discovery,
   context, history, and MCP operations. Correct CLI usage and MCP descriptions
   to match implemented commands, search semantics, and result ordering.
+- Document proactive reuse of relevant project knowledge in the usage skill,
+  with task-specific choices rather than a fixed reading sequence.
+- No operation behavior, wire fields, or durable storage formats change.
 
 ## 0.6.0
 
