@@ -35,6 +35,23 @@
       pkgsFor = forAllSystems (system: import nixpkgs { inherit system; });
       projectVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
       projectLicense = "Apache-2.0";
+      japaneseDictionaryFor =
+        system:
+        pkgsFor.${system}.fetchurl {
+          url = "https://Lindera.dev/mecab-ipadic-2.7.0-20250920.tar.gz";
+          hash = "sha256-p7qfZF/+cJTlauHEqB0QDfj7seKLvheSYi6XKOFi2z0=";
+        };
+      # Keep the cache layout in sync with locked lindera-ipadic 5.3.0 and
+      # lindera-dictionary format 2. Cargo builds need no dictionary network access.
+      prepareJapaneseDictionary = system: ''
+        mkdir -p "$LINDERA_BUILD_DICTIONARY_CACHE_DIR/5.3.0-fmt2"
+        japanese_dictionary_source="$LINDERA_BUILD_DICTIONARY_CACHE_DIR/5.3.0-fmt2/mecab-ipadic-2.7.0-20250920.tar.gz"
+        if ! cmp -s ${japaneseDictionaryFor system} "$japanese_dictionary_source"; then
+          cp ${japaneseDictionaryFor system} "$japanese_dictionary_source.tmp.$$"
+          chmod 644 "$japanese_dictionary_source.tmp.$$"
+          mv -f "$japanese_dictionary_source.tmp.$$" "$japanese_dictionary_source"
+        fi
+      '';
       queueIngressService = builtins.path {
         path = ./deploy/systemd + "/agent-knowledge-queue-ingress@.service";
         name = "agent-knowledge-queue-ingress-instance.service";
@@ -165,6 +182,17 @@
             };
             cargoLock.lockFile = ./Cargo.lock;
 
+            preBuild = ''
+              export LINDERA_BUILD_DICTIONARY_CACHE_DIR="$TMPDIR/lindera-dictionaries"
+              ${prepareJapaneseDictionary system}
+            '';
+            postInstall = ''
+              mkdir -p "$out/share/licenses/agent-knowledge"
+              tar -xOf ${japaneseDictionaryFor system} \
+                mecab-ipadic-2.7.0-20250920/COPYING \
+                > "$out/share/licenses/agent-knowledge/IPADIC-COPYING"
+            '';
+
             cargoBuildFlags = [
               "--workspace"
               "--all-features"
@@ -226,6 +254,9 @@
               }
             install -m755 ${unwrappedPackage}/bin/agent-knowledge-ssh-shell \
               "$out/bin/agent-knowledge-ssh-shell"
+            mkdir -p "$out/share/licenses"
+            ln -s ${unwrappedPackage}/share/licenses/agent-knowledge \
+              "$out/share/licenses/agent-knowledge"
 
             install -Dm644 ${./deploy/systemd/agent-knowledge-worker.service} \
               "$out/lib/systemd/system/agent-knowledge-worker.service"
@@ -592,6 +623,10 @@
         in
         {
           default = pkgs.mkShell {
+            shellHook = ''
+              export LINDERA_BUILD_DICTIONARY_CACHE_DIR="$PWD/target/lindera-dictionaries"
+              ${prepareJapaneseDictionary system}
+            '';
             AGENT_KNOWLEDGE_CSI_ATTACHER_RBAC = csiAttacherRbac;
             AGENT_KNOWLEDGE_CSI_EXTERNAL_HEALTH_MONITOR_RBAC = csiExternalHealthMonitorRbac;
             AGENT_KNOWLEDGE_CSI_HOSTPATH_SOURCE = csi-driver-host-path;

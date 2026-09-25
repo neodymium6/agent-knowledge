@@ -1810,8 +1810,18 @@ backends search:
 - tags; and
 - configured metadata fields.
 
-The initial Tantivy integration uses its standard tokenizer and does not add a
-Japanese-specific tokenizer.
+Titles, bodies, and tags use Lindera with an embedded, pinned IPADIC dictionary.
+NFKC normalization precedes segmentation; tokens without letters or numbers are
+discarded, and remaining tokens are lowercased. Indexing, queries, and excerpts
+share this analysis. Excerpts retain the original source spelling and offsets.
+Paths and optional metadata use Tantivy's standard tokenizer. Exact project,
+tag, and session filters are not normalized.
+
+The derived index manifest identifies both its format and analysis version.
+Worker startup rebuilds incompatible indexes even when the canonical commit
+has not changed. Upgrade the Worker and Gateway together; reads can return a
+retryable index error until rebuilding completes. Canonical Markdown needs no
+migration. The dictionary is embedded at build time, with no runtime download.
 
 It does not search:
 

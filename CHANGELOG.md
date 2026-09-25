@@ -4,6 +4,15 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add Japanese word search for indexed titles, bodies, and tags using Lindera
+  and embedded IPADIC, with NFKC normalization and original-source excerpts.
+  Document-based project discovery uses the same search analysis.
+- Normalize width and case in project name/index substring discovery, including
+  deployments without a search index.
+- Version derived search analysis and automatically rebuild incompatible
+  indexes on Worker startup. Upgrade the Worker and Gateway together; indexed
+  reads may temporarily fail until rebuilding finishes. Markdown is unchanged.
+
 ## 0.6.2
 
 - Explicitly release canonical content locks after publication and committed

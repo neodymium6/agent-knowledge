@@ -100,6 +100,10 @@ Search uses the Worker-published Tantivy index when it matches the committed
 revision, returning BM25-ranked results. A configured index that is absent,
 stale, or unreadable is a retryable failure. Deployments that omit
 `search_index_root` retain the bounded Markdown scan backend.
+Indexed titles, bodies, and tags support Japanese word search with embedded
+Lindera/IPADIC analysis and width normalization, while excerpts preserve the
+original text. See [Japanese search](docs/read-operations.md#japanese-search) for
+query behavior and the Worker/Gateway upgrade requirement.
 
 Project discovery lists project summaries or ranks projects by matching document
 counts. Add `--hits-per-project 3` in documents mode to include ranked matching

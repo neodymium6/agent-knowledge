@@ -1101,6 +1101,132 @@ fn project_hits(query: &str, maximum: usize, hits: usize, archived: bool) -> Ins
 }
 
 #[test]
+fn japanese_search_normalizes_width_and_preserves_source_excerpts_and_project_counts() {
+    let root = TestDirectory::create();
+    initialize_committed_content(&root);
+    let source = "架空の研究では機械学習の実験記録を整理して将来の研究活動に役立てます。ｻｰﾊﾞｰのｶﾞｽ観測をＡＰＩから取得します。";
+    project_document(&root, Some("fictional-research"), 5000, source, true, false);
+    project_document(
+        &root,
+        Some("fictional-research"),
+        5001,
+        "架空の実験記録です。",
+        false,
+        false,
+    );
+    project_document(
+        &root,
+        Some("fictional-hobby"),
+        5002,
+        "架空の趣味では天体観測を楽しみます。",
+        true,
+        false,
+    );
+    project_document(
+        &root,
+        Some("fictional-life"),
+        5003,
+        "架空の生活で食事を記録します。",
+        true,
+        false,
+    );
+    let hobby = root
+        .path()
+        .join("content/projects/fictional-hobby/index.md");
+    let markdown = fs::read_to_string(&hobby).unwrap_or_else(|e| panic!("read: {e}"));
+    fs::write(
+        hobby,
+        markdown
+            .replace("Fictional project overview", "架空のﾚﾝｽﾞ入門")
+            .replace("tags: [shared]", "tags: [ｶﾒﾗ]"),
+    )
+    .unwrap_or_else(|e| panic!("write: {e}"));
+    commit(&root);
+    publish_search_index(&root);
+    let gateway =
+        ReadGateway::open_until(&settings(&root), None).unwrap_or_else(|e| panic!("open: {e}"));
+    for (query, expected) in [("実験", 2), ("趣味", 1), ("生活", 1), ("実験 サーバー", 1)]
+    {
+        let Inspection::SearchExcerpts { hits, .. } = inspect(&gateway, search(query)) else {
+            panic!("search response");
+        };
+        assert_eq!(hits.len(), expected, "query: {query}");
+    }
+    for (query, field, original) in [
+        ("title:レンズ", "title", "ﾚﾝｽﾞ"),
+        ("tags:カメラ", "tags", "ｶﾒﾗ"),
+    ] {
+        let Inspection::SearchExcerpts { hits, .. } = inspect(&gateway, search(query)) else {
+            panic!("search response");
+        };
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0]
+                .excerpts
+                .iter()
+                .any(|e| e.field == field && e.text.contains(original))
+        );
+        assert!(!hits[0].excerpts.iter().any(|e| e.field == "body"));
+    }
+    for (tag, expected) in [("ｶﾒﾗ", 1), ("カメラ", 0)] {
+        let mut query = search("レンズ");
+        if let InspectQuery::SearchExcerpts { filter, .. } = &mut query {
+            filter.tag = Some(tag.into());
+        }
+        let Inspection::SearchExcerpts { hits, .. } = inspect(&gateway, query) else {
+            panic!("search response");
+        };
+        assert_eq!(hits.len(), expected, "exact tag: {tag}");
+    }
+    for (query, original) in [("サーバー", "ｻｰﾊﾞｰ"), ("ガス", "ｶﾞｽ"), ("api", "ＡＰＩ")]
+    {
+        let Inspection::SearchExcerpts { hits, .. } = inspect(&gateway, search(query)) else {
+            panic!("search response");
+        };
+        assert_eq!(hits.len(), 1, "query: {query}");
+        assert!(
+            hits[0]
+                .excerpts
+                .iter()
+                .any(|e| e.field == "body" && e.text.contains(original))
+        );
+        for excerpt in &hits[0].excerpts {
+            assert!(excerpt.text.chars().count() <= 30);
+            if excerpt.field == "body" {
+                assert!(source.contains(&excerpt.text));
+            }
+        }
+    }
+    let Inspection::Projects { projects, .. } =
+        inspect(&gateway, project_hits("実験", 10, 1, false))
+    else {
+        panic!("projects");
+    };
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].project.as_str(), "fictional-research");
+    assert_eq!(projects[0].matching_documents, Some(2));
+    // Name/index discovery is normalized substring matching on both backends.
+    for config in [settings(&root), settings_without_search_index(&root)] {
+        let gateway =
+            ReadGateway::open_until(&config, None).unwrap_or_else(|e| panic!("open: {e}"));
+        for query in [
+            "サーバー",
+            "ガス",
+            "api",
+            "ＦＩＣＴＩＯＮＡＬ－ＲＥＳＥＡＲＣＨ",
+        ] {
+            let Inspection::Projects { projects, .. } =
+                inspect(&gateway, project_query(Some(query), false, 10, false))
+            else {
+                panic!("projects");
+            };
+            assert_eq!(projects.len(), 1, "query: {query}");
+            assert_eq!(projects[0].project.as_str(), "fictional-research");
+        }
+    }
+}
+
+#[test]
 fn project_hits_preserve_counts_rank_scope_and_exact_excerpts_on_both_backends() {
     for indexed in [false, true] {
         let root = TestDirectory::create();

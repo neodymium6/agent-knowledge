@@ -30,5 +30,5 @@ pub use replication::{
 };
 pub use search_index::{
     ActiveSearchIndex, PreparedSearchIndex, SearchIndexStore, SearchIndexStoreError,
-    TantivySearchError, TantivySearchIndex, TantivySearchPolicy,
+    TantivySearchError, TantivySearchIndex, TantivySearchPolicy, normalize_search_text,
 };

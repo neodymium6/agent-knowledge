@@ -12,7 +12,7 @@ use tantivy::query::{
 };
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, NumericOptions, STORED, STRING, Schema, TEXT, TantivyDocument,
-    Term, TextOptions, Value,
+    Term, TextFieldIndexing, TextOptions, Value,
 };
 use tantivy::{DocSet, Index, IndexReader, Order, SegmentReader, TERMINATED};
 
@@ -27,9 +27,11 @@ use crate::{
 const INDEX_WRITER_MEMORY_BYTES: usize = 15_000_000;
 const SORT_PATH_FIELD: &str = "sort_path";
 
+mod analysis;
 mod disk;
 mod store;
 
+pub use analysis::normalize_search_text;
 pub use store::{ActiveSearchIndex, PreparedSearchIndex, SearchIndexStore, SearchIndexStoreError};
 
 /// A Tantivy index built from one exact committed snapshot.
@@ -105,8 +107,8 @@ impl TantivySearchIndex {
     /// Builds a new in-memory index from every validated Markdown document in
     /// one committed snapshot.
     ///
-    /// The standard Tantivy tokenizer is used. It lowercases text and splits
-    /// on punctuation and whitespace; no Japanese tokenizer is registered.
+    /// Titles, bodies, and tags use embedded IPADIC segmentation with NFKC
+    /// normalization and lowercase matching. Source text remains unchanged.
     ///
     /// # Errors
     ///
@@ -128,6 +130,7 @@ impl TantivySearchIndex {
         query_schema: Schema,
         fields: SearchFields,
     ) -> Result<Self, TantivySearchError> {
+        analysis::register(&index)?;
         let mut writer = index
             .writer_with_num_threads(1, INDEX_WRITER_MEMORY_BYTES)
             .map_err(TantivySearchError::engine)?;
@@ -491,16 +494,16 @@ impl SearchFields {
         let mut query_schema = Schema::builder();
         let document_id = schema.add_text_field("document_id", STRING | STORED);
         query_schema.add_text_field("document_id", TextOptions::default());
-        let title = schema.add_text_field("title", TEXT);
-        query_schema.add_text_field("title", TEXT);
-        let body = schema.add_text_field("body", TEXT);
-        query_schema.add_text_field("body", TEXT);
+        let title = schema.add_text_field("title", japanese_text());
+        query_schema.add_text_field("title", japanese_text());
+        let body = schema.add_text_field("body", japanese_text());
+        query_schema.add_text_field("body", japanese_text());
         let path = schema.add_text_field("path", TEXT);
         query_schema.add_text_field("path", TEXT);
         let sort_path = schema.add_text_field(SORT_PATH_FIELD, FAST);
         query_schema.add_text_field(SORT_PATH_FIELD, TextOptions::default());
-        let tags = schema.add_text_field("tags", TEXT);
-        query_schema.add_text_field("tags", TEXT);
+        let tags = schema.add_text_field("tags", japanese_text());
+        query_schema.add_text_field("tags", japanese_text());
         let exact_tags = schema.add_text_field("exact_tags", STRING);
         query_schema.add_text_field("exact_tags", TextOptions::default());
         let node = schema.add_text_field("node", optional_text(metadata_fields.node()));
@@ -692,6 +695,14 @@ impl SearchFields {
             IndexRecordOption::Basic,
         ))
     }
+}
+
+fn japanese_text() -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(analysis::ANALYZER)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    )
 }
 
 fn optional_text(enabled: bool) -> TextOptions {
