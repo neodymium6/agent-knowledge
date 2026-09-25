@@ -17,7 +17,7 @@ flake for `x86_64-linux` and `aarch64-linux`:
 
 ```sh
 nix profile install \
-  github:neodymium6/agent-knowledge/v0.6.2#agent-knowledge
+  github:neodymium6/agent-knowledge/v0.7.0#agent-knowledge
 agent-knowledge --version
 ```
 
@@ -29,12 +29,12 @@ archive for `x86_64-unknown-linux-musl` or
 Server containers are published to GHCR for `linux/amd64` and `linux/arm64`:
 
 ```text
-ghcr.io/neodymium6/agent-knowledge-worker:0.6.2
-ghcr.io/neodymium6/agent-knowledge-queue-ingress:0.6.2
-ghcr.io/neodymium6/agent-knowledge-gateway:0.6.2
-ghcr.io/neodymium6/agent-knowledge-openssh-gateway:0.6.2
-ghcr.io/neodymium6/agent-knowledge-storage-bootstrap:0.6.2
-ghcr.io/neodymium6/agent-knowledge-client-mcp:0.6.2
+ghcr.io/neodymium6/agent-knowledge-worker:0.7.0
+ghcr.io/neodymium6/agent-knowledge-queue-ingress:0.7.0
+ghcr.io/neodymium6/agent-knowledge-gateway:0.7.0
+ghcr.io/neodymium6/agent-knowledge-openssh-gateway:0.7.0
+ghcr.io/neodymium6/agent-knowledge-storage-bootstrap:0.7.0
+ghcr.io/neodymium6/agent-knowledge-client-mcp:0.7.0
 ```
 
 Images contain no deployment configuration, SSH keys, Git credentials, or
@@ -100,6 +100,10 @@ Search uses the Worker-published Tantivy index when it matches the committed
 revision, returning BM25-ranked results. A configured index that is absent,
 stale, or unreadable is a retryable failure. Deployments that omit
 `search_index_root` retain the bounded Markdown scan backend.
+Indexed titles, bodies, and tags support Japanese word search with embedded
+Lindera/IPADIC analysis and width normalization, while excerpts preserve the
+original text. See [Japanese search](docs/read-operations.md#japanese-search) for
+query behavior and the Worker/Gateway upgrade requirement.
 
 Project discovery lists project summaries or ranks projects by matching document
 counts. Add `--hits-per-project 3` in documents mode to include ranked matching
@@ -167,7 +171,7 @@ A minimal sidecar container is:
 
 ```yaml
 - name: agent-knowledge-mcp
-  image: ghcr.io/neodymium6/agent-knowledge-client-mcp:0.6.2
+  image: ghcr.io/neodymium6/agent-knowledge-client-mcp:0.7.0
   args:
     - --destination
     - fictional-knowledge

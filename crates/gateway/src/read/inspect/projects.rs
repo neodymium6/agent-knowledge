@@ -74,7 +74,7 @@ pub(super) fn list(
     let search_query = query;
     let query = query
         .filter(|_| search_in == ProjectSearchScope::Project)
-        .map(|q| q.trim().to_lowercase());
+        .map(|q| agent_knowledge_repository::normalize_search_text(q.trim()));
     let mut projects = Vec::new();
     let mut bytes = 0;
     let mut truncated = false;
@@ -94,10 +94,11 @@ pub(super) fn list(
             .unwrap_or("");
         let matches = query.as_ref().is_none_or(|q| {
             project.as_str().contains(q)
-                || document
-                    .as_ref()
-                    .is_some_and(|d| d.summary.metadata.title.to_lowercase().contains(q))
-                || raw.to_lowercase().contains(q)
+                || document.as_ref().is_some_and(|d| {
+                    agent_knowledge_repository::normalize_search_text(&d.summary.metadata.title)
+                        .contains(q)
+                })
+                || agent_knowledge_repository::normalize_search_text(raw).contains(q)
         });
         check_deadline(deadline)?;
         if !matches {

@@ -125,6 +125,65 @@ fn startup_rebuilds_corrupt_derived_search_publications() {
 }
 
 #[test]
+fn startup_rebuilds_obsolete_search_analysis_without_a_content_change() {
+    for legacy in [true, false] {
+        let root = TestDirectory::create();
+        initialize_repository(root.path());
+        initialize_quartz(root.path());
+        let settings = WorkerSettings::decode(&valid_yaml(root.path()))
+            .unwrap_or_else(|error| panic!("settings must decode: {error}"));
+        {
+            let bootstrap = WorkerBootstrap::open(settings.clone())
+                .unwrap_or_else(|error| panic!("Worker must open: {error}"));
+            let _started = bootstrap
+                .start(created_at())
+                .unwrap_or_else(|error| panic!("Worker must start: {error}"));
+        }
+        let search_root = root.path().join("search-indexes");
+        let first = SearchIndexStore::open(&search_root)
+            .and_then(|store| store.active_index())
+            .unwrap_or_else(|error| panic!("index must open: {error}"))
+            .unwrap_or_else(|| panic!("index must exist"));
+        let manifest = search_root
+            .join("by-id")
+            .join(first.generation_id())
+            .join(".agent-knowledge-search-index.json");
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &fs::read(&manifest).unwrap_or_else(|error| panic!("manifest must read: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("manifest must decode: {error}"));
+        if legacy {
+            value["format_version"] = serde_json::json!(2);
+            value
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("manifest object"))
+                .remove("analyzer");
+        } else {
+            value["analyzer"] = serde_json::json!("fictional-obsolete-analysis");
+        }
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&value)
+                .unwrap_or_else(|error| panic!("manifest must encode: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("manifest must write: {error}"));
+        // Readers refuse obsolete analysis instead of silently changing semantics.
+        assert!(SearchIndexStore::open_active_read_only(&search_root).is_err());
+        let bootstrap = WorkerBootstrap::open(settings)
+            .unwrap_or_else(|error| panic!("obsolete index must recover: {error}"));
+        let _started = bootstrap
+            .start(created_at())
+            .unwrap_or_else(|error| panic!("index must rebuild: {error}"));
+        let current = SearchIndexStore::open(&search_root)
+            .and_then(|store| store.active_index())
+            .unwrap_or_else(|error| panic!("new index must open: {error}"))
+            .unwrap_or_else(|| panic!("new index must exist"));
+        assert_ne!(first.generation_id(), current.generation_id());
+        assert_eq!(first.commit(), current.commit());
+    }
+}
+
+#[test]
 fn inspects_initialized_components_without_starting_the_worker() {
     let root = TestDirectory::create();
     initialize_repository(root.path());

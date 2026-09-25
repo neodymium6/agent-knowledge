@@ -20,6 +20,7 @@ test -f "$ingress_service"
 test -f "$sysusers"
 test -f "$tmpfiles"
 test -x "$ssh_shell"
+test -s "$package_path/share/licenses/agent-knowledge/IPADIC-COPYING"
 test "$(grep -Fxc "ExecStart=$package_path/bin/agent-knowledge worker run --config /etc/agent-knowledge/worker.yaml" "$service")" -eq 1
 for directive in \
   'Type=exec' \

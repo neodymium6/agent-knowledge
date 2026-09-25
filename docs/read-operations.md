@@ -40,8 +40,9 @@ agent-knowledge-client projects --destination fictional-knowledge \
   --query backup --search-in documents --maximum-results 10
 ```
 
-The default `--search-in project` mode uses case-insensitive substring matching
-on the project slug, index title, and complete index body. A query is optional;
+The default `--search-in project` mode uses NFKC-normalized, lowercase substring
+matching on the project slug, index title, and complete index body. Full-width
+ASCII and half-width katakana therefore match their normalized forms. A query is optional;
 results are ordered by project slug. It does not search other documents or
 require a Tantivy index.
 
@@ -146,6 +147,27 @@ project filters retains cross-project reads. The additive `projects` filter
 requires an updated Gateway; older Gateways reject it rather than silently
 searching all projects. Context selection remains a single-project operation.
 
+## Japanese search
+
+With a configured Tantivy index, titles, bodies, and tags use Lindera's embedded
+IPADIC dictionary to segment Japanese text. A word such as `実験` can match inside
+`架空の実験記録です` without inserting spaces into the document. Indexing and
+queries use NFKC normalization and lowercase matching: `サーバー` matches
+`ｻｰﾊﾞｰ`, and `api` matches `ＡＰＩ`. Project discovery by document hit count and
+its sample hits use the same analysis. Terms remain ANDed by default; existing
+Tantivy query syntax and BM25 field weights remain in effect.
+
+Paths and optional metadata retain the standard tokenizer. Exact project, tag,
+and session filters retain their original spelling requirements. Search does
+not expand synonyms, readings, or inflected forms. With indexing disabled,
+document search retains case-insensitive substring matching without Japanese
+segmentation or NFKC normalization.
+
+Upgrade the Worker and Gateway together. Worker startup automatically rebuilds
+older derived indexes; configured indexed reads can return retryable errors
+until rebuilding completes. Canonical Markdown is unchanged. The dictionary is
+embedded in the server package and requires no runtime download.
+
 ## Search excerpts
 
 ```sh
@@ -163,6 +185,8 @@ excerpt limit must be between 1 and 2000. Results retain document metadata,
 revision, ranking, and the exact searched commit. Each excerpt identifies its
 field and whether it omits part of that field. At most one excerpt is returned
 per field. Text is copied from the source without HTML highlighting.
+Japanese segmentation and normalization do not rewrite excerpt text; for
+example, a `サーバー` query can return the original spelling `ｻｰﾊﾞｰ`.
 
 The configured Tantivy backend extracts query-term fragments using its query
 parser and tokenizer. A fragment illustrates matching terms; it is not a proof

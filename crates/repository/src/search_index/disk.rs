@@ -15,7 +15,7 @@ use tantivy::directory::META_LOCK;
 use super::{SearchFields, TantivySearchError, TantivySearchIndex};
 use crate::{CommittedSnapshot, SearchMetadataFields};
 
-const FORMAT_VERSION: u16 = 2;
+const FORMAT_VERSION: u16 = 3;
 const INDEX_DIRECTORY: &str = "tantivy";
 const MANIFEST_FILE: &str = ".agent-knowledge-search-index.json";
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024;
@@ -28,6 +28,7 @@ const INDEX_LOCK_FILE_MODE: u32 = 0o660;
 #[serde(deny_unknown_fields)]
 struct DiskManifest {
     format_version: u16,
+    analyzer: String,
     commit: String,
     document_count: u64,
     metadata_fields: DiskMetadataFields,
@@ -75,6 +76,7 @@ impl TantivySearchIndex {
             .map_err(|_| TantivySearchError::InvalidDiskManifest)?;
         let manifest = DiskManifest {
             format_version: FORMAT_VERSION,
+            analyzer: super::analysis::ANALYZER.into(),
             commit: built.commit.clone(),
             document_count,
             metadata_fields: metadata_fields.into(),
@@ -123,6 +125,7 @@ impl TantivySearchIndex {
         if index.schema() != expected_schema {
             return Err(TantivySearchError::DiskSchemaMismatch);
         }
+        super::analysis::register(&index)?;
         let reader = index.reader().map_err(TantivySearchError::engine)?;
         let indexed_documents = reader.searcher().num_docs();
         if indexed_documents != manifest.document_count {
@@ -188,7 +191,10 @@ fn read_manifest(directory: &Path) -> Result<DiskManifest, TantivySearchError> {
         })?;
     let manifest = serde_json::from_slice::<DiskManifest>(&bytes)
         .map_err(|_| TantivySearchError::InvalidDiskManifest)?;
-    if manifest.format_version != FORMAT_VERSION || !valid_commit(&manifest.commit) {
+    if manifest.format_version != FORMAT_VERSION
+        || manifest.analyzer != super::analysis::ANALYZER
+        || !valid_commit(&manifest.commit)
+    {
         return Err(TantivySearchError::InvalidDiskManifest);
     }
     Ok(manifest)
