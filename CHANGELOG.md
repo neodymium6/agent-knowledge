@@ -4,6 +4,8 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.7.0
+
 - Add Japanese word search for indexed titles, bodies, and tags using Lindera
   and embedded IPADIC, with NFKC normalization and original-source excerpts.
   Document-based project discovery uses the same search analysis.
