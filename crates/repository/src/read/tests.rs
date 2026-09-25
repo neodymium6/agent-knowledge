@@ -999,7 +999,7 @@ fn run_git<const N: usize>(working_directory: Option<&Path>, arguments: [&str; N
 }
 
 #[test]
-fn shared_snapshot_lock_blocks_publication_until_drop() {
+fn shared_snapshot_lock_releases_while_an_inherited_descriptor_remains_open() {
     let fixture = Fixture::create();
     let snapshot = fixture
         .store()
@@ -1007,18 +1007,17 @@ fn shared_snapshot_lock_blocks_publication_until_drop() {
         .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
     let writer = File::open(&fixture.content)
         .unwrap_or_else(|error| panic!("publication lock fixture must open: {error}"));
+    let inherited = snapshot
+        ._content_lock
+        .0
+        .try_clone()
+        .unwrap_or_else(|error| panic!("snapshot descriptor must clone: {error}"));
     assert!(matches!(writer.try_lock(), Err(TryLockError::WouldBlock)));
     drop(snapshot);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    loop {
-        match writer.try_lock() {
-            Ok(()) => break,
-            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::yield_now();
-            }
-            Err(error) => panic!("writer lock must succeed after snapshot drop: {error}"),
-        }
-    }
+    writer
+        .try_lock()
+        .unwrap_or_else(|error| panic!("writer lock must succeed after snapshot drop: {error}"));
+    drop(inherited);
 }
 
 #[test]
@@ -1029,19 +1028,18 @@ fn detached_snapshot_releases_the_publication_lock() {
         .snapshot(ContentPolicy::default(), &PackagePolicy::default())
         .unwrap_or_else(|error| panic!("committed snapshot must open: {error}"));
     let commit = snapshot.commit().to_owned();
+    let inherited = snapshot
+        ._content_lock
+        .0
+        .try_clone()
+        .unwrap_or_else(|error| panic!("snapshot descriptor must clone: {error}"));
     let detached = snapshot.into_detached();
     let writer = File::open(&fixture.content)
         .unwrap_or_else(|error| panic!("publication lock fixture must open: {error}"));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    loop {
-        match writer.try_lock() {
-            Ok(()) => break,
-            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::yield_now();
-            }
-            Err(error) => panic!("detached metadata must not retain the lock: {error}"),
-        }
-    }
+    writer
+        .try_lock()
+        .unwrap_or_else(|error| panic!("detached metadata must not retain the lock: {error}"));
+    drop(inherited);
     assert_eq!(detached.commit(), commit);
 }
 

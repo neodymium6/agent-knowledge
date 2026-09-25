@@ -1205,6 +1205,27 @@ fn rejects_a_symlink_restoring_a_replaced_work_root() {
 }
 
 #[test]
+fn publication_lock_releases_while_an_inherited_descriptor_remains_open() {
+    let root = TestDirectory::new();
+    let lock = super::CanonicalContentLock::exclusive(root.path())
+        .unwrap_or_else(|error| panic!("publication lock must succeed: {error}"));
+    // dup and fork retain the same open file description and lock.
+    let inherited = lock
+        .0
+        .try_clone()
+        .unwrap_or_else(|error| panic!("publication descriptor must clone: {error}"));
+    assert!(matches!(
+        super::CanonicalContentLock::try_shared(root.path()),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(lock);
+    let reader = super::CanonicalContentLock::try_shared(root.path())
+        .unwrap_or_else(|error| panic!("finished publication must release its lock: {error}"));
+    drop(reader);
+    drop(inherited);
+}
+
+#[test]
 fn repository_root_lock_is_exclusive_across_cloned_handles() {
     let root = TestDirectory::new();
     let fixture = GitFixture::initialize(root.path());

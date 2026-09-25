@@ -1283,9 +1283,8 @@ impl GitRepository {
         publication_started: bool,
     ) -> Result<(), GitTransactionError> {
         self.validate_live_storage()?;
-        let canonical_lock =
-            File::open(&self.canonical_worktree).map_err(GitTransactionError::Io)?;
-        canonical_lock.lock().map_err(GitTransactionError::Io)?;
+        let _canonical_lock = CanonicalContentLock::exclusive(&self.canonical_worktree)
+            .map_err(GitTransactionError::Io)?;
         let actual = self.resolve_commit(&self.official_ref)?;
         if actual == base {
             self.ensure_canonical_clean()?;
@@ -1840,6 +1839,31 @@ pub(crate) fn ensure_canonical_worktree_clean_until(
         Ok(())
     } else {
         Err(GitTransactionError::CanonicalWorktreeDirty)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CanonicalContentLock(pub(crate) File);
+
+impl CanonicalContentLock {
+    fn exclusive(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        file.lock()?;
+        Ok(Self(file))
+    }
+
+    pub(crate) fn try_shared(path: &Path) -> Result<Self, TryLockError> {
+        let file = File::open(path).map_err(TryLockError::Error)?;
+        file.try_lock_shared()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for CanonicalContentLock {
+    fn drop(&mut self) {
+        // A concurrently spawned child can retain this open file description
+        // until exec. Release the lock without waiting for its descriptor to close.
+        let _ = self.0.unlock();
     }
 }
 
