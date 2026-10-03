@@ -4,6 +4,13 @@ Notable changes are recorded here. This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.7.1
+
+- Remove the permanent deployment warning from the SSH client administration
+  page. Keep authentication and proxy requirements in the deployment documentation.
+- No authentication behavior, protocol, or durable storage format changes.
+  Existing v0.7.0 clients remain compatible; no data migration is required.
+
 ## 0.7.0
 
 - Add Japanese word search for indexed titles, bodies, and tags using Lindera
