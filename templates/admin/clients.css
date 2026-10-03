@@ -48,7 +48,6 @@ p {
   color: GrayText;
 }
 
-.warning,
 .message {
   padding: 0.75rem 1rem;
   border-left: 0.25rem solid #c78600;
