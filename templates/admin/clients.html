@@ -19,7 +19,6 @@
       {% endmatch %}
     </header>
 
-    <p class="warning">This service does not authenticate users. Keep it behind an authenticated, same-host proxy.</p>
     {% if notice != "" %}<p class="message success" role="status">{{ notice }}</p>{% endif %}
     {% if error != "" %}<p class="message error" role="alert">{{ error }}</p>{% endif %}
 
